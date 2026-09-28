@@ -1,0 +1,20 @@
+# Partition table for 16 MB flash.
+# 2 OTA slots + LittleFS.
+# App partitions are aligned to 0x10000 (64 KB) for flash erase.
+#
+# NOTE: LittleFS in Arduino-ESP32 looks for a partition named "spiffs" by default.
+#
+# Layout:
+#   nvs      : 0x009000 + 0x006000 = 0x00F000
+#   otadata  : 0x00F000 + 0x002000 = 0x011000
+#   (gap to 0x020000 for app0 alignment)
+#   app0     : 0x020000 + 0x580000 = 0x5A0000
+#   app1     : 0x5A0000 + 0x580000 = 0xB20000
+#   spiffs   : 0xB20000 + 0x4E0000 = 0x1000000 (exactly 16 MB)
+
+# Name,   Type, SubType, Offset,   Size, Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+otadata,  data, ota,     0xF000,   0x2000,
+app0,     app,  ota_0,   0x20000,  0x580000,
+app1,     app,  ota_1,   ,         0x580000,
+spiffs,   data, littlefs,,         0x4E0000,
