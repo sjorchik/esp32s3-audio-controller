@@ -162,28 +162,34 @@
 **Виконані модулі:**
 - Скелет проекту (platformio.ini, partitions.csv, config/*, заглушки модулів, main.cpp).
 - `core/events.h` (`EventBus`) — реалізовано.
-- `input/buttons`, `input/encoder`, `config/input_config.h` — реалізовано (Prompt 1). Деталі нижче й у розділах 12–13.
+- `input/buttons`, `input/encoder`, `config/input_config.h` — реалізовано (Prompt 1).
+- `input/ir_rc5`, `config/ir_config.h` — реалізовано (Prompt 2): приймання RC5/RC5X (RMT RX), мапа кодів у NVS, режим навчання з подвійним підтвердженням, JSON-експорт/імпорт. Інструкція користувача — `IR_LEARNING.txt` (тимчасовий код навчання в `main.cpp`, видалити при появі UI).
 
 **Важливо для AppController (ще не написаний), врахувати при реалізації:**
 - `Action::ENC_PRESS` з `longPress=false` (коротке натискання кнопки енкодера) призначати на mute; `longPress=true` (утримання ≥ `kBtnLongPressMs`) — на іншу дію (наприклад, вхід у меню). Коротка подія приходить лише при відпусканні і не дублюється після довгої.
-- Аналогічно для POWER і OK: обидві мають `kBtnLongPress* = true`, тобто в них теж є окремі довгі події (за замовчуванням короткий POWER/OK поки нічого не займає в AppController — розподілити дії при написанні).
-- Демо-друк подій у `main.cpp` (`INPUT_DEMO_PRINT_EVENTS`) читає з тієї самої черги `EventBus`, що й майбутній `AppController`. Вимкнути прапорець у `input_config.h` (`#define INPUT_DEMO_PRINT_EVENTS 0`), коли AppController підключить власне читання черги — інакше вони конкуруватимуть за події.
-- `Buttons::droppedEvents()` / `Encoder::droppedEvents()` — лічильники втрачених подій (переповнена черга). Варто вивести кудись у діагностику/веб-статус.
+- Аналогічно для POWER і OK: обидві мають `kBtnLongPress* = true`, тобто в них теж є окремі довгі події (розподілити дії при написанні AppController).
+- Демо-друк подій у `main.cpp` (`INPUT_DEMO_PRINT_EVENTS`) читає з тієї самої черги `EventBus`, що й майбутній `AppController`. Вимкнути прапорець у `input_config.h`, коли AppController підключить власне читання черги.
+- `Buttons::droppedEvents()` / `Encoder::droppedEvents()` / `IrRc5::droppedEvents()` — лічильники втрачених подій (переповнена черга). Варто вивести кудись у діагностику/веб-статус.
+- Події з `source == EventSource::IR` для `Action::ENC_CW`/`ENC_CCW` завжди мають `delta = 1` (IR не має акселерації), а повтор (`repeat=true`) від IR приходить лише для VOL_UP, VOL_DOWN, UP, DOWN, LEFT, RIGHT — для решти дій (MENU, BACK, INPUT_*, DIGIT_*, POWER, OK, ENC_PRESS) з пульта приходить лише перше натискання серії.
+- Режим навчання IR (`IrRc5::beginLearn` / `status()` / `cancelLearn()` / `confirmOverwrite()`) поки викликається тимчасовим кодом у `main.cpp` (див. `IR_LEARNING.txt`). Коли буде екран `IrLearn`, він викликає ту саму статичну API `IrRc5`, а тимчасовий код і виклик `learnDemoTick()` з `main.cpp` прибираються.
 
 **Заплановані зміни інтерфейсів (виконуються у відповідних промптах):**
-- `Action`: додати IR-дії `VOL_UP`, `VOL_DOWN`, `MUTE`, `MENU`, `BACK`, `INPUT_RADIO`, `INPUT_TV`, `INPUT_PC`, `INPUT_AUX`, `DIGIT_0..DIGIT_9` (Prompt 2). `Event` більше не змінюється без потреби — поля `longPress`/`delta` вже додані.
-- `IrRc5`: новий інтерфейс з навчанням замість заглушки (Prompt 2).
 - `AudioProcessor`: додати `probe()`, `applyAll()`, розширені capabilities (фейдер, підсилення входу) (Prompt 3).
 - `AppState`: додати безпечне часткове оновлення (`modify`) при реалізації AppState.
 - `Settings`: додати `bass`, `treble`, `balance`, `loudness`; `processorType`: 0 = TDA7318, 1 = PT2313L.
 
 **Відомі особливості реалізації (не проблеми, але важливо знати):**
 - PCNT: поле `accum_count` у `pcnt_unit_config_t` — без `flags.` у IDF 5.5.2 (на відміну від 5.2.x). Якщо після оновлення тулчейну збірка видасть `no member named 'flags'` — прибрати `flags.`.
-- Дебаунс за часом дає затримку: коротка подія приходить приблизно через `kBtnDebounceMs` (30 мс) після фізичного відпускання; довге натискання спрацьовує приблизно через `kBtnLongPressMs` (800 мс) від початку натискання, плюс дебаунс.
+- Дебаунс за часом дає затримку: коротка подія кнопки приходить приблизно через `kBtnDebounceMs` (30 мс) після фізичного відпускання; довге натискання спрацьовує приблизно через `kBtnLongPressMs` (800 мс) від початку натискання, плюс дебаунс.
 - Поки кнопка утримується, повтор і довге натискання взаємовиключні (що настало першим — те й діє). З поточними прапорцями конфлікту немає: повтор лише в UP/DOWN/LEFT/RIGHT, довге — лише в POWER/OK/кнопки енкодера.
 - Кнопка, яка вже утримувалась на момент старту задачі `Buttons`, ігнорується до першого відпускання (так утримання OK на старті для скидання Wi-Fi не породжує хибних подій).
 - `delta` обмежене типом `int8_t` (максимум 127); надлишок відкидається, фізично недосяжно.
 - Акселерація енкодера одноступенева (один множник), скидається зміною напрямку або паузою довшою за поріг.
+- **Значення `enum class Action` зберігаються в NVS як числа (мапа IR).** Нові дії додавати ЛИШЕ в кінець `enum`, ніколи не вставляти й не переставляти посередині. Якщо порядок все ж довелось змінити — збільшити `ir_cfg::kMapFormatVersion`, стара мапа в NVS буде відкинута при завантаженні (не впаде, просто стане порожньою — користувач навчає пульт заново).
+- IR: несуча пульта RC5 — 36 кГц, приймач VS1838B розрахований на 38 кГц. Це знижує чутливість і може «плавати» довжину імпульсів; підбирається `ir_cfg::kMarkBiasUs` і `kHalfBitTolerancePercent`, не перевірено на реальному залізі.
+- IR: стартова мапа кодів порожня, конкретні коди Philips не зашиті — усе задається користувачем через режим навчання (описано в `IR_LEARNING.txt`).
+- IR: розширений RC5X-кадр (20 біт, з подовженою паузою) не підтримується, лише стандартні 14 біт.
+- IR: запис мапи в NVS (кілька мс) відбувається лише після навчання/імпорту/очищення, може на мить затримати задачу IR — на аудіо (інше ядро) не впливає.
 
 **Відомі проблеми:** поки немає.
 
@@ -191,7 +197,7 @@
 
 Нижче лише публічні інтерфейси: реалізації опущено.
 
-### `core/events.h` — реалізовано
+### `core/events.h` — реалізовано (розширено в Prompt 2)
 
 ```cpp
 #pragma once
@@ -205,6 +211,7 @@
 #include <stdint.h>
 
 // Логічні дії.
+// Нові значення додавати ЛИШЕ в кінець: числові значення Action зберігаються в NVS (мапа IR).
 enum class Action : uint8_t {
     POWER,
     UP,
@@ -215,6 +222,26 @@ enum class Action : uint8_t {
     ENC_CW,
     ENC_CCW,
     ENC_PRESS,
+    // [Prompt 2] ДОДАНО: VOL_UP..BACK, INPUT_RADIO..INPUT_AUX, DIGIT_0..DIGIT_9 (цифри йдуть підряд).
+    VOL_UP,
+    VOL_DOWN,
+    MUTE,
+    MENU,
+    BACK,
+    INPUT_RADIO,
+    INPUT_TV,
+    INPUT_PC,
+    INPUT_AUX,
+    DIGIT_0,
+    DIGIT_1,
+    DIGIT_2,
+    DIGIT_3,
+    DIGIT_4,
+    DIGIT_5,
+    DIGIT_6,
+    DIGIT_7,
+    DIGIT_8,
+    DIGIT_9,
 };
 
 // Джерело події.
@@ -506,21 +533,109 @@ public:
 };
 ```
 
-### `input/ir_rc5.h` — заглушка (буде замінено в Prompt 2)
+### `input/ir_rc5.h` — реалізовано (Prompt 2)
 
 ```cpp
 #pragma once
+
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <stddef.h>
 #include <stdint.h>
-struct IrRc5Code {
-    uint8_t address;
-    uint8_t command;
+
+#include "core/events.h"
+
+// Результат декодування одного кадру RC5/RC5X.
+struct IrRc5Frame {
+    uint8_t addr;          // 0..31
+    uint8_t cmd;           // 0..127 (для RC5X 7-й біт вже інвертовано з S2)
     bool toggle;
+    bool isRC5X;           // true, якщо S2 == 0 (тоді cmd >= 64)
+    uint32_t timestampMs;  // millis() на момент обробки кадру
 };
+
+// IR-приймач RC5/RC5X: RMT RX, мапа кодів у NVS, режим навчання.
+// Усі методи, крім begin(), викликати після begin().
 class IrRc5 {
 public:
+    enum class LearnStatus : uint8_t {
+        Idle,      // навчання не активне
+        Waiting,   // чекаємо перше натискання
+        Confirm,   // перший код прийнято, чекаємо такого ж другого натискання
+        Success,   // код привʼязано й збережено
+        Timeout,   // вичерпано час очікування
+        Conflict,  // код уже привʼязаний до іншої дії; чекаємо confirmOverwrite()
+    };
+
+    // Створює задачу приймання, налаштовує RMT RX, завантажує мапу з NVS.
+    // Потребує готового EventBus. Повторний виклик безпечний (повертає true).
     static bool begin();
-    static bool read(IrRc5Code& code);
-    static void enterLearnMode();
+
+    // Скільки подій відкинуто через переповнену чергу EventBus.
+    static uint32_t droppedEvents();
+
+    // Скільки прийнятих кадрів відкинуто як невалідні (діагностика шуму).
+    static uint32_t decodeErrors();
+
+    // --- Мапа кодів (потокобезпечна) ---
+
+    // Завантажує мапу з NVS. true — прочитано валідну мапу (можливо, порожню).
+    // false — нічого не збережено або дані пошкоджені (мапа очищена).
+    static bool load();
+
+    // Зберігає мапу в NVS.
+    static bool save();
+
+    // Очищає мапу в памʼяті й у NVS.
+    static void clearMap();
+
+    // Видаляє всі коди дії й зберігає. true, якщо щось було видалено.
+    static bool removeAction(Action action);
+
+    // Дія за кодом (addr, cmd).
+    static bool lookup(uint8_t addr, uint8_t cmd, Action& out);
+
+    // Перший код, привʼязаний до дії.
+    static bool codeFor(Action action, uint8_t& addr, uint8_t& cmd);
+
+    // Кількість записів у мапі.
+    static size_t mapSize();
+
+    // --- Навчання ---
+
+    // Починає навчання для дії. Звичайна генерація подій призупиняється.
+    // false — дія некоректна або мапа заповнена (і в дії немає власного запису).
+    static bool beginLearn(Action action);
+
+    // Завершує навчання будь-якого стану (у т.ч. скидає Success/Timeout в Idle).
+    static void cancelLearn();
+
+    // Поточний стан. Success/Timeout лишаються, доки не буде beginLearn/cancelLearn.
+    static LearnStatus status();
+
+    // Підтвердити перепризначення в стані Conflict (старий привʼязаний до
+    // цього коду запис іншої дії видаляється). true — статус став Success.
+    static bool confirmOverwrite();
+
+    // Для UI: дія, яку навчають.
+    static Action learnTarget();
+
+    // Для UI: кандидат (доступний у Confirm/Conflict).
+    static bool learnCandidate(uint8_t& addr, uint8_t& cmd);
+
+    // Для UI: з якою дією конфлікт (доступно лише в Conflict).
+    static bool learnConflictWith(Action& other);
+
+    // --- JSON (для майбутнього веб-інтерфейсу) ---
+
+    // Записує мапу як масив: [{"action":"VOL_UP","addr":0,"cmd":16,"rc5x":false}, ...]
+    // false — документ переповнено.
+    static bool exportJson(JsonDocument& doc);
+
+    // Замінює мапу вмістом масиву й зберігає в NVS. Атомарно: при будь-якій
+    // помилці валідації мапа не змінюється. false також під час навчання
+    // або якщо не вдалося зберегти в NVS (тоді мапа в RAM уже оновлена).
+    static bool importJson(const JsonDocument& doc);
 };
 ```
 
@@ -877,4 +992,134 @@ static_assert(kEncAccelMultiplier >= 1, "kEncAccelMultiplier must be >= 1");
 }  // namespace input_cfg
 ```
 
-_(наступний модуль додасть сюди `config/ir_config.h` після Prompt 2)_
+#### `config/ir_config.h` — реалізовано (Prompt 2)
+
+```cpp
+#pragma once
+
+// Константи модуля input/ir_rc5 (RC5/RC5X, навчання, NVS).
+// Усі часові значення — у мілісекундах або мікросекундах (вказано в імені).
+// Піни тут не дублюються: вони лише в config/pins.h (pins::kIrIn).
+
+#include <stddef.h>
+#include <stdint.h>
+
+// ---------------------------------------------------------------------------
+// Прапорці умовної компіляції
+// ---------------------------------------------------------------------------
+
+// Serial-лог кожного валідного кадру: "[IR] addr=0 cmd=16 toggle=1 rc5x=0"
+// та кроків режиму навчання. Окремо від INPUT_DEBUG.
+#define IR_DEBUG 1
+
+namespace ir_cfg {
+
+// ---------------------------------------------------------------------------
+// Задача приймання (FreeRTOS)
+// ---------------------------------------------------------------------------
+// Ядро 0, пріоритет 4 = як у кнопок/енкодера (розділ 5 MASTER SPEC):
+// вище за AppController/UI, нижче за аудіо (ядро 1). Задача майже весь час
+// блокується на черзі RMT, тож не заважає.
+constexpr int      kTaskCore       = 0;
+constexpr uint8_t  kTaskPriority   = 4;
+// Стек з запасом: у цій задачі виконується запис у NVS (Preferences) і Serial.printf.
+constexpr uint32_t kTaskStackBytes = 6144;
+
+// Період пробудження задачі без кадрів (перевірка таймаутів навчання).
+constexpr uint32_t kTaskTickMs     = 50;
+
+// Довжина черги ISR -> задача (одночасно армований лише один прийом).
+constexpr uint8_t  kRxQueueLen     = 2;
+
+// ---------------------------------------------------------------------------
+// RMT RX
+// ---------------------------------------------------------------------------
+// Роздільність 1 МГц: 1 тік = 1 мкс (декодер трактує тривалості як мкс).
+constexpr uint32_t kRmtResolutionHz    = 1000000;
+
+// Блок памʼяті каналу RX (ESP32-S3: 48 символів на блок).
+constexpr size_t   kRmtMemBlockSymbols = 48;
+
+// Буфер прийому в символах RMT (має бути >= kRmtMemBlockSymbols).
+constexpr size_t   kRmtRxBufSymbols    = 64;
+
+// Апаратний фільтр коротких імпульсів, нс (голки). Апаратна межа ≈ 3 мкс.
+constexpr uint32_t kRmtMinSignalNs     = 1000;
+
+// Кадр вважається завершеним, якщо рівень не змінюється так довго, мкс.
+// Має бути більшим за найдовший імпульс усередині кадру (2 піврівні ≈ 1778 мкс).
+constexpr uint32_t kRmtIdleThresholdUs = 4000;
+
+// Рівень піна, що означає «несуча присутня». VS1838B інвертує: LOW = 0.
+constexpr uint8_t  kMarkLevel          = 0;
+
+// Максимум сегментів (змін рівня) у кадрі, які декодер готовий розібрати.
+constexpr size_t   kMaxSegments        = 32;
+
+// ---------------------------------------------------------------------------
+// Таймінги RC5
+// ---------------------------------------------------------------------------
+// Тривалість півбіта, мкс (RC5: 889 мкс, повний біт 1778 мкс).
+constexpr uint32_t kHalfBitUs             = 889;
+
+// Допуск на тривалість (n × півбіт), ±%. Несуча 36 кГц при 38 кГц-приймачі
+// дає нижчу чутливість і «пливе» довжину імпульсів — допуск ширший за типовий.
+// Має бути < 33, щоб діапазони 1 і 2 півбітів не перекривалися.
+constexpr uint32_t kHalfBitTolerancePercent = 30;
+
+// Корекція асиметрії VS1838B, мкс: додається до тривалості несучої (LOW)
+// і віднімається від паузи. Підбирається за фактичними вимірами; 0 = вимкнено.
+constexpr int32_t  kMarkBiasUs            = 0;
+
+// ---------------------------------------------------------------------------
+// Розрізнення натискання / утримання
+// ---------------------------------------------------------------------------
+// Кадри при утриманні йдуть кожні ≈114 мс. Той самий (addr, cmd, toggle)
+// з паузою не більше цього порога = повтор; довша пауза = нове натискання.
+constexpr uint32_t kRepeatGapMs   = 250;
+
+// Скільки утримувати, перш ніж почати слати repeat=true
+// (VOL_UP, VOL_DOWN, UP, DOWN, LEFT, RIGHT). Далі — кожен кадр (≈114 мс).
+constexpr uint32_t kRepeatDelayMs = 500;
+
+// ---------------------------------------------------------------------------
+// Режим навчання
+// ---------------------------------------------------------------------------
+// Таймаут очікування першого й повторного натискання (кожного окремо).
+constexpr uint32_t kLearnTimeoutMs         = 8000;
+
+// Скільки чекати на confirmOverwrite() після статусу Conflict.
+constexpr uint32_t kLearnConflictTimeoutMs = 15000;
+
+// ---------------------------------------------------------------------------
+// NVS
+// ---------------------------------------------------------------------------
+constexpr const char* kNvsNamespace = "audioctl";
+constexpr const char* kNvsMapKey    = "ir_map";   // ≤ 15 символів
+
+// Версія бінарного формату blob (перший байт). Змінити при зміні формату
+// або при перестановці значень Action.
+constexpr uint8_t  kMapFormatVersion = 1;
+
+// Максимум записів у мапі (28 дій у Action + запас).
+constexpr uint8_t  kMaxMapEntries    = 40;
+
+// ---------------------------------------------------------------------------
+// Перевірки на етапі компіляції
+// ---------------------------------------------------------------------------
+static_assert(kRmtResolutionHz == 1000000, "decoder assumes 1 tick = 1 us");
+static_assert(kRmtRxBufSymbols >= kRmtMemBlockSymbols, "RX buffer must cover one RMT memory block");
+static_assert(kHalfBitTolerancePercent > 0 && kHalfBitTolerancePercent < 33,
+              "tolerance must keep 1x and 2x half-bit ranges apart");
+static_assert(kRmtIdleThresholdUs > (2 * kHalfBitUs * (100 + kHalfBitTolerancePercent)) / 100,
+              "idle threshold must exceed the longest in-frame pulse");
+static_assert(kRmtIdleThresholdUs <= 32000, "idle threshold exceeds RMT register range");
+static_assert(kMaxSegments >= 28, "need room for a full RC5 frame");
+static_assert(kRepeatGapMs >= 150, "repeat gap must exceed the ~114 ms RC5 frame period");
+static_assert(kTaskTickMs > 0, "kTaskTickMs must be > 0");
+static_assert(kMaxMapEntries >= 28 && kMaxMapEntries <= 255, "map size out of range");
+
+}  // namespace ir_cfg
+```
+
+_(наступний модуль додасть сюди `config/audio_config.h` / `config/tda7318_config.h` / `config/pt2313l_config.h` після Prompt 3)_

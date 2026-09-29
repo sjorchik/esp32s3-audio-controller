@@ -9,6 +9,7 @@
 #include <stdint.h>
 
 // Логічні дії.
+// Нові значення додавати ЛИШЕ в кінець: числові значення Action зберігаються в NVS (мапа IR).
 enum class Action : uint8_t {
     POWER,
     UP,
@@ -19,6 +20,26 @@ enum class Action : uint8_t {
     ENC_CW,
     ENC_CCW,
     ENC_PRESS,
+    // [Prompt 2] ДОДАНО: VOL_UP..BACK, INPUT_RADIO..INPUT_AUX, DIGIT_0..DIGIT_9 (цифри йдуть підряд).
+    VOL_UP,
+    VOL_DOWN,
+    MUTE,
+    MENU,
+    BACK,
+    INPUT_RADIO,
+    INPUT_TV,
+    INPUT_PC,
+    INPUT_AUX,
+    DIGIT_0,
+    DIGIT_1,
+    DIGIT_2,
+    DIGIT_3,
+    DIGIT_4,
+    DIGIT_5,
+    DIGIT_6,
+    DIGIT_7,
+    DIGIT_8,
+    DIGIT_9,
 };
 
 // Джерело події.

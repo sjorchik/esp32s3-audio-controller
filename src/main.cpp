@@ -4,8 +4,8 @@
 // - надрукувати інформацію про чіп, PSRAM, flash і розділи;
 // - ініціалізувати LittleFS (з форматуванням, якщо потрібно);
 // - підготувати подієву шину;
-// - запустити кнопки й енкодер і (тимчасово) друкувати їхні події.
-// Дисплей, аудіо, мережа та ІЧ не реалізуються.
+// - запустити кнопки, енкодер і IR та (тимчасово) друкувати їхні події.
+// Дисплей, аудіо та мережа не реалізуються.
 
 #include <Arduino.h>
 #include <LittleFS.h>
@@ -20,6 +20,7 @@
 #include "core/events.h"
 #include "input/buttons.h"
 #include "input/encoder.h"
+#include "input/ir_rc5.h"  // [Prompt 2] ДОДАНО
 
 // Друк інформації про чіп і памʼять.
 static void printChipInfo() {
@@ -115,15 +116,35 @@ static void initLittleFs() {
 // Прибрати разом з INPUT_DEMO_PRINT_EVENTS, коли зʼявиться AppController.
 static const char* actionName(Action a) {
     switch (a) {
-        case Action::POWER:     return "POWER";
-        case Action::UP:        return "UP";
-        case Action::DOWN:      return "DOWN";
-        case Action::LEFT:      return "LEFT";
-        case Action::RIGHT:     return "RIGHT";
-        case Action::OK:        return "OK";
-        case Action::ENC_CW:    return "ENC_CW";
-        case Action::ENC_CCW:   return "ENC_CCW";
-        case Action::ENC_PRESS: return "ENC_PRESS";
+        case Action::POWER:       return "POWER";
+        case Action::UP:          return "UP";
+        case Action::DOWN:        return "DOWN";
+        case Action::LEFT:        return "LEFT";
+        case Action::RIGHT:       return "RIGHT";
+        case Action::OK:          return "OK";
+        case Action::ENC_CW:      return "ENC_CW";
+        case Action::ENC_CCW:     return "ENC_CCW";
+        case Action::ENC_PRESS:   return "ENC_PRESS";
+        // [Prompt 2] ДОДАНО: нові Action
+        case Action::VOL_UP:      return "VOL_UP";
+        case Action::VOL_DOWN:    return "VOL_DOWN";
+        case Action::MUTE:        return "MUTE";
+        case Action::MENU:        return "MENU";
+        case Action::BACK:        return "BACK";
+        case Action::INPUT_RADIO: return "INPUT_RADIO";
+        case Action::INPUT_TV:    return "INPUT_TV";
+        case Action::INPUT_PC:    return "INPUT_PC";
+        case Action::INPUT_AUX:   return "INPUT_AUX";
+        case Action::DIGIT_0:     return "DIGIT_0";
+        case Action::DIGIT_1:     return "DIGIT_1";
+        case Action::DIGIT_2:     return "DIGIT_2";
+        case Action::DIGIT_3:     return "DIGIT_3";
+        case Action::DIGIT_4:     return "DIGIT_4";
+        case Action::DIGIT_5:     return "DIGIT_5";
+        case Action::DIGIT_6:     return "DIGIT_6";
+        case Action::DIGIT_7:     return "DIGIT_7";
+        case Action::DIGIT_8:     return "DIGIT_8";
+        case Action::DIGIT_9:     return "DIGIT_9";
     }
     return "?";
 }
@@ -140,6 +161,7 @@ static const char* sourceName(EventSource s) {
 
 static uint32_t s_lastBtnDropped = 0;
 static uint32_t s_lastEncDropped = 0;
+static uint32_t s_lastIrDropped = 0;  // [Prompt 2] ДОДАНО
 #endif
 
 void setup() {
@@ -183,6 +205,13 @@ void setup() {
         Serial.println("[MAIN] Encoder init failed");
     }
 
+    // [Prompt 2] ДОДАНО: IR-приймач після енкодера.
+    if (IrRc5::begin()) {
+        Serial.println("[MAIN] IR ready");
+    } else {
+        Serial.println("[MAIN] IR init failed");
+    }
+
     Serial.println("[MAIN] Skeleton ready");
 }
 
@@ -201,12 +230,16 @@ void loop() {
     // Діагностика втрат: друкуємо лише коли лічильники змінилися.
     const uint32_t btnDropped = Buttons::droppedEvents();
     const uint32_t encDropped = Encoder::droppedEvents();
-    if (btnDropped != s_lastBtnDropped || encDropped != s_lastEncDropped) {
+    const uint32_t irDropped = IrRc5::droppedEvents();  // [Prompt 2] ДОДАНО
+    if (btnDropped != s_lastBtnDropped || encDropped != s_lastEncDropped ||
+        irDropped != s_lastIrDropped) {
         s_lastBtnDropped = btnDropped;
         s_lastEncDropped = encDropped;
-        Serial.printf("[MAIN] events dropped: buttons=%u encoder=%u\n",
+        s_lastIrDropped = irDropped;
+        Serial.printf("[MAIN] events dropped: buttons=%u encoder=%u ir=%u\n",
                       static_cast<unsigned>(btnDropped),
-                      static_cast<unsigned>(encDropped));
+                      static_cast<unsigned>(encDropped),
+                      static_cast<unsigned>(irDropped));
     }
 #else
     // Скелет ще не має активної логіки.
