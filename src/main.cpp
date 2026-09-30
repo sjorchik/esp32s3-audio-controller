@@ -6,8 +6,10 @@
 // - підготувати подієву шину;
 // - запустити кнопки, енкодер і IR та (тимчасово) друкувати їхні події;
 // - [Prompt 3] створити аудіопроцесор (TDA7318 / PT2313L) і, під AUDIO_PROC_TEST,
-//   запустити Serial-тестовий режим.
-// Дисплей, аудіоплеєр та мережа не реалізуються.
+//   запустити Serial-тестовий режим;
+// - [Prompt 4] ініціалізувати дисплей (ST7789, спрайт у PSRAM, задача малювання;
+//   під DISPLAY_DEMO — статичний тестовий кадр).
+// Екрани (ui/screens), аудіоплеєр та мережа не реалізуються.
 
 #include <Arduino.h>
 #include <LittleFS.h>
@@ -26,6 +28,7 @@
 #include "input/buttons.h"
 #include "input/encoder.h"
 #include "input/ir_rc5.h"  // [Prompt 2] ДОДАНО
+#include "ui/display.h"    // [Prompt 4] ДОДАНО
 
 // [Prompt 3] ДОДАНО: аудіопроцесор живе весь час роботи прошивки.
 // Згодом його створюватиме AppController за типом з Settings (NVS).
@@ -150,6 +153,27 @@ static void initAudioProcessor() {
 #endif
 }
 
+// [Prompt 4] ДОДАНО: дисплей. DisplayManager::begin() сам ініціалізує шрифти
+// й іконки, панель, буфери в PSRAM і запускає задачу малювання.
+static void initDisplay() {
+    if (DisplayManager::begin()) {
+        Serial.println("[MAIN] Display ready");
+        return;
+    }
+
+    switch (DisplayManager::lastError()) {
+        case DisplayError::NoPsram:
+            Serial.println("[MAIN] Display disabled: PSRAM not found");
+            break;
+        case DisplayError::PanelInitFailed:
+            Serial.println("[MAIN] Display panel init failed");
+            break;
+        default:
+            Serial.printf("[MAIN] Display init failed: %s\n", DisplayManager::lastErrorName());
+            break;
+    }
+}
+
 #if INPUT_DEMO_PRINT_EVENTS
 // Тимчасово: імена для друку подій з EventBus.
 // Прибрати разом з INPUT_DEMO_PRINT_EVENTS, коли зʼявиться AppController.
@@ -253,6 +277,9 @@ void setup() {
 
     // [Prompt 3] ДОДАНО: аудіопроцесор (+ тестовий режим під AUDIO_PROC_TEST).
     initAudioProcessor();
+
+    // [Prompt 4] ДОДАНО: дисплей після ініціалізації аудіопроцесора.
+    initDisplay();
 
     Serial.println("[MAIN] Skeleton ready");
 }

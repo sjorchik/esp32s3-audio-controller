@@ -149,11 +149,12 @@
 
 ## 10. Українська мова та іконки на дисплеї
 
-- Повний український алфавіт, включно з `Є є І і Ї ї Ґ ґ`. Покриття шрифта потрібно ПЕРЕВІРИТИ; якщо якихось літер немає (наприклад, `Ґ ґ`) — згенерувати власний шрифт із TTF.
+- Повний український алфавіт, включно з `Є є І і Ї ї Ґ ґ`. Вбудовані шрифти LovyanGFX (`efontJA` тощо) НЕ мають потрібних літер (щонайменше `Ґ Є І Ї`). Рішення (Prompt 4): власний растровий шрифт `GFXfont` на основі DejaVu Sans, генерується інструментом `tools/gen_gfxfont.py` у файл `ui/font_data.h`, покриває ASCII/Latin-1/Latin Extended-A/кирилицю U+0400–U+045F і Ґ/ґ (U+0490/0491). **Перевірити:** що `tools/gen_gfxfont.py` і згенерований `ui/font_data.h` справді є в репозиторії (без них `fonts.cpp` не збереться), і візуально звірити рядок з проблемними літерами на реальному екрані — коментар коду про це не є доказом.
+- Типографські символи (тире, лапки, багатокрапка) у згенерованій таблиці відсутні: перед виведенням їх треба нормалізувати в ASCII-аналоги (майбутній модуль обробки ICY-метаданих).
 - Метадані ICY можуть приходити в UTF-8, cp1251 або Latin-1: потрібне визначення кодування й конвертація в UTF-8.
-- Довгі назви станцій і заголовки — прокрутка (marquee) без мерехтіння.
-- Іконки (Wi-Fi, мʼют, гучність, входи, standby тощо) — бітмапи в одному наборі, RGB565 або 1-біт, зберігаються централізовано в `ui/icons`.
-- Розкладка екрана (VU, назва станції, метадані) підбирається експериментально: усі координати й розміри виносити в константи.
+- Довгі назви станцій і заголовки — прокрутка (marquee) без мерехтіння; `UiFonts::textWidth()` дає ширину рядка в пікселях для цього.
+- Іконки — 1-бітні маски `kIconSize × kIconSize` (24×24), колір задає викликач; малює їх виключно `DisplayManager::drawIcon()` (єдиний власник спрайту), `UiIcons` лише віддає маску й назву.
+- Розкладка екрана (VU, назва станції, метадані) підбирається експериментально: усі координати й розміри виносити в константи (див. `display_cfg::demo::*` як приклад для тестового кадру; реальні екрани матимуть власний набір).
 
 ## 11. Поточний стан проекту (оновлювати вручну)
 
@@ -166,39 +167,40 @@
 - `core/events.h` (`EventBus`) — реалізовано.
 - `input/buttons`, `input/encoder`, `config/input_config.h` — реалізовано (Prompt 1).
 - `input/ir_rc5`, `config/ir_config.h` — реалізовано (Prompt 2). Інструкція користувача — `IR_LEARNING.txt`.
-- `audio/audio_processor.h` (розширено), `audio/tda7318`, `audio/pt2313l`, `audio/audio_i2c` (спільна I2C-шина/кеш/мʼютекс), `audio/audio_proc_test` (Serial-тест), `config/audio_config.h` — реалізовано (Prompt 3).
+- `audio/audio_processor.h` (розширено), `audio/tda7318`, `audio/pt2313l`, `audio/audio_i2c`, `audio/audio_proc_test`, `config/audio_config.h` — реалізовано (Prompt 3).
+- `ui/display`, `ui/fonts`, `ui/icons`, `config/display_config.h` — реалізовано (Prompt 4): ST7789 через LovyanGFX, подвійний буфер-спрайт у PSRAM, задача малювання, власний український шрифт (`ui/font_data.h`, генерується `tools/gen_gfxfont.py`), 1-бітні іконки, статичний тестовий кадр (`DISPLAY_DEMO`).
 
 **Важливо для AppController (ще не написаний), врахувати при реалізації:**
-- `Action::ENC_PRESS` з `longPress=false` → mute; `longPress=true` → інша дія (наприклад, меню). POWER і OK також мають окремі довгі події.
+- `Action::ENC_PRESS` з `longPress=false` → mute; `longPress=true` → інша дія. POWER і OK також мають окремі довгі події.
 - Вимкнути `INPUT_DEMO_PRINT_EVENTS` у `input_config.h`, коли AppController підключить власне читання `EventBus`.
-- `Buttons::droppedEvents()` / `Encoder::droppedEvents()` / `IrRc5::droppedEvents()` — лічильники втрат подій, варто вивести в діагностику/веб-статус.
-- IR: `ENC_CW`/`ENC_CCW` з `source==IR` завжди `delta=1` (без акселерації); `repeat=true` від IR приходить лише для VOL_UP, VOL_DOWN, UP, DOWN, LEFT, RIGHT.
-- Режим навчання IR поки керується тимчасовим кодом у `main.cpp` (`IR_LEARNING.txt`); коли зʼявиться екран `IrLearn`, він викликає ту саму статичну API `IrRc5`, тимчасовий код прибирається.
-- **Вибір типу процесора (TDA7318/PT2313L) зберігається в `Settings` (NVS), `AppController` створює драйвер один раз через `createAudioProcessor()` за цим значенням.**
+- `Buttons::droppedEvents()` / `Encoder::droppedEvents()` / `IrRc5::droppedEvents()` — лічильники втрат подій.
+- IR: `ENC_CW`/`ENC_CCW` з `source==IR` завжди `delta=1`; `repeat=true` від IR лише для VOL_UP, VOL_DOWN, UP, DOWN, LEFT, RIGHT.
+- Режим навчання IR поки керується тимчасовим кодом у `main.cpp` (`IR_LEARNING.txt`); коли зʼявиться екран `IrLearn`, він викликає ту саму статичну API `IrRc5`.
+- **Вибір типу процесора (TDA7318/PT2313L) зберігається в `Settings` (NVS), `AppController` створює драйвер один раз через `createAudioProcessor()`.**
 - `audio_cfg::kTestProcType` — НЕ рішення проєкту, а відображення поточного макетного стенду (зараз на макетці розпаяно PT2313L; на фінальній платі буде TDA7318). Значення константи поміняти на `Tda7318`, коли тестування переїде на фінальне залізо; коли зʼявиться `Settings`, ця константа взагалі йде в архів (тип читається з NVS).
-- **PT2313L має лише 3 фізичні входи (TDA7318 — 4).** Логічний вхід 3 (Aux) недоступний, коли активний PT2313L: `AppController`/UI мають ховати/пропускати пункти меню входів з індексом `>= capabilities().inputCount`, а не просто повертати помилку користувачу мовчки. Це узгоджене рішення (варіант «а»), не переробляти без потреби.
-- Ramp гучності (плавна зміна) — відповідальність `AppController`: він сам кроково викликає `setVolume()` з періодом на свій розсуд; драйвер не блокує і не чекає.
-- Послідовність при зміні входу/станції: `setMute(true)` → зміна входу/потоку → `setMute(false)`. Цю послідовність реалізує `AppController`, драйвери дають лише окремі примітиви.
-- Після відновлення зі standby або підозри на збій I2C — викликати `applyAll()` перш ніж довіряти стану чипа.
-- Serial-тестовий режим аудіопроцесора (`AUDIO_PROC_TEST`, увімкнено за замовчуванням) конкурує з майбутнім `AppController` за `AudioProcessor*` лише читанням команд з Serial — вимкнути прапорець (`#define AUDIO_PROC_TEST 0`) у `audio_config.h`, коли `AppController` візьме керування процесором на себе.
+- **PT2313L має лише 3 фізичні входи (TDA7318 — 4).** Логічний вхід 3 (Aux) недоступний, коли активний PT2313L: `AppController`/UI мають ховати/пропускати пункти меню входів з індексом `>= capabilities().inputCount`. Узгоджене рішення, не переробляти без потреби.
+- Ramp гучності — відповідальність `AppController`: він сам кроково викликає `setVolume()`; драйвер не блокує.
+- Послідовність при зміні входу/станції: `setMute(true)` → зміна → `setMute(false)`, реалізує `AppController`.
+- Після відновлення зі standby або підозри на збій I2C — викликати `applyAll()`.
+- Serial-тестовий режим аудіопроцесора (`AUDIO_PROC_TEST`) вимкнути, коли `AppController` візьме керування процесором на себе.
+- **Орієнтація дисплея (`DisplayManager::setFlipped()`) поки НЕ зберігається** — при старті завжди `display_cfg::kDefaultFlipped`. Коли зʼявиться `Settings`, додати туди поле (наприклад `displayFlipped`) і викликати `setFlipped()` при старті з цього значення; веб-інтерфейс дає можливість перемкнути.
+- `DisplayManager` не читає `EventBus` і не знає про екрани — реальний контент задає `FrameCallback` (`ui/screens`, ще не написаний), що викликається з display-задачі кожен період кадру.
+- Примітиви малювання `DisplayManager` (`fillScreen`, `drawText`, `drawIcon` тощо) і `present()` НЕ потокобезпечні — викликати лише з display-задачі (через `FrameCallback`), інші задачі — лише `setBrightness()`/`setFlipped()`/гетери.
+- Вимкнути `DISPLAY_DEMO`, коли з'явиться `ui/screens` і реальний `FrameCallback`.
 
 **Заплановані зміни інтерфейсів (виконуються у відповідних промптах):**
 - `AppState`: додати безпечне часткове оновлення (`modify`) при реалізації AppState.
-- `Settings`: додати `bass`, `treble`, `balance`, `loudness`, `processorType` (0 = TDA7318, 1 = PT2313L, значення узгоджені з `enum class AudioProcType`).
+- `Settings`: додати `bass`, `treble`, `balance`, `loudness`, `processorType`, `displayFlipped`, `brightness` (уже є в структурі-заглушці, перевір узгодженість типу).
 
 **Відомі особливості реалізації (не проблеми, але важливо знати):**
-- PCNT: поле `accum_count` у `pcnt_unit_config_t` — без `flags.` у IDF 5.5.2 (на відміну від 5.2.x). Якщо збірка видасть `no member named 'flags'` — прибрати `flags.`.
-- Дебаунс за часом дає затримку: коротка подія кнопки — приблизно через `kBtnDebounceMs` (30 мс) після відпускання; довге натискання — приблизно через `kBtnLongPressMs` (800 мс) від початку натискання.
-- Поки кнопка утримується, повтор і довге натискання взаємовиключні (перше настало — те й діє).
-- Кнопка, яка вже утримувалась на момент старту задачі `Buttons`, ігнорується до першого відпускання (захищає скидання Wi-Fi утриманням OK на старті від хибних подій).
-- `delta` обмежене типом `int8_t` (максимум 127), фізично недосяжно.
-- Акселерація енкодера одноступенева, скидається зміною напрямку або паузою довшою за поріг.
-- **`enum class Action` зберігається в NVS як числа (мапа IR).** Нові дії — ЛИШЕ в кінець `enum`; якщо порядок все ж змінено — збільшити `ir_cfg::kMapFormatVersion`.
-- IR: несуча пульта RC5 (36 кГц) нижча за розрахункову для VS1838B (38 кГц) — підбирається `ir_cfg::kMarkBiasUs`/`kHalfBitTolerancePercent`, не перевірено на залізі. Стартова мапа кодів порожня (навчається користувачем). Розширений RC5X (20 біт) не підтримується.
-- **Аудіопроцесор:** обидва драйвери (TDA7318 і PT2313L) використовують ідентичний формат байтів регістрів (сумісний з родиною TDA7313/7318/PT2313), різняться діапазоном підсилення входу (TDA7318 крок 6.25 дБ, PT2313L крок 3.75 дБ), наявністю loudness (PT2313L — лише в 28-pin корпусі, `audio_cfg::kPt2313lHasToneLoudness`; TDA7318 — немає loudness взагалі) і кількістю фізичних входів (4 проти 3).
-- **Крива гучності** (`audio_cfg::volumeAttSteps()`) — кусково-лінійна інтерполяція між підібраними на слух якорями (UI 0/25/50/75/100 → 63/32/16/8/0 кроків атенюації по 1.25 дБ); типова гучність за замовчуванням (UI 40) дає −27.5 дБ. Значення можна коригувати пізніше без зміни інтерфейсу.
-- `fader` у `capabilities()` завжди `false` для обох чипів: апаратно 4 незалежні атенюатори (перед/зад можливий) є, але в інтерфейсі немає окремого `setFader()` — баланс керує всіма чотирма каналами разом.
-- `kPowerOnSettleMs` (300 мс, пауза після подачі живлення перед першою I2C-командою) підібрано з запасом для обох чипів; вимога щодо PT2313L (Cref ≥ 300 мс) варто звірити з конкретним даташитом номіналу.
+- PCNT: поле `accum_count` у `pcnt_unit_config_t` — без `flags.` у IDF 5.5.2. Якщо збірка видасть `no member named 'flags'` — прибрати `flags.`.
+- Дебаунс кнопок: коротка подія — приблизно через `kBtnDebounceMs` (30 мс) після відпускання; довге — приблизно через `kBtnLongPressMs` (800 мс) від початку натискання.
+- `enum class Action` зберігається в NVS як числа (мапа IR) — нові дії лише в кінець `enum`.
+- IR: несуча пульта 36 кГц проти розрахункових 38 кГц VS1838B — підбирається `ir_cfg::kMarkBiasUs`/`kHalfBitTolerancePercent`, не перевірено на залізі. Стартова мапа порожня. Розширений RC5X (20 біт) не підтримується.
+- Аудіопроцесор: обидва драйвери використовують спільний формат байтів (родина TDA7313/7318/PT2313), різняться кроком підсилення входу (6.25 дБ проти 3.75 дБ), наявністю loudness (PT2313L — лише 28-pin) і кількістю фізичних входів (4 проти 3). `fader` завжди `false` (немає окремого `setFader()` в інтерфейсі, хоча апаратно можливий). `kPowerOnSettleMs` (300 мс) варто звірити з даташитом конкретного номіналу Cref PT2313L.
+- **Дисплей: `kOffsetX/Y`, `kInvertColors`, `kBgrOrder` — ПРИПУЩЕННЯ, НЕ перевірені на реальному залізі** (значення підібрані як типові для панелей 170×320, з чіткими ознаками помилки в коментарях `display_config.h`: зсунуті кути → offset, чорний виглядає білим → invert, червоний кут виглядає синім → BGR). Перевірити тестовим кадром (`DISPLAY_DEMO`) при першому включенні.
+- Дисплей: SPI на 80 МГц без DMA (`kUseDma=false`) — якщо зʼявляться артефакти на макетних дротах, спершу знизити `kSpiWriteHz` до 40 МГц, а не одразу підозрювати офсет/колір.
+- Дисплей: подвійний буфер (2 × ~108 КБ у PSRAM) обраний для плавності VU-метра; якщо PSRAM забракне під час додавання VU/аудіобуферів — можна повернутись до одного буфера ціною можливого мерехтіння.
 
 **Відомі проблеми:** поки немає.
 
@@ -556,151 +558,12 @@ public:
 };
 ```
 
-### `audio/tda7318.h` — реалізовано (Prompt 3)
+### `audio/tda7318.h` та `audio/pt2313l.h` — реалізовано (Prompt 3), стиснено
 
-```cpp
-#pragma once
-
-#include <stddef.h>
-#include <stdint.h>
-
-#include "audio/audio_i2c.h"
-#include "audio/audio_processor.h"
-
-// Драйвер TDA7318 (ST): 4 стерео входи з підсиленням, гучність, бас/дискант,
-// 4 атенюатори гучномовців (баланс/фейдер) з незалежним мʼютом. Loudness НЕМАЄ.
-// Регістри й формат байтів — у tda7318.cpp та в таблиці у відповіді.
-//
-// Плавна зміна гучності (ramp): ЗРОБЛЕНА ВИКЛИКАЧЕМ, у драйвері її немає.
-// Причина: драйвер не має ні задачі, ні таймера, а setVolume() не має блокувати.
-// AppController сам кроком (у UI-одиницях, наприклад 1 крок / 5..10 мс) викликає
-// setVolume(); кожен виклик коштує одну коротку I2C-транзакцію (≈0.3 мс), а
-// повторні значення, що дають той самий регістр, у шину не йдуть (кеш).
-//
-// Мʼют = мʼют усіх чотирьох атенюаторів гучномовців (апаратний «швидкий притиск»,
-// регістр гучності не чіпається). Послідовність «мʼют -> зміна входу/станції ->
-// розмʼют» координує AppController; драйвер лише виконує окремі примітиви.
-class Tda7318 : public AudioProcessor {
-public:
-    bool begin() override;
-    bool setInput(uint8_t index) override;
-    bool setVolume(int8_t value) override;
-    bool setBass(int8_t value) override;
-    bool setTreble(int8_t value) override;
-    bool setBalance(int8_t value) override;
-    bool setMute(bool mute) override;
-    bool setLoudness(bool on) override;
-    AudioProcessorCapabilities capabilities() const override;
-
-    bool probe() override;
-    bool applyAll() override;
-    uint32_t i2cErrorCount() const override;
-    AudioProcessorState cachedState() const override;
-
-private:
-    // Індекси кеш-регістрів (див. audio_i2c::RegShadow).
-    enum Reg : uint8_t {
-        kRegVol,
-        kRegSpkLf,
-        kRegSpkRf,
-        kRegSpkLr,
-        kRegSpkRr,
-        kRegSwitch,
-        kRegBass,
-        kRegTreble,
-        kRegCount,
-    };
-
-    struct Pending {
-        Reg reg;
-        uint8_t value;
-    };
-
-    static_assert(kRegCount <= audio_i2c::RegShadow::kMaxRegs, "shadow too small");
-
-    // Надсилає одним пакетом лише ті байти, що відрізняються від кешу.
-    bool commit(const Pending* items, size_t count);
-    bool commitSwitch();
-    bool commitSpeakers();
-    void fillSpeakers(Pending* out, bool forceMute) const;
-
-    AudioProcessorState m_state = {};
-    audio_i2c::RegShadow m_shadow;
-    uint32_t m_errors = 0;   // пишеться під мʼютексом, читається без нього (32 біти)
-    bool m_begun = false;
-};
-```
-
-### `audio/pt2313l.h` — реалізовано (Prompt 3)
-
-```cpp
-#pragma once
-
-#include <stddef.h>
-#include <stdint.h>
-
-#include "audio/audio_i2c.h"
-#include "audio/audio_processor.h"
-
-// Драйвер PT2313L (Princeton): 3 стерео входи з підсиленням, гучність, бас/дискант
-// і loudness (лише 28-pin корпус, див. audio_cfg::kPt2313lHasToneLoudness),
-// 4 атенюатори гучномовців (баланс/фейдер) з незалежним мʼютом.
-// Формат байтів збігається з TDA7318/TDA7313, крім аудіо-перемикача:
-// там біт 2 = loudness (0 = УВІМКНЕНО), а крок підсилення 3.75 дБ.
-//
-// ВХОДІВ ТРИ, а не чотири: setInput(3) повертає false (capabilities().inputCount == 3).
-//
-// Ramp гучності й послідовність мʼюту — так само, як у Tda7318: ramp робить
-// викликач (AppController), драйвер лише виконує примітиви, мʼют = мʼют атенюаторів.
-class Pt2313l : public AudioProcessor {
-public:
-    bool begin() override;
-    bool setInput(uint8_t index) override;
-    bool setVolume(int8_t value) override;
-    bool setBass(int8_t value) override;
-    bool setTreble(int8_t value) override;
-    bool setBalance(int8_t value) override;
-    bool setMute(bool mute) override;
-    bool setLoudness(bool on) override;
-    AudioProcessorCapabilities capabilities() const override;
-
-    bool probe() override;
-    bool applyAll() override;
-    uint32_t i2cErrorCount() const override;
-    AudioProcessorState cachedState() const override;
-
-private:
-    enum Reg : uint8_t {
-        kRegVol,
-        kRegSpkLf,
-        kRegSpkRf,
-        kRegSpkLr,
-        kRegSpkRr,
-        kRegSwitch,
-        kRegBass,
-        kRegTreble,
-        kRegCount,
-    };
-
-    struct Pending {
-        Reg reg;
-        uint8_t value;
-    };
-
-    static_assert(kRegCount <= audio_i2c::RegShadow::kMaxRegs, "shadow too small");
-
-    bool commit(const Pending* items, size_t count);
-    bool commitSwitch();
-    bool commitSpeakers();
-    void fillSpeakers(Pending* out, bool forceMute) const;
-    uint8_t switchByte() const;
-
-    AudioProcessorState m_state = {};
-    audio_i2c::RegShadow m_shadow;
-    uint32_t m_errors = 0;   // пишеться під мʼютексом, читається без нього (32 біти)
-    bool m_begun = false;
-};
-```
+Обидва — `class Tda7318 : public AudioProcessor` і `class Pt2313l : public AudioProcessor`, публічний інтерфейс ІДЕНТИЧНИЙ базовому `AudioProcessor` (розділ вище) без додаткових публічних методів. Приватні деталі (регістри, кеш, мʼютекс-обгортки) нікому, крім самих драйверів, не потрібні — прибрано зі спеку заради розміру; повний код лишається в репозиторії. Ключове, що варто памʼятати про поведінку (без коду):
+- **Tda7318:** 4 фізичні входи, loudness відсутній, ramp гучності й послідовність мʼюту — відповідальність викликача (див. розділ 11).
+- **Pt2313l:** 3 фізичні входи (`setInput(3)` → `false`), loudness лише за `audio_cfg::kPt2313lHasToneLoudness` (28-pin корпус), формат байтів як у Tda7318, крім перемикача (біт 2 = loudness, 0 = увімкнено) і кроку підсилення входу (3.75 дБ проти 6.25 дБ).
+- Обидва: мʼют = мʼют усіх атенюаторів гучномовців (регістр гучності не чіпається), кеш регістрів через `audio_i2c::RegShadow`, лічильник помилок і стан — через `i2cErrorCount()`/`cachedState()` з базового інтерфейсу.
 
 ### `audio/audio_proc_test.h` — реалізовано (Prompt 3)
 
@@ -920,35 +783,208 @@ public:
 };
 ```
 
-### `ui/display.h`, `ui/fonts.h`, `ui/icons.h`, `ui/screens.h` — заглушки
+### `ui/display.h` — реалізовано (Prompt 4)
 
 ```cpp
-// display.h
 #pragma once
+
+// DisplayManager: ST7789 170×320 (у проєкті горизонтально, 320×170) через LovyanGFX.
+//
+// Архітектура:
+//  - малювання лише у власні повнокадрові спрайти RGB565 у PSRAM (2 буфери);
+//  - весь цикл кадру виконується в ОДНІЙ задачі FreeRTOS (taskLoop);
+//  - примітиви малюють у «задній» буфер, present() виводить його на панель і
+//    міняє буфери місцями. Після present() вміст нового заднього буфера
+//    НЕВИЗНАЧЕНИЙ: кадр малюється повністю (починаючи з fillScreen).
+//
+// ПОТОКОВА МОДЕЛЬ: примітиви малювання й present() НЕ потокобезпечні. Їх слід
+// викликати лише з display-задачі (з FrameCallback або з taskLoop). Інші
+// задачі можуть викликати лише setBrightness()/brightness()/isReady()/
+// lastError*()/setFlipped()/isFlipped(). Реальний контент (екрани) зʼявиться
+// через FrameCallback.
+//
+// DisplayManager не читає EventBus і не знає про екрани.
+
+#include <stdint.h>
+
+#include "config/display_config.h"
+#include "ui/fonts.h"
+#include "ui/icons.h"
+
+// Результат останньої спроби begin().
+enum class DisplayError : uint8_t {
+    None,                // усе гаразд
+    NotStarted,          // begin() ще не викликали
+    NoPsram,             // PSRAM не знайдено
+    ResourceInitFailed,  // не ініціалізовано шрифти/іконки
+    BacklightInitFailed, // ledcAttach() для BLK не вдався
+    PanelInitFailed,     // init() панелі не вдався або розмір ≠ 320×170
+    SpriteAllocFailed,   // не вдалося виділити буфери кадру в PSRAM
+    TaskCreateFailed,    // не створено задачу малювання
+};
+
 class DisplayManager {
 public:
+    // Викликається кожен період кадру з display-задачі. Малює кадр примітивами
+    // нижче й повертає true, якщо кадр треба вивести (present() викличе задача).
+    // Повертає false — панель лишається як була. Встановлюється до або після begin().
+    using FrameCallback = bool (*)();
+
+    // Ініціалізація: PSRAM-перевірка, шрифти, іконки, підсвітка (вимкнена), панель
+    // (апаратний скид через RST), буфери, задача. Повторний виклик після успіху
+    // повертає true. Підсвітка вмикається після виводу ПЕРШОГО кадру.
     static bool begin();
+
+    // Тіло задачі малювання. Не викликати вручну: його запускає begin().
     static void taskLoop();
+
+    static DisplayError lastError();
+    static const char* lastErrorName();
+    static bool isReady();
+
+    // Підсвітка, 0..100 %. Безпечно з будь-якої задачі. До першого кадру значення
+    // лише запамʼятовується. Лінійна залежність яскравості від шпаруватості.
+    static void setBrightness(uint8_t percent);
+    static uint8_t brightness();
+
+    static void setFrameCallback(FrameCallback callback);
+
+    // Орієнтація: false = kRotationNormal, true = розвернуто на 180°
+    // (kRotationFlipped). Безпечно з будь-якої задачі й до begin(): запит лише
+    // запамʼятовується, а поворот панелі виконує display-задача в наступному
+    // періоді кадру й одразу повторно виводить останній кадр. Розмір 320×170
+    // не змінюється, координати екранів переписувати не треба.
+    static void setFlipped(bool flipped);
+    static bool isFlipped();
+
+    static int16_t width();
+    static int16_t height();
+
+    // --- Примітиви (лише з display-задачі; координати в пікселях, 0,0 = лівий верх) ---
+    static void fillScreen(uint16_t color);
+    static void fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color);
+    static void drawRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color);
+    static void drawLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color);
+
+    // Текст UTF-8, (x, y) — лівий верхній кут. Перша версія — прозоре тло,
+    // друга — тло кольору bg (стирає попередній напис у межах символів).
+    static void drawText(const char* utf8, int16_t x, int16_t y, FontSize size, uint16_t fg);
+    static void drawText(const char* utf8, int16_t x, int16_t y, FontSize size, uint16_t fg,
+                         uint16_t bg);
+
+    // Іконка kIconSize×kIconSize, (x, y) — лівий верхній кут. Вся робота зі
+    // спрайтом (drawBitmap) — тут; UiIcons дає лише маску.
+    static void drawIcon(IconId id, int16_t x, int16_t y,
+                         uint16_t color = display_cfg::kColorFg);
+
+    // Вивести готовий задній буфер на панель і поміняти буфери місцями.
+    static void present();
+};
+```
+
+### `ui/fonts.h` — реалізовано (Prompt 4)
+
+```cpp
+#pragma once
+
+// Українські шрифти для дисплея.
+//
+// Власні растрові шрифти GFXfont (1 біт/піксель) з DejaVu Sans, згенеровані
+// tools/gen_gfxfont.py у ui/font_data.h. Покриття: ASCII, Latin-1, Latin
+// Extended-A, уся кирилиця U+0400..U+045F і Ґ ґ (U+0490/0491) — тобто повний
+// український алфавіт. Вбудовані шрифти LovyanGFX (efontJA) НЕ мають
+// Ґ Є І Ї (підтверджено на залізі), тому не використовуються.
+// Типографські символи (— – " " ' …) у таблицю не входять: перед
+// виведенням їх треба замінювати на ASCII-аналоги (ICY-нормалізація в
+// майбутньому модулі).
+
+#include <LovyanGFX.hpp>
+#include <stdint.h>
+
+// Розміри шрифта. Номінальна висота в пікселях — display_cfg::kFont*Px.
+enum class FontSize : uint8_t {
+    Large,  // назва станції, заголовок меню
+    Small,  // статус-рядок, тембр
+    Tiny,   // підписи, дрібні позначки
 };
 
-// fonts.h
-#pragma once
 class UiFonts {
 public:
+    // Створює службовий обʼєкт виміру й перевіряє, що всі розміри доступні.
+    // Викликається з DisplayManager::begin(); повторний виклик безпечний.
     static bool begin();
+
+    // Шрифт для setFont() поверх спрайту. Ніколи не nullptr.
+    static const lgfx::IFont* font(FontSize size);
+
+    // Висота рядка шрифта, пікселів (0, якщо begin() не викликано).
+    static int32_t lineHeight(FontSize size);
+
+    // Ширина рядка UTF-8 у пікселях для обраного шрифта (для marquee в ui/screens).
+    // Потокобезпечна (внутрішній мʼютекс); малювання не потребує.
+    static int32_t textWidth(const char* utf8, FontSize size);
+};
+```
+
+**Перевірено:** твердження «підтверджено на залізі» справді має підставу — на фото реального дисплея бракувало українських літер (квадрати замість гліфів), чат виправив генератор шрифту за цим фото. `tools/gen_gfxfont.py` існує (Python + Pillow, без залежності від FreeType-CLI; покриває ASCII/Latin-1/Latin Extended-A/кирилицю U+0400–U+045F/Ґ ґ U+0490–0491, з коректно вбудованою ліцензією DejaVu Fonts у шапці згенерованого файлу). `ui/font_data.h` генерується цим скриптом; сам файл — великий масив даних, у MASTER SPEC не зберігається (лише публічний інтерфейс `ui/fonts.h` вище).
+
+### `ui/icons.h` — реалізовано (Prompt 4)
+
+```cpp
+#pragma once
+
+// Іконки інтерфейсу: 1-бітні маски display_cfg::kIconSize × kIconSize
+// (24×24), зберігаються у flash (icons.cpp). Колір задає викликач.
+//
+// UiIcons лише ВІДДАЄ дані маски. Малює іконку DisplayManager::drawIcon()
+// (він єдиний володіє спрайтом і викликом drawBitmap), тому UiIcons не
+// потребує доступу до спрайта.
+//
+// Формат маски: рядки згори вниз, (kIconSize+7)/8 байт на рядок, старший
+// біт зліва; 1 = піксель кольору іконки, 0 = прозорий.
+
+#include <stddef.h>
+#include <stdint.h>
+
+enum class IconId : uint8_t {
+    Wifi,      // повний сигнал (той самий бітмап, що Wifi3)
+    Mute,
+    Volume,
+    Input,
+    Standby,
+    // [Prompt 4] ДОДАНО:
+    WifiOff,   // немає з'єднання
+    Wifi1,     // слабкий сигнал (1 дуга)
+    Wifi2,     // середній сигнал (2 дуги)
+    Wifi3,     // сильний сигнал (3 дуги)
 };
 
-// icons.h
-#pragma once
-#include <stdint.h>
-enum class IconId : uint8_t {
-    Wifi, Mute, Volume, Input, Standby,
-};
 class UiIcons {
 public:
-    static bool begin();
-};
+    // Кількість значень IconId (для перебору в тестовому кадрі).
+    static constexpr uint8_t kCount = 9;
 
+    // Перевіряє таблицю іконок (порядок = порядок enum, маски не nullptr).
+    static bool begin();
+
+    // Маска іконки або nullptr для невідомого id.
+    static const uint8_t* mask(IconId id);
+
+    // Короткий ASCII-підпис (для діагностики й тестового кадру, ≤ 4 символи).
+    static const char* name(IconId id);
+
+    // IconId за порядковим номером 0..kCount-1 (для перебору); поза межами — Wifi.
+    static IconId fromIndex(uint8_t index);
+
+    // Іконка Wi-Fi за кількістю «рисок» сигналу: 0 = WifiOff, 1..3 = Wifi1..Wifi3,
+    // більше 3 — як 3. Відображення RSSI → рівні робить ui/screens.
+    static IconId wifiForBars(uint8_t bars);
+};
+```
+
+### `ui/screens.h` — заглушка (буде замінено в Prompt 6)
+
+```cpp
 // screens.h
 #pragma once
 class UiScreens {
@@ -1582,4 +1618,174 @@ static_assert(kTestLineMax >= 8, "kTestLineMax too small");
 }  // namespace audio_cfg
 ```
 
-_(наступний модуль додасть сюди константи дисплея після Prompt 4)_
+#### `config/display_config.h` — реалізовано (Prompt 4)
+
+```cpp
+#pragma once
+
+// Константи модуля ui/ (display, fonts, icons).
+// Піни тут не дублюються: вони лише в config/pins.h (pins::kSt7789*).
+// Яскравість за замовчуванням — defaults::kDefaultBrightness (config/defaults.h).
+
+#include <stddef.h>
+#include <stdint.h>
+
+// ---------------------------------------------------------------------------
+// Прапорці умовної компіляції
+// ---------------------------------------------------------------------------
+
+// Тестовий кадр (статичний, без анімації, малюється один раз при старті):
+// рамка + кольорові кути (перевірка зміщення вікна), рядки з українськими
+// літерами трьома розмірами, алфавіт, усі IconId з підписами.
+// Не заміна ui/screens. Вимкнути (0), коли зʼявляться екрани.
+#define DISPLAY_DEMO 1
+
+namespace display_cfg {
+
+// ---------------------------------------------------------------------------
+// Геометрія
+// ---------------------------------------------------------------------------
+// Робоча (горизонтальна) роздільність: 320×170.
+constexpr int16_t kWidth  = 320;
+constexpr int16_t kHeight = 170;
+
+// Фізична (портретна) матриця панелі: 170 (коротка сторона) × 320.
+constexpr int16_t kPanelWidth  = 170;
+constexpr int16_t kPanelHeight = 320;
+
+// Памʼять кадру самого ST7789 — 240×320 (панель 170 пікселів показує лише
+// частину цього вікна, звідси зміщення).
+constexpr int16_t kMemoryWidth  = 240;
+constexpr int16_t kMemoryHeight = 320;
+
+// ПРИПУЩЕННЯ, ПЕРЕВІРИТИ НА ЗАЛІЗІ (див. «Перевірити на залізі»):
+// зміщення вікна в ПОРТРЕТНІЙ системі координат панелі (rotation 0).
+// (240 − 170) / 2 = 35 — типове значення для 170×320 ST7789 (напр. LilyGO
+// T-Display-S3). LovyanGFX сам перераховує зміщення при повороті, тому тут
+// вказується саме портретне. Якщо кути/рамка зʼїхали — змінювати ці два числа
+// (варіанти: 0/35, 35/0, 0/0, 70/0).
+constexpr int16_t kOffsetX = 35;
+constexpr int16_t kOffsetY = 0;
+
+// Поворот LovyanGFX: 1 = ландшафт 320×170; 3 = той самий ландшафт, розвернутий
+// на 180°. Дисплей у корпусі може стояти в будь-який бік, тому орієнтація
+// перемикається під час роботи: DisplayManager::setFlipped(bool) — це буде
+// налаштування в Settings/вебі. Розміри 320×170 в обох випадках однакові.
+constexpr uint8_t kRotationNormal  = 1;
+constexpr uint8_t kRotationFlipped = 3;
+
+// Орієнтація при старті, поки Settings немає. true = kRotationFlipped.
+// Перевірено на макетці: з виводами модуля праворуч правильний напрямок
+// тексту дає саме kRotationFlipped (при kRotationNormal картинка догори дригом).
+constexpr bool kDefaultFlipped = true;
+
+// ПРИПУЩЕННЯ, ПЕРЕВІРИТИ: більшість модулів 170×320 потребують інверсії кольорів.
+// Ознака помилки: чорний фон виглядає білим. Тоді змінити на false.
+constexpr bool kInvertColors = true;
+
+// ПРИПУЩЕННЯ, ПЕРЕВІРИТИ: порядок RGB/BGR. Ознака помилки: червоний кут
+// (лівий верхній) виглядає синім. Тоді змінити на true.
+constexpr bool kBgrOrder = false;
+
+// ---------------------------------------------------------------------------
+// SPI
+// ---------------------------------------------------------------------------
+// Піни SCLK12/MOSI11/CS10 — нативні IOMUX-лінії FSPI, тож шина витримує до
+// 80 МГц. Початкове безпечне значення — 40 МГц. Підняти до 80 МГц можна
+// ПІСЛЯ перевірки на залізі (артефакти: «сніг», зсунуті рядки, збої кольору
+// на довгих провідниках/макетці). Час передачі кадру = 320·170·16 біт / f:
+// 40 МГц ≈ 22 мс, 80 МГц ≈ 11 мс.
+constexpr uint32_t kSpiWriteHz = 80000000;
+constexpr uint8_t  kSpiMode    = 0;
+
+// Передача кадру через DMA (кадр у PSRAM). За замовчуванням ВИМКНЕНО: поведінка
+// DMA з PSRAM залежить від версії LovyanGFX/IDF і не перевірена на залізі.
+// Увімкнути (true) після успішної перевірки: тоді передача кадру A йде у фоні,
+// поки задача малює кадр B у другий буфер.
+constexpr bool kUseDma = false;
+
+// ---------------------------------------------------------------------------
+// Підсвітка (LEDC PWM, лише ledcAttach())
+// ---------------------------------------------------------------------------
+// 20 кГц — вище за чутний діапазон (5 кГц давали б писк у аналоговому тракті
+// поруч з аудіопроцесором). 10 біт: 80 МГц / (20 кГц · 1024) ≈ 3.9 — дільник
+// LEDC у допустимих межах.
+constexpr uint32_t kBacklightFreqHz         = 20000;
+constexpr uint8_t  kBacklightResolutionBits = 10;
+// true: високий рівень на BLK = підсвітка ввімкнена.
+constexpr bool     kBacklightActiveHigh     = true;
+
+// ---------------------------------------------------------------------------
+// Задача малювання (FreeRTOS)
+// ---------------------------------------------------------------------------
+// Ядро 0 (UI), пріоритет 2 — за таблицею розділу 5 MASTER SPEC:
+// введення = 4, AppController ≈ 3, UI = 2, мережа/веб ≈ 1. Число зі
+// специфікації не змінювалось. Аудіотест (audio_cfg::kTestTaskPriority) = 1.
+constexpr int      kTaskCore       = 0;
+constexpr uint8_t  kTaskPriority   = 2;
+constexpr uint32_t kTaskStackBytes = 8192;
+
+// Період кадру, мс. 40 мс = 25 кадр/с: для VU-метра й UI достатньо плавно;
+// при 40 МГц передача кадру ≈ 22 мс (без DMA) + малювання ≈ 5..10 мс
+// вкладаються в 40 мс, а 33 мс (30 кадр/с) лишили б замало запасу.
+constexpr uint32_t kFramePeriodMs = 40;
+
+// Кількість повнокадрових буферів (спрайтів) у PSRAM: 2 × 320·170·2 ≈ 217 КБ.
+constexpr uint8_t  kBufferCount = 2;
+
+// ---------------------------------------------------------------------------
+// Шрифти: власні GFXfont з DejaVu Sans (ui/font_data.h, генерує
+// tools/gen_gfxfont.py). Значення — висота рядка (yAdvance) у пікселях; вони
+// мусять збігатися з тими, що надрукує UiFonts::begin() у Serial.
+// ---------------------------------------------------------------------------
+constexpr uint8_t kFontLargePx = 24;   // FontSize::Large — назва станції, заголовок меню
+constexpr uint8_t kFontSmallPx = 17;   // FontSize::Small — статус-рядок, тембр
+constexpr uint8_t kFontTinyPx  = 14;   // FontSize::Tiny  — підписи, дрібні позначки
+
+// ---------------------------------------------------------------------------
+// Іконки: 1-бітна маска kIconSize × kIconSize, рядки по (kIconSize+7)/8 байт,
+// старший біт зліва; колір задає викликач.
+// ---------------------------------------------------------------------------
+constexpr uint8_t kIconSize = 24;
+
+// ---------------------------------------------------------------------------
+// Кольори (RGB565, тип uint16_t — LovyanGFX трактує його як RGB565)
+// ---------------------------------------------------------------------------
+constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
+    return static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+constexpr uint16_t kColorBlack  = rgb565(0, 0, 0);
+constexpr uint16_t kColorWhite  = rgb565(255, 255, 255);
+constexpr uint16_t kColorRed    = rgb565(255, 0, 0);
+constexpr uint16_t kColorGreen  = rgb565(0, 255, 0);
+constexpr uint16_t kColorBlue   = rgb565(0, 0, 255);
+constexpr uint16_t kColorYellow = rgb565(255, 220, 0);
+constexpr uint16_t kColorGray   = rgb565(140, 140, 140);
+
+// Кольори за замовчуванням для примітивів.
+constexpr uint16_t kColorBg = kColorBlack;
+constexpr uint16_t kColorFg = kColorWhite;
+
+// ---------------------------------------------------------------------------
+// Розкладка тестового кадру (DISPLAY_DEMO). Лише для перевірки заліза.
+// ---------------------------------------------------------------------------
+namespace demo {
+constexpr int16_t kFrameThickness = 2;    // товщина рамки по краю
+constexpr int16_t kCornerSize     = 10;   // кольорові квадрати в кутах
+constexpr int16_t kCornerInset    = 2;    // відступ квадратів від краю (всередину рамки)
+constexpr int16_t kTextX          = 16;   // лівий відступ тексту й ряду іконок
+constexpr int16_t kTitleY         = 14;   // Large: «Ґрунт Їжачок Єдність»
+constexpr int16_t kSubtitleY      = 44;   // Small
+constexpr int16_t kAlphaUpperY    = 68;   // Tiny: великі літери
+constexpr int16_t kAlphaLowerY    = 84;   // Tiny: малі літери
+constexpr int16_t kIconRowY       = 102;  // верх ряду іконок
+constexpr int16_t kIconSlotW      = 32;   // ширина комірки іконки з підписом (9 × 32 = 288)
+constexpr int16_t kCaptionY       = 130;  // Tiny: підписи під іконками
+constexpr int16_t kInfoY          = 148;  // Tiny: параметри панелі
+}  // namespace demo
+
+}  // namespace display_cfg
+```
+
+_(наступний модуль додасть сюди константи аудіоплеєра/радіо після Prompt 5)_
