@@ -4,8 +4,10 @@
 // - надрукувати інформацію про чіп, PSRAM, flash і розділи;
 // - ініціалізувати LittleFS (з форматуванням, якщо потрібно);
 // - підготувати подієву шину;
-// - запустити кнопки, енкодер і IR та (тимчасово) друкувати їхні події.
-// Дисплей, аудіо та мережа не реалізуються.
+// - запустити кнопки, енкодер і IR та (тимчасово) друкувати їхні події;
+// - [Prompt 3] створити аудіопроцесор (TDA7318 / PT2313L) і, під AUDIO_PROC_TEST,
+//   запустити Serial-тестовий режим.
+// Дисплей, аудіоплеєр та мережа не реалізуються.
 
 #include <Arduino.h>
 #include <LittleFS.h>
@@ -13,6 +15,9 @@
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 
+#include "audio/audio_proc_test.h"  // [Prompt 3] ДОДАНО
+#include "audio/audio_processor.h"  // [Prompt 3] ДОДАНО
+#include "config/audio_config.h"    // [Prompt 3] ДОДАНО
 #include "config/defaults.h"
 #include "config/features.h"
 #include "config/input_config.h"
@@ -21,6 +26,10 @@
 #include "input/buttons.h"
 #include "input/encoder.h"
 #include "input/ir_rc5.h"  // [Prompt 2] ДОДАНО
+
+// [Prompt 3] ДОДАНО: аудіопроцесор живе весь час роботи прошивки.
+// Згодом його створюватиме AppController за типом з Settings (NVS).
+static AudioProcessor* s_audioProc = nullptr;
 
 // Друк інформації про чіп і памʼять.
 static void printChipInfo() {
@@ -109,6 +118,36 @@ static void initLittleFs() {
                   static_cast<unsigned>(LittleFS.totalBytes()));
     Serial.printf("[MAIN] LittleFS used: %u bytes\n",
                   static_cast<unsigned>(LittleFS.usedBytes()));
+}
+
+// [Prompt 3] ДОДАНО: створення й запуск аудіопроцесора.
+// Тип поки береться з константи audio_cfg::kTestProcType (вибору через NVS ще немає).
+static void initAudioProcessor() {
+    const char* typeName =
+        (audio_cfg::kTestProcType == AudioProcType::Tda7318) ? "TDA7318" : "PT2313L";
+
+    s_audioProc = createAudioProcessor(audio_cfg::kTestProcType);
+    if (s_audioProc == nullptr) {
+        Serial.printf("[MAIN] Audio processor %s create failed (disabled in features.h?)\n",
+                      typeName);
+        return;
+    }
+
+    // Результат begin() і probe() логуємо окремо: begin() = усі команди пройшли,
+    // probe() = хтось відповів ACK на 0x44 (тип чіпа цим не підтверджується).
+    const bool beginOk = s_audioProc->begin();
+    Serial.printf("[MAIN] Audio processor %s begin: %s\n", typeName, beginOk ? "ok" : "FAILED");
+    Serial.printf("[MAIN] Audio processor probe 0x%02X: %s\n",
+                  static_cast<unsigned>(defaults::kAudioProcessorI2cAddr),
+                  s_audioProc->probe() ? "ACK" : "no ACK");
+
+#if AUDIO_PROC_TEST
+    if (AudioProcTest::begin(s_audioProc)) {
+        Serial.println("[MAIN] Audio test mode ready (send 'h' for help)");
+    } else {
+        Serial.println("[MAIN] Audio test mode init failed");
+    }
+#endif
 }
 
 #if INPUT_DEMO_PRINT_EVENTS
@@ -211,6 +250,9 @@ void setup() {
     } else {
         Serial.println("[MAIN] IR init failed");
     }
+
+    // [Prompt 3] ДОДАНО: аудіопроцесор (+ тестовий режим під AUDIO_PROC_TEST).
+    initAudioProcessor();
 
     Serial.println("[MAIN] Skeleton ready");
 }
