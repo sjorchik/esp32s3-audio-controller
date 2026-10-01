@@ -4,7 +4,8 @@
 // Абстрактний інтерфейс аудіопроцесора (TDA7318 / PT2313L).
 // [Prompt 3] Розширено: AudioProcType, probe(), applyAll(), i2cErrorCount(),
 // cachedState(), поля fader/inputGain/balanceMin/balanceMax у capabilities,
-// фабрика createAudioProcessor(). Наявні методи не змінювалися.
+// фабрика createAudioProcessor().
+// [Prompt 7] ДОДАНО: setGain(), gainMin/gainMax у capabilities, gain у стані.
 
 // Тип чіпа. Автовизначення неможливе (обидва на 0x44, зчитування немає),
 // тому тип задається ззовні (згодом — з NVS/Settings: 0 = Tda7318, 1 = Pt2313l).
@@ -29,13 +30,16 @@ struct AudioProcessorCapabilities {
     int8_t toneMax;
     // [Prompt 3] ДОДАНО
     // Окремий перед/зад: true лише якщо його можна керувати через цей інтерфейс.
-    // Обидва чіпи мають 4 незалежні атенюатори (апаратно фейдер можливий),
-    // але setFader() в інтерфейсі немає, тому обидва драйвери повертають false.
     bool fader;
-    // Підсилення конкретного входу (задається в audio_cfg::kInputGainSteps).
+    // Підсилення входу: true, якщо setGain() підтримується.
     bool inputGain;
     int8_t balanceMin;
     int8_t balanceMax;
+    // [Prompt 7] ДОДАНО: діапазон setGain() — СИРІ апаратні кроки (без UI-кривої).
+    // Фізичний крок у дБ залежить від чипа: TDA7318 6.25 дБ, PT2313L 3.75 дБ.
+    // Якщо inputGain == false, обидва поля 0.
+    int8_t gainMin;
+    int8_t gainMax;
 };
 
 // [Prompt 3] ДОДАНО: останній ЗАПИТАНИЙ стан (не те, що гарантовано лежить у чіпі
@@ -48,6 +52,9 @@ struct AudioProcessorState {
     int8_t balance;
     bool mute;
     bool loudness;
+    // [Prompt 7] ДОДАНО: підсилення ПОТОЧНОГО активного входу (сирі кроки).
+    // Значення решти входів драйвер тримає всередині й підставляє при setInput().
+    int8_t gain;
 };
 
 // Усі методи потокобезпечні (спільний мʼютекс I2C-шини).
@@ -63,6 +70,9 @@ public:
     virtual bool setBass(int8_t value) = 0;
     virtual bool setTreble(int8_t value) = 0;
     virtual bool setBalance(int8_t value) = 0;
+    // [Prompt 7] Підсилення ПОТОЧНОГО входу, сирі кроки gainMin..gainMax.
+    // Значення зберігається саме для цього входу й повертається при setInput().
+    virtual bool setGain(int8_t value) = 0;
     virtual bool setMute(bool mute) = 0;
     virtual bool setLoudness(bool on) = 0;
     virtual AudioProcessorCapabilities capabilities() const = 0;

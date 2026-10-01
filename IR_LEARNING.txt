@@ -50,12 +50,10 @@
         {Action::DOWN, "DOWN"},
         {Action::LEFT, "LEFT"},
         {Action::RIGHT, "RIGHT"},
-        {Action::OK, "OK"},
         {Action::VOL_UP, "VOL_UP"},
         {Action::VOL_DOWN, "VOL_DOWN"},
         {Action::MUTE, "MUTE"},
         {Action::MENU, "MENU"},
-        {Action::BACK, "BACK"},
         {Action::INPUT_RADIO, "INPUT_RADIO"},
         {Action::INPUT_TV, "INPUT_TV"},
         {Action::INPUT_PC, "INPUT_PC"},
@@ -70,6 +68,14 @@
         {Action::DIGIT_7, "DIGIT_7"},
         {Action::DIGIT_8, "DIGIT_8"},
         {Action::DIGIT_9, "DIGIT_9"},
+        {Action::BASS_UP, "BASS_UP"},
+        {Action::BASS_DOWN, "BASS_DOWN"},
+        {Action::TREBLE_UP, "TREBLE_UP"},
+        {Action::TREBLE_DOWN, "TREBLE_DOWN"},
+        {Action::BALANCE_UP, "BALANCE_UP"},
+        {Action::BALANCE_DOWN, "BALANCE_DOWN"},
+        {Action::GAIN_UP, "GAIN_UP"},
+        {Action::GAIN_DOWN, "GAIN_DOWN"},
     };
     static size_t s_learnIdx = 0;
     static bool s_learnStarted = false;

@@ -25,7 +25,6 @@ enum class Action : uint8_t {
     VOL_DOWN,
     MUTE,
     MENU,
-    BACK,
     INPUT_RADIO,
     INPUT_TV,
     INPUT_PC,
@@ -40,6 +39,15 @@ enum class Action : uint8_t {
     DIGIT_7,
     DIGIT_8,
     DIGIT_9,
+    // [Prompt 7] ДОДАНО (лише в кінець — порядок наявних значень не змінено).
+    BASS_UP,
+    BASS_DOWN,
+    TREBLE_UP,
+    TREBLE_DOWN,
+    BALANCE_UP,
+    BALANCE_DOWN,
+    GAIN_UP,
+    GAIN_DOWN,
 };
 
 // Джерело події.

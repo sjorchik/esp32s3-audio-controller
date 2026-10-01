@@ -29,6 +29,10 @@ constexpr uint8_t kSubSpkRr  = 0xE0;   // 111 ...
 constexpr uint8_t kSpkMuteCode = 0x1F;   // B1 B0 A2 A1 A0 = 11111 (як у TDA7318) — ЗВІРИТИ
 constexpr uint8_t kLoudnessOffBit = 0x04;
 
+// [Prompt 7] Підсилення входу: поле G1 G0 — 2 біти, сирі кроки 0..3 (крок 3.75 дБ).
+constexpr int8_t kGainMin = 0;
+constexpr int8_t kGainMax = 3;
+
 constexpr uint8_t kMaxBatch = 8;
 
 constexpr int clampInt(int v, int lo, int hi) {
@@ -46,7 +50,7 @@ constexpr uint8_t encodeSpeaker(uint8_t sub, uint8_t attSteps) {
 // G1 G0: 00 = +11.25 дБ, 01 = +7.5, 10 = +3.75, 11 = 0 дБ. Біт 2: 0 = loudness ON.
 // S1 S0: 00..10 = Stereo 1..3 (11 = «Stereo 4», назовні не виведений — не використовується).
 constexpr uint8_t encodeSwitch(uint8_t input, uint8_t gainSteps, bool loudnessOn) {
-    return static_cast<uint8_t>(kSubSwitch | ((3 - gainSteps) << 3) |
+    return static_cast<uint8_t>(kSubSwitch | ((3 - (gainSteps & 0x03)) << 3) |
                                 (loudnessOn ? 0 : kLoudnessOffBit) | (input & 0x03));
 }
 
@@ -62,6 +66,7 @@ constexpr uint8_t encodeTone(uint8_t sub, int8_t steps) {
 // Приклад з даташиту PT2313L: Stereo 1, +11.25 дБ, Loudness ON = 0 1 0 0 0 0 0 0.
 static_assert(encodeSwitch(0, 3, true) == 0x40, "datasheet: Stereo 1, +11.25 dB, loudness ON");
 static_assert(encodeSwitch(0, 0, false) == 0x5C, "Stereo 1, 0 dB, loudness OFF");
+static_assert(encodeSwitch(0, kGainMin, true) == 0x58, "Stereo 1, 0 dB, loudness ON");
 static_assert(encodeVolume(36) == 0x24, "-45 dB");
 static_assert(encodeSpeaker(kSubSpkRf, 20) == 0xB4, "RF -25 dB");
 
@@ -103,6 +108,12 @@ bool Pt2313l::begin() {
             defaults::kDefaultBalance, audio_cfg::kBalanceUiMin, audio_cfg::kBalanceUiMax));
         m_state.mute = defaults::kDefaultMute;
         m_state.loudness = kHasTone && defaults::kDefaultLoudness;
+        // [Prompt 7] kInputGainSteps — лише СТАРТОВІ значення; далі керує setGain().
+        for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+            m_gain[i] = static_cast<int8_t>(
+                clampInt(audio_cfg::kInputGainSteps[i], kGainMin, kGainMax));
+        }
+        m_state.gain = m_gain[m_state.input];
         m_shadow.invalidateAll();
         m_begun = true;
     }
@@ -121,6 +132,7 @@ bool Pt2313l::setInput(uint8_t index) {
         return false;
     }
     m_state.input = index;
+    m_state.gain = m_gain[index];   // [Prompt 7] вхід повертає СВІЙ gain
     return commitSwitch();
 }
 
@@ -173,6 +185,17 @@ bool Pt2313l::setBalance(int8_t value) {
     return commitSpeakers();
 }
 
+bool Pt2313l::setGain(int8_t value) {
+    audio_i2c::Lock lock;
+    if (!lock.ok() || !m_begun) {
+        return false;
+    }
+    const int8_t g = static_cast<int8_t>(clampInt(value, kGainMin, kGainMax));
+    m_gain[m_state.input] = g;
+    m_state.gain = g;
+    return commitSwitch();   // той самий байт, що вхід і loudness; switchByte() збирає все разом
+}
+
 bool Pt2313l::setMute(bool mute) {
     audio_i2c::Lock lock;
     if (!lock.ok() || !m_begun) {
@@ -209,6 +232,8 @@ AudioProcessorCapabilities Pt2313l::capabilities() const {
     c.inputGain = true;    // 0..+11.25 дБ, крок 3.75 дБ
     c.balanceMin = audio_cfg::kBalanceUiMin;
     c.balanceMax = audio_cfg::kBalanceUiMax;
+    c.gainMin = kGainMin;  // сирі кроки 0..3
+    c.gainMax = kGainMax;
     return c;
 }
 
@@ -232,7 +257,8 @@ bool Pt2313l::applyAll() {
         return false;
     }
 
-    // Крок 2: гучність, тембр (якщо є), вхід + loudness, гучномовці зі справжнім значенням.
+    // Крок 2: гучність, тембр (якщо є), вхід + gain + loudness (switchByte),
+    // гучномовці зі справжнім значенням.
     Pending spk[4];
     fillSpeakers(spk, false);
     Pending all[kMaxBatch];
@@ -287,7 +313,7 @@ bool Pt2313l::commit(const Pending* items, size_t count) {
 }
 
 uint8_t Pt2313l::switchByte() const {
-    return encodeSwitch(m_state.input, audio_cfg::kInputGainSteps[m_state.input],
+    return encodeSwitch(m_state.input, static_cast<uint8_t>(m_gain[m_state.input]),
                         kHasTone && m_state.loudness);
 }
 

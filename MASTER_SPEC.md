@@ -100,6 +100,13 @@ IR-пульт: фізично НЕМАЄ кнопок OK і BACK — ці дві
 
 Меню (`Mode::Menu`) — розкладка узгоджується окремо в Prompt 9 (`ui/screens`), поки не фіксується.
 
+**Узгоджена поведінка переходів (Prompt 8):**
+- **POWER (standby):** вхід у standby зупиняє `AudioPlayer` (`stop()`), мʼютить атенюатори. Вихід зі standby відновлює той самий режим/вхід/станцію, що були до вимкнення (з `Settings.lastInput`/`lastStation`).
+- **Зміна входу (UP/DOWN):** якщо йде відтворення радіо і вхід міняється на інший — `AudioPlayer::stop()` викликається (не просто мʼют/фонова буферизація).
+- **Список станцій (утримання OK):** окремий `Mode`-подібний стан, відмінний від головного екрана. Потрібен спосіб сказати майбутньому `ui/screens`, ЯКИЙ саме підрежим меню активний (список станцій — це не єдиний майбутній «підекран» у `Mode::Menu`) — конкретне рішення (нове поле в `AppStateData`, напр. enum «контекст меню», чи окремий getter у `AppController`) приймається в Prompt 8, обґрунтувати вибір.
+- **Ramp гучності — ТІЛЬКИ при виході з мʼюту** (пробудження зі standby, після зміни входу/станції): AppController плавно піднімає гучність від 0 до цільового значення кроками, а потім знімає мʼют атенюаторів. Для звичайного керування енкодером/кнопками досить одного виклику `setVolume()` на подію (чіп не клацає на зміні гучності, лише на зміні входу/мʼюту) — додатковий ramp там не потрібен.
+- **Мʼют атенюаторів уручну (утримання енкодера):** негайний `setMute()`, без ramp.
+
 **AppState.** Єдине сховище стану: режим, поточний вхід, гучність, тембр, баланс, мʼют, індекс станції, метадані, статус Wi-Fi/потоку, рівні VU. Доступ потокобезпечний.
 
 **Режими:** `Standby` (мʼют, підсвітка вимкнена, потік зупинений, Wi-Fi і веб працюють), `Radio`, `ExternalInput`, `Menu`, `IrLearn`, `WifiSetup`.
@@ -135,8 +142,8 @@ IR-пульт: фізично НЕМАЄ кнопок OK і BACK — ці дві
 
 Спільний абстрактний інтерфейс для TDA7318 і PT2313L (актуальний код — розділ 12):
 
-- `begin()`, `setInput(index)`, `setVolume(value)`, `setBass(value)`, `setTreble(value)`, `setBalance(value)`, `setMute(bool)`, `setLoudness(bool)`, `probe()` (ACK на I2C-адресу, стан не змінює), `applyAll()` (повторно надіслати весь закешований стан — спершу мʼют гучномовців окремою транзакцією, потім решта, потім повернути баланс), `i2cErrorCount()`, `cachedState()`.
-- `capabilities()` — реальні можливості чипа: `bass`, `treble`, `balance`, `loudness`, `inputCount` (TDA7318 = 4, PT2313L = 3 — див. розділ 3), `volumeMin/Max`, `toneMin/Max`, `balanceMin/Max` (усе — шкала UI, не сирі регістри), `fader` (апаратно є в обох чипах, але інтерфейс не дає `setFader()`, тому завжди `false`), `inputGain` (підсилення конкретного входу, якщо драйвер це реалізує).
+- `begin()`, `setInput(index)`, `setVolume(value)`, `setBass(value)`, `setTreble(value)`, `setBalance(value)`, `setGain(value)` (Prompt 7: підсилення ПОТОЧНОГО входу, сирі апаратні кроки `gainMin..gainMax` — для обох чипів 0..3; TDA7318 крок 6.25 дБ, PT2313L крок 3.75 дБ, значення для решти входів тримає сам драйвер у приватному `m_gain[]`), `setMute(bool)`, `setLoudness(bool)`, `probe()` (ACK на I2C-адресу, стан не змінює), `applyAll()` (повторно надіслати весь закешований стан — спершу мʼют гучномовців окремою транзакцією, потім решта, потім повернути баланс), `i2cErrorCount()`, `cachedState()` (тепер містить і `gain` активного входу).
+- `capabilities()` — реальні можливості чипа: `bass`, `treble`, `balance`, `loudness`, `inputCount` (TDA7318 = 4, PT2313L = 3 — див. розділ 3), `volumeMin/Max`, `toneMin/Max`, `balanceMin/Max` (усе — шкала UI, не сирі регістри), `fader` (апаратно є в обох чипах, але інтерфейс не дає `setFader()`, тому завжди `false`), `inputGain` (булевий прапорець, в обох драйверів `true`), `gainMin/Max` (Prompt 7: сирі кроки, завжди 0..3 для обох чипів).
 - UI/AppController ховають непідтримувані функції та пункти входів понад `inputCount`.
 - Плавна зміна гучності (ramp) — відповідальність ВИКЛИКАЧА (`AppController`): він сам покроково викликає `setVolume()`; драйвер не блокує і не має власного таймера. Кожен виклик — одна коротка I2C-транзакція; повторні однакові значення в шину не йдуть (кеш `audio_i2c::RegShadow`).
 - Мʼют = мʼют усіх атенюаторів гучномовців (регістр гучності не чіпається). Послідовність «мʼют → зміна входу/станції → розмʼют» координує `AppController`; драйвер надає лише окремі примітиви.
@@ -173,8 +180,8 @@ IR-пульт: фізично НЕМАЄ кнопок OK і BACK — ці дві
 
 **План кроків:**
 6. ~~Settings (NVS)~~ — зроблено.
-7. **Розширення `AudioProcessor`: `setGain()`** — наступний крок (потрібне для кнопок GAIN UP/DOWN, див. нижче).
-8. `AppController` (повна розкладка керування — узгоджена, див. розділ 5)
+7. ~~Розширення `AudioProcessor`: `setGain()`~~ — зроблено.
+8. **`AppController`** (повна розкладка керування — узгоджена, див. розділ 5) — наступний крок.
 9. `ui/screens`
 10. `stations/station_store`
 11. `net/wifi_manager`
@@ -202,13 +209,23 @@ IR-пульт: фізично НЕМАЄ кнопок OK і BACK — ці дві
 - Три Serial-тестові режими (`AudioProcTest`, `AudioPlayerTest`, `SettingsTest`) читають один Serial. `SettingsTest` за замовчуванням НЕ стартує, поки активний `AUDIO_PROC_TEST` або `AUDIO_PLAYER_TEST` (байти між читачами плутаються навіть з префіксом команд) — прапорець `SETTINGS_TEST_SHARE_SERIAL=1` форсує запуск на свій ризик. Усі три прапорці вимкнути одночасно з переходом на AppController.
 - `DisplayManager::setFlipped()` вже сама перемальовує останній кадр у наступному періоді (визначено в Prompt 4) — побоювання про порожній екран після зміни орієнтації (піднімалося при реалізації Settings) необґрунтоване, виправляти нічого не треба.
 
-**Заплановані зміни інтерфейсів (Prompt 7, наступний):**
-- `core/events.h`: додати в `Action` (ЛИШЕ в кінець enum, як завжди) — `BASS_UP`, `BASS_DOWN`, `TREBLE_UP`, `TREBLE_DOWN`, `BALANCE_UP`, `BALANCE_DOWN`, `GAIN_UP`, `GAIN_DOWN`.
-- `audio/audio_processor.h`: додати `virtual bool setGain(int8_t value) = 0;` і в `AudioProcessorCapabilities` — `int8_t gainMin, gainMax;` (разом з уже наявним булевим `inputGain`). Припущення (підлягає підтвердженню в самому промпті): шкала — сирі апаратні кроки 0..3 (2-бітне поле), без UI-кривої, як у гучності; TDA7318 крок 6.25 дБ, PT2313L — 3.75 дБ.
-- `audio/tda7318.cpp`, `audio/pt2313l.cpp`: реалізувати `setGain()` реальним I2C-записом замість статичного `audio_cfg::kInputGainSteps` (запис відбувається у той самий регістр входу/перемикача, що й `setInput()` — перевірити, чи gain і input кодуються в одному байті, чи окремо, за даташитом).
-- `audio/audio_proc_test.h`/`.cpp`: додати тестову команду `g<0..3>` для перевірки `setGain()` без AppController.
+**Виконано в Prompt 7:**
+- `core/events.h`: `Action` розширено (лише в кінець) на `BASS_UP`, `BASS_DOWN`, `TREBLE_UP`, `TREBLE_DOWN`, `BALANCE_UP`, `BALANCE_DOWN`, `GAIN_UP`, `GAIN_DOWN`. `ir_cfg::kMapFormatVersion` НЕ зростає (порядок наявних значень не порушено).
+- `audio/audio_processor.h`: `setGain(int8_t)`, `capabilities().gainMin/gainMax` (0..3 для обох чипів), `cachedState().gain` (активного входу).
+- `audio/tda7318.cpp`, `audio/pt2313l.cpp`: `setGain()` реалізовано реальним I2C-записом. Gain і вибір входу (і для PT2313L ще й loudness) кодуються в ОДНОМУ байті перемикача (субадреса `0x40`, поле `G1G0` — біти 4:3). Кожен драйвер тримає `int8_t m_gain[defaults::kInputCount]` — gain усіх входів у RAM, `cachedState().gain` показує лише активний; `setInput()` підставляє gain нового активного входу з цього масиву.
+- `audio/audio_proc_test.cpp`: команда `g<0..3>` (абсолютна, у стилі `b`/`t`/`a`), `capabilities().gainMin/Max` у `h`/`p`.
 
-**IR-навчання (не зміна коду, зміна інструкції):** `IR_LEARNING.txt` і тимчасовий список навчання в `main.cpp` — прибрати `OK`/`BACK` (на пульті фізично немає цих кнопок), додати 8 нових дій вище.
+**Важливо для AppController (Prompt 8, наступний):**
+- Зміна gain — апаратний стрибок рівня без плавного переходу (чипи не мають soft-step для цього поля): так само, як при зміні входу, мʼютити атенюатори (`AudioProcessor::setMute()`) на час `GAIN_UP`/`GAIN_DOWN`, не лишати без мʼюту.
+- `m_gain[]` кожного драйвера живе ЛИШЕ в RAM — Settings поки НЕ зберігає gain per-input. Якщо потрібно відновлювати gain усіх входів при старті (не лише активного), доведеться пройти `setInput(i)` + `setGain(...)` для кожного `i` під мʼютом — незручно й з побічним ефектом (тимчасово міняє активний вхід). **Рекомендація на майбутнє** (не зроблено, не входить у поточний план): додати `AudioProcessor::setInputGain(uint8_t index, int8_t value)` (без перемикання активного входу) і поле `int8_t gain[4]` у `Settings`.
+- Цикл цілі регулювання енкодером (гучність → бас → дискант → баланс → gain → …) — усе необхідне вже є: `capabilities().gainMin/gainMax` дають межі, `cachedState().gain` — поточне значення; `capabilities().inputGain` (булевий) підтверджує, що gain взагалі підтримується (в обох чипів — `true`, тому ховати пункт з циклу не доведеться).
+
+**IR-навчання (ручна дія, не зроблено жодним чатом):** онови `IR_LEARNING.txt` і тимчасовий список навчання в `main.cpp` — прибери `OK`/`BACK` (на пульті фізично немає цих кнопок), додай 8 нових дій (`BASS_UP/DOWN`, `TREBLE_UP/DOWN`, `BALANCE_UP/DOWN`, `GAIN_UP/DOWN`).
+
+**Непідтверджені припущення з даташитів (звірити перед довірою коду):**
+- PT2313L: кодування `G1G0 = 11 → 0 дБ` виведено за аналогією з TDA7318 і лінійною послідовністю — надійно підтверджено в джерелах чату лише `G1G0 = 00 → +11.25 дБ`.
+- PT2313L: крок підсилення 3.75 дБ/крок — не бачений у першоджерелі чатом, взятий з наявних коментарів коду.
+- PT2313L: кодування тембру (`C3..C0`) скопійоване з TDA7318 за принципом pin-to-pin сумісності чипів — не звірено окремо.
 
 **Відомі особливості реалізації (коротко, без змін із попередніх версій):** PCNT `accum_count` без `flags.` в IDF 5.5.2; дебаунс кнопок і repeat/longPress — взаємовиключні; `Action` зберігається в NVS як числа (нові лише в кінець enum); IR на несучій 36 кГц проти 38 кГц VS1838B; аудіопроцесори мають різний крок підсилення/loudness/кількість входів, `fader` завжди `false`; дисплей — offset/invert/BGR підібрані типово (шрифт перевірено фото); аудіоплеєр — автомат станів `Idle→Connecting→Buffering→Playing`, збій веде в `Error→Reconnecting`.
 
@@ -221,7 +238,7 @@ IR-пульт: фізично НЕМАЄ кнопок OK і BACK — ці дві
 ### `core/`
 | Файл | Що містить | Промпт |
 |---|---|---|
-| `events.h` | `EventBus`, `enum Action` (POWER..ENC_PRESS, VOL_UP..DIGIT_9), `EventSource`, `Event{action,source,repeat,longPress,delta}` | база, розширено Prompt 2 |
+| `events.h` | `EventBus`, `enum Action` (POWER..ENC_PRESS, VOL_UP..DIGIT_9, BASS_UP..GAIN_DOWN), `EventSource`, `Event{action,source,repeat,longPress,delta}` | база, розширено Prompt 2 і 7 |
 | `app_state.h` | `AppStateData`, `AppState` (`snapshot`/`update`/`modify` — 2 перевантаження) | Prompt 6 |
 | `app_controller.h` | заглушка | Prompt 7 (наступний) |
 | `settings.h` | `Settings` (+`displayFlipped`/`bass`/`treble`/`balance`/`loudness`), `SettingsStore` (`snapshot`/`modify`/`requestSave`/`flush`/`isDirty`/`resetToDefaults`/`eraseStored`/`writeCount`) | Prompt 6 |
@@ -237,11 +254,11 @@ IR-пульт: фізично НЕМАЄ кнопок OK і BACK — ці дві
 ### `audio/`
 | Файл | Що містить | Промпт |
 |---|---|---|
-| `audio_processor.h` | `AudioProcessor` (абстрактний), `AudioProcessorCapabilities/State`, `AudioProcType`, `createAudioProcessor()` | Prompt 3 |
+| `audio_processor.h` | `AudioProcessor` (абстрактний, +`setGain`), `AudioProcessorCapabilities/State` (+`gainMin/Max`, `gain`), `AudioProcType`, `createAudioProcessor()` | Prompt 3, розширено Prompt 7 |
 | `audio_i2c.h` | спільна I2C-шина: `begin/probe/write`, `Lock`, `RegShadow` | Prompt 3 |
-| `tda7318.h` | `Tda7318 : AudioProcessor` (4 входи, без loudness) | Prompt 3 |
-| `pt2313l.h` | `Pt2313l : AudioProcessor` (3 входи, loudness лише 28-pin) | Prompt 3 |
-| `audio_proc_test.h` | `AudioProcTest` (Serial-тест процесора) | Prompt 3 |
+| `tda7318.h` | `Tda7318 : AudioProcessor` (4 входи, без loudness, `m_gain[4]` per-input) | Prompt 3, розширено Prompt 7 |
+| `pt2313l.h` | `Pt2313l : AudioProcessor` (3 входи, loudness лише 28-pin, `m_gain[4]` per-input) | Prompt 3, розширено Prompt 7 |
+| `audio_proc_test.h` | `AudioProcTest` (Serial-тест процесора, команди `i/v/b/t/a/g/m/l/p/r/x/h`) | Prompt 3, розширено Prompt 7 |
 | `audio_player.h` | `AudioPlayer`, `PlayerState`, метадані/перепідключення/XSMT | Prompt 5 |
 | `audio_player_test.h` | `AudioPlayerTest` (Serial-тест плеєра) | Prompt 5 |
 | `vu_source.h` | `VuSource`, `VuSourceDecodedPcm` (абстрактний) | заглушка з Prompt 0 |

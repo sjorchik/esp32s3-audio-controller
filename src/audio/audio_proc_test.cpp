@@ -16,6 +16,8 @@
 //   b<N>    бас  -7..+7   (крок 2 дБ)
 //   t<N>    дискант -7..+7 (крок 2 дБ)
 //   a<N>    баланс -20..+20 (крок 1.25 дБ; + = правий гучніший)
+//   g<N>    підсилення ПОТОЧНОГО входу, сирі кроки gainMin..gainMax (0..3);
+//           TDA7318 6.25 дБ/крок, PT2313L 3.75 дБ/крок. Абсолютне значення.
 //   m       мʼют: перемкнути;  m1 = увімкнути, m0 = вимкнути
 //   l       loudness: перемкнути; l1 / l0 (лише PT2313L 28-pin)
 //   p       надрукувати capabilities() і поточний кеш
@@ -30,13 +32,17 @@ AudioProcessor* s_proc = nullptr;
 TaskHandle_t s_task = nullptr;
 
 void printHelp() {
+    const AudioProcessorCapabilities c = s_proc->capabilities();
     Serial.println("[ATEST] commands (end with Enter):");
     Serial.println("[ATEST]   i<N> input   v<N> volume   b<N> bass   t<N> treble   a<N> balance");
+    Serial.println("[ATEST]   g<N> gain of current input (raw steps)");
     Serial.println("[ATEST]   m[0|1] mute  l[0|1] loudness   p print   r reapply   x probe   h help");
     Serial.printf("[ATEST] ranges: v %d..%d, b/t %d..%d (x%d dB), a %d..%d (+ = right louder)\n",
                   audio_cfg::kVolumeUiMin, audio_cfg::kVolumeUiMax,
                   audio_cfg::kToneUiMin, audio_cfg::kToneUiMax, audio_cfg::kToneStepDb,
                   audio_cfg::kBalanceUiMin, audio_cfg::kBalanceUiMax);
+    Serial.printf("[ATEST] gain: g %d..%d (TDA7318 6.25 dB/step, PT2313L 3.75 dB/step), "
+                  "stored per input\n", c.gainMin, c.gainMax);
 }
 
 void printInfo() {
@@ -45,13 +51,15 @@ void printInfo() {
                   "inputGain=%d inputs=%u\n",
                   c.bass, c.treble, c.balance, c.loudness, c.fader, c.inputGain,
                   static_cast<unsigned>(c.inputCount));
-    Serial.printf("[ATEST] range: vol=%d..%d tone=%d..%d bal=%d..%d\n",
-                  c.volumeMin, c.volumeMax, c.toneMin, c.toneMax, c.balanceMin, c.balanceMax);
+    Serial.printf("[ATEST] range: vol=%d..%d tone=%d..%d bal=%d..%d gain=%d..%d\n",
+                  c.volumeMin, c.volumeMax, c.toneMin, c.toneMax, c.balanceMin, c.balanceMax,
+                  c.gainMin, c.gainMax);
     const AudioProcessorState s = s_proc->cachedState();
-    Serial.printf("[ATEST] state: input=%u vol=%d bass=%d treble=%d bal=%d mute=%d loud=%d "
-                  "i2cErrors=%lu\n",
+    Serial.printf("[ATEST] state: input=%u vol=%d bass=%d treble=%d bal=%d gain=%d mute=%d "
+                  "loud=%d i2cErrors=%lu\n",
                   static_cast<unsigned>(s.input), s.volume, s.bass, s.treble, s.balance,
-                  s.mute, s.loudness, static_cast<unsigned long>(s_proc->i2cErrorCount()));
+                  s.gain, s.mute, s.loudness,
+                  static_cast<unsigned long>(s_proc->i2cErrorCount()));
 }
 
 bool parseLong(const char* s, long& out) {
@@ -100,8 +108,10 @@ void handleLine(char* line) {
         case 'b':
         case 't':
         case 'a':
+        case 'g':
             if (!hasArg) {
-                Serial.printf("[ATEST] '%c' needs a number, e.g. %c5\n", cmd, cmd);
+                Serial.printf("[ATEST] '%c' needs a number, e.g. %c%d\n", cmd, cmd,
+                              cmd == 'g' ? 1 : 5);
                 return;
             }
             break;
@@ -128,6 +138,10 @@ void handleLine(char* line) {
             break;
         case 'a':
             report("balance", val, s_proc->setBalance(toI8(val)));
+            break;
+        case 'g':
+            // Значення поза gainMin..gainMax обрізає драйвер; ефективне — у `p`.
+            report("gain", val, s_proc->setGain(toI8(val)));
             break;
         case 'm': {
             const bool target = hasArg ? (val != 0) : !s_proc->cachedState().mute;

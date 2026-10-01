@@ -20,7 +20,7 @@
 // УВАГА: AudioProcTest і AudioPlayerTest читають той самий Serial, тому при
 // AUDIO_PLAYER_TEST == 1 main.cpp НЕ запускає AudioProcTest (див. main.cpp).
 // Гучність процесора в цьому режимі — команда `vol`.
-#define AUDIO_PLAYER_TEST 1
+#define AUDIO_PLAYER_TEST 0
 
 // Serial-лог плеєра: зміни стану, мʼют, перепідключення ("[PLAYER] ...").
 #define AUDIO_PLAYER_DEBUG 1

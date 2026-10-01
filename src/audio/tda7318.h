@@ -5,6 +5,7 @@
 
 #include "audio/audio_i2c.h"
 #include "audio/audio_processor.h"
+#include "config/defaults.h"
 
 // Драйвер TDA7318 (ST): 4 стерео входи з підсиленням, гучність, бас/дискант,
 // 4 атенюатори гучномовців (баланс/фейдер) з незалежним мʼютом. Loudness НЕМАЄ.
@@ -19,6 +20,10 @@
 // Мʼют = мʼют усіх чотирьох атенюаторів гучномовців (апаратний «швидкий притиск»,
 // регістр гучності не чіпається). Послідовність «мʼют -> зміна входу/станції ->
 // розмʼют» координує AppController; драйвер лише виконує окремі примітиви.
+//
+// [Prompt 7] Підсилення входу: gain лежить у тому самому байті, що й вибір входу
+// (kRegSwitch). Значення для КОЖНОГО входу тримає m_gain[]; m_state.gain дзеркалить
+// активний вхід.
 class Tda7318 : public AudioProcessor {
 public:
     bool begin() override;
@@ -27,6 +32,7 @@ public:
     bool setBass(int8_t value) override;
     bool setTreble(int8_t value) override;
     bool setBalance(int8_t value) override;
+    bool setGain(int8_t value) override;
     bool setMute(bool mute) override;
     bool setLoudness(bool on) override;
     AudioProcessorCapabilities capabilities() const override;
@@ -64,6 +70,7 @@ private:
     void fillSpeakers(Pending* out, bool forceMute) const;
 
     AudioProcessorState m_state = {};
+    int8_t m_gain[defaults::kInputCount] = {};   // [Prompt 7] gain кожного входу, кроки 0..3
     audio_i2c::RegShadow m_shadow;
     uint32_t m_errors = 0;   // пишеться під мʼютексом, читається без нього (32 біти)
     bool m_begun = false;

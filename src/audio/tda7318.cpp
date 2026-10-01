@@ -16,7 +16,7 @@ namespace {
 
 // --- Субадреси (старші біти байта) ---
 constexpr uint8_t kSubVolume = 0x00;   // 00 B2 B1 B0 A2 A1 A0
-constexpr uint8_t kSubSwitch = 0x40;   // 010 G1 G0 S2 S1 S0
+constexpr uint8_t kSubSwitch = 0x40;   // 010 G1 G0 S2 S1 S0  (G = підсилення, S = вхід)
 constexpr uint8_t kSubBass   = 0x60;   // 0110 C3 C2 C1 C0
 constexpr uint8_t kSubTreble = 0x70;   // 0111 C3 C2 C1 C0
 constexpr uint8_t kSubSpkLf  = 0x80;   // 100 B1 B0 A2 A1 A0  (лівий передній)
@@ -27,6 +27,10 @@ constexpr uint8_t kSubSpkRr  = 0xE0;   // 111 ...             (правий за
 // Атенюатор гучномовця: 5 біт B1 B0 A2 A1 A0 = кількість кроків по 1.25 дБ (0..30);
 // 11111 = мʼют.
 constexpr uint8_t kSpkMuteCode = 0x1F;
+
+// [Prompt 7] Підсилення входу: поле G1 G0 — 2 біти, сирі кроки 0..3 (крок 6.25 дБ).
+constexpr int8_t kGainMin = 0;
+constexpr int8_t kGainMax = 3;
 
 constexpr uint8_t kMaxBatch = 8;   // найбільший пакет: applyAll, крок 2
 
@@ -46,7 +50,7 @@ constexpr uint8_t encodeSpeaker(uint8_t sub, uint8_t attSteps) {
 // Аудіо-перемикач: G1 G0 — підсилення (11 = 0 дБ, 10 = +6.25, 01 = +12.5, 00 = +18.75),
 // S2 = 0, S1 S0 — вхід 0..3 (Stereo 1..4).
 constexpr uint8_t encodeSwitch(uint8_t input, uint8_t gainSteps) {
-    return static_cast<uint8_t>(kSubSwitch | ((3 - gainSteps) << 3) | (input & 0x03));
+    return static_cast<uint8_t>(kSubSwitch | ((3 - (gainSteps & 0x03)) << 3) | (input & 0x03));
 }
 
 // Тембр: кроки по 2 дБ, -7..+7. C3 = знак.
@@ -67,6 +71,9 @@ static_assert(encodeTone(kSubBass, -5) == 0x62, "datasheet: bass -10 dB = 0 1 1 
 static_assert(encodeSpeaker(kSubSpkLf, kSpkMuteCode) == 0x9F, "LF mute");
 static_assert(encodeTone(kSubTreble, 7) == 0x78 && encodeTone(kSubTreble, 0) == 0x77,
               "treble +14 dB / 0 dB");
+// [Prompt 7] Межі gain для входу 0: 0 дБ = 0x58, +18.75 дБ = 0x40.
+static_assert(encodeSwitch(0, kGainMin) == 0x58 && encodeSwitch(0, kGainMax) == 0x40,
+              "gain field G1 G0 in bits 4:3");
 
 constexpr uint8_t balanceAttLeft(int8_t b)  { return b > 0 ? static_cast<uint8_t>(b) : 0; }
 constexpr uint8_t balanceAttRight(int8_t b) { return b < 0 ? static_cast<uint8_t>(-b) : 0; }
@@ -104,6 +111,12 @@ bool Tda7318::begin() {
             defaults::kDefaultBalance, audio_cfg::kBalanceUiMin, audio_cfg::kBalanceUiMax));
         m_state.mute = defaults::kDefaultMute;
         m_state.loudness = false;   // у TDA7318 loudness немає
+        // [Prompt 7] kInputGainSteps — лише СТАРТОВІ значення; далі керує setGain().
+        for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+            m_gain[i] = static_cast<int8_t>(
+                clampInt(audio_cfg::kInputGainSteps[i], kGainMin, kGainMax));
+        }
+        m_state.gain = m_gain[m_state.input];
         m_shadow.invalidateAll();
         m_begun = true;
     }
@@ -122,6 +135,7 @@ bool Tda7318::setInput(uint8_t index) {
         return false;
     }
     m_state.input = index;
+    m_state.gain = m_gain[index];   // [Prompt 7] вхід повертає СВІЙ gain
     return commitSwitch();
 }
 
@@ -168,6 +182,17 @@ bool Tda7318::setBalance(int8_t value) {
     return commitSpeakers();
 }
 
+bool Tda7318::setGain(int8_t value) {
+    audio_i2c::Lock lock;
+    if (!lock.ok() || !m_begun) {
+        return false;
+    }
+    const int8_t g = static_cast<int8_t>(clampInt(value, kGainMin, kGainMax));
+    m_gain[m_state.input] = g;
+    m_state.gain = g;
+    return commitSwitch();   // той самий байт, що й вибір входу; кеш пропустить дублікат
+}
+
 bool Tda7318::setMute(bool mute) {
     audio_i2c::Lock lock;
     if (!lock.ok() || !m_begun) {
@@ -198,6 +223,8 @@ AudioProcessorCapabilities Tda7318::capabilities() const {
     c.inputGain = true;    // 0..+18.75 дБ, крок 6.25 дБ
     c.balanceMin = audio_cfg::kBalanceUiMin;
     c.balanceMax = audio_cfg::kBalanceUiMax;
+    c.gainMin = kGainMin;  // сирі кроки 0..3
+    c.gainMax = kGainMax;
     return c;
 }
 
@@ -222,15 +249,17 @@ bool Tda7318::applyAll() {
         return false;
     }
 
-    // Крок 2: гучність, тембр, вхід, а тоді гучномовці зі справжнім значенням.
+    // Крок 2: гучність, тембр, вхід+gain, а тоді гучномовці зі справжнім значенням.
     // Якщо m_state.mute == true, їхні байти збігаються з уже надісланими й пропускаються.
+    // Чип тримає gain лише активного входу; gain решти живе в m_gain[] і
+    // підставляється при setInput().
     Pending spk[4];
     fillSpeakers(spk, false);
     const Pending all[kMaxBatch] = {
         {kRegVol, encodeVolume(audio_cfg::volumeAttSteps(m_state.volume))},
         {kRegBass, encodeTone(kSubBass, m_state.bass)},
         {kRegTreble, encodeTone(kSubTreble, m_state.treble)},
-        {kRegSwitch, encodeSwitch(m_state.input, audio_cfg::kInputGainSteps[m_state.input])},
+        {kRegSwitch, encodeSwitch(m_state.input, static_cast<uint8_t>(m_gain[m_state.input]))},
         spk[0], spk[1], spk[2], spk[3],
     };
     return commit(all, kMaxBatch);
@@ -275,7 +304,7 @@ bool Tda7318::commit(const Pending* items, size_t count) {
 
 bool Tda7318::commitSwitch() {
     const Pending p[] = {
-        {kRegSwitch, encodeSwitch(m_state.input, audio_cfg::kInputGainSteps[m_state.input])}};
+        {kRegSwitch, encodeSwitch(m_state.input, static_cast<uint8_t>(m_gain[m_state.input]))}};
     return commit(p, 1);
 }
 

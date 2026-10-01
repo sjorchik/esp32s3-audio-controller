@@ -5,6 +5,7 @@
 
 #include "audio/audio_i2c.h"
 #include "audio/audio_processor.h"
+#include "config/defaults.h"
 
 // Драйвер PT2313L (Princeton): 3 стерео входи з підсиленням, гучність, бас/дискант
 // і loudness (лише 28-pin корпус, див. audio_cfg::kPt2313lHasToneLoudness),
@@ -16,6 +17,9 @@
 //
 // Ramp гучності й послідовність мʼюту — так само, як у Tda7318: ramp робить
 // викликач (AppController), драйвер лише виконує примітиви, мʼют = мʼют атенюаторів.
+//
+// [Prompt 7] Підсилення входу: gain, вибір входу й loudness ділять один байт
+// (kRegSwitch). Gain кожного входу тримає m_gain[]; m_state.gain дзеркалить активний.
 class Pt2313l : public AudioProcessor {
 public:
     bool begin() override;
@@ -24,6 +28,7 @@ public:
     bool setBass(int8_t value) override;
     bool setTreble(int8_t value) override;
     bool setBalance(int8_t value) override;
+    bool setGain(int8_t value) override;
     bool setMute(bool mute) override;
     bool setLoudness(bool on) override;
     AudioProcessorCapabilities capabilities() const override;
@@ -60,6 +65,7 @@ private:
     uint8_t switchByte() const;
 
     AudioProcessorState m_state = {};
+    int8_t m_gain[defaults::kInputCount] = {};   // [Prompt 7] gain кожного входу, кроки 0..3
     audio_i2c::RegShadow m_shadow;
     uint32_t m_errors = 0;   // пишеться під мʼютексом, читається без нього (32 біти)
     bool m_begun = false;
