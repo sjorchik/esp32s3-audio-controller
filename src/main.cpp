@@ -10,7 +10,10 @@
 // - [Prompt 4] ініціалізувати дисплей (ST7789, спрайт у PSRAM, задача малювання;
 //   під DISPLAY_DEMO — статичний тестовий кадр);
 // - [Prompt 5] створити аудіоплеєр інтернет-радіо (ESP32-audioI2S) і, під
-//   AUDIO_PLAYER_TEST, запустити його Serial-тестовий режим.
+//   AUDIO_PLAYER_TEST, запустити його Serial-тестовий режим;
+// - [Prompt 6] ініціалізувати Settings (NVS) ДО аудіопроцесора й дисплея:
+//   тип процесора і орієнтація дисплея беруться з Settings; під SETTINGS_TEST —
+//   Serial-тест Settings (команди з префіксом `set.`).
 // Екрани (ui/screens) та мережа (net/*) не реалізуються.
 
 #include <Arduino.h>
@@ -26,10 +29,14 @@
 #include "config/audio_config.h"      // [Prompt 3] ДОДАНО
 #include "config/audio_player_config.h"  // [Prompt 5] ДОДАНО
 #include "config/defaults.h"
+#include "config/display_config.h"  // [Prompt 6] ДОДАНО (display_cfg::kDefaultFlipped)
 #include "config/features.h"
 #include "config/input_config.h"
 #include "config/pins.h"
+#include "config/settings_config.h"  // [Prompt 6] ДОДАНО
 #include "core/events.h"
+#include "core/settings.h"       // [Prompt 6] ДОДАНО
+#include "core/settings_test.h"  // [Prompt 6] ДОДАНО
 #include "input/buttons.h"
 #include "input/encoder.h"
 #include "input/ir_rc5.h"  // [Prompt 2] ДОДАНО
@@ -132,13 +139,16 @@ static void initLittleFs() {
                   static_cast<unsigned>(LittleFS.usedBytes()));
 }
 
-// [Prompt 3] ДОДАНО: створення й запуск аудіопроцесора.
-// Тип поки береться з константи audio_cfg::kTestProcType (вибору через NVS ще немає).
+// [Prompt 6] ЗМІНЕНО: тип чіпа береться з Settings (NVS). Settings::processorType
+// уже перевірено в SettingsStore::load() (0 або 1). Якщо Settings дадуть збій —
+// швидкий відкат: підставити audio_cfg::kTestProcType замість procType нижче
+// (константа з audio_config.h лишається).
 static void initAudioProcessor() {
-    const char* typeName =
-        (audio_cfg::kTestProcType == AudioProcType::Tda7318) ? "TDA7318" : "PT2313L";
+    const AudioProcType procType =
+        static_cast<AudioProcType>(SettingsStore::get().processorType);
+    const char* typeName = (procType == AudioProcType::Tda7318) ? "TDA7318" : "PT2313L";
 
-    s_audioProc = createAudioProcessor(audio_cfg::kTestProcType);
+    s_audioProc = createAudioProcessor(procType);
     if (s_audioProc == nullptr) {
         Serial.printf("[MAIN] Audio processor %s create failed (disabled in features.h?)\n",
                       typeName);
@@ -194,6 +204,15 @@ static void initAudioPlayer() {
 static void initDisplay() {
     if (DisplayManager::begin()) {
         Serial.println("[MAIN] Display ready");
+        // [Prompt 6] ДОДАНО: begin() стартує з display_cfg::kDefaultFlipped; якщо
+        // в Settings інша орієнтація — перемикаємо. Рівне значення пропускаємо,
+        // щоб не робити зайвий поворот панелі.
+        const bool flipped = SettingsStore::get().displayFlipped;
+        if (flipped != display_cfg::kDefaultFlipped) {
+            DisplayManager::setFlipped(flipped);
+            Serial.printf("[MAIN] Display orientation from Settings: %s\n",
+                          flipped ? "flipped" : "normal");
+        }
         return;
     }
 
@@ -208,6 +227,41 @@ static void initDisplay() {
             Serial.printf("[MAIN] Display init failed: %s\n", DisplayManager::lastErrorName());
             break;
     }
+}
+
+// [Prompt 6] ДОДАНО: Settings (NVS). Має відпрацювати ДО initAudioProcessor() та
+// initDisplay(): вони читають SettingsStore::get(). Збій NVS не зупиняє старт —
+// у кеші лежать значення за замовчуванням.
+static void initSettings() {
+    if (!SettingsStore::begin()) {
+        Serial.println("[MAIN] Settings init failed (NVS/task), RAM defaults in use");
+    }
+    if (!SettingsStore::load()) {
+        Serial.println("[MAIN] Settings load/save failed, RAM defaults in use");
+    }
+
+    const Settings& s = SettingsStore::get();
+    Serial.printf("[MAIN] Settings: proc=%s flipped=%d brightness=%u\n",
+                  (s.processorType == 0) ? "TDA7318" : "PT2313L", s.displayFlipped ? 1 : 0,
+                  static_cast<unsigned>(s.brightness));
+}
+
+// [Prompt 6] ДОДАНО: Serial-тест Settings. Читає той самий Serial, що й
+// AudioProcTest / AudioPlayerTest, тому за замовчуванням не стартує, поки
+// активний хоч один із них (див. SETTINGS_TEST_SHARE_SERIAL у settings_config.h).
+static void initSettingsTest() {
+#if SETTINGS_TEST
+#if (AUDIO_PROC_TEST || AUDIO_PLAYER_TEST) && !SETTINGS_TEST_SHARE_SERIAL
+    Serial.println("[MAIN] Settings test skipped: Serial is used by another test "
+                   "(set AUDIO_PLAYER_TEST/AUDIO_PROC_TEST to 0 or SETTINGS_TEST_SHARE_SERIAL to 1)");
+#else
+    if (SettingsTest::begin()) {
+        Serial.println("[MAIN] Settings test mode ready (send 'set.help')");
+    } else {
+        Serial.println("[MAIN] Settings test mode init failed");
+    }
+#endif
+#endif
 }
 
 #if INPUT_DEMO_PRINT_EVENTS
@@ -286,6 +340,9 @@ void setup() {
     printPartitionInfo();
     initLittleFs();
 
+    // [Prompt 6] ДОДАНО: Settings до аудіопроцесора й дисплея.
+    initSettings();
+
     if (!EventBus::begin()) {
         Serial.println("[MAIN] EventBus init failed");
     } else {
@@ -319,6 +376,9 @@ void setup() {
 
     // [Prompt 5] ДОДАНО: аудіоплеєр (після процесора, щоб передати вказівник).
     initAudioPlayer();
+
+    // [Prompt 6] ДОДАНО: Serial-тест Settings (останнім, щоб не заважати логу старту).
+    initSettingsTest();
 
     Serial.println("[MAIN] Skeleton ready");
 }

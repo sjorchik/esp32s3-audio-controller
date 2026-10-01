@@ -82,16 +82,23 @@
 
 **Логічні Action:** див. `core/events.h` у розділі 12. Кожна подія має прапорець `repeat` (утримання) і джерело (`EventSource`).
 
-**Розкладка керування за замовчуванням** (реалізується в `AppController`):
+**Розкладка керування, узгоджена з користувачем** (реалізується в `AppController`, Prompt 8):
 
-| Дія | Radio / зовнішній вхід | Меню |
+Головний екран:
+| Дія | Вхід = Radio | Інші входи |
 |---|---|---|
-| Енкодер обертається | гучність | навігація по пунктах / зміна значення |
-| Енкодер натиснуто | мʼют | вибір |
-| UP / DOWN | попередня / наступна станція | навігація |
-| LEFT / RIGHT | попередній / наступний вхід | зміна значення |
-| OK | відкрити меню | вибір |
-| POWER | standby вкл/викл | standby вкл/викл |
+| UP / DOWN (кнопки) | перемикання логічного входу (0..3, пропускаючи вхід 3 для PT2313L) | те саме |
+| LEFT / RIGHT (кнопки) | перемикання станції | немає дії |
+| OK коротко | play/pause | немає дії |
+| OK утримання | список станцій | немає дії |
+| Енкодер обертання | гучність (завжди, незалежно від входу) | те саме |
+| Енкодер клік | цикл цілі регулювання: гучність → бас → дискант → баланс → gain → гучність … | те саме |
+| Енкодер утримання | мʼют (атенюаторів, `AudioProcessor::setMute()`) | те саме |
+| POWER | standby вкл/викл | те саме |
+
+IR-пульт: фізично НЕМАЄ кнопок OK і BACK — ці дві дії залишаються доступні лише з кнопок/енкодера, їх не включати в список навчання `IR_LEARNING.txt`. Натомість пульт має прямі кнопки `BASS_UP/DOWN`, `TREBLE_UP/DOWN`, `BALANCE_UP/DOWN`, `GAIN_UP/DOWN` — додані в `Action` (Prompt 7), включити в список навчання.
+
+Меню (`Mode::Menu`) — розкладка узгоджується окремо в Prompt 9 (`ui/screens`), поки не фіксується.
 
 **AppState.** Єдине сховище стану: режим, поточний вхід, гучність, тембр, баланс, мʼют, індекс станції, метадані, статус Wi-Fi/потоку, рівні VU. Доступ потокобезпечний.
 
@@ -162,49 +169,48 @@
 
 **Бібліотеки:** LovyanGFX ^1.2.0, ESP32-audioI2S (git), ESPAsyncWebServer + AsyncTCP (ESP32Async, git), ArduinoJson ^7.4.1. `lib_ldf_mode = chain`.
 
-**Виконані модулі:**
-- Скелет проекту (platformio.ini, partitions.csv, config/*, заглушки модулів, main.cpp).
-- `core/events.h` (`EventBus`) — реалізовано.
-- `input/buttons`, `input/encoder`, `config/input_config.h` — реалізовано (Prompt 1).
-- `input/ir_rc5`, `config/ir_config.h` — реалізовано (Prompt 2). Інструкція користувача — `IR_LEARNING.txt`.
-- `audio/audio_processor.h` (розширено), `audio/tda7318`, `audio/pt2313l`, `audio/audio_i2c`, `audio/audio_proc_test`, `config/audio_config.h` — реалізовано (Prompt 3).
-- `ui/display`, `ui/fonts`, `ui/icons`, `config/display_config.h` — реалізовано (Prompt 4). Український шрифт (DejaVu Sans через `tools/gen_gfxfont.py` → `ui/font_data.h`) перевірено на реальному екрані (фото, спершу квадрати замість гліфів, потім виправлено).
-- `audio/audio_player`, `audio/audio_player_test`, `config/audio_player_config.h` — реалізовано (Prompt 5): обгортка над ESP32-audioI2S, автомат станів `PlayerState`, керування XSMT (софт-мʼют ЦАП), перепідключення з exponential backoff, евристика визначення кодування ICY (ASCII/UTF-8/cp1251/Latin-1) з нормалізацією під шрифт.
+**Виконані модулі:** скелет; `core/events`; `input/buttons`, `input/encoder` (Prompt 1); `input/ir_rc5` (Prompt 2); `audio/audio_processor` + `tda7318`/`pt2313l`/`audio_i2c`/`audio_proc_test` (Prompt 3); `ui/display`/`fonts`/`icons` (Prompt 4); `audio/audio_player`/`audio_player_test` (Prompt 5); `core/settings`, `core/app_state` (додано `modify()`), `core/settings_test` (Prompt 6).
 
-**Важливо для AppController (ще не написаний), врахувати при реалізації:**
+**План кроків:**
+6. ~~Settings (NVS)~~ — зроблено.
+7. **Розширення `AudioProcessor`: `setGain()`** — наступний крок (потрібне для кнопок GAIN UP/DOWN, див. нижче).
+8. `AppController` (повна розкладка керування — узгоджена, див. розділ 5)
+9. `ui/screens`
+10. `stations/station_store`
+11. `net/wifi_manager`
+12. `net/web_server`
+13. `audio/vu_source`
+
+**Важливо для AppController (Prompt 7, наступний), врахувати при реалізації:**
 - `Action::ENC_PRESS` з `longPress=false` → mute; `longPress=true` → інша дія. POWER і OK також мають окремі довгі події.
-- Вимкнути `INPUT_DEMO_PRINT_EVENTS` у `input_config.h`, коли AppController підключить власне читання `EventBus`.
+- Вимкнути `INPUT_DEMO_PRINT_EVENTS`, `AUDIO_PROC_TEST`, `AUDIO_PLAYER_TEST`, `SETTINGS_TEST` у відповідних `config/*_config.h`, коли AppController візьме керування на себе.
 - `Buttons::droppedEvents()` / `Encoder::droppedEvents()` / `IrRc5::droppedEvents()` — лічильники втрат подій.
-- IR: `ENC_CW`/`ENC_CCW` з `source==IR` завжди `delta=1`; `repeat=true` від IR лише для VOL_UP, VOL_DOWN, UP, DOWN, LEFT, RIGHT.
-- Режим навчання IR поки керується тимчасовим кодом у `main.cpp` (`IR_LEARNING.txt`); коли зʼявиться екран `IrLearn`, він викликає ту саму статичну API `IrRc5`.
-- **Вибір типу процесора (TDA7318/PT2313L) зберігається в `Settings` (NVS), `AppController` створює драйвер один раз через `createAudioProcessor()`.** `audio_cfg::kTestProcType` — лише відображення поточного макетного стенду (зараз PT2313L; фінальна плата — TDA7318), не рішення проєкту.
-- **PT2313L має лише 3 фізичні входи (TDA7318 — 4).** Логічний вхід 3 (Aux) недоступний з PT2313L: UI/AppController ховають пункти меню входів з індексом `>= capabilities().inputCount`.
-- Ramp гучності — відповідальність `AppController`, як і послідовність «мʼют атенюаторів → зміна входу/станції → розмʼют» через `AudioProcessor::setMute()`.
-- Після відновлення зі standby або підозри на збій I2C — викликати `applyAll()`.
-- **Два НЕЗАЛЕЖНІ рівні мʼюту:** `AudioPlayer` сам керує XSMT (софт-мʼют ЦАП PCM5102) за власним автоматом станів (мʼютить у Idle/Connecting/Error/Reconnecting, розмʼючує лише після `kUnmuteStableMs` стабільного Playing) — це НЕ стосується мʼюту атенюаторів `AudioProcessor::setMute()`, яким керує AppController при перемиканні входів. Обидва мʼюти працюють незалежно й одночасно потрібні при зміні станції/входу.
-- `AudioPlayer` НЕ перевіряє Wi-Fi сам: без мережі просто йде нескінченний backoff (1с→2→4→…→30с). Реальне Wi-Fi-підключення зʼявиться з `net/wifi_manager` (Prompt 8).
-- Точка інтеграції VU-метра позначена коментарем-TODO в `audio_player.h` (можливий callback `audio_process_i2s(int16_t*, int32_t, bool*)`, залежить від версії бібліотеки) — сам VU (Prompt 10) ще не написаний.
-- **Прапорці, залежні від версії ESP32-audioI2S — ОБОВʼЯЗКОВО звірити при першій компіляції:** `AUDIO_PLAYER_CB_STYLE` (1 чи 2 — стиль callback-ів; неправильне значення 2 дає помилку компіляції, неправильне 1 компілюється, але мовчки не викликає callback-и), `AUDIO_PLAYER_HAS_SETBUFSIZE` (чи є `Audio::setBufsize()` у вашій версії), `AUDIO_PLAYER_CALL_LOOP` (чи справді треба самим викликати `Audio::loop()`, чи бібліотека має власну задачу).
-- Serial-тестові режими `AudioProcTest` (Prompt 3) і `AudioPlayerTest` (Prompt 5) читають той самий Serial і не працюють одночасно: при `AUDIO_PLAYER_TEST == 1` `main.cpp` НЕ запускає `AudioProcTest`. Обидва прапорці (`AUDIO_PROC_TEST`, `AUDIO_PLAYER_TEST`) вимкнути, коли `AppController` візьме керування на себе.
-- `AudioPlayerTest` має власне тимчасове Wi-Fi-підключення (`wifi <ssid> <pass>` у Serial, `player_cfg::kTestWifiSsid/Pass` — порожні за замовчуванням, пароль не комітити) — це тимчасовий код, який піде під ніж разом із тестовим режимом, коли зʼявиться `net/wifi_manager`.
-- Тестові URL станцій (`player_cfg::kTestStationUrls`) публічні, але їхню працездатність чат не перевіряв (немає доступу до мережі) — може знадобитись підставити робочі адреси.
-- Евристика визначення кодування ICY (ASCII/UTF-8/cp1251/Latin-1 за розподілом байтів ≥0xC0) — не точна наука, можливі помилки на текстах з латинською діакритикою поруч (приклад із відповіді чату: "Café", "Motörhead" можуть розпізнатися неправильно за певних сусідств символів).
-- **Орієнтація дисплея (`DisplayManager::setFlipped()`) поки НЕ зберігається** — при старті завжди `display_cfg::kDefaultFlipped`. Коли зʼявиться `Settings`, додати поле (наприклад `displayFlipped`) і викликати `setFlipped()` при старті; веб-інтерфейс дає можливість перемкнути.
-- `DisplayManager` не читає `EventBus`, реальний контент задає `FrameCallback` (`ui/screens`, ще не написаний). Примітиви малювання й `present()` — лише з display-задачі.
-- Вимкнути `DISPLAY_DEMO`, коли з'явиться `ui/screens`.
+- IR: `ENC_CW`/`ENC_CCW` з `source==IR` завжди `delta=1`; `repeat=true` лише для VOL_UP, VOL_DOWN, UP, DOWN, LEFT, RIGHT.
+- Режим навчання IR поки керується тимчасовим кодом у `main.cpp` (`IR_LEARNING.txt`); екран `IrLearn` викликає ту саму статичну API `IrRc5`.
+- **PT2313L має лише 3 фізичні входи (TDA7318 — 4).** Вхід 3 (Aux) недоступний з PT2313L: AppController/UI ховають пункти меню входів `>= capabilities().inputCount`.
+- Ramp гучності й послідовність «мʼют атенюаторів → зміна входу/станції → розмʼют» (`AudioProcessor::setMute()`) — відповідальність AppController.
+- **Два НЕЗАЛЕЖНІ мʼюти:** `AudioPlayer` сам керує XSMT за власним автоматом станів; `AudioProcessor::setMute()` (атенюатори) — окремо, керує AppController.
+- `AudioPlayer` не перевіряє Wi-Fi сам — без мережі йде нескінченний backoff.
+- Точка інтеграції VU — TODO-коментар у `audio_player.h`, сам `vu_source` ще не реалізований (тепер пункт 12 плану).
+- **Settings тепер реальні (Prompt 6):** `AppController` МАЄ викликати `SettingsStore::begin()`+`load()` і `AppState::begin()` на старті (останній поки НІХТО не викликає — `main.cpp` цього не робить, `snapshot()`/`modify()` досі працюють без блокування як до-AppController виняток).
+- **Запис у NVS:** `SettingsStore::requestSave()` можна смело викликати на кожному кроці ramp — це лише прапорець, фактичний запис стається один раз після того, як зміни стихнуть (`kSaveDebounceMs`=2с) або мине `kSaveMaxDelayMs`=10с від початку серії. Перед переходом у standby/перезавантаженням — викликати `flush()`.
+- `SettingsStore::resetToDefaults()`/`eraseStored()` чіпають ЛИШЕ ключ `"settings"` у спільному namespace `"audioctl"`, НЕ весь namespace — мапа IR-пульта (ключ `"ir_map"`) лишається недоторканою.
+- `Settings::processorType` за замовчуванням при першому запуску бере значення з `audio_cfg::kTestProcType` (бо в `defaults::*` типового значення процесора немає) — тобто поведінка макетного стенду не зміниться після появи Settings.
+- `AppState::update()` залишено поруч з новим `modify()` з обережності (не доведено, що його ще ніхто не викликає) — АЛЕ патерн `snapshot() → змінити поле → update()` НЕ атомарний (паралельна зміна іншого поля іншою задачею, наприклад VU, буде затерта). **AppController має використовувати `modify()` для часткових змін**, `update()` — лише якщо справді треба замінити весь стан одразу.
+- `AppState::modify()` має два перевантаження: без контексту (`fn(AppStateData&)`) і з контекстом (`fn(AppStateData&, void* ctx)`) для передачі значення без глобальних змінних.
+- Settings НЕ валідує діапазони `bass`/`treble`/`balance`/`lastVolume` — їх обрізає сам драйвер `AudioProcessor`. AppController не повинен покладатись на те, що значення зі Settings завжди в межах capabilities, а завжди пропускати їх через `setXxx()` драйвера (який сам обрізає).
+- Три Serial-тестові режими (`AudioProcTest`, `AudioPlayerTest`, `SettingsTest`) читають один Serial. `SettingsTest` за замовчуванням НЕ стартує, поки активний `AUDIO_PROC_TEST` або `AUDIO_PLAYER_TEST` (байти між читачами плутаються навіть з префіксом команд) — прапорець `SETTINGS_TEST_SHARE_SERIAL=1` форсує запуск на свій ризик. Усі три прапорці вимкнути одночасно з переходом на AppController.
+- `DisplayManager::setFlipped()` вже сама перемальовує останній кадр у наступному періоді (визначено в Prompt 4) — побоювання про порожній екран після зміни орієнтації (піднімалося при реалізації Settings) необґрунтоване, виправляти нічого не треба.
 
-**Заплановані зміни інтерфейсів (виконуються у відповідних промптах):**
-- `AppState`: додати безпечне часткове оновлення (`modify`) при реалізації AppState.
-- `Settings`: додати `bass`, `treble`, `balance`, `loudness`, `processorType`, `displayFlipped`, `brightness`.
+**Заплановані зміни інтерфейсів (Prompt 7, наступний):**
+- `core/events.h`: додати в `Action` (ЛИШЕ в кінець enum, як завжди) — `BASS_UP`, `BASS_DOWN`, `TREBLE_UP`, `TREBLE_DOWN`, `BALANCE_UP`, `BALANCE_DOWN`, `GAIN_UP`, `GAIN_DOWN`.
+- `audio/audio_processor.h`: додати `virtual bool setGain(int8_t value) = 0;` і в `AudioProcessorCapabilities` — `int8_t gainMin, gainMax;` (разом з уже наявним булевим `inputGain`). Припущення (підлягає підтвердженню в самому промпті): шкала — сирі апаратні кроки 0..3 (2-бітне поле), без UI-кривої, як у гучності; TDA7318 крок 6.25 дБ, PT2313L — 3.75 дБ.
+- `audio/tda7318.cpp`, `audio/pt2313l.cpp`: реалізувати `setGain()` реальним I2C-записом замість статичного `audio_cfg::kInputGainSteps` (запис відбувається у той самий регістр входу/перемикача, що й `setInput()` — перевірити, чи gain і input кодуються в одному байті, чи окремо, за даташитом).
+- `audio/audio_proc_test.h`/`.cpp`: додати тестову команду `g<0..3>` для перевірки `setGain()` без AppController.
 
-**Відомі особливості реалізації (не проблеми, але важливо знати):**
-- PCNT: поле `accum_count` у `pcnt_unit_config_t` — без `flags.` у IDF 5.5.2. Якщо збірка видасть `no member named 'flags'` — прибрати `flags.`.
-- Дебаунс кнопок і взаємовиключність repeat/longPress — див. попередні версії цього розділу (без змін).
-- `enum class Action` зберігається в NVS як числа (мапа IR) — нові дії лише в кінець `enum`.
-- IR: несуча 36 кГц проти розрахункових 38 кГц VS1838B, стартова мапа порожня, розширений RC5X не підтримується.
-- Аудіопроцесор: спільний формат байтів (родина TDA7313/7318/PT2313), різний крок підсилення входу й наявність loudness, різна кількість фізичних входів (4 проти 3), `fader` завжди `false`.
-- Дисплей: `kOffsetX/Y`, `kInvertColors`, `kBgrOrder` — підібрані як типові значення, шрифт перевірено фото, решта геометрії панелі — ні.
-- Аудіоплеєр: автомат станів `Idle → Connecting → Buffering → Playing`, збій (не підключився / eof-callback / `isRunning()==false` довше `kNotRunningGraceMs` / `Buffering` довше `kBufferingTimeoutMs`) веде в `Error → Reconnecting`; перехід у `Playing` — за bitrate-callback, текстом `"stream ready"` в `audio_info`, або запасним таймером `kAssumePlayingMs`.
+**IR-навчання (не зміна коду, зміна інструкції):** `IR_LEARNING.txt` і тимчасовий список навчання в `main.cpp` — прибрати `OK`/`BACK` (на пульті фізично немає цих кнопок), додати 8 нових дій вище.
+
+**Відомі особливості реалізації (коротко, без змін із попередніх версій):** PCNT `accum_count` без `flags.` в IDF 5.5.2; дебаунс кнопок і repeat/longPress — взаємовиключні; `Action` зберігається в NVS як числа (нові лише в кінець enum); IR на несучій 36 кГц проти 38 кГц VS1838B; аудіопроцесори мають різний крок підсилення/loudness/кількість входів, `fader` завжди `false`; дисплей — offset/invert/BGR підібрані типово (шрифт перевірено фото); аудіоплеєр — автомат станів `Idle→Connecting→Buffering→Playing`, збій веде в `Error→Reconnecting`.
 
 **Відомі проблеми:** поки немає.
 
@@ -216,9 +222,10 @@
 | Файл | Що містить | Промпт |
 |---|---|---|
 | `events.h` | `EventBus`, `enum Action` (POWER..ENC_PRESS, VOL_UP..DIGIT_9), `EventSource`, `Event{action,source,repeat,longPress,delta}` | база, розширено Prompt 2 |
-| `app_state.h` | `AppStateData`, `AppState` (`snapshot`/`update`, заплановано `modify`) | заглушка; `modify()` — Prompt 6 (план) |
-| `app_controller.h` | заглушка | Prompt 7 (план) |
-| `settings.h` | `Settings`, `SettingsStore` | заглушка; реалізація — Prompt 6 (план) |
+| `app_state.h` | `AppStateData`, `AppState` (`snapshot`/`update`/`modify` — 2 перевантаження) | Prompt 6 |
+| `app_controller.h` | заглушка | Prompt 7 (наступний) |
+| `settings.h` | `Settings` (+`displayFlipped`/`bass`/`treble`/`balance`/`loudness`), `SettingsStore` (`snapshot`/`modify`/`requestSave`/`flush`/`isDirty`/`resetToDefaults`/`eraseStored`/`writeCount`) | Prompt 6 |
+| `settings_test.h` | `SettingsTest` (Serial-тест, префікс `set.`) | Prompt 6 |
 
 ### `input/`
 | Файл | Що містить | Промпт |
@@ -264,6 +271,6 @@
 | `audio_config.h` | `namespace audio_cfg`, `#define AUDIO_PROC_TEST` | Prompt 3 |
 | `display_config.h` | `namespace display_cfg` (+ `display_cfg::demo`), `#define DISPLAY_DEMO` | Prompt 4 |
 | `audio_player_config.h` | `namespace player_cfg`, `#define AUDIO_PLAYER_*` | Prompt 5 |
-| `settings_config.h` | `namespace settings_cfg`, `#define SETTINGS_TEST` | Prompt 6 (план, ще не отримано) |
+| `settings_config.h` | `namespace settings_cfg`, `#define SETTINGS_TEST`, `SETTINGS_TEST_SHARE_SERIAL` | Prompt 6 |
 
 Коли константа з одного `config/*.h` потрібна як опорне значення в новому промпті (наприклад `defaults::kInputCount` при розширенні `AudioProcessorCapabilities`) — чат читає її з прикріпленого файлу, а не з MASTER SPEC.
