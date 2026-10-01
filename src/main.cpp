@@ -8,8 +8,10 @@
 // - [Prompt 3] створити аудіопроцесор (TDA7318 / PT2313L) і, під AUDIO_PROC_TEST,
 //   запустити Serial-тестовий режим;
 // - [Prompt 4] ініціалізувати дисплей (ST7789, спрайт у PSRAM, задача малювання;
-//   під DISPLAY_DEMO — статичний тестовий кадр).
-// Екрани (ui/screens), аудіоплеєр та мережа не реалізуються.
+//   під DISPLAY_DEMO — статичний тестовий кадр);
+// - [Prompt 5] створити аудіоплеєр інтернет-радіо (ESP32-audioI2S) і, під
+//   AUDIO_PLAYER_TEST, запустити його Serial-тестовий режим.
+// Екрани (ui/screens) та мережа (net/*) не реалізуються.
 
 #include <Arduino.h>
 #include <LittleFS.h>
@@ -17,9 +19,12 @@
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 
-#include "audio/audio_proc_test.h"  // [Prompt 3] ДОДАНО
-#include "audio/audio_processor.h"  // [Prompt 3] ДОДАНО
-#include "config/audio_config.h"    // [Prompt 3] ДОДАНО
+#include "audio/audio_player.h"       // [Prompt 5] ДОДАНО
+#include "audio/audio_player_test.h"  // [Prompt 5] ДОДАНО
+#include "audio/audio_proc_test.h"    // [Prompt 3] ДОДАНО
+#include "audio/audio_processor.h"    // [Prompt 3] ДОДАНО
+#include "config/audio_config.h"      // [Prompt 3] ДОДАНО
+#include "config/audio_player_config.h"  // [Prompt 5] ДОДАНО
 #include "config/defaults.h"
 #include "config/features.h"
 #include "config/input_config.h"
@@ -33,6 +38,10 @@
 // [Prompt 3] ДОДАНО: аудіопроцесор живе весь час роботи прошивки.
 // Згодом його створюватиме AppController за типом з Settings (NVS).
 static AudioProcessor* s_audioProc = nullptr;
+
+// [Prompt 5] ДОДАНО: true, якщо аудіопроцесор створено й begin() пройшов успішно.
+// Лише тоді його вказівник передається плеєру (інакше nullptr).
+static bool s_audioProcReady = false;
 
 // Друк інформації про чіп і памʼять.
 static void printChipInfo() {
@@ -139,16 +148,43 @@ static void initAudioProcessor() {
     // Результат begin() і probe() логуємо окремо: begin() = усі команди пройшли,
     // probe() = хтось відповів ACK на 0x44 (тип чіпа цим не підтверджується).
     const bool beginOk = s_audioProc->begin();
+    s_audioProcReady = beginOk;  // [Prompt 5] ДОДАНО
     Serial.printf("[MAIN] Audio processor %s begin: %s\n", typeName, beginOk ? "ok" : "FAILED");
     Serial.printf("[MAIN] Audio processor probe 0x%02X: %s\n",
                   static_cast<unsigned>(defaults::kAudioProcessorI2cAddr),
                   s_audioProc->probe() ? "ACK" : "no ACK");
 
-#if AUDIO_PROC_TEST
+    // [Prompt 5] ЗМІНЕНО: AudioProcTest і AudioPlayerTest читають той самий Serial і
+    // крали б байти один в одного, тому одночасно вони не запускаються.
+    // При AUDIO_PLAYER_TEST == 1 керування процесором — команди `vol` / `pmute`
+    // плеєрного тесту. Щоб знову користуватись AudioProcTest — AUDIO_PLAYER_TEST 0.
+#if AUDIO_PROC_TEST && !AUDIO_PLAYER_TEST
     if (AudioProcTest::begin(s_audioProc)) {
         Serial.println("[MAIN] Audio test mode ready (send 'h' for help)");
     } else {
         Serial.println("[MAIN] Audio test mode init failed");
+    }
+#elif AUDIO_PROC_TEST && AUDIO_PLAYER_TEST
+    Serial.println("[MAIN] Audio proc test skipped: Serial is used by player test");
+#endif
+}
+
+// [Prompt 5] ДОДАНО: аудіоплеєр. Приймає вказівник на процесор лише якщо той
+// успішно ініціалізувався (плеєр ним не володіє й setMute() не викликає).
+static void initAudioPlayer() {
+    AudioProcessor* proc = s_audioProcReady ? s_audioProc : nullptr;
+
+    if (!AudioPlayer::begin(proc)) {
+        Serial.println("[MAIN] Audio player init failed");
+        return;
+    }
+    Serial.println("[MAIN] Audio player ready");
+
+#if AUDIO_PLAYER_TEST
+    if (AudioPlayerTest::begin(proc)) {
+        Serial.println("[MAIN] Player test mode ready (send 'help')");
+    } else {
+        Serial.println("[MAIN] Player test mode init failed");
     }
 #endif
 }
@@ -280,6 +316,9 @@ void setup() {
 
     // [Prompt 4] ДОДАНО: дисплей після ініціалізації аудіопроцесора.
     initDisplay();
+
+    // [Prompt 5] ДОДАНО: аудіоплеєр (після процесора, щоб передати вказівник).
+    initAudioPlayer();
 
     Serial.println("[MAIN] Skeleton ready");
 }
