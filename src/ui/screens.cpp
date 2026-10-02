@@ -148,6 +148,53 @@ void drawStatusRow(const AppStateData& s) {
                 c::kColorAccent);
 }
 
+// [Prompt 10] ДОДАНО: малювання статусу потоку на основі StreamStatus.
+// Виводить текст і колір залежно від статусу:
+//   Idle           → сірий "Stopped"
+//   Connecting     → жовтий "Connecting…"
+//   Buffering      → жовтий "Buffering…"
+//   Playing        → зелений "Playing"
+//   Error          → червоний "Error"
+//   Reconnecting   → жовтий "Reconnecting…"
+// Wi-Fi статус показується окремою іконкою (не змінюється).
+void drawStreamStatus(const AppStateData& s) {
+    const char* state;
+    uint16_t color;
+
+    switch (s.streamStatus) {
+        case StreamStatus::Idle:
+            state = "Stopped";
+            color = c::kColorDim;
+            break;
+        case StreamStatus::Connecting:
+            state = "Connecting…";
+            color = c::kColorAccent;  // жовтий
+            break;
+        case StreamStatus::Buffering:
+            state = "Buffering…";
+            color = c::kColorAccent;  // жовтий
+            break;
+        case StreamStatus::Playing:
+            state = "Playing";
+            color = c::kColorOk;  // зелений
+            break;
+        case StreamStatus::Error:
+            state = "Error";
+            color = c::kColorBad;  // червоний
+            break;
+        case StreamStatus::Reconnecting:
+            state = "Reconnecting…";
+            color = c::kColorAccent;  // жовтий
+            break;
+        default:
+            state = "?";
+            color = c::kColorDim;
+            break;
+    }
+
+    D::drawText(state, c::kMargin, c::kStateY, FontSize::Small, color);
+}
+
 // ---------------------------------------------------------------------------
 // Екрани
 // ---------------------------------------------------------------------------
@@ -166,12 +213,8 @@ void drawRadio(const AppStateData& s) {
     // TODO (Prompt 13): VU meter
     D::drawRect(c::kVuX, c::kVuY, c::kVuW, c::kVuH, c::kColorDim);
 
-    const char* state;
-    uint16_t color;
-    if (!s.wifiConnected)       { state = "No Wi-Fi"; color = c::kColorBad; }
-    else if (s.streamPlaying)   { state = "Playing";  color = c::kColorOk; }
-    else                        { state = "Stopped";  color = c::kColorAccent; }
-    D::drawText(state, c::kMargin, c::kStateY, FontSize::Small, color);
+    // [Prompt 10] ДОДАНО: використовуємо StreamStatus замість наївної евристики
+    drawStreamStatus(s);
 
     drawStatusRow(s);
 }

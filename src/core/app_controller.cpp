@@ -321,6 +321,7 @@ struct SyncCtx {
     char title[128];
     bool playing;
     bool wifi;
+    StreamStatus status;  // [Prompt 10] ДОДАНО: детальний статус поток
 };
 
 void applySync(AppStateData& s, void* c) {
@@ -329,6 +330,7 @@ void applySync(AppStateData& s, void* c) {
     strlcpy(s.trackTitle, x->title, sizeof(s.trackTitle));
     s.streamPlaying = x->playing;
     s.wifiConnected = x->wifi;
+    s.streamStatus = x->status;  // [Prompt 10] ДОДАНО
 }
 
 void syncPlayer() {
@@ -341,6 +343,23 @@ void syncPlayer() {
     }
     c.playing = AudioPlayer::isPlaying();
     c.wifi = wifiUp();
+    
+    // [Prompt 10] ДОДАНО: маппінг PlayerState → StreamStatus за назвою
+    // audio_player.h::PlayerState і core/app_state.h::StreamStatus мають однакові
+    // стани, але різний порядок значень, тому маппуємо явно для безпеки й ясності.
+    // Це дозволяє ui/screens розрізнити Buffering/Error/Reconnecting без
+    // включення audio/audio_player.h.
+    const PlayerState playerState = AudioPlayer::state();
+    switch (playerState) {
+        case PlayerState::Idle:         c.status = StreamStatus::Idle; break;
+        case PlayerState::Connecting:   c.status = StreamStatus::Connecting; break;
+        case PlayerState::Buffering:    c.status = StreamStatus::Buffering; break;
+        case PlayerState::Playing:      c.status = StreamStatus::Playing; break;
+        case PlayerState::Error:        c.status = StreamStatus::Error; break;
+        case PlayerState::Reconnecting: c.status = StreamStatus::Reconnecting; break;
+        default:                        c.status = StreamStatus::Idle; break;
+    }
+    
     AppState::modify(applySync, &c);
 }
 

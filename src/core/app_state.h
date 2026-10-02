@@ -8,6 +8,8 @@
 // AppStateData (gain, adjustTarget, menuContext, menuSelection). Нові поля
 // додано лише в кінець структури, тому код, що ініціалізує наявні поля за
 // іменами чи агрегатно, лишається чинним (нові поля нульові).
+// [Prompt 10] ДОДАНО: enum StreamStatus та поле streamStatus для детального
+// статусу потоку у UI. Незалежно від audio/audio_player.h.
 
 #include <Arduino.h>
 #include <stdint.h>
@@ -37,6 +39,19 @@ enum class AdjustTarget : uint8_t {
 enum class MenuContext : uint8_t {
     None,
     StationList,
+};
+
+// [Prompt 10] ДОДАНО: детальний статус потоку для UI. Незалежно від
+// audio_player.h::PlayerState, але семантично відповідає йому.
+// Дозволяє ui/screens розрізнити Buffering/Error/Reconnecting без прямого
+// доступу до AudioPlayer.
+enum class StreamStatus : uint8_t {
+    Idle,         // нічого не відтворюється (початковий стан)
+    Connecting,   // перша спроба підключення до станції
+    Buffering,    // наповнюється буфер або просів під час відтворення
+    Playing,      // потік грає
+    Error,        // потік обірвався/не підключився
+    Reconnecting, // повторна спроба підключення після Error
 };
 
 // Дані стану.
@@ -71,6 +86,10 @@ struct AppStateData {
     MenuContext menuContext;
     // Вибраний пункт у меню/списку (для StationList — індекс станції).
     uint16_t menuSelection;
+
+    // --- [Prompt 10] ДОДАНО ---
+    // Детальний статус потоку для UI (Idle/Connecting/Buffering/Playing/Error/Reconnecting).
+    StreamStatus streamStatus;
 };
 
 class AppState {
