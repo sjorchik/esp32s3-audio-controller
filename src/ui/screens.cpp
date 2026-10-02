@@ -11,11 +11,17 @@
 #include "core/app_state.h"
 #include "ui/display.h"
 #include "ui/fonts.h"
+#include "stations/station_store.h"  // [Prompt 11] ДОДАНО: чисті дані, не залізо
 #include "ui/icons.h"
 
 #if DISPLAY_DEMO
 #warning "DISPLAY_DEMO = 1: постав 0 у config/display_config.h, щоб показувати реальні екрани"
 #endif
+
+// [Prompt 11] ВИНЯТОК З ІЗОЛЯЦІЇ: окрім AppState::snapshot(), цей файл читає
+// UiFonts/UiIcons і StationStore::count()/get() (список станцій потрібен одразу
+// для кількох сусідніх рядків). StationStore — модуль чистих даних, не залізо,
+// тож правило «AppController — єдиний власник заліза» не порушується.
 
 namespace {
 
@@ -226,21 +232,44 @@ void drawExternal(const AppStateData& s) {
     drawStatusRow(s);
 }
 
+// Вписує src у maxW пікселів: за потреби обрізає по межі UTF-8-символу й додає
+// "...". out має вміщати кінцевий текст: cap >= sizeof(Station::name) + 8.
+void fitText(const char* src, char* out, size_t cap, FontSize size, int32_t maxW) {
+    strlcpy(out, src, cap);
+    if (UiFonts::textWidth(out, size) <= maxW) return;
+    size_t len = strlen(src);
+    while (len > 0) {
+        --len;
+        while (len > 0 && (static_cast<uint8_t>(src[len]) & 0xC0) == 0x80) --len;
+        memcpy(out, src, len);
+        strcpy(out + len, "...");
+        if (UiFonts::textWidth(out, size) <= maxW) return;
+    }
+}
+
 void drawStationList(const AppStateData& s) {
     D::drawText("Stations", c::kMargin, c::kListTitleY, FontSize::Small, c::kColorDim);
     D::drawLine(0, c::kListLineY, c::kW - 1, c::kListLineY, c::kColorDim);
 
+    // [Prompt 11] Реальні назви зі StationStore.
+    const size_t count = StationStore::count();
+    if (count == 0) {
+        drawCentered("No stations", c::kPlaceholderY, FontSize::Large, c::kColorDim);
+        return;
+    }
+
+    const int32_t maxW = c::kW - c::kListTextX - c::kMargin;
     const uint16_t sel = s.menuSelection;
     const uint16_t first = (sel >= c::kListRows) ? static_cast<uint16_t>(sel - c::kListRows + 1) : 0;
+    Station st;
+    char text[sizeof(Station::name) + 8];
     for (uint8_t i = 0; i < c::kListRows; ++i) {
         const uint32_t idx = static_cast<uint32_t>(first) + i;
         const int16_t y = static_cast<int16_t>(c::kListFirstY + i * c::kListRowH);
         if (idx == sel) D::fillRect(0, y, c::kW, c::kListRowH, c::kColorSelectionBg);
-        // TODO: назви з player_cfg::kTestStationNames, коли UI отримає доступ до списку станцій
-        // (station_store). Зараз плейсхолдер — UI не залежить від конфігу плеєра.
-        char buf[16];
-        snprintf(buf, sizeof(buf), "Station %u", static_cast<unsigned>(idx + 1));
-        D::drawText(buf, c::kListTextX, static_cast<int16_t>(y + c::kListTextDy), FontSize::Small,
+        if (idx >= count || !StationStore::get(idx, st)) continue;  // порожній рядок
+        fitText(st.name, text, sizeof(text), FontSize::Small, maxW);
+        D::drawText(text, c::kListTextX, static_cast<int16_t>(y + c::kListTextDy), FontSize::Small,
                     dc::kColorFg);
     }
 }

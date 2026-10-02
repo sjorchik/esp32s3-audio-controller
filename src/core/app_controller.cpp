@@ -4,6 +4,9 @@
 // невеликий автомат Phase, який рухає tick() за збереженим часом, а не
 // блокуючими затримками. Один внутрішній рекурсивний мʼютекс захищає і
 // handleEvent(), і tick().
+//
+// [Prompt 11] Список станцій береться зі StationStore (LittleFS), а не з
+// тестових констант плеєра.
 
 #include "core/app_controller.h"
 
@@ -14,10 +17,10 @@
 #include "audio/audio_player.h"
 #include "audio/audio_processor.h"
 #include "config/app_controller_config.h"
-#include "config/audio_player_config.h"
 #include "config/defaults.h"
 #include "core/app_state.h"
 #include "core/settings.h"
+#include "stations/station_store.h"  // [Prompt 11] ДОДАНО
 
 namespace cfg = app_controller_cfg;
 
@@ -166,30 +169,48 @@ const char* sourceName(EventSource s) {
 #endif
 
 // --- Станції ---------------------------------------------------------------
-// TODO (Prompt 10): замінити на station_store.
+// [Prompt 11] Список живе в StationStore (LittleFS + PSRAM). Station (≈258 байт)
+// завжди локальна й короткоживуча (стек задачі app_ctrl).
 uint16_t stationCount() {
-    return static_cast<uint16_t>(player_cfg::kTestStationCount);
+    const size_t n = StationStore::count();
+    return static_cast<uint16_t>(n > 0xFFFFu ? 0xFFFFu : n);
 }
-const char* stationUrl(uint16_t i) {
-    return player_cfg::kTestStationUrls[i % player_cfg::kTestStationCount];
+
+// Копіює назву станції i в out; для недійсного індексу — порожній рядок.
+void stationLabel(uint16_t i, char* out, size_t cap) {
+    if (cap == 0) {
+        return;
+    }
+    Station st;
+    if (StationStore::get(i, st)) {
+        strlcpy(out, st.name, cap);
+    } else {
+        out[0] = '\0';
+    }
 }
-const char* stationLabel(uint16_t i) {
-    return player_cfg::kTestStationNames[i % player_cfg::kTestStationCount];
-}
-static_assert(player_cfg::kTestStationCount > 0, "need at least one station");
 
 // --- Потік і Wi-Fi ---------------------------------------------------------
 // AudioPlayer сам Wi-Fi не перевіряє, а без піднятого мережевого стеку
 // бібліотека падає в assert (xQueueSemaphoreTake). Тому playUrl() викликаємо
-// лише при підключеному Wi-Fi. TODO (Prompt 11): замінити на WifiManager.
+// лише при підключеному Wi-Fi. TODO (Prompt 12): замінити на WifiManager.
 bool wifiUp() {
     return WiFi.status() == WL_CONNECTED;
 }
 
 void startStream() {
+    if (stationCount() == 0) {
+        s_playPending = false;
+        APP_LOG("no stations: nothing to play\n");
+        return;
+    }
     if (wifiUp()) {
         s_playPending = false;
-        if (!AudioPlayer::playUrl(stationUrl(s_station))) {
+        Station st;
+        if (!StationStore::get(s_station, st)) {
+            APP_LOG("station %u not found\n", static_cast<unsigned>(s_station));
+            return;
+        }
+        if (!AudioPlayer::playUrl(st.url)) {
             APP_LOG("playUrl rejected\n");
         }
     } else {
@@ -338,7 +359,7 @@ void syncPlayer() {
     if (s_input == 0 && s_mode != Mode::Standby) {
         AudioPlayer::currentMetadata(c.station, sizeof(c.station), c.title, sizeof(c.title));
         if (c.station[0] == '\0') {
-            strlcpy(c.station, stationLabel(s_station), sizeof(c.station));
+            stationLabel(s_station, c.station, sizeof(c.station));
         }
     }
     c.playing = AudioPlayer::isPlaying();
@@ -497,8 +518,10 @@ void selectInput(uint8_t idx) {
 }
 
 void changeStation(uint16_t idx) {
+    char nm[sizeof(Station::name)];
+    stationLabel(idx, nm, sizeof(nm));
     APP_LOG("station %u -> %u (%s)\n", static_cast<unsigned>(s_station),
-            static_cast<unsigned>(idx), stationLabel(idx));
+            static_cast<unsigned>(idx), nm);
     s_station = idx;
     startTransition();
     startStream();
@@ -521,7 +544,9 @@ void togglePlayPause() {
         stopStream();
         APP_LOG("pause\n");
     } else {
-        APP_LOG("play %s\n", stationLabel(s_station));
+        char nm[sizeof(Station::name)];
+        stationLabel(s_station, nm, sizeof(nm));
+        APP_LOG("play %s\n", nm);
         startStream();
     }
 }
@@ -610,6 +635,10 @@ void openStationList() {
     if (s_mode != Mode::Radio) {
         return;
     }
+    if (stationCount() == 0) {
+        APP_LOG("list not opened: no stations\n");
+        return;
+    }
     s_menuCtx = MenuContext::StationList;
     s_menuSel = s_station;
     s_mode = Mode::Menu;
@@ -624,15 +653,23 @@ void closeStationList() {
 
 void moveListSelection(int d) {
     const int count = stationCount();
+    if (count <= 0) {
+        return;  // список спорожнів (майбутній веб-імпорт): ділити на 0 не можна
+    }
     int n = (static_cast<int>(s_menuSel) + d) % count;
     if (n < 0) n += count;
     s_menuSel = static_cast<uint16_t>(n);
-    APP_LOG("list sel=%u (%s)\n", static_cast<unsigned>(s_menuSel), stationLabel(s_menuSel));
+    char nm[sizeof(Station::name)];
+    stationLabel(s_menuSel, nm, sizeof(nm));
+    APP_LOG("list sel=%u (%s)\n", static_cast<unsigned>(s_menuSel), nm);
 }
 
 void selectFromList() {
     const uint16_t sel = s_menuSel;
     closeStationList();
+    if (sel >= stationCount()) {
+        return;  // список скоротився, поки був відкритий
+    }
     // Та сама станція вже грає — нічого не робимо; якщо стоїть пауза — запускаємо.
     if (sel != s_station || AudioPlayer::state() == PlayerState::Idle) {
         changeStation(sel);
@@ -853,6 +890,12 @@ bool AppController::begin(AudioProcessor* processorOrNull) {
     if (!AppState::begin()) {
         Serial.println("[APP] AppState::begin failed");
         return false;
+    }
+    // [Prompt 11] StationStore не залежить від AppState (порядок байдужий), але
+    // МАЄ бути готовий до читання Settings.lastStation нижче (обрізання індексу
+    // за stationCount()). Збій не фатальний: без станцій Radio просто мовчить.
+    if (!StationStore::begin()) {
+        Serial.println("[APP] StationStore::begin failed or empty: no stations");
     }
     if (!EventBus::isReady()) {
         Serial.println("[APP] EventBus is not ready");

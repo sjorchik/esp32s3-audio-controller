@@ -16,7 +16,9 @@
 //   Serial-тест Settings (команди з префіксом `set.`).
 // - [Prompt 8] запустити AppController (читає EventBus, керує звуком/плеєром/станом);
 //   тимчасовий друк подій (INPUT_DEMO_PRINT_EVENTS) прибрано, loop() порожній.
-// Екрани (ui/screens) та мережа (net/*) не реалізуються.
+// - [Prompt 11] StationStore стартує всередині AppController::begin(); тут лише
+//   Serial-тест станцій (команди `st.*`).
+// Мережа (net/*) не реалізується.
 
 #include <Arduino.h>
 #include <LittleFS.h>
@@ -36,6 +38,7 @@
 #include "config/input_config.h"
 #include "config/pins.h"
 #include "config/settings_config.h"  // [Prompt 6] ДОДАНО
+#include "config/station_store_config.h"  // [Prompt 11] ДОДАНО
 #include "core/app_controller.h"  // [Prompt 8] ДОДАНО
 #include "core/events.h"
 #include "core/settings.h"       // [Prompt 6] ДОДАНО
@@ -43,6 +46,7 @@
 #include "input/buttons.h"
 #include "input/encoder.h"
 #include "input/ir_rc5.h"  // [Prompt 2] ДОДАНО
+#include "stations/station_store_test.h"  // [Prompt 11] ДОДАНО
 #include "ui/display.h"    // [Prompt 4] ДОДАНО
 #include "ui/screens.h"   // [Prompt 9] ДОДАНО
 
@@ -281,6 +285,26 @@ static void initAppController() {
     }
 }
 
+// [Prompt 11] ДОДАНО: Serial-тест StationStore (після AppController, який
+// викликає StationStore::begin()). Кілька читачів Serial діляться байтами, тому
+// не стартуємо, поки активний інший тест (на відміну від них, тут перевіряємо й
+// SETTINGS_TEST): знімається лише STATION_STORE_TEST_SHARE_SERIAL = 1.
+static void initStationStoreTest() {
+#if STATION_STORE_TEST
+#if (AUDIO_PROC_TEST || AUDIO_PLAYER_TEST || SETTINGS_TEST) && !STATION_STORE_TEST_SHARE_SERIAL
+    Serial.println("[MAIN] Station store test skipped: Serial is used by another test "
+                   "(set AUDIO_PLAYER_TEST/AUDIO_PROC_TEST/SETTINGS_TEST to 0 or "
+                   "STATION_STORE_TEST_SHARE_SERIAL to 1)");
+#else
+    if (StationStoreTest::begin()) {
+        Serial.println("[MAIN] Station store test mode ready (send 'st.help')");
+    } else {
+        Serial.println("[MAIN] Station store test mode init failed");
+    }
+#endif
+#endif
+}
+
 void setup() {
     Serial.begin(defaults::kSerialBaud);
 
@@ -346,6 +370,9 @@ void setup() {
 
     // [Prompt 6] ДОДАНО: Serial-тест Settings (останнім, щоб не заважати логу старту).
     initSettingsTest();
+
+    // [Prompt 11] ДОДАНО
+    initStationStoreTest();
 
     Serial.println("[MAIN] Skeleton ready");
 }
