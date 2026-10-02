@@ -3,8 +3,11 @@
 // Єдине сховище стану пристрою.
 // Доступ потокобезпечний (мʼютекс всередині).
 // [Prompt 6] Реалізовано core/app_state.cpp; ДОДАНО modify() (два варіанти).
-// begin() викличе AppController (Prompt 7); до того snapshot()/modify() працюють
-// без блокування (однопотокова рання фаза старту).
+// [Prompt 8] begin() викликає AppController (першим ділом у своєму begin()).
+// [Prompt 8] ДОДАНО: enum AdjustTarget, enum MenuContext та чотири поля В КІНЕЦЬ
+// AppStateData (gain, adjustTarget, menuContext, menuSelection). Нові поля
+// додано лише в кінець структури, тому код, що ініціалізує наявні поля за
+// іменами чи агрегатно, лишається чинним (нові поля нульові).
 
 #include <Arduino.h>
 #include <stdint.h>
@@ -19,17 +22,34 @@ enum class Mode : uint8_t {
     WifiSetup,
 };
 
+// [Prompt 8] ДОДАНО: яким параметром зараз керує обертання енкодера.
+// Порядок = порядок циклу кліку енкодера (Volume -> Bass -> Treble -> Balance -> Gain).
+enum class AdjustTarget : uint8_t {
+    Volume,
+    Bass,
+    Treble,
+    Balance,
+    Gain,
+};
+
+// [Prompt 8] ДОДАНО: який саме підрежим активний, коли mode == Mode::Menu.
+// Нові підрежими (меню налаштувань тощо) додавати лише в кінець.
+enum class MenuContext : uint8_t {
+    None,
+    StationList,
+};
+
 // Дані стану.
 // Розміри буферів під метадані залишаються константами.
 struct AppStateData {
     Mode mode;
     uint8_t inputIndex;
 
-    int8_t volume;
+    int8_t volume;   // ЦІЛЬОВА гучність (під час ramp в чіпі може бути менше)
     int8_t bass;
     int8_t treble;
     int8_t balance;
-    bool mute;
+    bool mute;       // мʼют, який зробив користувач (Standby/переходи сюди не входять)
 
     uint16_t stationIndex;
     char stationName[64];
@@ -41,6 +61,16 @@ struct AppStateData {
     // Рівні VU, нормалізовані 0..1.
     float vuLeft;
     float vuRight;
+
+    // --- [Prompt 8] ДОДАНО (лише в кінець) ---
+    // Підсилення ПОТОЧНОГО входу, сирі апаратні кроки (0..3 для обох чипів).
+    int8_t gain;
+    // Ціль, яку регулює обертання енкодера.
+    AdjustTarget adjustTarget;
+    // Підрежим меню; осмислений лише при mode == Mode::Menu (інакше None).
+    MenuContext menuContext;
+    // Вибраний пункт у меню/списку (для StationList — індекс станції).
+    uint16_t menuSelection;
 };
 
 class AppState {

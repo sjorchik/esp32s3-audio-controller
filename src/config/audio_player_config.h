@@ -20,7 +20,7 @@
 // УВАГА: AudioProcTest і AudioPlayerTest читають той самий Serial, тому при
 // AUDIO_PLAYER_TEST == 1 main.cpp НЕ запускає AudioProcTest (див. main.cpp).
 // Гучність процесора в цьому режимі — команда `vol`.
-#define AUDIO_PLAYER_TEST 0
+#define AUDIO_PLAYER_TEST 1
 
 // Serial-лог плеєра: зміни стану, мʼют, перепідключення ("[PLAYER] ...").
 #define AUDIO_PLAYER_DEBUG 1
@@ -184,9 +184,9 @@ constexpr const char* kTestWifiPass = "";
 // (доступу до мережі не було): стріми можуть змінити адресу, кодек чи піти на
 // https. Якщо станція не грає — підставте власний робочий URL.
 constexpr const char* kTestStationNames[] = {
-    "SomaFM Groove Salad (MP3 128k)",
-    "Radio Paradise (MP3 128k)",
-    "France Inter (MP3 mid-fi)",
+    "Radio ROKS",
+    "Radio Gold",
+    "Hit FM",
 };
 constexpr const char* kTestStationUrls[] = {
     "https://online.radioroks.ua/RadioROKS",

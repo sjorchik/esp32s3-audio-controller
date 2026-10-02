@@ -14,8 +14,11 @@
 #define INPUT_DEBUG 1
 
 // Тимчасовий вивід усіх подій з EventBus у main.cpp ("[EVT] ...").
-// Вимкнути, коли з'явиться AppController, який сам читає EventBus.
-#define INPUT_DEMO_PRINT_EVENTS 1
+// [Prompt 8] ЗМІНЕНО: 1 -> 0. Тепер EventBus читає AppController; два читачі
+// однієї черги отримували б різні підмножини подій. Код друку з main.cpp
+// прибрано; прапорець лишено (0), щоб не ламати можливі #if в інших файлах.
+// Лог подій тепер веде AppController (APP_CONTROLLER_LOG_EVENTS).
+#define INPUT_DEMO_PRINT_EVENTS 0
 
 namespace input_cfg {
 

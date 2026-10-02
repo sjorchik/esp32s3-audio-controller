@@ -14,6 +14,8 @@
 // - [Prompt 6] ініціалізувати Settings (NVS) ДО аудіопроцесора й дисплея:
 //   тип процесора і орієнтація дисплея беруться з Settings; під SETTINGS_TEST —
 //   Serial-тест Settings (команди з префіксом `set.`).
+// - [Prompt 8] запустити AppController (читає EventBus, керує звуком/плеєром/станом);
+//   тимчасовий друк подій (INPUT_DEMO_PRINT_EVENTS) прибрано, loop() порожній.
 // Екрани (ui/screens) та мережа (net/*) не реалізуються.
 
 #include <Arduino.h>
@@ -34,6 +36,7 @@
 #include "config/input_config.h"
 #include "config/pins.h"
 #include "config/settings_config.h"  // [Prompt 6] ДОДАНО
+#include "core/app_controller.h"  // [Prompt 8] ДОДАНО
 #include "core/events.h"
 #include "core/settings.h"       // [Prompt 6] ДОДАНО
 #include "core/settings_test.h"  // [Prompt 6] ДОДАНО
@@ -264,58 +267,17 @@ static void initSettingsTest() {
 #endif
 }
 
-#if INPUT_DEMO_PRINT_EVENTS
-// Тимчасово: імена для друку подій з EventBus.
-// Прибрати разом з INPUT_DEMO_PRINT_EVENTS, коли зʼявиться AppController.
-static const char* actionName(Action a) {
-    switch (a) {
-        case Action::POWER:       return "POWER";
-        case Action::UP:          return "UP";
-        case Action::DOWN:        return "DOWN";
-        case Action::LEFT:        return "LEFT";
-        case Action::RIGHT:       return "RIGHT";
-        case Action::OK:          return "OK";
-        case Action::ENC_CW:      return "ENC_CW";
-        case Action::ENC_CCW:     return "ENC_CCW";
-        case Action::ENC_PRESS:   return "ENC_PRESS";
-        // [Prompt 2] ДОДАНО: нові Action
-        case Action::VOL_UP:      return "VOL_UP";
-        case Action::VOL_DOWN:    return "VOL_DOWN";
-        case Action::MUTE:        return "MUTE";
-        case Action::MENU:        return "MENU";
-        case Action::BACK:        return "BACK";
-        case Action::INPUT_RADIO: return "INPUT_RADIO";
-        case Action::INPUT_TV:    return "INPUT_TV";
-        case Action::INPUT_PC:    return "INPUT_PC";
-        case Action::INPUT_AUX:   return "INPUT_AUX";
-        case Action::DIGIT_0:     return "DIGIT_0";
-        case Action::DIGIT_1:     return "DIGIT_1";
-        case Action::DIGIT_2:     return "DIGIT_2";
-        case Action::DIGIT_3:     return "DIGIT_3";
-        case Action::DIGIT_4:     return "DIGIT_4";
-        case Action::DIGIT_5:     return "DIGIT_5";
-        case Action::DIGIT_6:     return "DIGIT_6";
-        case Action::DIGIT_7:     return "DIGIT_7";
-        case Action::DIGIT_8:     return "DIGIT_8";
-        case Action::DIGIT_9:     return "DIGIT_9";
+// [Prompt 8] ДОДАНО: AppController. Останній з модулів, від яких він залежить
+// (EventBus, Settings, аудіопроцесор, плеєр). Вказівник на процесор передається
+// лише якщо begin() процесора пройшов успішно (так само, як для плеєра).
+static void initAppController() {
+    AudioProcessor* proc = s_audioProcReady ? s_audioProc : nullptr;
+    if (AppController::begin(proc)) {
+        Serial.println("[MAIN] AppController ready");
+    } else {
+        Serial.println("[MAIN] AppController init failed");
     }
-    return "?";
 }
-
-static const char* sourceName(EventSource s) {
-    switch (s) {
-        case EventSource::BUTTON:  return "BUTTON";
-        case EventSource::ENCODER: return "ENCODER";
-        case EventSource::IR:      return "IR";
-        case EventSource::WEB:     return "WEB";
-    }
-    return "?";
-}
-
-static uint32_t s_lastBtnDropped = 0;
-static uint32_t s_lastEncDropped = 0;
-static uint32_t s_lastIrDropped = 0;  // [Prompt 2] ДОДАНО
-#endif
 
 void setup() {
     Serial.begin(defaults::kSerialBaud);
@@ -377,6 +339,9 @@ void setup() {
     // [Prompt 5] ДОДАНО: аудіоплеєр (після процесора, щоб передати вказівник).
     initAudioPlayer();
 
+    // [Prompt 8] ДОДАНО: AppController після процесора, плеєра й Settings.
+    initAppController();
+
     // [Prompt 6] ДОДАНО: Serial-тест Settings (останнім, щоб не заважати логу старту).
     initSettingsTest();
 
@@ -384,35 +349,7 @@ void setup() {
 }
 
 void loop() {
-#if INPUT_DEMO_PRINT_EVENTS
-    // Тимчасово: друкуємо все, що прийшло в EventBus.
-    // Замінить AppController.
-    Event ev;
-    if (EventBus::poll(ev, pdMS_TO_TICKS(1000))) {
-        Serial.printf("[MAIN] event: %s %s repeat=%d long=%d delta=%d\n",
-                      sourceName(ev.source), actionName(ev.action),
-                      ev.repeat ? 1 : 0, ev.longPress ? 1 : 0,
-                      static_cast<int>(ev.delta));
-    }
-
-    // Діагностика втрат: друкуємо лише коли лічильники змінилися.
-    const uint32_t btnDropped = Buttons::droppedEvents();
-    const uint32_t encDropped = Encoder::droppedEvents();
-    const uint32_t irDropped = IrRc5::droppedEvents();  // [Prompt 2] ДОДАНО
-    if (btnDropped != s_lastBtnDropped || encDropped != s_lastEncDropped ||
-        irDropped != s_lastIrDropped) {
-        s_lastBtnDropped = btnDropped;
-        s_lastEncDropped = encDropped;
-        s_lastIrDropped = irDropped;
-        Serial.printf("[MAIN] events dropped: buttons=%u encoder=%u ir=%u\n",
-                      static_cast<unsigned>(btnDropped),
-                      static_cast<unsigned>(encDropped),
-                      static_cast<unsigned>(irDropped));
-    }
-#else
-    // Скелет ще не має активної логіки.
-    // Використовуємо затримку в стилі FreeRTOS,
-    // щоб не крутити порожній цикл без потреби.
+    // [Prompt 8] ЗМІНЕНО: уся логіка — в задачах (AppController, введення, аудіо,
+    // дисплей). loopTask живе на ядрі 1 поруч з аудіо, тому лише спить.
     vTaskDelay(pdMS_TO_TICKS(1000));
-#endif
 }

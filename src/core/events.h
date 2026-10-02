@@ -25,6 +25,7 @@ enum class Action : uint8_t {
     VOL_DOWN,
     MUTE,
     MENU,
+    BACK,
     INPUT_RADIO,
     INPUT_TV,
     INPUT_PC,

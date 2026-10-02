@@ -16,7 +16,7 @@
 
 // Тестовий режим: Serial-команди для ручної перевірки процесора
 // (audio/audio_proc_test.*). Вимкнути (0), коли зʼявиться AppController.
-#define AUDIO_PROC_TEST 1
+#define AUDIO_PROC_TEST 0
 
 namespace audio_cfg {
 
