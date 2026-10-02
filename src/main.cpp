@@ -44,6 +44,7 @@
 #include "input/encoder.h"
 #include "input/ir_rc5.h"  // [Prompt 2] ДОДАНО
 #include "ui/display.h"    // [Prompt 4] ДОДАНО
+#include "ui/screens.h"   // [Prompt 9] ДОДАНО
 
 // [Prompt 3] ДОДАНО: аудіопроцесор живе весь час роботи прошивки.
 // Згодом його створюватиме AppController за типом з Settings (NVS).
@@ -210,6 +211,7 @@ static void initDisplay() {
         // [Prompt 6] ДОДАНО: begin() стартує з display_cfg::kDefaultFlipped; якщо
         // в Settings інша орієнтація — перемикаємо. Рівне значення пропускаємо,
         // щоб не робити зайвий поворот панелі.
+        UiScreens::begin();   // [Prompt 9] ДОДАНО: після begin() дисплея
         const bool flipped = SettingsStore::get().displayFlipped;
         if (flipped != display_cfg::kDefaultFlipped) {
             DisplayManager::setFlipped(flipped);

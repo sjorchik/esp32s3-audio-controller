@@ -1,0 +1,281 @@
+#include "ui/screens.h"
+
+#include <Arduino.h>
+#include <stdio.h>
+#include <string.h>
+#include <type_traits>
+
+#include "config/defaults.h"
+#include "config/display_config.h"
+#include "config/screens_config.h"
+#include "core/app_state.h"
+#include "ui/display.h"
+#include "ui/fonts.h"
+#include "ui/icons.h"
+
+#if DISPLAY_DEMO
+#warning "DISPLAY_DEMO = 1: постав 0 у config/display_config.h, щоб показувати реальні екрани"
+#endif
+
+namespace {
+
+using D = DisplayManager;
+namespace c = screens_cfg;
+namespace dc = display_cfg;
+
+static_assert(std::is_trivially_copyable<AppStateData>::value,
+              "AppStateData має бути POD для memcmp");
+
+// ---------------------------------------------------------------------------
+// Стан UI (лише візуальний, не частина AppStateData)
+// ---------------------------------------------------------------------------
+struct Marquee {
+    char     text[128];
+    int32_t  textW;
+    int32_t  offset;
+    uint32_t lastStepMs;
+    uint32_t holdUntilMs;
+    bool     atEnd;
+    bool     seeded;
+};
+
+Marquee s_station = {};
+Marquee s_track   = {};
+
+AppStateData s_prev;            // попередній знімок (VU обнулено)
+bool         s_havePrev = false;
+bool         s_modeKnown = false;
+Mode         s_prevMode = Mode::Standby;
+uint8_t      s_savedBrightness = defaults::kDefaultBrightness;
+
+// ---------------------------------------------------------------------------
+// Marquee
+// ---------------------------------------------------------------------------
+// Повертає true, якщо вигляд змінився (новий текст або зсув) і потрібен кадр.
+bool marqueeUpdate(Marquee& m, const char* src, FontSize size, uint32_t now) {
+    if (!m.seeded || strcmp(m.text, src) != 0) {
+        strlcpy(m.text, src, sizeof(m.text));
+        m.textW       = m.text[0] ? UiFonts::textWidth(m.text, size) : 0;
+        m.offset      = 0;
+        m.lastStepMs  = now;
+        m.holdUntilMs = now + c::kMarqueeEdgePauseMs;
+        m.atEnd       = false;
+        m.seeded      = true;
+        return true;
+    }
+    if (m.textW <= c::kContentW) return false;
+
+    if (static_cast<int32_t>(now - m.holdUntilMs) < 0) {   // пауза
+        m.lastStepMs = now;
+        return false;
+    }
+    if (m.atEnd) {                                          // кінець -> початок
+        m.offset      = 0;
+        m.atEnd       = false;
+        m.holdUntilMs = now + c::kMarqueeEdgePauseMs;
+        m.lastStepMs  = now;
+        return true;
+    }
+    const uint32_t steps = (now - m.lastStepMs) / c::kMarqueeStepMs;
+    if (steps == 0) return false;
+    m.lastStepMs += steps * c::kMarqueeStepMs;
+    m.offset += static_cast<int32_t>(steps) * c::kMarqueeStepPx;
+    const int32_t maxOff = m.textW - c::kContentW;
+    if (m.offset >= maxOff) {
+        m.offset      = maxOff;
+        m.atEnd       = true;
+        m.holdUntilMs = now + c::kMarqueeEdgePauseMs;
+    }
+    return true;
+}
+
+// DisplayManager не має clip-прямокутника: текст малюється зі зсувом, а потім
+// бічні поля перекриваються кольором фону. Тому рядок marquee має займати
+// всю ширину екрана без іншого вмісту.
+void marqueeDraw(const Marquee& m, int16_t y, FontSize size, uint16_t color) {
+    if (!m.text[0]) return;
+    const bool scrolling = m.textW > c::kContentW;
+    const int16_t x = static_cast<int16_t>(c::kMargin - (scrolling ? m.offset : 0));
+    D::drawText(m.text, x, y, size, color);
+    if (scrolling) {
+        const int16_t h = static_cast<int16_t>(UiFonts::lineHeight(size));
+        D::fillRect(0, y, c::kMargin, h, dc::kColorBg);
+        D::fillRect(c::kW - c::kMargin, y, c::kMargin, h, dc::kColorBg);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Допоміжні малювання
+// ---------------------------------------------------------------------------
+void drawCentered(const char* text, int16_t y, FontSize size, uint16_t color) {
+    int32_t x = (c::kW - UiFonts::textWidth(text, size)) / 2;
+    if (x < 0) x = 0;
+    D::drawText(text, static_cast<int16_t>(x), y, size, color);
+}
+
+const char* inputName(uint8_t index) {
+    return (index < defaults::kInputCount) ? defaults::kInputNames[index] : "Input";
+}
+
+void drawTopIcons(const AppStateData& s, bool showWifi) {
+    if (showWifi) {
+        D::drawIcon(s.wifiConnected ? IconId::Wifi : IconId::WifiOff, c::kWifiIconX, c::kTopBarY,
+                    s.wifiConnected ? dc::kColorFg : c::kColorBad);
+    }
+    if (s.mute) D::drawIcon(IconId::Mute, c::kMuteIconX, c::kTopBarY, c::kColorAccent);
+}
+
+// Статус-рядок: ціль енкодера зліва, значення справа. Завжди видимий.
+void drawStatusRow(const AppStateData& s) {
+    const char* label = "";
+    int value = 0;
+    bool signedValue = false;
+    switch (s.adjustTarget) {
+        case AdjustTarget::Volume:  label = "Volume";  value = s.volume;  break;
+        case AdjustTarget::Bass:    label = "Bass";    value = s.bass;    signedValue = true; break;
+        case AdjustTarget::Treble:  label = "Treble";  value = s.treble;  signedValue = true; break;
+        case AdjustTarget::Balance: label = "Balance"; value = s.balance; signedValue = true; break;
+        case AdjustTarget::Gain:    label = "Gain";    value = s.gain;    break;
+    }
+    char buf[12];
+    if (signedValue && value != 0) snprintf(buf, sizeof(buf), "%+d", value);
+    else                           snprintf(buf, sizeof(buf), "%d", value);
+
+    D::drawLine(0, c::kStatusLineY, c::kW - 1, c::kStatusLineY, c::kColorDim);
+    D::drawText(label, c::kMargin, c::kStatusY, FontSize::Small, dc::kColorFg);
+    const int32_t w = UiFonts::textWidth(buf, FontSize::Small);
+    D::drawText(buf, static_cast<int16_t>(c::kW - c::kMargin - w), c::kStatusY, FontSize::Small,
+                c::kColorAccent);
+}
+
+// ---------------------------------------------------------------------------
+// Екрани
+// ---------------------------------------------------------------------------
+void drawStandby() {
+    D::drawIcon(IconId::Standby, c::kStandbyIconX, c::kStandbyIconY, c::kColorDim);
+    drawCentered("Standby", c::kStandbyCaptionY, FontSize::Tiny, c::kColorDim);
+}
+
+void drawRadio(const AppStateData& s) {
+    D::drawText(inputName(s.inputIndex), c::kMargin, c::kTopBarTextY, FontSize::Small, c::kColorDim);
+    drawTopIcons(s, true);
+
+    marqueeDraw(s_station, c::kStationY, FontSize::Large, dc::kColorFg);
+    marqueeDraw(s_track, c::kTrackY, FontSize::Small, c::kColorDim);
+
+    // TODO (Prompt 13): VU meter
+    D::drawRect(c::kVuX, c::kVuY, c::kVuW, c::kVuH, c::kColorDim);
+
+    const char* state;
+    uint16_t color;
+    if (!s.wifiConnected)       { state = "No Wi-Fi"; color = c::kColorBad; }
+    else if (s.streamPlaying)   { state = "Playing";  color = c::kColorOk; }
+    else                        { state = "Stopped";  color = c::kColorAccent; }
+    D::drawText(state, c::kMargin, c::kStateY, FontSize::Small, color);
+
+    drawStatusRow(s);
+}
+
+void drawExternal(const AppStateData& s) {
+    drawTopIcons(s, false);
+    drawCentered("INPUT", c::kExtCaptionY, FontSize::Tiny, c::kColorDim);
+    drawCentered(inputName(s.inputIndex), c::kExtNameY, FontSize::Large, dc::kColorFg);
+    drawStatusRow(s);
+}
+
+void drawStationList(const AppStateData& s) {
+    D::drawText("Stations", c::kMargin, c::kListTitleY, FontSize::Small, c::kColorDim);
+    D::drawLine(0, c::kListLineY, c::kW - 1, c::kListLineY, c::kColorDim);
+
+    const uint16_t sel = s.menuSelection;
+    const uint16_t first = (sel >= c::kListRows) ? static_cast<uint16_t>(sel - c::kListRows + 1) : 0;
+    for (uint8_t i = 0; i < c::kListRows; ++i) {
+        const uint32_t idx = static_cast<uint32_t>(first) + i;
+        const int16_t y = static_cast<int16_t>(c::kListFirstY + i * c::kListRowH);
+        if (idx == sel) D::fillRect(0, y, c::kW, c::kListRowH, c::kColorSelectionBg);
+        // TODO: назви з player_cfg::kTestStationNames, коли UI отримає доступ до списку станцій
+        // (station_store). Зараз плейсхолдер — UI не залежить від конфігу плеєра.
+        char buf[16];
+        snprintf(buf, sizeof(buf), "Station %u", static_cast<unsigned>(idx + 1));
+        D::drawText(buf, c::kListTextX, static_cast<int16_t>(y + c::kListTextDy), FontSize::Small,
+                    dc::kColorFg);
+    }
+}
+
+void drawPlaceholder(const char* text) {
+    drawCentered(text, c::kPlaceholderY, FontSize::Large, dc::kColorFg);
+}
+
+// ---------------------------------------------------------------------------
+// Підсвітка при вході/виході зі Standby
+// ---------------------------------------------------------------------------
+void handleModeChange(Mode mode) {
+    if (s_modeKnown && mode == s_prevMode) return;
+
+    const bool wasStandby = s_modeKnown && s_prevMode == Mode::Standby;
+    const bool isStandby  = mode == Mode::Standby;
+    if (isStandby && !wasStandby) {
+        s_savedBrightness = D::brightness();
+        D::setBrightness(c::kStandbyBrightnessPercent);
+    } else if (wasStandby && !isStandby) {
+        D::setBrightness(s_savedBrightness);
+    }
+    // Нова сцена -> marquee починається спочатку.
+    s_station.seeded = false;
+    s_track.seeded   = false;
+    s_prevMode  = mode;
+    s_modeKnown = true;
+}
+
+// ---------------------------------------------------------------------------
+// FrameCallback
+// ---------------------------------------------------------------------------
+bool frame() {
+    const uint32_t now = millis();
+    const AppStateData s = AppState::snapshot();   // один знімок на кадр
+
+    handleModeChange(s.mode);
+
+    AppStateData cmp = s;
+    cmp.vuLeft  = 0.0f;   // VU поки не малюється; прибрати в Prompt 13
+    cmp.vuRight = 0.0f;
+    bool dirty = !s_havePrev || memcmp(&cmp, &s_prev, sizeof(cmp)) != 0;
+    if (dirty) {
+        s_prev = cmp;
+        s_havePrev = true;
+    }
+
+    if (s.mode == Mode::Radio) {
+        dirty |= marqueeUpdate(s_station, s.stationName[0] ? s.stationName : "No station",
+                               FontSize::Large, now);
+        dirty |= marqueeUpdate(s_track, s.trackTitle, FontSize::Small, now);
+    }
+
+    if (!dirty) return false;   // панель лишається як була
+
+    D::fillScreen(dc::kColorBg);
+    switch (s.mode) {
+        case Mode::Standby:       drawStandby();                 break;
+        case Mode::Radio:         drawRadio(s);                  break;
+        case Mode::ExternalInput: drawExternal(s);               break;
+        case Mode::Menu:
+            if (s.menuContext == MenuContext::StationList) drawStationList(s);
+            else                                           drawPlaceholder("Menu (TODO)");
+            break;
+        case Mode::IrLearn:       drawPlaceholder("IR Learn (TODO)");   break;
+        case Mode::WifiSetup:     drawPlaceholder("Wi-Fi Setup (TODO)"); break;
+        default:                  drawPlaceholder("?");          break;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool UiScreens::begin() {
+    s_havePrev  = false;
+    s_modeKnown = false;
+    s_station.seeded = false;
+    s_track.seeded   = false;
+    DisplayManager::setFrameCallback(&frame);
+    return true;
+}
