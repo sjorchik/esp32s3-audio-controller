@@ -6,6 +6,11 @@
 // s_dataLock підміняє живий список — тому при будь-якій помилці старий список
 // лишається цілим (атомарність). Порядок захоплення: s_ioLock -> s_dataLock,
 // ніколи навпаки.
+//
+// [Prompt 14] Редагування (add/update/remove/move) іде тим самим шляхом, що й
+// імпорт: під s_ioLock робимо ТИМЧАСОВУ копію списку, змінюємо її, пишемо файл
+// і лише тоді під s_dataLock підміняємо живий список. Живий список не
+// змінюється до успішного запису, тож «відкат» = відкинути копію.
 
 #include "stations/station_store.h"
 
@@ -50,6 +55,7 @@ SemaphoreHandle_t s_ioLock = nullptr;    // серіалізує імпорт/е
 Station* s_list = nullptr;               // PSRAM
 size_t s_count = 0;
 bool s_ready = false;
+const char* s_lastImportErr = "ok";  // [Prompt 14] пишеться під s_ioLock
 
 enum class Res : uint8_t {
     Ok,
@@ -74,6 +80,21 @@ const char* resName(Res r) {
         case Res::IoError:         return "I/O error";
     }
     return "?";
+}
+
+// [Prompt 14] Код причини для lastImportError() / HTTP-відповіді.
+const char* resCode(Res r) {
+    switch (r) {
+        case Res::Ok:              return "ok";
+        case Res::NotFound:        return "file_not_found";
+        case Res::Empty:           return "empty";
+        case Res::TooBig:          return "too_big";
+        case Res::VersionMismatch: return "version_mismatch";
+        case Res::Invalid:         return "parse_error";
+        case Res::Overflow:        return "too_many_stations";
+        case Res::IoError:         return "io_error";
+    }
+    return "io_error";
 }
 
 struct ParseStats {
@@ -538,12 +559,14 @@ bool importCommon(const char* path, Fmt fmt) {
     Lock io(s_ioLock, pdMS_TO_TICKS(cfg::kIoMutexTimeoutMs));
     if (!io.ok()) {
         ST_LOG("import: busy\n");
+        s_lastImportErr = "busy";  // без мʼютекса: лише інформативне значення
         return false;
     }
 
     Station* tmp = allocStations(cfg::kMaxStations, true);
     if (tmp == nullptr) {
         ST_LOG("import: out of memory\n");
+        s_lastImportErr = "out_of_memory";
         return false;
     }
 
@@ -557,6 +580,7 @@ bool importCommon(const char* path, Fmt fmt) {
     }
     if (r != Res::Ok) {
         ST_LOG("import %s failed: %s (list unchanged)\n", path, resName(r));
+        s_lastImportErr = resCode(r);
         freeStations(tmp);
         return false;
     }
@@ -566,6 +590,7 @@ bool importCommon(const char* path, Fmt fmt) {
     // (обидва зі старим списком).
     if (!writeJsonFile(cfg::kStoragePath, tmp, n)) {
         ST_LOG("import %s: storage write failed (list unchanged)\n", path);
+        s_lastImportErr = "storage_write_failed";
         freeStations(tmp);
         return false;
     }
@@ -576,11 +601,71 @@ bool importCommon(const char* path, Fmt fmt) {
         s_count = n;
     }
     freeStations(tmp);
+    s_lastImportErr = "ok";
     ST_LOG("import %s ok: %u stations (skipped: %u not http(s), %u too long)\n", path,
            static_cast<unsigned>(n), static_cast<unsigned>(st.invalid),
            static_cast<unsigned>(st.tooLong));
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// [Prompt 14] Редагування
+// ---------------------------------------------------------------------------
+// Валідація й нормалізація станції від викликача (критерій як в імпорті):
+// url не довший за буфер (обрізати URL не можна — він марний), без пробілів по
+// краях, http(s)://; name обрізається по межі UTF-8 до kNameMax-1 і не порожнє.
+bool normalizeStation(const Station& in, Station& out) {
+    if (strnlen(in.url, sizeof(in.url)) >= sizeof(in.url)) return false;
+    char u[cfg::kUrlMax];
+    strcpy(u, in.url);
+    trimMove(u);
+    if (!isHttpUrl(u)) return false;
+
+    char nm[cfg::kNameMax + 1];  // name міг прийти без '\0'
+    memcpy(nm, in.name, cfg::kNameMax);
+    nm[cfg::kNameMax] = '\0';
+
+    memset(&out, 0, sizeof(out));
+    copyUtf8(out.name, cfg::kNameMax, nm);
+    trimMove(out.name);
+    if (out.name[0] == '\0') return false;
+    strcpy(out.url, u);
+    return true;
+}
+
+// Сеанс редагування: s_ioLock + робоча копія списку (PSRAM).
+struct EditSession {
+    Lock io;
+    Station* work = nullptr;
+    size_t n = 0;
+
+    EditSession() : io(s_ioLock, pdMS_TO_TICKS(cfg::kEditIoMutexTimeoutMs)) {}
+    ~EditSession() { freeStations(work); }
+    EditSession(const EditSession&) = delete;
+    EditSession& operator=(const EditSession&) = delete;
+
+    bool open() {
+        if (!s_ready || !io.ok()) return false;
+        work = allocStations(cfg::kMaxStations, false);
+        if (work == nullptr) return false;
+        Lock data(s_dataLock, portMAX_DELAY);  // утримання — лише memcpy
+        n = s_count;
+        memcpy(work, s_list, n * sizeof(Station));
+        return true;
+    }
+
+    // Записує копію у файл; лише після успіху підміняє живий список.
+    // false — файл не записано, живий список НЕ змінено.
+    bool commit() {
+        for (size_t i = 0; i < n; ++i) work[i].id = static_cast<uint16_t>(i);
+        if (!writeJsonFile(cfg::kStoragePath, work, n)) return false;
+        Lock data(s_dataLock, portMAX_DELAY);
+        memcpy(s_list, work, n * sizeof(Station));
+        if (n < s_count) memset(s_list + n, 0, (s_count - n) * sizeof(Station));
+        s_count = n;
+        return true;
+    }
+};
 
 }  // namespace
 
@@ -651,6 +736,95 @@ bool StationStore::get(size_t index, Station& out) {
 bool StationStore::importM3u(const char* path) { return importCommon(path, Fmt::M3u); }
 bool StationStore::importPls(const char* path) { return importCommon(path, Fmt::Pls); }
 bool StationStore::importJson(const char* path) { return importCommon(path, Fmt::Json); }
+
+const char* StationStore::lastImportError() { return s_lastImportErr; }
+
+bool StationStore::add(const Station& st, size_t* outIndex) {
+    Station norm;
+    if (!normalizeStation(st, norm)) {
+        ST_LOG("add: invalid station\n");
+        return false;
+    }
+    EditSession ed;
+    if (!ed.open()) {
+        ST_LOG("add: busy or out of memory\n");
+        return false;
+    }
+    if (ed.n >= cfg::kMaxStations) {
+        ST_LOG("add: list full\n");
+        return false;
+    }
+    ed.work[ed.n++] = norm;
+    if (!ed.commit()) {
+        ST_LOG("add: storage write failed (list unchanged)\n");
+        return false;
+    }
+    if (outIndex != nullptr) *outIndex = ed.n - 1;
+    ST_LOG("add ok: #%u (%u total)\n", static_cast<unsigned>(ed.n - 1), static_cast<unsigned>(ed.n));
+    return true;
+}
+
+bool StationStore::update(size_t index, const Station& st) {
+    Station norm;
+    if (!normalizeStation(st, norm)) {
+        ST_LOG("update: invalid station\n");
+        return false;
+    }
+    EditSession ed;
+    if (!ed.open()) {
+        ST_LOG("update: busy or out of memory\n");
+        return false;
+    }
+    if (index >= ed.n) return false;
+    ed.work[index] = norm;
+    if (!ed.commit()) {
+        ST_LOG("update #%u: storage write failed (list unchanged)\n", static_cast<unsigned>(index));
+        return false;
+    }
+    ST_LOG("update ok: #%u\n", static_cast<unsigned>(index));
+    return true;
+}
+
+bool StationStore::remove(size_t index) {
+    EditSession ed;
+    if (!ed.open()) {
+        ST_LOG("remove: busy or out of memory\n");
+        return false;
+    }
+    if (index >= ed.n) return false;
+    memmove(ed.work + index, ed.work + index + 1, (ed.n - index - 1) * sizeof(Station));
+    --ed.n;
+    if (!ed.commit()) {
+        ST_LOG("remove #%u: storage write failed (list unchanged)\n", static_cast<unsigned>(index));
+        return false;
+    }
+    ST_LOG("remove ok: #%u (%u left)\n", static_cast<unsigned>(index), static_cast<unsigned>(ed.n));
+    return true;
+}
+
+bool StationStore::move(size_t fromIndex, size_t toIndex) {
+    EditSession ed;
+    if (!ed.open()) {
+        ST_LOG("move: busy or out of memory\n");
+        return false;
+    }
+    if (fromIndex >= ed.n || toIndex >= ed.n) return false;
+    if (fromIndex == toIndex) return true;  // нічого змінювати й писати
+    const Station moving = ed.work[fromIndex];
+    if (fromIndex < toIndex) {
+        memmove(ed.work + fromIndex, ed.work + fromIndex + 1, (toIndex - fromIndex) * sizeof(Station));
+    } else {
+        memmove(ed.work + toIndex + 1, ed.work + toIndex, (fromIndex - toIndex) * sizeof(Station));
+    }
+    ed.work[toIndex] = moving;
+    if (!ed.commit()) {
+        ST_LOG("move %u->%u: storage write failed (list unchanged)\n",
+               static_cast<unsigned>(fromIndex), static_cast<unsigned>(toIndex));
+        return false;
+    }
+    ST_LOG("move ok: %u -> %u\n", static_cast<unsigned>(fromIndex), static_cast<unsigned>(toIndex));
+    return true;
+}
 
 bool StationStore::exportJson(const char* path) {
     if (!s_ready || path == nullptr) return false;

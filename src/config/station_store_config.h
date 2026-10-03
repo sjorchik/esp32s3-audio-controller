@@ -75,6 +75,9 @@ constexpr size_t kMaxFileBytes = 128 * 1024;
 constexpr uint32_t kMutexTimeoutMs   = 50;
 // Мʼютекс операцій з файлами (імпорт/експорт): запис у flash триває довго.
 constexpr uint32_t kIoMutexTimeoutMs = 10000;
+// [Prompt 14] Те саме для add/update/remove/move (їх викликає обробник HTTP у задачі
+// async_tcp, якій не можна зависати надовго): коротший тайм-аут -> false.
+constexpr uint32_t kEditIoMutexTimeoutMs = 2000;
 
 // ---------------------------------------------------------------------------
 // Тестовий режим (STATION_STORE_TEST)
@@ -97,5 +100,7 @@ static_assert(kLineMax > kUrlMax + 2, "line buffer must hold a full URL");
 static_assert(kMaxFileBytes >= 4096, "kMaxFileBytes too small");
 static_assert(kTestLineMax >= 128, "kTestLineMax too small");
 static_assert(kFormatVersion >= 1, "version starts at 1");
+static_assert(kEditIoMutexTimeoutMs >= 100 && kEditIoMutexTimeoutMs <= kIoMutexTimeoutMs,
+              "edit IO timeout out of range");
 
 }  // namespace station_store_cfg

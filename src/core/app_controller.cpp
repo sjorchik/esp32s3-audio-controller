@@ -15,6 +15,12 @@
 // гучність.
 //
 // [Prompt 13] ДОДАНО: AppController::setTone() для веб-сервера (див. app_controller.h).
+//
+// [Prompt 14] Список станцій може змінитись з вебу (видалення/перестановка/імпорт),
+// тож s_station і s_menuSel можуть вказувати за межу списку. Додано
+// clampStationIndex(): обрізає s_station до [0, count-1] (при count == 0 нічого
+// не робить — це обробляють окремі перевірки) і викликається перед кожним
+// використанням індексу та періодично з tickLocked(). Публічний API не змінено.
 
 #include "core/app_controller.h"
 
@@ -184,6 +190,22 @@ uint16_t stationCount() {
     return static_cast<uint16_t>(n > 0xFFFFu ? 0xFFFFu : n);
 }
 
+// [Prompt 14] Обрізає s_station до [0, count-1]. true — індекс було змінено.
+// count == 0 не чіпаємо: порожній список обробляють startStream()/openStationList().
+// Також обережно з count() == 0 через тайм-аут мʼютекса — тоді теж не чіпаємо.
+bool clampStationIndex() {
+    const uint16_t n = stationCount();
+    if (n == 0 || s_station < n) {
+        return false;
+    }
+    APP_LOG("station index %u out of range (%u), clamped to %u\n",
+            static_cast<unsigned>(s_station), static_cast<unsigned>(n),
+            static_cast<unsigned>(n - 1));
+    s_station = static_cast<uint16_t>(n - 1);
+    s_persistNeeded = true;
+    return true;
+}
+
 // Копіює назву станції i в out; для недійсного індексу — порожній рядок.
 void stationLabel(uint16_t i, char* out, size_t cap) {
     if (cap == 0) {
@@ -211,6 +233,7 @@ void startStream() {
         APP_LOG("no stations: nothing to play\n");
         return;
     }
+    clampStationIndex();  // [Prompt 14] список міг скоротитись з вебу
     if (wifiUp()) {
         s_playPending = false;
         Station st;
@@ -550,9 +573,18 @@ void changeStation(uint16_t idx) {
 
 void stepStation(int dir) {
     const int count = stationCount();
-    if (count < 2) {
+    if (count < 1) {
         return;
     }
+    if (count == 1) {
+        // [Prompt 14] Єдина станція: якщо індекс застарів (список скоротився) —
+        // переходимо на неї; якщо вже на ній — нічого не робимо.
+        if (s_station != 0) {
+            changeStation(0);
+        }
+        return;
+    }
+    clampStationIndex();  // [Prompt 14] крок рахуємо від дійсного індексу
     changeStation(static_cast<uint16_t>((static_cast<int>(s_station) + dir + count) % count));
 }
 
@@ -659,6 +691,7 @@ void openStationList() {
         APP_LOG("list not opened: no stations\n");
         return;
     }
+    clampStationIndex();  // [Prompt 14]
     s_menuCtx = MenuContext::StationList;
     s_menuSel = s_station;
     s_mode = Mode::Menu;
@@ -675,6 +708,9 @@ void moveListSelection(int d) {
     const int count = stationCount();
     if (count <= 0) {
         return;  // список спорожнів (майбутній веб-імпорт): ділити на 0 не можна
+    }
+    if (s_menuSel >= count) {
+        s_menuSel = static_cast<uint16_t>(count - 1);  // [Prompt 14] список скоротився
     }
     int n = (static_cast<int>(s_menuSel) + d) % count;
     if (n < 0) n += count;
@@ -889,6 +925,13 @@ void tickLocked() {
 
     if (static_cast<uint32_t>(now - s_lastSyncMs) >= cfg::kSyncPeriodMs) {
         s_lastSyncMs = now;
+        // [Prompt 14] Список міг змінитись з вебу: тримаємо s_station у межах і
+        // публікуємо виправлений індекс (AppState.stationIndex, Settings.lastStation).
+        if (clampStationIndex()) {
+            publishState();
+            persist();
+            s_persistNeeded = false;
+        }
         syncPlayer();
     }
 }

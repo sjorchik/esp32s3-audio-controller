@@ -1,12 +1,19 @@
 // net/web_server.cpp (Prompt 13): інфраструктура, /api/status, /api/settings.
+// [Prompt 14] ДОДАНО: /api/stations* (список, додати, змінити, видалити,
+// перемістити, імпорт, експорт). handleSettingsBody() перейменовано на
+// handleJsonBody() (тепер спільний для всіх JSON-POST/PUT); логіку не змінено.
 
 #include "net/web_server.h"
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <ESPAsyncWebServer.h>
+#include <LittleFS.h>
+#include <ctype.h>
 #include <esp_timer.h>
+#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include <new>
 
@@ -17,6 +24,7 @@
 #include "core/app_state.h"
 #include "core/settings.h"
 #include "net/wifi_manager.h"
+#include "stations/station_store.h"  // [Prompt 14]
 #include "ui/display.h"
 
 #if WEB_SERVER_DEBUG
@@ -211,12 +219,12 @@ void handleSettingsGet(AsyncWebServerRequest* req) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /api/settings — приймання тіла
+// Приймання малого JSON-тіла (POST /api/settings, /api/stations*)
 // ---------------------------------------------------------------------------
 // Тіло збираємо у malloc-буфер, який AsyncWebServerRequest сам звільняє
 // (_tempObject) разом із запитом. Завеликі тіла не буферизуємо — відповідь 413
 // дає handleSettingsPost() за Content-Length.
-void handleSettingsBody(AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index,
+void handleJsonBody(AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index,
                         size_t total) {
     if (total == 0 || total > web_cfg::kMaxBodyBytes) return;
     if (index == 0) {
@@ -581,12 +589,469 @@ void handleNotFound(AsyncWebServerRequest* req) {
 }
 
 // ---------------------------------------------------------------------------
+// [Prompt 14] /api/stations*
+// ---------------------------------------------------------------------------
+constexpr const char* kStationsPath = "/api/stations";
+constexpr const char* kStationsPrefix = "/api/stations/";
+
+void sendFieldError(AsyncWebServerRequest* req, int code, const char* error, const char* field) {
+    JsonDocument doc;
+    doc["ok"] = false;
+    doc["error"] = error;
+    if (field != nullptr) doc["field"] = field;
+    sendJson(req, code, doc);
+}
+
+// Читає й розбирає JSON-обʼєкт із тіла. При помилці сам шле відповідь і false.
+bool readJsonObjectBody(AsyncWebServerRequest* req, JsonDocument& in) {
+    if (req->contentLength() > web_cfg::kMaxBodyBytes) {
+        sendError(req, 413, "body_too_large");
+        return false;
+    }
+    const char* body = static_cast<const char*>(req->_tempObject);
+    if (req->contentLength() == 0 || body == nullptr) {
+        sendError(req, 400, "no_body");
+        return false;
+    }
+    const DeserializationError de = deserializeJson(in, body, req->contentLength());
+    if (de || !in.is<JsonObject>()) {
+        sendError(req, 400, "invalid_json");
+        return false;
+    }
+    return true;
+}
+
+bool hasNonSpace(const char* s) {
+    for (; *s != '\0'; ++s) {
+        if (!isspace(static_cast<unsigned char>(*s))) return true;
+    }
+    return false;
+}
+
+// {"name","url"} -> Station. Обидва поля обовʼязкові, інших ключів немає.
+// nullptr — успіх; інакше код помилки й *badField (ім'я поля чи nullptr).
+const char* parseStationObject(JsonObjectConst root, Station& out, const char** badField) {
+    *badField = nullptr;
+    for (JsonPairConst kv : root) {
+        const char* k = kv.key().c_str();
+        if (strcmp(k, "name") != 0 && strcmp(k, "url") != 0) {
+            *badField = "unknown";
+            return "unknown_field";
+        }
+    }
+    JsonVariantConst vn = root["name"];
+    JsonVariantConst vu = root["url"];
+
+    const char* name = vn.is<const char*>() ? vn.as<const char*>() : nullptr;
+    if (name == nullptr || !hasNonSpace(name)) {
+        *badField = "name";
+        return "name_required";
+    }
+    if (strlen(name) > station_store_cfg::kNameMax - 1) {
+        *badField = "name";
+        return "name_too_long";
+    }
+    if (!isCleanUtf8(name)) {
+        *badField = "name";
+        return "name_invalid";
+    }
+
+    const char* url = vu.is<const char*>() ? vu.as<const char*>() : nullptr;
+    if (url == nullptr || !hasNonSpace(url)) {
+        *badField = "url";
+        return "url_required";
+    }
+    if (strlen(url) > station_store_cfg::kUrlMax - 1) {
+        *badField = "url";
+        return "url_too_long";
+    }
+    if (!isCleanUtf8(url)) {
+        *badField = "url";
+        return "url_invalid";
+    }
+    const char* u = url;
+    while (*u != '\0' && isspace(static_cast<unsigned char>(*u))) ++u;
+    if (strncasecmp(u, "http://", 7) != 0 && strncasecmp(u, "https://", 8) != 0) {
+        *badField = "url";
+        return "url_invalid_scheme";
+    }
+
+    memset(&out, 0, sizeof(out));
+    strlcpy(out.name, name, sizeof(out.name));
+    strlcpy(out.url, url, sizeof(out.url));
+    return nullptr;
+}
+
+// "/api/stations/{index}" -> index. false — не число, порожньо чи задовге.
+bool parseStationIndex(const String& url, size_t& out) {
+    if (!url.startsWith(kStationsPrefix)) return false;
+    const char* p = url.c_str() + strlen(kStationsPrefix);
+    const size_t len = strlen(p);
+    if (len == 0 || len > web_cfg::kStationIndexMaxDigits) return false;
+    for (size_t i = 0; i < len; ++i) {
+        if (!isdigit(static_cast<unsigned char>(p[i]))) return false;
+    }
+    out = static_cast<size_t>(strtoul(p, nullptr, 10));
+    return true;
+}
+
+// Захист від перетину маршрутів: ESPAsyncWebServer зіставляє "/api/stations" і
+// з "/api/stations/...". Обробники точного шляху перевіряють url самі.
+bool exactStationsUrl(AsyncWebServerRequest* req) {
+    if (req->url() == kStationsPath) return true;
+    handleNotFound(req);
+    return false;
+}
+
+// GET /api/stations -> [{"index":0,"name":"..","url":".."},..]
+// Пишемо елемент за елементом (без одного великого JsonDocument на весь список).
+void handleStationsList(AsyncWebServerRequest* req) {
+    if (!exactStationsUrl(req)) return;
+    WEB_LOG("%s %s", req->methodToString(), req->url().c_str());
+
+    AsyncResponseStream* r = req->beginResponseStream("application/json");
+    if (r == nullptr) {
+        req->send(503);
+        return;
+    }
+    r->addHeader("Cache-Control", "no-store");
+    r->print("[");
+    const size_t n = StationStore::count();
+    bool first = true;
+    for (size_t i = 0; i < n; ++i) {
+        Station st;
+        if (!StationStore::get(i, st)) continue;  // список скоротився під час відповіді
+        if (!first) r->print(",");
+        first = false;
+        JsonDocument d;
+        d["index"] = i;
+        d["name"] = st.name;
+        d["url"] = st.url;
+        serializeJson(d, *r);
+    }
+    r->print("]");
+    req->send(r);
+}
+
+// POST /api/stations {"name","url"} -> 201 {"ok":true,"index":N}
+void handleStationsAdd(AsyncWebServerRequest* req) {
+    if (!exactStationsUrl(req)) return;
+    WEB_LOG("%s %s", req->methodToString(), req->url().c_str());
+
+    JsonDocument in;
+    if (!readJsonObjectBody(req, in)) return;
+
+    Station st;
+    const char* field = nullptr;
+    const char* err = parseStationObject(in.as<JsonObjectConst>(), st, &field);
+    if (err != nullptr) {
+        sendFieldError(req, 400, err, field);
+        return;
+    }
+    size_t idx = 0;
+    if (!StationStore::add(st, &idx)) {
+        if (StationStore::count() >= station_store_cfg::kMaxStations) {
+            sendError(req, 409, "list_full");
+        } else {
+            sendError(req, 500, "storage_error");
+        }
+        return;
+    }
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["index"] = idx;
+    sendJson(req, 201, doc);
+}
+
+// PUT /api/stations/{index} {"name","url"} (повна заміна) -> 200 {"ok":true,"index":N}
+void handleStationsUpdate(AsyncWebServerRequest* req) {
+    WEB_LOG("%s %s", req->methodToString(), req->url().c_str());
+
+    size_t idx = 0;
+    if (!parseStationIndex(req->url(), idx)) {
+        sendError(req, 400, "invalid_index");
+        return;
+    }
+    if (idx >= StationStore::count()) {
+        sendError(req, 404, "not_found");
+        return;
+    }
+    JsonDocument in;
+    if (!readJsonObjectBody(req, in)) return;
+
+    Station st;
+    const char* field = nullptr;
+    const char* err = parseStationObject(in.as<JsonObjectConst>(), st, &field);
+    if (err != nullptr) {
+        sendFieldError(req, 400, err, field);
+        return;
+    }
+    if (!StationStore::update(idx, st)) {
+        if (idx >= StationStore::count()) {
+            sendError(req, 404, "not_found");  // список скоротився між перевіркою й записом
+        } else {
+            sendError(req, 500, "storage_error");
+        }
+        return;
+    }
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["index"] = idx;
+    sendJson(req, 200, doc);
+}
+
+// DELETE /api/stations/{index} -> 200 {"ok":true}
+void handleStationsDelete(AsyncWebServerRequest* req) {
+    WEB_LOG("%s %s", req->methodToString(), req->url().c_str());
+
+    size_t idx = 0;
+    if (!parseStationIndex(req->url(), idx)) {
+        sendError(req, 400, "invalid_index");
+        return;
+    }
+    if (idx >= StationStore::count()) {
+        sendError(req, 404, "not_found");
+        return;
+    }
+    if (!StationStore::remove(idx)) {
+        if (idx >= StationStore::count()) {
+            sendError(req, 404, "not_found");
+        } else {
+            sendError(req, 500, "storage_error");
+        }
+        return;
+    }
+    JsonDocument doc;
+    doc["ok"] = true;
+    sendJson(req, 200, doc);
+}
+
+// POST /api/stations/move {"from":N,"to":M} -> 200 {"ok":true}
+void handleStationsMove(AsyncWebServerRequest* req) {
+    WEB_LOG("%s %s", req->methodToString(), req->url().c_str());
+
+    JsonDocument in;
+    if (!readJsonObjectBody(req, in)) return;
+
+    JsonObjectConst root = in.as<JsonObjectConst>();
+    for (JsonPairConst kv : root) {
+        const char* k = kv.key().c_str();
+        if (strcmp(k, "from") != 0 && strcmp(k, "to") != 0) {
+            sendFieldError(req, 400, "unknown_field", "unknown");
+            return;
+        }
+    }
+    JsonVariantConst vf = root["from"];
+    JsonVariantConst vt = root["to"];
+    if (!vf.is<int>()) {
+        sendFieldError(req, 400, "invalid_value", "from");
+        return;
+    }
+    if (!vt.is<int>()) {
+        sendFieldError(req, 400, "invalid_value", "to");
+        return;
+    }
+    const int from = vf.as<int>();
+    const int to = vt.as<int>();
+    const size_t n = StationStore::count();
+    if (from < 0 || static_cast<size_t>(from) >= n) {
+        sendFieldError(req, 400, "index_out_of_range", "from");
+        return;
+    }
+    if (to < 0 || static_cast<size_t>(to) >= n) {
+        sendFieldError(req, 400, "index_out_of_range", "to");
+        return;
+    }
+    if (!StationStore::move(static_cast<size_t>(from), static_cast<size_t>(to))) {
+        const size_t now = StationStore::count();
+        if (static_cast<size_t>(from) >= now || static_cast<size_t>(to) >= now) {
+            sendError(req, 400, "index_out_of_range");
+        } else {
+            sendError(req, 500, "storage_error");
+        }
+        return;
+    }
+    JsonDocument doc;
+    doc["ok"] = true;
+    sendJson(req, 200, doc);
+}
+
+// --- POST /api/stations/import -------------------------------------------
+// Тіло — сирий вміст файлу. Складаємо його прямо у тимчасовий файл LittleFS (до
+// 128 КБ у RAM не тримаємо). Станом володіє одна «активна» заявка; друга
+// одночасна отримає 409. Стан — статичний, бо req->_tempObject звільняється
+// через free() і не годиться для обʼєкта з File.
+struct ImportCtx {
+    File file;
+    AsyncWebServerRequest* owner = nullptr;
+    bool failed = false;
+    size_t written = 0;
+};
+ImportCtx s_imp;
+
+void importRelease() {
+    if (s_imp.file) s_imp.file.close();
+    LittleFS.remove(web_cfg::kStationsImportTmpPath);
+    s_imp.owner = nullptr;
+    s_imp.failed = false;
+    s_imp.written = 0;
+}
+
+void handleImportBody(AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index,
+                      size_t total) {
+    if (total == 0 || total > web_cfg::kStationsImportMaxBytes) return;  // відповість handler
+    if (index == 0) {
+        if (s_imp.owner != nullptr) return;  // зайнято іншою заявкою -> 409 у handler
+        LittleFS.remove(web_cfg::kStationsImportTmpPath);
+        s_imp.file = LittleFS.open(web_cfg::kStationsImportTmpPath, "w");
+        s_imp.owner = req;
+        s_imp.failed = !s_imp.file;
+        s_imp.written = 0;
+        // Обрив зʼєднання посеред завантаження: звільнити стан і файл.
+        req->onDisconnect([req]() {
+            if (s_imp.owner == req) importRelease();
+        });
+    }
+    if (s_imp.owner != req || s_imp.failed) return;
+    if (s_imp.file.write(data, len) != len) {
+        s_imp.failed = true;
+        return;
+    }
+    s_imp.written += len;
+}
+
+// Формат: ?format=m3u|pls|json (головне), інакше за Content-Type.
+// nullptr — не визначено.
+const char* detectImportFormat(AsyncWebServerRequest* req) {
+    if (req->hasParam("format")) {
+        const String f = req->getParam("format")->value();
+        if (f.equalsIgnoreCase("m3u")) return "m3u";
+        if (f.equalsIgnoreCase("pls")) return "pls";
+        if (f.equalsIgnoreCase("json")) return "json";
+        return nullptr;  // явно вказано, але невідомо — не вгадуємо
+    }
+    String ct = req->contentType();
+    ct.toLowerCase();
+    if (ct.startsWith("application/json")) return "json";
+    if (ct.startsWith("audio/x-scpls") || ct.startsWith("audio/scpls")) return "pls";
+    if (ct.startsWith("audio/x-mpegurl") || ct.startsWith("audio/mpegurl") ||
+        ct.startsWith("application/vnd.apple.mpegurl") ||
+        ct.startsWith("application/x-mpegurl")) {
+        return "m3u";
+    }
+    return nullptr;
+}
+
+void handleStationsImport(AsyncWebServerRequest* req) {
+    WEB_LOG("%s %s (%u bytes)", req->methodToString(), req->url().c_str(),
+            static_cast<unsigned>(req->contentLength()));
+
+    const size_t total = req->contentLength();
+    if (total > web_cfg::kStationsImportMaxBytes) {
+        sendError(req, 413, "body_too_large");
+        return;
+    }
+    if (total == 0) {
+        sendError(req, 400, "no_body");
+        return;
+    }
+    if (s_imp.owner != req) {
+        sendError(req, 409, "import_busy");
+        return;
+    }
+    if (s_imp.file) s_imp.file.close();
+    if (s_imp.failed || s_imp.written != total) {
+        importRelease();
+        sendError(req, 500, "upload_failed");
+        return;
+    }
+
+    const char* fmt = detectImportFormat(req);
+    if (fmt == nullptr) {
+        importRelease();
+        sendError(req, 400, "unknown_format");
+        return;
+    }
+
+    const char* path = web_cfg::kStationsImportTmpPath;
+    bool ok = false;
+    if (strcmp(fmt, "m3u") == 0) {
+        ok = StationStore::importM3u(path);
+    } else if (strcmp(fmt, "pls") == 0) {
+        ok = StationStore::importPls(path);
+    } else {
+        ok = StationStore::importJson(path);
+    }
+    const char* why = StationStore::lastImportError();
+    importRelease();  // видаляє тимчасовий файл
+
+    if (!ok) {
+        int code = 400;  // помилка вмісту
+        if (strcmp(why, "busy") == 0) {
+            code = 503;
+        } else if (strcmp(why, "out_of_memory") == 0 || strcmp(why, "io_error") == 0 ||
+                   strcmp(why, "storage_write_failed") == 0 ||
+                   strcmp(why, "file_not_found") == 0) {
+            code = 500;
+        }
+        WEB_LOG("stations import (%s) failed: %s", fmt, why);
+        JsonDocument doc;
+        doc["ok"] = false;
+        doc["error"] = "import_failed";
+        doc["reason"] = why;
+        doc["format"] = fmt;
+        sendJson(req, code, doc);
+        return;
+    }
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["format"] = fmt;
+    doc["count"] = StationStore::count();
+    doc["replaced"] = true;
+    sendJson(req, 200, doc);
+}
+
+// GET /api/stations/export -> файл (Content-Disposition: attachment)
+void handleStationsExport(AsyncWebServerRequest* req) {
+    WEB_LOG("%s %s", req->methodToString(), req->url().c_str());
+
+    if (!StationStore::exportJson(web_cfg::kStationsExportPath)) {
+        sendError(req, 500, "export_failed");
+        return;
+    }
+    AsyncWebServerResponse* r =
+        req->beginResponse(LittleFS, web_cfg::kStationsExportPath, "application/json");
+    if (r == nullptr) {
+        sendError(req, 500, "export_failed");
+        return;
+    }
+    char cd[96];
+    snprintf(cd, sizeof(cd), "attachment; filename=\"%s\"", web_cfg::kStationsExportFilename);
+    r->addHeader("Content-Disposition", cd);
+    r->addHeader("Cache-Control", "no-store");
+    req->send(r);
+}
+
+// ---------------------------------------------------------------------------
 // Старт сервера
 // ---------------------------------------------------------------------------
 void registerRoutes(AsyncWebServer& server) {
     server.on("/api/status", HTTP_GET, handleStatus);
     server.on("/api/settings", HTTP_GET, handleSettingsGet);
-    server.on("/api/settings", HTTP_POST, handleSettingsPost, nullptr, handleSettingsBody);
+    server.on("/api/settings", HTTP_POST, handleSettingsPost, nullptr, handleJsonBody);
+
+    // [Prompt 14] ПОРЯДОК ВАЖЛИВИЙ: ESPAsyncWebServer вважає "/api/stations" збігом і
+    // для "/api/stations/...", а перший збіг за методом виграє. Тому спершу точні
+    // підшляхи, потім "/api/stations/*" (PUT/DELETE за індексом), і наприкінці —
+    // "/api/stations" (його обробники ще й перевіряють url самі).
+    server.on("/api/stations/move", HTTP_POST, handleStationsMove, nullptr, handleJsonBody);
+    server.on("/api/stations/import", HTTP_POST, handleStationsImport, nullptr, handleImportBody);
+    server.on("/api/stations/export", HTTP_GET, handleStationsExport);
+    server.on("/api/stations/*", HTTP_PUT, handleStationsUpdate, nullptr, handleJsonBody);
+    server.on("/api/stations/*", HTTP_DELETE, handleStationsDelete);
+    server.on("/api/stations", HTTP_GET, handleStationsList);
+    server.on("/api/stations", HTTP_POST, handleStationsAdd, nullptr, handleJsonBody);
+
     server.onNotFound(handleNotFound);
 }
 

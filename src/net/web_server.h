@@ -1,6 +1,7 @@
 #pragma once
 
 // HTTP-сервер (ESPAsyncWebServer): /api/status, GET/POST /api/settings.
+// [Prompt 14] ДОДАНО маршрути /api/stations* (лише .cpp; цей інтерфейс не змінено).
 //
 // [Prompt 13] Заглушку замінено. ЗМІНЕНО: begin() тепер приймає вказівник на
 // аудіопроцесор (так само, як AudioPlayer::begin / AppController::begin);
