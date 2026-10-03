@@ -13,6 +13,8 @@
 // Mode::WifiSetup (екран з назвою AP та адресою). Зовнішні входи від Wi-Fi не
 // залежать і лишаються робочими; зі WifiSetup можна перемикати вхід і міняти
 // гучність.
+//
+// [Prompt 13] ДОДАНО: AppController::setTone() для веб-сервера (див. app_controller.h).
 
 #include "core/app_controller.h"
 
@@ -926,6 +928,38 @@ void AppController::handleEvent(const Event& event) {
     }
     handleLocked(event);
     xSemaphoreGiveRecursive(s_lock);
+}
+
+// [Prompt 13] ДОДАНО
+bool AppController::setTone(ToneUpdate& u) {
+    u.bassOk = u.trebleOk = u.balanceOk = false;
+    if (!s_started || s_lock == nullptr ||
+        xSemaphoreTakeRecursive(s_lock, pdMS_TO_TICKS(cfg::kLockTimeoutMs)) != pdTRUE) {
+        return false;
+    }
+    if (s_proc != nullptr) {
+        if (u.hasBass && s_caps.bass && s_proc->setBass(u.bass)) {
+            s_bass = u.bass;
+            u.bassOk = true;
+            APP_LOG("bass=%d (WEB)\n", static_cast<int>(s_bass));
+        }
+        if (u.hasTreble && s_caps.treble && s_proc->setTreble(u.treble)) {
+            s_treble = u.treble;
+            u.trebleOk = true;
+            APP_LOG("treble=%d (WEB)\n", static_cast<int>(s_treble));
+        }
+        if (u.hasBalance && s_caps.balance && s_proc->setBalance(u.balance)) {
+            s_balance = u.balance;
+            u.balanceOk = true;
+            APP_LOG("balance=%d (WEB)\n", static_cast<int>(s_balance));
+        }
+    }
+    if (u.bassOk || u.trebleOk || u.balanceOk) {
+        publishState();
+        persist();
+    }
+    xSemaphoreGiveRecursive(s_lock);
+    return true;
 }
 
 bool AppController::begin(AudioProcessor* processorOrNull) {

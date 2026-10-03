@@ -21,7 +21,8 @@
 // - [Prompt 12] WifiManager::begin(wifiResetRequested) викликається тут, окремо від
 //   AppController::begin() (сигнатуру AppController не змінено); WifiManager сам
 //   піднімає mDNS після підключення.
-// Веб-сервер (net/web_server) не реалізується.
+// - [Prompt 13] WebServerManager::begin(proc) викликається ПІСЛЯ AppController::begin()
+//   (потрібні AppState і Settings); сервер сам піднімається, коли WifiManager дасть STA.
 
 #include <Arduino.h>
 #include <LittleFS.h>
@@ -49,6 +50,7 @@
 #include "input/buttons.h"
 #include "input/encoder.h"
 #include "input/ir_rc5.h"  // [Prompt 2] ДОДАНО
+#include "net/web_server.h"   // [Prompt 13] ДОДАНО
 #include "net/wifi_manager.h"  // [Prompt 12] ДОДАНО
 #include "stations/station_store_test.h"  // [Prompt 11] ДОДАНО
 #include "ui/display.h"    // [Prompt 4] ДОДАНО
@@ -299,6 +301,17 @@ static void initAppController() {
     }
 }
 
+// [Prompt 13] ДОДАНО: веб-сервер. Вказівник на процесор — як для плеєра та AppController.
+// begin() лише створює задачу-стартер; HTTP піднімається, коли WifiManager дасть STA.
+static void initWebServer() {
+    AudioProcessor* proc = s_audioProcReady ? s_audioProc : nullptr;
+    if (WebServerManager::begin(proc)) {
+        Serial.println("[MAIN] WebServer starter task created");
+    } else {
+        Serial.println("[MAIN] WebServer init failed");
+    }
+}
+
 // [Prompt 11] ДОДАНО: Serial-тест StationStore (після AppController, який
 // викликає StationStore::begin()). Кілька читачів Serial діляться байтами, тому
 // не стартуємо, поки активний інший тест (на відміну від них, тут перевіряємо й
@@ -385,6 +398,9 @@ void setup() {
 
     // [Prompt 8] ДОДАНО: AppController після процесора, плеєра й Settings.
     initAppController();
+
+    // [Prompt 13] ДОДАНО: веб-сервер після AppController (AppState::begin() уже виконано).
+    initWebServer();
 
     // [Prompt 6] ДОДАНО: Serial-тест Settings (останнім, щоб не заважати логу старту).
     initSettingsTest();
