@@ -8,6 +8,7 @@
 #include "config/defaults.h"
 #include "config/display_config.h"
 #include "config/screens_config.h"
+#include "core/action_names.h"  // [Prompt 15] ДОДАНО: імена дій (чисті дані)
 #include "core/app_state.h"
 #include "ui/display.h"
 #include "ui/fonts.h"
@@ -22,6 +23,8 @@
 // UiFonts/UiIcons і StationStore::count()/get() (список станцій потрібен одразу
 // для кількох сусідніх рядків). StationStore — модуль чистих даних, не залізо,
 // тож правило «AppController — єдиний власник заліза» не порушується.
+// [Prompt 15] Так само читається core/action_names (таблиця імен без стану); стан навчання
+// IR береться з AppState (irLearnStatus/irLearnTarget/irLearnConflictWith), не з IrRc5.
 
 namespace {
 
@@ -288,6 +291,53 @@ void drawWifiSetup(const AppStateData& s) {
     drawCentered(url, c::kWifiSetupIpY, FontSize::Small, c::kColorDim);
 }
 
+// [Prompt 15] Екран Mode::IrLearn: статус (Small) над назвою дії (Large), підказка під нею.
+// Лише інформаційний: підтвердження/скасування робиться з вебу. Статус «Waiting» дає
+// «Press remote button for» просто над назвою дії - фраза читається разом з нею.
+void drawIrLearn(const AppStateData& s) {
+    char line[40];
+    const char* hint = "";
+    uint16_t color = c::kColorDim;
+
+    switch (s.irLearnStatus) {
+        case IrLearnStatus::Waiting:
+            strlcpy(line, "Press remote button for", sizeof(line));
+            color = c::kColorAccent;
+            break;
+        case IrLearnStatus::Confirm:
+            strlcpy(line, "Press again to confirm", sizeof(line));
+            color = c::kColorAccent;
+            break;
+        case IrLearnStatus::Success:
+            strlcpy(line, "Learned!", sizeof(line));
+            color = c::kColorOk;
+            break;
+        case IrLearnStatus::Timeout:
+            strlcpy(line, "Timeout", sizeof(line));
+            color = c::kColorBad;
+            break;
+        case IrLearnStatus::Conflict:
+            snprintf(line, sizeof(line), "Already used by %s",
+                     action_names::name(s.irLearnConflictWith));
+            hint = "Resolve on web";
+            color = c::kColorBad;
+            break;
+        case IrLearnStatus::Idle:
+        default:
+            line[0] = '\0';  // кадр-два між зміною режиму й першим статусом
+            break;
+    }
+
+    char text[48];  // fitText: cap >= довжина джерела + 8
+    fitText(line, text, sizeof(text), FontSize::Small, c::kContentW);
+    drawCentered(text, c::kIrStatusY, FontSize::Small, color);
+    drawCentered(action_names::name(s.irLearnTarget), c::kIrActionY, FontSize::Large,
+                 dc::kColorFg);
+    if (hint[0] != '\0') {
+        drawCentered(hint, c::kIrHintY, FontSize::Small, c::kColorDim);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Підсвітка при вході/виході зі Standby
 // ---------------------------------------------------------------------------
@@ -344,7 +394,7 @@ bool frame() {
             if (s.menuContext == MenuContext::StationList) drawStationList(s);
             else                                           drawPlaceholder("Menu (TODO)");
             break;
-        case Mode::IrLearn:       drawPlaceholder("IR Learn (TODO)");   break;
+        case Mode::IrLearn:       drawIrLearn(s);                break;   // [Prompt 15]
         case Mode::WifiSetup:     drawWifiSetup(s);              break;
         default:                  drawPlaceholder("?");          break;
     }

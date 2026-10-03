@@ -61,7 +61,12 @@ constexpr uint8_t kListRows     = 5;
 constexpr int16_t kListTextX    = 14;
 constexpr int16_t kListTextDy   = 5;               // відступ тексту від верху рядка
 
-// --- Плейсхолдер (Menu без контексту, IrLearn) ---
+// --- [Prompt 15] IrLearn: статус (Small) над назвою дії (Large), підказка (Small) під нею ---
+constexpr int16_t kIrStatusY = 24;
+constexpr int16_t kIrActionY = 62;
+constexpr int16_t kIrHintY   = 108;
+
+// --- Плейсхолдер (Menu без контексту) ---
 constexpr int16_t kPlaceholderY = 73;              // Large, по центру
 
 // --- [Prompt 12] WifiSetup: заголовок Large, під ним SSID і адреса Small ---
@@ -85,6 +90,10 @@ static_assert(kWifiSetupTitleY + display_cfg::kFontLargePx < kWifiSetupSsidY &&
                   kWifiSetupSsidY + display_cfg::kFontSmallPx < kWifiSetupIpY &&
                   kWifiSetupIpY + display_cfg::kFontSmallPx <= kH,
               "WifiSetup layout overlaps or leaves the screen");
+static_assert(kIrStatusY + display_cfg::kFontSmallPx < kIrActionY &&
+                  kIrActionY + display_cfg::kFontLargePx < kIrHintY &&
+                  kIrHintY + display_cfg::kFontSmallPx <= kH,
+              "IrLearn layout overlaps or leaves the screen");
 static_assert(kMarqueeStepMs > 0 && kMarqueeStepPx > 0, "marquee step must be positive");
 
 }  // namespace screens_cfg

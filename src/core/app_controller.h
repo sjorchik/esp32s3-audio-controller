@@ -12,6 +12,10 @@
 // [Prompt 13] ДОДАНО: setTone() — вхід для веб-сервера. AppController тримає власні
 //             копії bass/treble/balance і публікує їх у AppState/Settings після КОЖНОЇ
 //             події, тож пряма зміна чипа повз нього була б затерта наступною подією.
+// [Prompt 15] ДОДАНО: beginIrLearn()/cancelIrLearn()/confirmIrOverwrite() — вхід для
+//             веб-сервера до навчання IR. IR-приймач — апаратний ресурс, а навчання
+//             змінює глобальну поведінку (Mode::IrLearn), тож веб не викликає
+//             IrRc5::beginLearn() та інші напряму.
 
 #include "core/events.h"
 
@@ -50,4 +54,22 @@ public:
     // змінено). true — запит оброблено; успіх кожного поля — у *Ok (false = I2C не
     // відповів або чип не підтримує функцію; копія в такому разі не змінюється).
     static bool setTone(ToneUpdate& update);
+
+    // [Prompt 15] ДОДАНО: починає навчання дії target. Запамʼятовує поточний Mode,
+    // ставить Mode::IrLearn і викликає IrRc5::beginLearn(). Звук/потік не чіпає.
+    // false — контролер не запущено, мʼютекс зайнятий довше kLockTimeoutMs, навчання
+    // вже триває (Waiting/Confirm/Conflict) або IrRc5::beginLearn() відмовив (дія
+    // некоректна чи мапа заповнена). Якщо на екрані ще результат попереднього навчання
+    // (Success/Timeout) — його знімає одразу й починає нове.
+    static bool beginIrLearn(Action target);
+
+    // [Prompt 15] ДОДАНО: скасовує навчання (IrRc5::cancelLearn()) і одразу повертає
+    // збережений Mode; статус у AppState стає Idle. Поза навчанням — лише скидає
+    // «липкий» результат (Success/Timeout) у Idle. Безпечно викликати завжди.
+    static void cancelIrLearn();
+
+    // [Prompt 15] ДОДАНО: підтверджує перепризначення коду в стані Conflict
+    // (IrRc5::confirmOverwrite()). false — не в Conflict, контролер зайнятий або
+    // IrRc5 відмовив.
+    static bool confirmIrOverwrite();
 };

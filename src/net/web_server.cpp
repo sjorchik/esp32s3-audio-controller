@@ -2,6 +2,9 @@
 // [Prompt 14] ДОДАНО: /api/stations* (список, додати, змінити, видалити,
 // перемістити, імпорт, експорт). handleSettingsBody() перейменовано на
 // handleJsonBody() (тепер спільний для всіх JSON-POST/PUT); логіку не змінено.
+// [Prompt 15] ДОДАНО: /api/ir* (список дій, мапа, імпорт/видалення, навчання). Навчання
+// (start/confirm-overwrite/cancel) — лише через AppController; мапу (exportJson/
+// importJson/removeAction/codeFor) читаємо й міняємо напряму, як StationStore.
 
 #include "net/web_server.h"
 
@@ -20,9 +23,11 @@
 #include "audio/audio_processor.h"
 #include "config/defaults.h"
 #include "config/web_server_config.h"
+#include "core/action_names.h"   // [Prompt 15]
 #include "core/app_controller.h"
 #include "core/app_state.h"
 #include "core/settings.h"
+#include "input/ir_rc5.h"         // [Prompt 15] мапа кодів (прямі виклики лише для даних)
 #include "net/wifi_manager.h"
 #include "stations/station_store.h"  // [Prompt 14]
 #include "ui/display.h"
@@ -1033,6 +1038,280 @@ void handleStationsExport(AsyncWebServerRequest* req) {
 }
 
 // ---------------------------------------------------------------------------
+// [Prompt 15] /api/ir*
+// ---------------------------------------------------------------------------
+constexpr const char* kIrMapPrefix = "/api/ir/map/";
+
+const char* irStatusName(IrLearnStatus s) {
+    switch (s) {
+        case IrLearnStatus::Idle:     return "Idle";
+        case IrLearnStatus::Waiting:  return "Waiting";
+        case IrLearnStatus::Confirm:  return "Confirm";
+        case IrLearnStatus::Success:  return "Success";
+        case IrLearnStatus::Timeout:  return "Timeout";
+        case IrLearnStatus::Conflict: return "Conflict";
+    }
+    return "Unknown";
+}
+
+// Навчання триває й чекає користувача.
+bool irStatusActive(IrLearnStatus s) {
+    return s == IrLearnStatus::Waiting || s == IrLearnStatus::Confirm ||
+           s == IrLearnStatus::Conflict;
+}
+
+// Захист від перетину маршрутів (ESPAsyncWebServer зіставляє "/x" і з "/x/..."):
+// обробники точного шляху перевіряють url самі, як exactStationsUrl().
+bool exactUrl(AsyncWebServerRequest* req, const char* path) {
+    if (req->url() == path) return true;
+    handleNotFound(req);
+    return false;
+}
+
+// Мапа/імпорт/видалення НЕ чіпають живе навчання, але під час нього IrRc5::importJson()
+// відмовляє, а видалення дії, яку зараз навчають (чи з якою конфлікт), зіпсувало б
+// Conflict. Тому поки Mode::IrLearn - 409. (Перевірка не атомарна щодо старту навчання
+// з іншого запиту; IrRc5 усе одно захищений власним мʼютексом.)
+bool irLearningNow() {
+    return AppState::snapshot().mode == Mode::IrLearn;
+}
+
+// Тіло імпорту мапи: як handleJsonBody(), але зі своїм (більшим) лімітом.
+void handleIrImportBody(AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index,
+                        size_t total) {
+    if (total == 0 || total > web_cfg::kIrImportMaxBytes) return;
+    if (index == 0) {
+        req->_tempObject = malloc(total + 1);
+    }
+    char* buf = static_cast<char*>(req->_tempObject);
+    if (buf == nullptr || index + len > total) return;
+    memcpy(buf + index, data, len);
+    if (index + len == total) buf[total] = '\0';
+}
+
+// {"status","target","conflictWith"} зі знімка AppState (веб і екран пристрою
+// читають одне джерело). target = null у Idle; conflictWith = null поза Conflict.
+void fillIrStatus(JsonDocument& doc, const AppStateData& st) {
+    doc["status"] = irStatusName(st.irLearnStatus);
+    if (st.irLearnStatus == IrLearnStatus::Idle) {
+        doc["target"] = nullptr;
+    } else {
+        doc["target"] = action_names::name(st.irLearnTarget);
+    }
+    if (st.irLearnStatus == IrLearnStatus::Conflict) {
+        doc["conflictWith"] = action_names::name(st.irLearnConflictWith);
+    } else {
+        doc["conflictWith"] = nullptr;
+    }
+}
+
+// GET /api/ir/actions -> [{"action":"VOL_UP","learned":true,"addr":0,"cmd":16},
+//                         {"action":"MUTE","learned":false}, ...]
+// Лише дії, придатні для навчання (action_names::Info::learnable).
+void handleIrActions(AsyncWebServerRequest* req) {
+    if (!exactUrl(req, "/api/ir/actions")) return;
+    WEB_LOG("%s %s", req->methodToString(), req->url().c_str());
+
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+    for (size_t i = 0; i < action_names::count(); ++i) {
+        const action_names::Info& info = action_names::at(i);
+        if (!info.learnable) continue;
+        JsonObject o = arr.add<JsonObject>();
+        o["action"] = info.name;
+        uint8_t addr = 0;
+        uint8_t cmd = 0;
+        const bool learned = IrRc5::codeFor(info.action, addr, cmd);
+        o["learned"] = learned;
+        if (learned) {
+            o["addr"] = addr;
+            o["cmd"] = cmd;
+        }
+    }
+    sendJson(req, 200, doc);
+}
+
+// GET /api/ir/map -> IrRc5::exportJson() як є
+void handleIrMapGet(AsyncWebServerRequest* req) {
+    if (!exactUrl(req, "/api/ir/map")) return;
+    WEB_LOG("%s %s", req->methodToString(), req->url().c_str());
+
+    JsonDocument doc;
+    if (!IrRc5::exportJson(doc)) {
+        sendError(req, 500, "export_failed");
+        return;
+    }
+    sendJson(req, 200, doc);
+}
+
+// POST /api/ir/map/import  тіло: масив як у GET /api/ir/map -> IrRc5::importJson()
+// Замінює мапу цілком. false від importJson() не розрізняє «не пройшла валідація» і
+// «RAM оновлено, але NVS не записався» - тому у відповіді є актуальний mapSize.
+void handleIrMapImport(AsyncWebServerRequest* req) {
+    WEB_LOG("%s %s (%u bytes)", req->methodToString(), req->url().c_str(),
+            static_cast<unsigned>(req->contentLength()));
+
+    if (req->contentLength() > web_cfg::kIrImportMaxBytes) {
+        sendError(req, 413, "body_too_large");
+        return;
+    }
+    const char* body = static_cast<const char*>(req->_tempObject);
+    if (req->contentLength() == 0 || body == nullptr) {
+        sendError(req, 400, "no_body");
+        return;
+    }
+    if (irLearningNow()) {
+        sendError(req, 409, "learning_active");
+        return;
+    }
+    JsonDocument in;
+    const DeserializationError de = deserializeJson(in, body, req->contentLength());
+    if (de || !in.is<JsonArray>()) {
+        sendError(req, 400, "invalid_json");
+        return;
+    }
+    if (!IrRc5::importJson(in)) {
+        JsonDocument doc;
+        doc["ok"] = false;
+        doc["error"] = "import_failed";
+        doc["mapSize"] = IrRc5::mapSize();
+        sendJson(req, 400, doc);
+        return;
+    }
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["count"] = IrRc5::mapSize();
+    sendJson(req, 200, doc);
+}
+
+// DELETE /api/ir/map/{action} -> IrRc5::removeAction()
+// {action} - будь-яке імʼя з action_names (мапа, імпортована вручну, може мати й
+// «ненавчальні» дії), не лише learnable.
+void handleIrMapDelete(AsyncWebServerRequest* req) {
+    WEB_LOG("%s %s", req->methodToString(), req->url().c_str());
+
+    const String url = req->url();
+    if (!url.startsWith(kIrMapPrefix)) {
+        sendError(req, 404, "not_found");
+        return;
+    }
+    const char* nm = url.c_str() + strlen(kIrMapPrefix);
+    const size_t len = strlen(nm);
+    if (len == 0 || len > web_cfg::kIrActionNameMaxChars) {
+        sendError(req, 400, "invalid_action");
+        return;
+    }
+    Action a;
+    if (!action_names::fromName(nm, a)) {
+        sendError(req, 400, "unknown_action");
+        return;
+    }
+    if (irLearningNow()) {
+        sendError(req, 409, "learning_active");
+        return;
+    }
+    if (!IrRc5::removeAction(a)) {
+        sendError(req, 404, "no_code_for_action");
+        return;
+    }
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["count"] = IrRc5::mapSize();
+    sendJson(req, 200, doc);
+}
+
+// POST /api/ir/learn {"action":"BASS_UP"} -> AppController::beginIrLearn()
+void handleIrLearnStart(AsyncWebServerRequest* req) {
+    if (!exactUrl(req, "/api/ir/learn")) return;
+    WEB_LOG("%s %s", req->methodToString(), req->url().c_str());
+
+    JsonDocument in;
+    if (!readJsonObjectBody(req, in)) return;
+
+    JsonObjectConst root = in.as<JsonObjectConst>();
+    for (JsonPairConst kv : root) {
+        if (strcmp(kv.key().c_str(), "action") != 0) {
+            sendFieldError(req, 400, "unknown_field", "unknown");
+            return;
+        }
+    }
+    const char* nm = root["action"].is<const char*>() ? root["action"].as<const char*>() : nullptr;
+    if (nm == nullptr) {
+        sendFieldError(req, 400, "invalid_value", "action");
+        return;
+    }
+    Action a;
+    if (!action_names::fromName(nm, a)) {
+        sendFieldError(req, 400, "unknown_action", "action");
+        return;
+    }
+    if (!action_names::isLearnable(a)) {
+        sendFieldError(req, 400, "not_learnable", "action");
+        return;
+    }
+    const AppStateData before = AppState::snapshot();
+    if (before.mode == Mode::IrLearn && irStatusActive(before.irLearnStatus)) {
+        sendError(req, 409, "already_learning");
+        return;
+    }
+    if (!AppController::beginIrLearn(a)) {
+        // Мапа заповнена, IrRc5 відмовив або контролер зайнятий/не запущений.
+        sendError(req, 409, "cannot_start");
+        return;
+    }
+    JsonDocument doc;
+    doc["ok"] = true;
+    fillIrStatus(doc, AppState::snapshot());
+    sendJson(req, 200, doc);
+}
+
+// GET /api/ir/learn/status -> {"status":"Waiting","target":"BASS_UP","conflictWith":null}
+// Success/Timeout лишаються до нового навчання чи cancel (див. app_state.h).
+void handleIrLearnStatus(AsyncWebServerRequest* req) {
+    if (!exactUrl(req, "/api/ir/learn/status")) return;
+    WEB_LOG("%s %s", req->methodToString(), req->url().c_str());
+
+    JsonDocument doc;
+    fillIrStatus(doc, AppState::snapshot());
+    sendJson(req, 200, doc);
+}
+
+// POST /api/ir/learn/confirm-overwrite -> AppController::confirmIrOverwrite()
+void handleIrLearnConfirm(AsyncWebServerRequest* req) {
+    if (!exactUrl(req, "/api/ir/learn/confirm-overwrite")) return;
+    WEB_LOG("%s %s", req->methodToString(), req->url().c_str());
+
+    if (!AppController::confirmIrOverwrite()) {
+        sendError(req, 409, "not_in_conflict");
+        return;
+    }
+    JsonDocument doc;
+    doc["ok"] = true;
+    fillIrStatus(doc, AppState::snapshot());
+    sendJson(req, 200, doc);
+}
+
+// POST /api/ir/learn/cancel -> AppController::cancelIrLearn() (ідемпотентно: поза
+// навчанням просто скидає останній результат у Idle).
+void handleIrLearnCancel(AsyncWebServerRequest* req) {
+    if (!exactUrl(req, "/api/ir/learn/cancel")) return;
+    WEB_LOG("%s %s", req->methodToString(), req->url().c_str());
+
+    AppController::cancelIrLearn();
+    const AppStateData st = AppState::snapshot();
+    // cancelIrLearn() - void: якщо мʼютекс контролера був зайнятий, скасування не
+    // відбулось, і чесна відповідь - 503, а не ok.
+    if (st.mode == Mode::IrLearn && irStatusActive(st.irLearnStatus)) {
+        sendError(req, 503, "busy");
+        return;
+    }
+    JsonDocument doc;
+    doc["ok"] = true;
+    fillIrStatus(doc, st);
+    sendJson(req, 200, doc);
+}
+
+// ---------------------------------------------------------------------------
 // Старт сервера
 // ---------------------------------------------------------------------------
 void registerRoutes(AsyncWebServer& server) {
@@ -1051,6 +1330,18 @@ void registerRoutes(AsyncWebServer& server) {
     server.on("/api/stations/*", HTTP_DELETE, handleStationsDelete);
     server.on("/api/stations", HTTP_GET, handleStationsList);
     server.on("/api/stations", HTTP_POST, handleStationsAdd, nullptr, handleJsonBody);
+
+    // [Prompt 15] /api/ir*. Той самий порядок «спершу точніші»: "/api/ir/learn" (POST)
+    // зіставилось би й з "/api/ir/learn/cancel", тож його реєструємо останнім; те саме
+    // для "/api/ir/map" (GET) відносно "/api/ir/map/*".
+    server.on("/api/ir/actions", HTTP_GET, handleIrActions);
+    server.on("/api/ir/map/import", HTTP_POST, handleIrMapImport, nullptr, handleIrImportBody);
+    server.on("/api/ir/map/*", HTTP_DELETE, handleIrMapDelete);
+    server.on("/api/ir/map", HTTP_GET, handleIrMapGet);
+    server.on("/api/ir/learn/status", HTTP_GET, handleIrLearnStatus);
+    server.on("/api/ir/learn/confirm-overwrite", HTTP_POST, handleIrLearnConfirm);
+    server.on("/api/ir/learn/cancel", HTTP_POST, handleIrLearnCancel);
+    server.on("/api/ir/learn", HTTP_POST, handleIrLearnStart, nullptr, handleJsonBody);
 
     server.onNotFound(handleNotFound);
 }

@@ -1,6 +1,6 @@
 #pragma once
 
-// Константи модуля net/web_server (Prompt 13).
+// Константи модуля net/web_server (Prompt 13; [Prompt 14] станції; [Prompt 15] IR).
 // Порт НЕ дублюється: береться з wifi_cfg::kMdnsHttpPort (той самий, що оголошує
 // mDNS), щоб оголошений і фактичний порт не розійшлись.
 // Часові значення — у мілісекундах.
@@ -50,6 +50,19 @@ constexpr const char* kStationsExportFilename = "stations.json";
 constexpr size_t kStationIndexMaxDigits = 4;
 
 // ---------------------------------------------------------------------------
+// [Prompt 15] IR (/api/ir*)
+// ---------------------------------------------------------------------------
+// Максимальний розмір тіла POST /api/ir/map/import (байти): масив
+// [{"action":"VOL_UP","addr":0,"cmd":16,"rc5x":false},...] ~ 55-60 байт на запис.
+// Більше за kMaxBodyBytes (1024), тож власний ліміт; більше -> 413. Має вміщати
+// найбільшу мапу, яку приймає IrRc5::importJson() (перевір за ємністю мапи в
+// config/ir_config.h при зміні).
+constexpr size_t kIrImportMaxBytes = 8192;
+
+// Максимум символів імені дії в DELETE /api/ir/map/{action} (найдовше: BALANCE_DOWN).
+constexpr size_t kIrActionNameMaxChars = 24;
+
+// ---------------------------------------------------------------------------
 // Одноразова задача-стартер (чекає на Connected, піднімає сервер, видаляє себе)
 // ---------------------------------------------------------------------------
 constexpr int      kStarterTaskCore     = 0;
@@ -82,6 +95,8 @@ static_assert(kInputNameMaxBytes >= 1, "input name must hold at least 1 byte");
 static_assert(kStationsImportMaxBytes >= 4096, "station import limit too small");
 static_assert(kStationsImportTmpPath[0] == '/' && kStationsExportPath[0] == '/',
               "station temp/export paths must be absolute LittleFS paths");
+static_assert(kIrImportMaxBytes >= 4096, "IR map import limit too small");
+static_assert(kIrActionNameMaxChars >= 12, "IR action name limit too small (BALANCE_DOWN)");
 static_assert(kStationIndexMaxDigits >= 3 && kStationIndexMaxDigits <= 5,
               "station index digits out of range");
 

@@ -21,6 +21,16 @@
 // clampStationIndex(): обрізає s_station до [0, count-1] (при count == 0 нічого
 // не робить — це обробляють окремі перевірки) і викликається перед кожним
 // використанням індексу та періодично з tickLocked(). Публічний API не змінено.
+//
+// [Prompt 15] ДОДАНО: навчання IR-пульта (beginIrLearn/cancelIrLearn/confirmIrOverwrite).
+// Mode::IrLearn тепер реально вмикається: попередній Mode запамʼятовується й
+// відновлюється після навчання. Звук і потік під час навчання НЕ чіпаємо (мʼют, ramp,
+// плеєр — як були); для мʼюту «логічний Standby» = Standby АБО навчання, розпочате
+// зі Standby (logicallyStandby()). Статус IrRc5 синхронізується в AppState щотакту
+// tickLocked() (а не раз на kSyncPeriodMs), щоб екран і веб бачили кроки навчання без
+// затримки; поки триває навчання, задача опитує чергу з активним періодом.
+// Success/Timeout показуються ir_learn_ui_cfg::kResultHoldMs і лишаються в AppState як
+// «останній результат» до нового навчання чи cancelIrLearn().
 
 #include "core/app_controller.h"
 
@@ -31,8 +41,10 @@
 #include "audio/audio_processor.h"
 #include "config/app_controller_config.h"
 #include "config/defaults.h"
+#include "config/ir_learn_ui_config.h"  // [Prompt 15] ДОДАНО
 #include "core/app_state.h"
 #include "core/settings.h"
+#include "input/ir_rc5.h"            // [Prompt 15] ДОДАНО
 #include "net/wifi_manager.h"       // [Prompt 12] ДОДАНО
 #include "stations/station_store.h"  // [Prompt 11] ДОДАНО
 
@@ -93,6 +105,15 @@ uint32_t s_lastSyncMs = 0;
 // true: потік потрібен, але Wi-Fi ще немає; playUrl() відкладено до зʼєднання.
 bool s_playPending = false;
 bool s_persistNeeded = false;
+
+// --- [Prompt 15] Навчання IR ---
+Mode s_irPrevMode = Mode::Radio;  // режим ДО навчання; осмислений лише при s_mode == IrLearn
+bool s_irHolding = false;         // фінальний результат (Success/Timeout) вже показується
+uint32_t s_irHoldUntilMs = 0;
+// Остання опублікована в AppState трійка (щоб не смикати мʼютекс стану щотакту).
+IrLearnStatus s_irPubStatus = IrLearnStatus::Idle;
+Action s_irPubTarget = Action::POWER;
+Action s_irPubOther = Action::POWER;
 
 // ---------------------------------------------------------------------------
 // Допоміжне
@@ -283,9 +304,16 @@ bool targetSupported(AdjustTarget t) {
 }
 
 // --- Мʼют атенюаторів ------------------------------------------------------
+// [Prompt 15] «Логічний» Standby: Standby АБО навчання IR, розпочате зі Standby. Без цього
+// вхід у IrLearn зі Standby зняв би мʼют атенюаторів (desiredMute() бачив би
+// mode != Standby) і зовнішній вхід заграв би на «вимкненому» пристрої.
+bool logicallyStandby() {
+    return s_mode == Mode::Standby ||
+           (s_mode == Mode::IrLearn && s_irPrevMode == Mode::Standby);
+}
+
 bool desiredMute() {
-    return s_userMute || s_mode == Mode::Standby || s_phase == Phase::Settle ||
-           s_gainHoldActive;
+    return s_userMute || logicallyStandby() || s_phase == Phase::Settle || s_gainHoldActive;
 }
 
 void applyHardwareMute(bool force = false) {
@@ -396,7 +424,7 @@ void applySync(AppStateData& s, void* c) {
 
 void syncPlayer() {
     SyncCtx c = {};
-    if (s_input == 0 && s_mode != Mode::Standby) {
+    if (s_input == 0 && !logicallyStandby()) {  // [Prompt 15]: було s_mode != Standby
         AudioPlayer::currentMetadata(c.station, sizeof(c.station), c.title, sizeof(c.title));
         if (c.station[0] == '\0') {
             stationLabel(s_station, c.station, sizeof(c.station));
@@ -794,6 +822,175 @@ void handleMainEvent(const Event& e) {
     }
 }
 
+// --- [Prompt 15] Навчання IR -------------------------------------------------
+// Явний мапінг (як PlayerState -> StreamStatus): AppState не залежить від ir_rc5.h.
+IrLearnStatus mapIrStatus(IrRc5::LearnStatus st) {
+    switch (st) {
+        case IrRc5::LearnStatus::Idle:     return IrLearnStatus::Idle;
+        case IrRc5::LearnStatus::Waiting:  return IrLearnStatus::Waiting;
+        case IrRc5::LearnStatus::Confirm:  return IrLearnStatus::Confirm;
+        case IrRc5::LearnStatus::Success:  return IrLearnStatus::Success;
+        case IrRc5::LearnStatus::Timeout:  return IrLearnStatus::Timeout;
+        case IrRc5::LearnStatus::Conflict: return IrLearnStatus::Conflict;
+    }
+    return IrLearnStatus::Idle;
+}
+
+// Навчання триває й чекає користувача (на відміну від Success/Timeout/Idle).
+bool irStatusActive(IrLearnStatus st) {
+    return st == IrLearnStatus::Waiting || st == IrLearnStatus::Confirm ||
+           st == IrLearnStatus::Conflict;
+}
+
+bool irStatusFinal(IrLearnStatus st) {
+    return st == IrLearnStatus::Success || st == IrLearnStatus::Timeout;
+}
+
+struct IrPubCtx {
+    IrLearnStatus status;
+    Action target;
+    Action other;
+};
+
+void applyIrPub(AppStateData& s, void* c) {
+    const IrPubCtx* p = static_cast<const IrPubCtx*>(c);
+    s.irLearnStatus = p->status;
+    s.irLearnTarget = p->target;
+    s.irLearnConflictWith = p->other;
+}
+
+void publishIrLearn(IrLearnStatus st, Action target, Action other) {
+    if (st == s_irPubStatus && target == s_irPubTarget && other == s_irPubOther) {
+        return;
+    }
+    s_irPubStatus = st;
+    s_irPubTarget = target;
+    s_irPubOther = other;
+    IrPubCtx p = {st, target, other};
+    AppState::modify(applyIrPub, &p);
+}
+
+// Вихід з Mode::IrLearn у збережений режим. Викликати лише під s_lock і лише коли
+// s_mode == IrLearn. IrRc5 приводимо в Idle (cancelLearn скидає й Success/Timeout) —
+// це гарантує, що звичайна генерація Action з пульта відновлена. Статус у AppState
+// НЕ чіпаємо: викликач сам вирішує, лишати «липкий» результат чи скидати в Idle.
+void leaveIrLearnMode() {
+    IrRc5::cancelLearn();
+    s_mode = s_irPrevMode;
+    s_irHolding = false;
+    APP_LOG("IR learn end, mode -> %s\n", modeName(s_mode));
+    publishState();
+}
+
+// Явне скасування: одразу назад, статус Idle.
+void abortIrLearn() {
+    publishIrLearn(IrLearnStatus::Idle, s_irPubTarget, s_irPubTarget);
+    leaveIrLearnMode();
+}
+
+// Щотакту (tickLocked): переносить стан IrRc5 в AppState і завершує навчання.
+void syncIrLearn(uint32_t now) {
+    if (s_mode != Mode::IrLearn) {
+        return;
+    }
+    const IrLearnStatus st = mapIrStatus(IrRc5::status());
+    if (st == IrLearnStatus::Idle) {
+        // Навчання зникло з-під нас (хтось викликав IrRc5::cancelLearn() повз контролер).
+        abortIrLearn();
+        return;
+    }
+    const Action target = IrRc5::learnTarget();
+    Action other = target;
+    if (st == IrLearnStatus::Conflict) {
+        Action o;
+        if (IrRc5::learnConflictWith(o)) {
+            other = o;
+        }
+    }
+    publishIrLearn(st, target, other);
+
+    if (irStatusFinal(st)) {
+        if (!s_irHolding) {
+            s_irHolding = true;
+            s_irHoldUntilMs = now + ir_learn_ui_cfg::kResultHoldMs;
+            APP_LOG("IR learn result %s, hold %u ms\n",
+                    st == IrLearnStatus::Success ? "Success" : "Timeout",
+                    static_cast<unsigned>(ir_learn_ui_cfg::kResultHoldMs));
+        } else if (reached(now, s_irHoldUntilMs)) {
+            leaveIrLearnMode();  // статус Success/Timeout лишається в AppState
+        }
+    } else {
+        s_irHolding = false;
+    }
+}
+
+// Події під час навчання. Звичайні кнопки/енкодер ігноруються; пульт і так
+// призупинений в IrRc5. POWER -> Standby, MENU/BACK -> попередній режим.
+void handleIrLearnEvent(const Event& e) {
+    if (e.repeat || e.longPress) {
+        return;
+    }
+    switch (e.action) {
+        case Action::POWER: {
+            const bool wasStandby = (s_irPrevMode == Mode::Standby);
+            abortIrLearn();
+            if (!wasStandby) {
+                enterStandby();
+            }
+            break;
+        }
+        case Action::MENU:
+        case Action::BACK:
+            abortIrLearn();
+            break;
+        default:
+            break;
+    }
+}
+
+bool beginIrLearnLocked(Action target) {
+    if (s_mode == Mode::IrLearn) {
+        if (irStatusActive(mapIrStatus(IrRc5::status()))) {
+            return false;  // навчання триває: спершу cancelIrLearn()
+        }
+        leaveIrLearnMode();  // на екрані ще результат попереднього - знімаємо одразу
+    }
+    if (!IrRc5::beginLearn(target)) {
+        return false;
+    }
+    s_irPrevMode = s_mode;
+    s_mode = Mode::IrLearn;
+    s_irHolding = false;
+    IrLearnStatus st = mapIrStatus(IrRc5::status());
+    if (st == IrLearnStatus::Idle) {
+        st = IrLearnStatus::Waiting;
+    }
+    publishIrLearn(st, target, target);
+    APP_LOG("IR learn begin, mode %s -> IrLearn\n", modeName(s_irPrevMode));
+    publishState();
+    return true;
+}
+
+bool confirmIrOverwriteLocked() {
+    if (s_mode != Mode::IrLearn || mapIrStatus(IrRc5::status()) != IrLearnStatus::Conflict) {
+        return false;
+    }
+    if (!IrRc5::confirmOverwrite()) {
+        return false;
+    }
+    syncIrLearn(millis());  // одразу публікуємо Success (запускає паузу показу результату)
+    return true;
+}
+
+void cancelIrLearnLocked() {
+    if (s_mode == Mode::IrLearn) {
+        abortIrLearn();
+        return;
+    }
+    IrRc5::cancelLearn();  // поза навчанням: лише скидаємо «липкий» результат
+    publishIrLearn(IrLearnStatus::Idle, s_irPubTarget, s_irPubTarget);
+}
+
 void handleLocked(const Event& e) {
 #if APP_CONTROLLER_LOG_EVENTS && APP_CONTROLLER_DEBUG
     Serial.printf("[APP] evt %s %s%s%s delta=%d\n", sourceName(e.source), actionName(e.action),
@@ -801,14 +998,18 @@ void handleLocked(const Event& e) {
                   static_cast<int>(e.delta));
 #endif
 
-    if (e.action == Action::POWER) {
+    if (s_mode == Mode::IrLearn) {
+        // [Prompt 15] Навчання IR: окрема гілка (POWER тут НЕ перемикає Standby, а
+        // скасовує навчання й веде в Standby).
+        handleIrLearnEvent(e);
+    } else if (e.action == Action::POWER) {
         if (!e.longPress && !e.repeat) {
             togglePower();
         } else {
             APP_LOG("POWER long/repeat ignored\n");
         }
-    } else if (s_mode == Mode::Standby || s_mode == Mode::IrLearn) {
-        // Standby: усе, крім POWER, ігнорується. IrLearn поки ніхто не вмикає.
+    } else if (s_mode == Mode::Standby) {
+        // Standby: усе, крім POWER, ігнорується.
         // [Prompt 12] WifiSetup тут більше не ігнорується: перемикання входу й
         // гучність працюють (радіо без Wi-Fi недоступне, зовнішні входи — так).
     } else {
@@ -916,6 +1117,7 @@ void tickLocked() {
     }
 
     followWifiMode();  // [Prompt 12] ДОДАНО
+    syncIrLearn(now);  // [Prompt 15] ДОДАНО
 
     if (s_playPending && s_input == 0 &&
         (s_mode == Mode::Radio || s_mode == Mode::Menu) && wifiUp()) {
@@ -948,7 +1150,9 @@ void tick() {
 void taskMain(void*) {
     for (;;) {
         // Читаємо без мʼютекса: це лише вибір тайм-ауту, хибне значення безпечне.
-        const bool active = (s_phase != Phase::None) || s_gainHoldActive;
+        // [Prompt 15]: під час навчання IR теж активний (короткий) період опитування.
+        const bool active =
+            (s_phase != Phase::None) || s_gainHoldActive || (s_mode == Mode::IrLearn);
         Event ev;
         const TickType_t timeout =
             pdMS_TO_TICKS(active ? cfg::kActivePollMs : cfg::kIdlePollMs);
@@ -1003,6 +1207,36 @@ bool AppController::setTone(ToneUpdate& u) {
     }
     xSemaphoreGiveRecursive(s_lock);
     return true;
+}
+
+// [Prompt 15] ДОДАНО: навчання IR
+bool AppController::beginIrLearn(Action target) {
+    if (!s_started || s_lock == nullptr ||
+        xSemaphoreTakeRecursive(s_lock, pdMS_TO_TICKS(cfg::kLockTimeoutMs)) != pdTRUE) {
+        return false;
+    }
+    const bool ok = beginIrLearnLocked(target);
+    xSemaphoreGiveRecursive(s_lock);
+    return ok;
+}
+
+void AppController::cancelIrLearn() {
+    if (!s_started || s_lock == nullptr ||
+        xSemaphoreTakeRecursive(s_lock, pdMS_TO_TICKS(cfg::kLockTimeoutMs)) != pdTRUE) {
+        return;
+    }
+    cancelIrLearnLocked();
+    xSemaphoreGiveRecursive(s_lock);
+}
+
+bool AppController::confirmIrOverwrite() {
+    if (!s_started || s_lock == nullptr ||
+        xSemaphoreTakeRecursive(s_lock, pdMS_TO_TICKS(cfg::kLockTimeoutMs)) != pdTRUE) {
+        return false;
+    }
+    const bool ok = confirmIrOverwriteLocked();
+    xSemaphoreGiveRecursive(s_lock);
+    return ok;
 }
 
 bool AppController::begin(AudioProcessor* processorOrNull) {

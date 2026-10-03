@@ -11,6 +11,8 @@
 //    Mode::Menu/StationList. StationStore — модуль чистих даних (не залізо, не
 //    читає EventBus, не впливає на звуковий тракт), тому читати його напряму
 //    дозволено; правило «AppController — єдиний власник заліза» не порушується.
+//  - [Prompt 15] core/action_names — таблиця імен Action (чисті дані без стану) для
+//    екрана Mode::IrLearn; стан навчання береться з AppState (irLearn*), а не з IrRc5.
 // UiScreens не володіє задачею, не читає EventBus, не знає про спрайти.
 
 class UiScreens {

@@ -13,9 +13,15 @@
 // [Prompt 12] ДОДАНО: wifiSsid, wifiIp, wifiApMode (лише в кінець структури) —
 // дані net/wifi_manager для екрана Mode::WifiSetup. wifiConnected (Prompt 6)
 // тепер заповнюється з WifiManager::isConnected().
+// [Prompt 15] ДОДАНО: enum IrLearnStatus та поля irLearnTarget, irLearnStatus,
+// irLearnConflictWith (лише в кінець структури) — стан навчання IR-пульта для
+// екрана Mode::IrLearn та веб-API. Нульові значення = Idle. Підключено
+// core/events.h (потрібен лише тип Action).
 
 #include <Arduino.h>
 #include <stdint.h>
+
+#include "core/events.h"  // [Prompt 15] ДОДАНО: тип Action
 
 // Режими пристрою.
 enum class Mode : uint8_t {
@@ -55,6 +61,20 @@ enum class StreamStatus : uint8_t {
     Playing,      // потік грає
     Error,        // потік обірвався/не підключився
     Reconnecting, // повторна спроба підключення після Error
+};
+
+// [Prompt 15] ДОДАНО: стан навчання IR для UI/вебу. Незалежно від input/ir_rc5.h
+// (так само, як StreamStatus від audio_player.h): AppController мапить
+// IrRc5::LearnStatus явним switch. Success/Timeout лишаються в AppState і ПІСЛЯ
+// повернення з Mode::IrLearn — доки не почнеться нове навчання чи не буде
+// cancelIrLearn() — щоб веб-клієнт, який опитує статус, не пропустив результат.
+enum class IrLearnStatus : uint8_t {
+    Idle,      // навчання не було / скасовано
+    Waiting,   // чекаємо перше натискання
+    Confirm,   // перший код прийнято, чекаємо такого ж другого
+    Success,   // код привʼязано й збережено
+    Timeout,   // вичерпано час очікування
+    Conflict,  // код уже привʼязаний до іншої дії; чекаємо рішення з вебу
 };
 
 // Дані стану.
@@ -101,6 +121,13 @@ struct AppStateData {
     char wifiIp[16];
     // true: пристрій у режимі AP (captive portal), STA не підключена.
     bool wifiApMode;
+
+    // --- [Prompt 15] ДОДАНО ---
+    // Дія, яку навчають; осмислена, коли irLearnStatus != Idle.
+    Action irLearnTarget;
+    IrLearnStatus irLearnStatus;
+    // З якою дією конфлікт кодів; осмислене лише при irLearnStatus == Conflict.
+    Action irLearnConflictWith;
 };
 
 class AppState {
