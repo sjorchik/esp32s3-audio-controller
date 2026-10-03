@@ -20,7 +20,7 @@
 // УВАГА: AudioProcTest і AudioPlayerTest читають той самий Serial, тому при
 // AUDIO_PLAYER_TEST == 1 main.cpp НЕ запускає AudioProcTest (див. main.cpp).
 // Гучність процесора в цьому режимі — команда `vol`.
-#define AUDIO_PLAYER_TEST 1
+#define AUDIO_PLAYER_TEST 0
 
 // Serial-лог плеєра: зміни стану, мʼют, перепідключення ("[PLAYER] ...").
 #define AUDIO_PLAYER_DEBUG 1
@@ -173,12 +173,6 @@ constexpr uint32_t kTestPollMs         = 20;
 
 // Максимальна довжина рядка команди разом із '\0' (URL і hex-рядки довгі).
 constexpr size_t   kTestLineMax        = 200;
-
-// Тимчасове Wi-Fi ТІЛЬКИ для тесту (WifiManager ще немає). Порожній SSID =
-// не підключатись автоматично; підключення командою `wifi <ssid> <pass>`.
-// НЕ комітьте сюди реальний пароль.
-constexpr const char* kTestWifiSsid = "";
-constexpr const char* kTestWifiPass = "";
 
 // Тестові станції. URL ПУБЛІЧНІ, але їхню працездатність я не перевіряв
 // (доступу до мережі не було): стріми можуть змінити адресу, кодек чи піти на

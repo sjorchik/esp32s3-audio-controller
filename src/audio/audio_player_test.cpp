@@ -9,11 +9,11 @@
 //                             перевірки перепідключення)
 //   stop                    — зупинити (скасовує перепідключення)
 //   info                    — стан, метадані, лічильники, XSMT, Wi-Fi, памʼять
-//   wifi                    — стан Wi-Fi
-//   wifi <ssid> <password>  — підключити Wi-Fi (ТІЛЬКИ для тесту, у NVS не
-//                             зберігається; пароль — усе після першого пробілу)
-//   wifioff                 — відключити Wi-Fi (симуляція обриву мережі)
-//   wifion                  — знову підключитись із запамʼятованими даними
+//
+// [Prompt 12] Тимчасові команди `wifi`, `wifioff`, `wifion` та константи
+// player_cfg::kTestWifiSsid/Pass прибрано: Wi-Fi тепер повністю належить
+// net/wifi_manager (інакше обидва модулі смикали б WiFi.begin()/режим).
+// Для відтворення потрібна мережа, налаштована через портал AudioCtrl-Setup.
 //   norm <hex>              — прогнати байти ICY-рядка (hex, напр. CEEAE5E0ED)
 //                             через визначення кодування й перекодування
 //   vol <0..100>            — гучність AudioProcessor (якщо він переданий)
@@ -24,7 +24,6 @@
 #if AUDIO_PLAYER_TEST
 
 #include <Arduino.h>
-#include <WiFi.h>
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -34,45 +33,18 @@
 #include "audio/audio_processor.h"
 #include "config/audio_player_config.h"
 #include "config/pins.h"
+#include "net/wifi_manager.h"  // [Prompt 12] ДОДАНО: лише читання стану Wi-Fi
 
 namespace {
 
 AudioProcessor* s_proc = nullptr;
 TaskHandle_t s_task = nullptr;
-bool s_wifiEventsRegistered = false;
-
-char s_ssid[33];
-char s_pass[65];
-bool s_haveCreds = false;
-
-// Події Wi-Fi лише друкуємо (WifiManager ще немає).
-void onWifiEvent(arduino_event_id_t event) {
-    if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
-        Serial.printf("[PTEST] wifi got IP %s\n", WiFi.localIP().toString().c_str());
-    } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
-        Serial.println("[PTEST] wifi disconnected");
-    }
-}
-
-void wifiStart(const char* ssid, const char* pass) {
-    if (!s_wifiEventsRegistered) {
-        WiFi.onEvent(onWifiEvent, ARDUINO_EVENT_WIFI_STA_GOT_IP);
-        WiFi.onEvent(onWifiEvent, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
-        s_wifiEventsRegistered = true;
-    }
-    WiFi.persistent(false);  // не писати облікові дані у flash
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);  // економія енергії Wi-Fi шкодить безперервному потоку
-    WiFi.begin(ssid, pass);
-    Serial.printf("[PTEST] wifi connecting to \"%s\"...\n", ssid);
-}
 
 void printHelp() {
     Serial.println("[PTEST] commands:");
     Serial.println("  play <N|url>   play test station N (1..) or an http(s) URL");
     Serial.println("  stop           stop playback");
     Serial.println("  info           state, metadata, counters, XSMT, Wi-Fi");
-    Serial.println("  wifi [ssid pass] / wifioff / wifion   test-only Wi-Fi control");
     Serial.println("  norm <hex>     test ICY encoding detection, e.g. norm CEEAE5E0ED");
     Serial.println("  vol <0..100>   AudioProcessor volume");
     Serial.println("  pmute <0|1>    AudioProcessor speaker mute (independent of XSMT)");
@@ -98,8 +70,11 @@ void printInfo() {
                   static_cast<unsigned long>(AudioPlayer::bufferUnderrunCount()),
                   AudioPlayer::lastHttpCode());
     Serial.printf("[PTEST] XSMT pin level=%d (0 = muted)\n", digitalRead(pins::kXsmt));
+    char wifiSsid[33];
+    char wifiIp[16];
+    WifiManager::copyInfo(wifiSsid, sizeof(wifiSsid), wifiIp, sizeof(wifiIp));
     Serial.printf("[PTEST] wifi=%s heap=%u psram=%u\n",
-                  (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString().c_str() : "down",
+                  WifiManager::isConnected() ? wifiIp : "down",
                   static_cast<unsigned>(ESP.getFreeHeap()),
                   static_cast<unsigned>(ESP.getFreePsram()));
 }
@@ -124,33 +99,6 @@ void cmdPlay(const char* arg) {
     const size_t idx = static_cast<size_t>(n - 1);
     Serial.printf("[PTEST] play %ld: %s -> %s\n", n, player_cfg::kTestStationNames[idx],
                   AudioPlayer::playUrl(player_cfg::kTestStationUrls[idx]) ? "queued" : "REJECTED");
-}
-
-void cmdWifi(const char* arg) {
-    if (arg[0] == '\0') {
-        Serial.printf("[PTEST] wifi status=%d ip=%s\n", static_cast<int>(WiFi.status()),
-                      WiFi.localIP().toString().c_str());
-        return;
-    }
-    const char* sp = strchr(arg, ' ');
-    const size_t ssidLen = (sp != nullptr) ? static_cast<size_t>(sp - arg) : strlen(arg);
-    if (ssidLen == 0 || ssidLen >= sizeof(s_ssid)) {
-        Serial.println("[PTEST] bad ssid");
-        return;
-    }
-    memcpy(s_ssid, arg, ssidLen);
-    s_ssid[ssidLen] = '\0';
-    s_pass[0] = '\0';
-    if (sp != nullptr) {
-        while (*sp == ' ') ++sp;
-        if (strlen(sp) >= sizeof(s_pass)) {
-            Serial.println("[PTEST] password too long");
-            return;
-        }
-        strcpy(s_pass, sp);
-    }
-    s_haveCreds = true;
-    wifiStart(s_ssid, s_pass);
 }
 
 void cmdNorm(const char* arg) {
@@ -227,17 +175,6 @@ void execute(char* line) {
         Serial.printf("[PTEST] stop -> %s\n", AudioPlayer::stop() ? "queued" : "REJECTED");
     } else if (strcmp(cmd, "info") == 0) {
         printInfo();
-    } else if (strcmp(cmd, "wifi") == 0) {
-        cmdWifi(arg);
-    } else if (strcmp(cmd, "wifioff") == 0) {
-        WiFi.disconnect(false, false);
-        Serial.println("[PTEST] wifi off (network outage simulation)");
-    } else if (strcmp(cmd, "wifion") == 0) {
-        if (s_haveCreds) {
-            wifiStart(s_ssid, s_pass);
-        } else {
-            Serial.println("[PTEST] no saved credentials: use `wifi <ssid> <pass>`");
-        }
     } else if (strcmp(cmd, "norm") == 0) {
         cmdNorm(arg);
     } else if (strcmp(cmd, "vol") == 0) {
@@ -284,13 +221,6 @@ bool AudioPlayerTest::begin(AudioProcessor* processorOrNull) {
         return true;
     }
     s_proc = processorOrNull;
-
-    if (player_cfg::kTestWifiSsid[0] != '\0') {
-        strncpy(s_ssid, player_cfg::kTestWifiSsid, sizeof(s_ssid) - 1);
-        strncpy(s_pass, player_cfg::kTestWifiPass, sizeof(s_pass) - 1);
-        s_haveCreds = true;
-        wifiStart(s_ssid, s_pass);
-    }
 
     const BaseType_t ok = xTaskCreatePinnedToCore(
         testTask, "player_test", player_cfg::kTestTaskStackBytes, nullptr,

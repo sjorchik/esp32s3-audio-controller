@@ -10,6 +10,9 @@
 // іменами чи агрегатно, лишається чинним (нові поля нульові).
 // [Prompt 10] ДОДАНО: enum StreamStatus та поле streamStatus для детального
 // статусу потоку у UI. Незалежно від audio/audio_player.h.
+// [Prompt 12] ДОДАНО: wifiSsid, wifiIp, wifiApMode (лише в кінець структури) —
+// дані net/wifi_manager для екрана Mode::WifiSetup. wifiConnected (Prompt 6)
+// тепер заповнюється з WifiManager::isConnected().
 
 #include <Arduino.h>
 #include <stdint.h>
@@ -90,6 +93,14 @@ struct AppStateData {
     // --- [Prompt 10] ДОДАНО ---
     // Детальний статус потоку для UI (Idle/Connecting/Buffering/Playing/Error/Reconnecting).
     StreamStatus streamStatus;
+
+    // --- [Prompt 12] ДОДАНО ---
+    // Поточна Wi-Fi мережа (STA) або назва точки доступу (AP); "" якщо невідомо.
+    char wifiSsid[33];
+    // IP: отриманий (STA) або адреса AP ("192.168.4.1"); "" якщо немає.
+    char wifiIp[16];
+    // true: пристрій у режимі AP (captive portal), STA не підключена.
+    bool wifiApMode;
 };
 
 class AppState {

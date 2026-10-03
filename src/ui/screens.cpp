@@ -278,6 +278,16 @@ void drawPlaceholder(const char* text) {
     drawCentered(text, c::kPlaceholderY, FontSize::Large, dc::kColorFg);
 }
 
+// [Prompt 12] Екран Mode::WifiSetup: до чого підключитись і що відкрити на телефоні.
+void drawWifiSetup(const AppStateData& s) {
+    drawCentered("Setup Wi-Fi", c::kWifiSetupTitleY, FontSize::Large, dc::kColorFg);
+    drawCentered(s.wifiSsid[0] ? s.wifiSsid : defaults::kApSsid, c::kWifiSetupSsidY,
+                 FontSize::Small, c::kColorAccent);
+    char url[32];
+    snprintf(url, sizeof(url), "http://%s", s.wifiIp[0] ? s.wifiIp : "192.168.4.1");
+    drawCentered(url, c::kWifiSetupIpY, FontSize::Small, c::kColorDim);
+}
+
 // ---------------------------------------------------------------------------
 // Підсвітка при вході/виході зі Standby
 // ---------------------------------------------------------------------------
@@ -335,7 +345,7 @@ bool frame() {
             else                                           drawPlaceholder("Menu (TODO)");
             break;
         case Mode::IrLearn:       drawPlaceholder("IR Learn (TODO)");   break;
-        case Mode::WifiSetup:     drawPlaceholder("Wi-Fi Setup (TODO)"); break;
+        case Mode::WifiSetup:     drawWifiSetup(s);              break;
         default:                  drawPlaceholder("?");          break;
     }
     return true;

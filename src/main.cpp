@@ -18,7 +18,10 @@
 //   тимчасовий друк подій (INPUT_DEMO_PRINT_EVENTS) прибрано, loop() порожній.
 // - [Prompt 11] StationStore стартує всередині AppController::begin(); тут лише
 //   Serial-тест станцій (команди `st.*`).
-// Мережа (net/*) не реалізується.
+// - [Prompt 12] WifiManager::begin(wifiResetRequested) викликається тут, окремо від
+//   AppController::begin() (сигнатуру AppController не змінено); WifiManager сам
+//   піднімає mDNS після підключення.
+// Веб-сервер (net/web_server) не реалізується.
 
 #include <Arduino.h>
 #include <LittleFS.h>
@@ -46,6 +49,7 @@
 #include "input/buttons.h"
 #include "input/encoder.h"
 #include "input/ir_rc5.h"  // [Prompt 2] ДОДАНО
+#include "net/wifi_manager.h"  // [Prompt 12] ДОДАНО
 #include "stations/station_store_test.h"  // [Prompt 11] ДОДАНО
 #include "ui/display.h"    // [Prompt 4] ДОДАНО
 #include "ui/screens.h"   // [Prompt 9] ДОДАНО
@@ -273,6 +277,16 @@ static void initSettingsTest() {
 #endif
 }
 
+// [Prompt 12] ДОДАНО: Wi-Fi менеджер. Створює власну задачу й одразу повертається;
+// forceReset = утримання OK при старті (стерти збережену мережу -> AP).
+static void initWifi(bool forceReset) {
+    if (WifiManager::begin(forceReset)) {
+        Serial.println("[MAIN] WifiManager started");
+    } else {
+        Serial.println("[MAIN] WifiManager init failed");
+    }
+}
+
 // [Prompt 8] ДОДАНО: AppController. Останній з модулів, від яких він залежить
 // (EventBus, Settings, аудіопроцесор, плеєр). Вказівник на процесор передається
 // лише якщо begin() процесора пройшов успішно (так само, як для плеєра).
@@ -317,7 +331,7 @@ void setup() {
     // Утримання OK при старті = запит скидання Wi-Fi.
     // Перевірка йде ДО запуску задач і не залежить від EventBus.
     // Без утримання повертається за ~5 мс.
-    // TODO (WifiManager): передати wifiResetRequested у логіку старту Wi-Fi.
+    // [Prompt 12] wifiResetRequested передається в WifiManager::begin() нижче.
     const bool wifiResetRequested =
         Buttons::isHeldAtBoot(pins::kBtnOk, input_cfg::kBootWifiResetHoldMs);
     if (wifiResetRequested) {
@@ -364,6 +378,10 @@ void setup() {
 
     // [Prompt 5] ДОДАНО: аудіоплеєр (після процесора, щоб передати вказівник).
     initAudioPlayer();
+
+    // [Prompt 12] ДОДАНО: Wi-Fi після плеєра, але до AppController, щоб перший
+    // синхронізований стан AppController уже бачив Connecting/AP.
+    initWifi(wifiResetRequested);
 
     // [Prompt 8] ДОДАНО: AppController після процесора, плеєра й Settings.
     initAppController();

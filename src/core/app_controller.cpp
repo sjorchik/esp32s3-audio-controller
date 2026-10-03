@@ -7,11 +7,16 @@
 //
 // [Prompt 11] Список станцій береться зі StationStore (LittleFS), а не з
 // тестових констант плеєра.
+//
+// [Prompt 12] Стан Wi-Fi береться з WifiManager (прямі виклики WiFi.* прибрано).
+// Коли WifiManager піднімає AP, а вхід — Radio, контролер переходить у
+// Mode::WifiSetup (екран з назвою AP та адресою). Зовнішні входи від Wi-Fi не
+// залежать і лишаються робочими; зі WifiSetup можна перемикати вхід і міняти
+// гучність.
 
 #include "core/app_controller.h"
 
 #include <Arduino.h>
-#include <WiFi.h>
 #include <string.h>
 
 #include "audio/audio_player.h"
@@ -20,6 +25,7 @@
 #include "config/defaults.h"
 #include "core/app_state.h"
 #include "core/settings.h"
+#include "net/wifi_manager.h"       // [Prompt 12] ДОДАНО
 #include "stations/station_store.h"  // [Prompt 11] ДОДАНО
 
 namespace cfg = app_controller_cfg;
@@ -192,9 +198,9 @@ void stationLabel(uint16_t i, char* out, size_t cap) {
 // --- Потік і Wi-Fi ---------------------------------------------------------
 // AudioPlayer сам Wi-Fi не перевіряє, а без піднятого мережевого стеку
 // бібліотека падає в assert (xQueueSemaphoreTake). Тому playUrl() викликаємо
-// лише при підключеному Wi-Fi. TODO (Prompt 12): замінити на WifiManager.
+// лише при підключеному Wi-Fi. [Prompt 12] Джерело — WifiManager.
 bool wifiUp() {
-    return WiFi.status() == WL_CONNECTED;
+    return WifiManager::isConnected();
 }
 
 void startStream() {
@@ -343,6 +349,10 @@ struct SyncCtx {
     bool playing;
     bool wifi;
     StreamStatus status;  // [Prompt 10] ДОДАНО: детальний статус поток
+    // [Prompt 12] ДОДАНО: дані WifiManager для екрана WifiSetup.
+    char wifiSsid[33];
+    char wifiIp[16];
+    bool wifiApMode;
 };
 
 void applySync(AppStateData& s, void* c) {
@@ -352,6 +362,11 @@ void applySync(AppStateData& s, void* c) {
     s.streamPlaying = x->playing;
     s.wifiConnected = x->wifi;
     s.streamStatus = x->status;  // [Prompt 10] ДОДАНО
+    // [Prompt 12] memcpy усього буфера (хвіст обнулено в copyInfo): однакові рядки
+    // дають однакові байти, тож screens не перемальовує екран без потреби.
+    memcpy(s.wifiSsid, x->wifiSsid, sizeof(s.wifiSsid));
+    memcpy(s.wifiIp, x->wifiIp, sizeof(s.wifiIp));
+    s.wifiApMode = x->wifiApMode;
 }
 
 void syncPlayer() {
@@ -364,7 +379,10 @@ void syncPlayer() {
     }
     c.playing = AudioPlayer::isPlaying();
     c.wifi = wifiUp();
-    
+    // [Prompt 12] ДОДАНО
+    WifiManager::copyInfo(c.wifiSsid, sizeof(c.wifiSsid), c.wifiIp, sizeof(c.wifiIp));
+    c.wifiApMode = WifiManager::isApMode();
+
     // [Prompt 10] ДОДАНО: маппінг PlayerState → StreamStatus за назвою
     // audio_player.h::PlayerState і core/app_state.h::StreamStatus мають однакові
     // стани, але різний порядок значень, тому маппуємо явно для безпеки й ясності.
@@ -708,13 +726,17 @@ void handleMainEvent(const Event& e) {
             if (plain) stepInput(cfg::kInputDownStep);
             break;
         case Action::LEFT:
-            if (plain && s_input == 0) stepStation(cfg::kStationLeftStep);
+            if (plain && s_input == 0 && s_mode != Mode::WifiSetup) {
+                stepStation(cfg::kStationLeftStep);
+            }
             break;
         case Action::RIGHT:
-            if (plain && s_input == 0) stepStation(cfg::kStationRightStep);
+            if (plain && s_input == 0 && s_mode != Mode::WifiSetup) {
+                stepStation(cfg::kStationRightStep);
+            }
             break;
         case Action::OK:
-            if (s_input == 0) {
+            if (s_input == 0 && s_mode != Mode::WifiSetup) {  // [Prompt 12]: у WifiSetup потоку немає
                 if (e.longPress) {
                     openStationList();
                 } else if (!e.repeat) {
@@ -747,10 +769,10 @@ void handleLocked(const Event& e) {
         } else {
             APP_LOG("POWER long/repeat ignored\n");
         }
-    } else if (s_mode == Mode::Standby || s_mode == Mode::IrLearn ||
-               s_mode == Mode::WifiSetup) {
-        // Standby: усе, крім POWER, ігнорується. IrLearn/WifiSetup поки ніхто
-        // не вмикає (Prompt 9+).
+    } else if (s_mode == Mode::Standby || s_mode == Mode::IrLearn) {
+        // Standby: усе, крім POWER, ігнорується. IrLearn поки ніхто не вмикає.
+        // [Prompt 12] WifiSetup тут більше не ігнорується: перемикання входу й
+        // гучність працюють (радіо без Wi-Fi недоступне, зовнішні входи — так).
     } else {
         bool handled = true;
         switch (e.action) {
@@ -795,6 +817,29 @@ void handleLocked(const Event& e) {
     }
 }
 
+// --- Wi-Fi і Mode::WifiSetup ------------------------------------------------
+// [Prompt 12] AP піднято + вхід Radio -> WifiSetup; AP зникла -> назад у Radio.
+// Зовнішні входи, Standby, Menu/IrLearn не чіпаємо. Режим міняється тут, у tick(),
+// тож публікуємо стан одразу (handleLocked() цього не зробить).
+void followWifiMode() {
+    const bool ap = WifiManager::isApMode();
+    Mode want = s_mode;
+    if (ap && s_mode == Mode::Radio) {
+        want = Mode::WifiSetup;
+    } else if (!ap && s_mode == Mode::WifiSetup) {
+        want = Mode::Radio;
+    }
+    if (want == s_mode) {
+        return;
+    }
+    s_mode = want;
+    // WifiSetup: відкладений старт потоку не потрібен (AP завершується перезапуском).
+    // Назад у Radio: дозволити відкладений старт, коли зʼявиться Wi-Fi.
+    s_playPending = (want == Mode::Radio);
+    APP_LOG("mode -> %s (Wi-Fi)\n", modeName(s_mode));
+    publishState();
+}
+
 // --- Періодика (ramp, таймери, синхронізація) -------------------------------
 void tickLocked() {
     const uint32_t now = millis();
@@ -831,6 +876,8 @@ void tickLocked() {
         static_cast<uint32_t>(now - s_lastMuteTryMs) >= cfg::kMuteRetryMs) {
         applyHardwareMute();
     }
+
+    followWifiMode();  // [Prompt 12] ДОДАНО
 
     if (s_playPending && s_input == 0 &&
         (s_mode == Mode::Radio || s_mode == Mode::Menu) && wifiUp()) {

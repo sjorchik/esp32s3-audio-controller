@@ -61,8 +61,13 @@ constexpr uint8_t kListRows     = 5;
 constexpr int16_t kListTextX    = 14;
 constexpr int16_t kListTextDy   = 5;               // відступ тексту від верху рядка
 
-// --- Плейсхолдер (Menu без контексту, IrLearn, WifiSetup) ---
+// --- Плейсхолдер (Menu без контексту, IrLearn) ---
 constexpr int16_t kPlaceholderY = 73;              // Large, по центру
+
+// --- [Prompt 12] WifiSetup: заголовок Large, під ним SSID і адреса Small ---
+constexpr int16_t kWifiSetupTitleY = 48;
+constexpr int16_t kWifiSetupSsidY  = 88;
+constexpr int16_t kWifiSetupIpY    = 112;
 
 // --- Marquee ---
 constexpr uint32_t kMarqueeStepMs      = 40;       // крок зсуву
@@ -76,6 +81,10 @@ static_assert(kTrackY + display_cfg::kFontSmallPx < kVuY, "track overlaps VU fra
 static_assert(kStationY + display_cfg::kFontLargePx < kTrackY, "station overlaps track");
 static_assert(kListFirstY + kListRows * kListRowH <= kH, "station list out of screen");
 static_assert(kMuteIconX > kMargin, "icons overflow top bar");
+static_assert(kWifiSetupTitleY + display_cfg::kFontLargePx < kWifiSetupSsidY &&
+                  kWifiSetupSsidY + display_cfg::kFontSmallPx < kWifiSetupIpY &&
+                  kWifiSetupIpY + display_cfg::kFontSmallPx <= kH,
+              "WifiSetup layout overlaps or leaves the screen");
 static_assert(kMarqueeStepMs > 0 && kMarqueeStepPx > 0, "marquee step must be positive");
 
 }  // namespace screens_cfg
