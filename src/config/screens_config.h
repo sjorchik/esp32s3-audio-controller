@@ -66,6 +66,15 @@ constexpr int16_t kIrStatusY = 24;
 constexpr int16_t kIrActionY = 62;
 constexpr int16_t kIrHintY   = 108;
 
+// --- [Prompt 16] OtaUpdate: заголовок Large, відсоток Large, смуга, підказка Small ---
+constexpr int16_t kOtaTitleY   = 28;
+constexpr int16_t kOtaPercentY = 64;
+constexpr int16_t kOtaBarX     = kMargin;
+constexpr int16_t kOtaBarY     = 106;
+constexpr int16_t kOtaBarW     = kContentW;
+constexpr int16_t kOtaBarH     = 16;
+constexpr int16_t kOtaHintY    = 136;
+
 // --- Плейсхолдер (Menu без контексту) ---
 constexpr int16_t kPlaceholderY = 73;              // Large, по центру
 
@@ -94,6 +103,11 @@ static_assert(kIrStatusY + display_cfg::kFontSmallPx < kIrActionY &&
                   kIrActionY + display_cfg::kFontLargePx < kIrHintY &&
                   kIrHintY + display_cfg::kFontSmallPx <= kH,
               "IrLearn layout overlaps or leaves the screen");
+static_assert(kOtaTitleY + display_cfg::kFontLargePx < kOtaPercentY &&
+                  kOtaPercentY + display_cfg::kFontLargePx < kOtaBarY &&
+                  kOtaBarY + kOtaBarH < kOtaHintY &&
+                  kOtaHintY + display_cfg::kFontSmallPx <= kH,
+              "OtaUpdate layout overlaps or leaves the screen");
 static_assert(kMarqueeStepMs > 0 && kMarqueeStepPx > 0, "marquee step must be positive");
 
 }  // namespace screens_cfg

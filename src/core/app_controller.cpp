@@ -31,6 +31,12 @@
 // затримки; поки триває навчання, задача опитує чергу з активним періодом.
 // Success/Timeout показуються ir_learn_ui_cfg::kResultHoldMs і лишаються в AppState як
 // «останній результат» до нового навчання чи cancelIrLearn().
+//
+// [Prompt 16] ДОДАНО: OTA-оновлення (beginOta/setOtaProgress/otaFailed). Mode::OtaUpdate:
+// звук зупинено (stopStream), атенюатори замʼючені (desiredMute()), усі події ігноруються
+// (навіть POWER), setTone()/beginIrLearn() відмовляють. Попередній Mode запамʼятовується й
+// відновлюється лише на невдачі; на успіху пристрій перезапускає web_server. Якщо
+// otaFailed() не отримав мʼютекс, відновлення робить найближчий tickLocked().
 
 #include "core/app_controller.h"
 
@@ -115,6 +121,11 @@ IrLearnStatus s_irPubStatus = IrLearnStatus::Idle;
 Action s_irPubTarget = Action::POWER;
 Action s_irPubOther = Action::POWER;
 
+// --- [Prompt 16] OTA ---
+Mode s_otaPrevMode = Mode::Radio;         // режим ДО OTA; осмислений лише при s_mode == OtaUpdate
+volatile uint8_t s_otaPubPercent = 0;     // остання опублікована цифра (читає setOtaProgress без мʼютекса)
+volatile bool s_otaAbortPending = false;  // otaFailed() не взяв мʼютекс -> tickLocked() відновить
+
 // ---------------------------------------------------------------------------
 // Допоміжне
 // ---------------------------------------------------------------------------
@@ -134,6 +145,7 @@ const char* modeName(Mode m) {
         case Mode::Menu:          return "Menu";
         case Mode::IrLearn:       return "IrLearn";
         case Mode::WifiSetup:     return "WifiSetup";
+        case Mode::OtaUpdate:     return "OtaUpdate";  // [Prompt 16]
     }
     return "?";
 }
@@ -313,7 +325,8 @@ bool logicallyStandby() {
 }
 
 bool desiredMute() {
-    return s_userMute || logicallyStandby() || s_phase == Phase::Settle || s_gainHoldActive;
+    return s_userMute || logicallyStandby() || s_phase == Phase::Settle || s_gainHoldActive ||
+           s_mode == Mode::OtaUpdate;  // [Prompt 16]: під час прошивки тиша
 }
 
 void applyHardwareMute(bool force = false) {
@@ -949,6 +962,9 @@ void handleIrLearnEvent(const Event& e) {
 }
 
 bool beginIrLearnLocked(Action target) {
+    if (s_mode == Mode::OtaUpdate) {
+        return false;  // [Prompt 16]
+    }
     if (s_mode == Mode::IrLearn) {
         if (irStatusActive(mapIrStatus(IrRc5::status()))) {
             return false;  // навчання триває: спершу cancelIrLearn()
@@ -991,12 +1007,46 @@ void cancelIrLearnLocked() {
     publishIrLearn(IrLearnStatus::Idle, s_irPubTarget, s_irPubTarget);
 }
 
+// --- [Prompt 16] OTA ---------------------------------------------------------
+void applyOtaPub(AppStateData& s, void* c) {
+    s.otaProgress = *static_cast<uint8_t*>(c);
+}
+
+void publishOtaProgress(uint8_t p) {
+    s_otaPubPercent = p;
+    AppState::modify(applyOtaPub, &p);
+}
+
+// Викликати лише під s_lock. Повертає збережений Mode і відновлює звук. Standby: мʼют
+// лишається (desiredMute()), потік не потрібен. Інакше — мʼют, volumeMin, ramp у tick().
+void leaveOtaLocked() {
+    if (s_mode != Mode::OtaUpdate) {
+        return;
+    }
+    s_mode = s_otaPrevMode;
+    APP_LOG("OTA end, mode -> %s\n", modeName(s_mode));
+    if (s_mode == Mode::Standby) {
+        applyHardwareMute();
+    } else {
+        startTransition();
+        if (s_input == 0 && (s_mode == Mode::Radio || s_mode == Mode::Menu)) {
+            startStream();  // сам відкладе, якщо немає Wi-Fi
+        }
+    }
+    publishState();
+    publishOtaProgress(0);
+}
+
 void handleLocked(const Event& e) {
 #if APP_CONTROLLER_LOG_EVENTS && APP_CONTROLLER_DEBUG
     Serial.printf("[APP] evt %s %s%s%s delta=%d\n", sourceName(e.source), actionName(e.action),
                   e.repeat ? " repeat" : "", e.longPress ? " long" : "",
                   static_cast<int>(e.delta));
 #endif
+
+    if (s_mode == Mode::OtaUpdate) {
+        return;  // [Prompt 16] під час прошивки ігноруємо все, включно з POWER
+    }
 
     if (s_mode == Mode::IrLearn) {
         // [Prompt 15] Навчання IR: окрема гілка (POWER тут НЕ перемикає Standby, а
@@ -1082,6 +1132,11 @@ void followWifiMode() {
 // --- Періодика (ramp, таймери, синхронізація) -------------------------------
 void tickLocked() {
     const uint32_t now = millis();
+
+    if (s_otaAbortPending) {  // [Prompt 16] otaFailed() не отримав мʼютекс
+        s_otaAbortPending = false;
+        leaveOtaLocked();
+    }
 
     if (s_phase == Phase::Settle && reached(now, s_phaseStartMs + cfg::kUnmuteDelayMs)) {
         s_phase = Phase::Ramp;
@@ -1184,6 +1239,10 @@ bool AppController::setTone(ToneUpdate& u) {
         xSemaphoreTakeRecursive(s_lock, pdMS_TO_TICKS(cfg::kLockTimeoutMs)) != pdTRUE) {
         return false;
     }
+    if (s_mode == Mode::OtaUpdate) {  // [Prompt 16] під час прошивки чип не чіпаємо
+        xSemaphoreGiveRecursive(s_lock);
+        return false;
+    }
     if (s_proc != nullptr) {
         if (u.hasBass && s_caps.bass && s_proc->setBass(u.bass)) {
             s_bass = u.bass;
@@ -1237,6 +1296,52 @@ bool AppController::confirmIrOverwrite() {
     const bool ok = confirmIrOverwriteLocked();
     xSemaphoreGiveRecursive(s_lock);
     return ok;
+}
+
+// [Prompt 16] ДОДАНО: OTA
+bool AppController::beginOta() {
+    if (!s_started || s_lock == nullptr ||
+        xSemaphoreTakeRecursive(s_lock, pdMS_TO_TICKS(cfg::kLockTimeoutMs)) != pdTRUE) {
+        return false;
+    }
+    bool ok = false;
+    if (s_mode != Mode::IrLearn && s_mode != Mode::OtaUpdate) {
+        s_otaPrevMode = s_mode;
+        s_otaAbortPending = false;
+        publishOtaProgress(0);  // спершу 0, потім режим: екран не покаже старий відсоток
+        s_mode = Mode::OtaUpdate;
+        s_phase = Phase::None;  // Settle/Ramp скасовано
+        s_gainHoldActive = false;
+        applyHardwareMute();    // desiredMute() уже true; мʼют ПЕРЕД зупинкою потоку
+        stopStream();
+        publishState();
+        APP_LOG("OTA begin, mode %s -> OtaUpdate\n", modeName(s_otaPrevMode));
+        ok = true;
+    }
+    xSemaphoreGiveRecursive(s_lock);
+    return ok;
+}
+
+void AppController::setOtaProgress(uint8_t percent) {
+    if (percent > 100) {
+        percent = 100;
+    }
+    // Читання без мʼютекса: хибне значення безпечне (пропущений чи зайвий кадр).
+    if (!s_started || s_mode != Mode::OtaUpdate || percent == s_otaPubPercent) {
+        return;
+    }
+    publishOtaProgress(percent);
+}
+
+void AppController::otaFailed(const char* reason) {
+    APP_LOG("OTA failed: %s\n", reason != nullptr ? reason : "?");
+    if (!s_started || s_lock == nullptr ||
+        xSemaphoreTakeRecursive(s_lock, pdMS_TO_TICKS(cfg::kLockTimeoutMs)) != pdTRUE) {
+        s_otaAbortPending = true;
+        return;
+    }
+    leaveOtaLocked();
+    xSemaphoreGiveRecursive(s_lock);
 }
 
 bool AppController::begin(AudioProcessor* processorOrNull) {

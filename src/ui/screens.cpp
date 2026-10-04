@@ -25,6 +25,7 @@
 // тож правило «AppController — єдиний власник заліза» не порушується.
 // [Prompt 15] Так само читається core/action_names (таблиця імен без стану); стан навчання
 // IR береться з AppState (irLearnStatus/irLearnTarget/irLearnConflictWith), не з IrRc5.
+// [Prompt 16] Екран Mode::OtaUpdate читає лише AppState.otaProgress.
 
 namespace {
 
@@ -338,6 +339,24 @@ void drawIrLearn(const AppStateData& s) {
     }
 }
 
+// [Prompt 16] Екран Mode::OtaUpdate: великий відсоток по центру + смуга; під час прошивки
+// дивляться на пристрій, а не на телефон. Три крапки ASCII, не «…»: U+2026 немає в шрифті
+// (ASCII/Latin-1/Latin Ext-A/кирилиця).
+void drawOtaUpdate(const AppStateData& s) {
+    const uint8_t pct = s.otaProgress > 100 ? 100 : s.otaProgress;
+    drawCentered("Updating...", c::kOtaTitleY, FontSize::Large, dc::kColorFg);
+    char num[8];
+    snprintf(num, sizeof(num), "%u%%", static_cast<unsigned>(pct));
+    drawCentered(num, c::kOtaPercentY, FontSize::Large, c::kColorAccent);
+    D::drawRect(c::kOtaBarX, c::kOtaBarY, c::kOtaBarW, c::kOtaBarH, c::kColorDim);
+    const int16_t inner = static_cast<int16_t>(c::kOtaBarW - 2);
+    const int16_t fillW = static_cast<int16_t>((static_cast<int32_t>(inner) * pct) / 100);
+    if (fillW > 0) {
+        D::fillRect(c::kOtaBarX + 1, c::kOtaBarY + 1, fillW, c::kOtaBarH - 2, c::kColorAccent);
+    }
+    drawCentered("Do not power off", c::kOtaHintY, FontSize::Small, c::kColorDim);
+}
+
 // ---------------------------------------------------------------------------
 // Підсвітка при вході/виході зі Standby
 // ---------------------------------------------------------------------------
@@ -396,6 +415,7 @@ bool frame() {
             break;
         case Mode::IrLearn:       drawIrLearn(s);                break;   // [Prompt 15]
         case Mode::WifiSetup:     drawWifiSetup(s);              break;
+        case Mode::OtaUpdate:     drawOtaUpdate(s);              break;   // [Prompt 16]
         default:                  drawPlaceholder("?");          break;
     }
     return true;

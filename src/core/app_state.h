@@ -17,6 +17,9 @@
 // irLearnConflictWith (лише в кінець структури) — стан навчання IR-пульта для
 // екрана Mode::IrLearn та веб-API. Нульові значення = Idle. Підключено
 // core/events.h (потрібен лише тип Action).
+// [Prompt 16] ДОДАНО: Mode::OtaUpdate (в кінець enum) та поле otaProgress (в кінець
+// структури) — прогрес запису прошивки для екрана та веб-API. Окремого статусу
+// помилки немає: при невдачі AppController одразу повертає попередній Mode.
 
 #include <Arduino.h>
 #include <stdint.h>
@@ -31,6 +34,7 @@ enum class Mode : uint8_t {
     Menu,
     IrLearn,
     WifiSetup,
+    OtaUpdate,  // [Prompt 16] ДОДАНО: запис прошивки, звук зупинено
 };
 
 // [Prompt 8] ДОДАНО: яким параметром зараз керує обертання енкодера.
@@ -128,6 +132,10 @@ struct AppStateData {
     IrLearnStatus irLearnStatus;
     // З якою дією конфлікт кодів; осмислене лише при irLearnStatus == Conflict.
     Action irLearnConflictWith;
+
+    // --- [Prompt 16] ДОДАНО ---
+    // Прогрес OTA 0..100; осмислений лише при mode == Mode::OtaUpdate.
+    uint8_t otaProgress;
 };
 
 class AppState {

@@ -5,6 +5,9 @@
 // [Prompt 15] ДОДАНО: /api/ir* (список дій, мапа, імпорт/видалення, навчання). Навчання
 // (start/confirm-overwrite/cancel) — лише через AppController; мапу (exportJson/
 // importJson/removeAction/codeFor) читаємо й міняємо напряму, як StationStore.
+// [Prompt 16] ДОДАНО: POST /api/ota (оновлення прошивки сирим тілом .bin). Запис у вільний
+// OTA-розділ веде цей файл (Update.*), а звук/режим — лише через AppController::beginOta()/
+// setOtaProgress()/otaFailed(). Перезапуск після відповіді — окрема одноразова задача.
 
 #include "net/web_server.h"
 
@@ -12,7 +15,11 @@
 #include <ArduinoJson.h>
 #include <ESPAsyncWebServer.h>
 #include <LittleFS.h>
+#include <Update.h>        // [Prompt 16]
 #include <ctype.h>
+#include <esp_ota_ops.h>   // [Prompt 16] esp_ota_get_next_update_partition()
+#include <esp_partition.h> // [Prompt 16]
+#include <esp_task_wdt.h>  // [Prompt 16] esp_task_wdt_reconfigure()
 #include <esp_timer.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,6 +74,7 @@ const char* modeName(Mode m) {
         case Mode::Menu:          return "Menu";
         case Mode::IrLearn:       return "IrLearn";
         case Mode::WifiSetup:     return "WifiSetup";
+        case Mode::OtaUpdate:     return "OtaUpdate";  // [Prompt 16]
     }
     return "Unknown";
 }
@@ -1312,6 +1320,236 @@ void handleIrLearnCancel(AsyncWebServerRequest* req) {
 }
 
 // ---------------------------------------------------------------------------
+// [Prompt 16] POST /api/ota
+// ---------------------------------------------------------------------------
+// Тіло — сирий .bin (Content-Type: application/octet-stream), не multipart. Увесь стан —
+// статичний і чіпається лише з задачі async_tcp (body-callback, handler, onDisconnect), тож
+// без блокувань. Помилку фіксуємо ОДРАЗУ (звук повертається негайно), а відповідь клієнту
+// шле handler після кінця тіла: надійно відповідати зсередини body-callback ця бібліотека
+// не гарантує.
+enum class OtaState : uint8_t { Idle, Receiving, Failed, Succeeded };
+
+struct OtaCtx {
+    AsyncWebServerRequest* owner;
+    OtaState state;
+    size_t total;
+    size_t written;
+    bool appBegun;     // AppController::beginOta() пройшов
+    bool updateBegun;  // Update.begin() пройшов
+    bool wdtExtended;  // таймаут TWDT подовжено -> на невдачі треба повернути
+    uint8_t lastLoggedPct;
+    uint32_t startMs;
+    int httpCode;
+    char error[web_cfg::kOtaErrorBufBytes];
+    char reason[web_cfg::kOtaReasonBufBytes];
+};
+OtaCtx s_ota = {};
+
+// Змінює таймаут TWDT, лишаючи IDLE-задачі обох ядер підписаними (ESP32-S3: маска 0b11).
+bool otaSetWdtTimeout(uint32_t ms) {
+    esp_task_wdt_config_t cfg = {};
+    cfg.timeout_ms = ms;
+    cfg.idle_core_mask = 0x3;
+    cfg.trigger_panic = true;
+    const esp_err_t e = esp_task_wdt_reconfigure(&cfg);
+    if (e != ESP_OK) {
+        WEB_LOG("OTA: esp_task_wdt_reconfigure(%u ms) failed: %d", static_cast<unsigned>(ms),
+                static_cast<int>(e));
+    }
+    return e == ESP_OK;
+}
+
+void otaFail(int code, const char* error, const char* reason) {
+    if (s_ota.state == OtaState::Failed) return;
+    // reason копіюємо ДО abort(): abort() міняє внутрішню помилку Update.
+    strlcpy(s_ota.reason, reason != nullptr ? reason : "", sizeof(s_ota.reason));
+    strlcpy(s_ota.error, error, sizeof(s_ota.error));
+    s_ota.httpCode = code;
+    s_ota.state = OtaState::Failed;
+    if (s_ota.updateBegun) {
+        Update.abort();
+        s_ota.updateBegun = false;
+    }
+    if (s_ota.wdtExtended) {
+        otaSetWdtTimeout(web_cfg::kOtaWdtNormalTimeoutMs);  // невдача -> звичайний таймаут
+        s_ota.wdtExtended = false;
+    }
+    if (s_ota.appBegun) {
+        AppController::otaFailed(s_ota.reason);  // повертає режим і звук
+        s_ota.appBegun = false;
+    }
+    WEB_LOG("OTA failed: %s (%s), %u/%u bytes", s_ota.error, s_ota.reason,
+            static_cast<unsigned>(s_ota.written), static_cast<unsigned>(s_ota.total));
+}
+
+void otaOnDisconnect(AsyncWebServerRequest* req) {
+    if (s_ota.owner != req) return;
+    if (s_ota.state == OtaState::Succeeded) return;  // чекаємо перезапуск, слот не звільняємо
+    if (s_ota.state == OtaState::Receiving) otaFail(0, "disconnected", "client disconnected");
+    memset(&s_ota, 0, sizeof(s_ota));
+}
+
+// Перевірки першого шматка + beginOta + Update.begin. Помилка -> otaFail().
+void otaStart(AsyncWebServerRequest* req, const uint8_t* first, size_t total) {
+    // 1) Сигнатура — ДО будь-чого: сміття не мʼютить звук і не чіпає флеш.
+    if (first[0] != web_cfg::kOtaImageMagic) {
+        otaFail(400, "bad_image", "bad_magic");
+        return;
+    }
+    // 2) Content-Type: бібліотека розбирає form-urlencoded тіло як параметри в RAM.
+    String ct = req->contentType();
+    ct.toLowerCase();
+    if (ct.startsWith("application/x-www-form-urlencoded") || ct.startsWith("multipart/")) {
+        otaFail(415, "unsupported_content_type", "send raw body as application/octet-stream");
+        return;
+    }
+    if (total < web_cfg::kOtaMinImageBytes) {
+        otaFail(400, "bad_image", "too_small");
+        return;
+    }
+    const esp_partition_t* part = esp_ota_get_next_update_partition(nullptr);
+    if (part == nullptr) {
+        otaFail(500, "no_ota_partition", "no free OTA partition");
+        return;
+    }
+    if (total > part->size) {
+        otaFail(413, "image_too_large", "image does not fit OTA partition");
+        return;
+    }
+    // 3) Контролер: мʼют, зупинка потоку, Mode::OtaUpdate.
+    if (!AppController::beginOta()) {
+        otaFail(503, "busy", "device busy (IR learning or OTA already running)");
+        return;
+    }
+    s_ota.appBegun = true;
+    s_ota.startMs = millis();
+    // 4) TWDT: флеш-операції (стирання/запис) на ядрі 0 тримають CPU довше за звичайний
+    // таймаут (на залізі: "task_wdt: IDLE0 ... ipc0"). Подовжуємо таймаут на час OTA; на
+    // невдачі otaFail() повертає звичайний, на успіху далі йде перезапуск. Якщо подовжити не
+    // вдалось — працюємо лише з паузами між шматками (див. kOtaChunkYieldTicks).
+    s_ota.wdtExtended = otaSetWdtTimeout(web_cfg::kOtaWdtTimeoutMs);
+    // 5) Бібліотека сама перевіряє, чи влізає розмір у розділ.
+    if (!Update.begin(total, U_FLASH)) {
+        otaFail(Update.getError() == UPDATE_ERROR_SPACE ? 413 : 500, "begin_failed",
+                Update.errorString());
+        return;
+    }
+    s_ota.updateBegun = true;
+    WEB_LOG("OTA start: %u bytes -> %s (Update.begin %u ms)", static_cast<unsigned>(total),
+            part->label, static_cast<unsigned>(millis() - s_ota.startMs));
+}
+
+void handleOtaBody(AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index,
+                   size_t total) {
+    if (len == 0 || total == 0) return;
+    if (index == 0) {
+        if (s_ota.owner != nullptr) return;  // інший OTA активний -> 409 у handler
+        memset(&s_ota, 0, sizeof(s_ota));
+        s_ota.owner = req;
+        s_ota.state = OtaState::Receiving;
+        s_ota.total = total;
+        req->onDisconnect([req]() { otaOnDisconnect(req); });
+        otaStart(req, data, total);
+    }
+    if (s_ota.owner != req || s_ota.state != OtaState::Receiving) return;
+
+    if (Update.write(data, len) != len) {
+        otaFail(500, "write_failed", Update.errorString());
+        return;
+    }
+    s_ota.written += len;
+
+    if (s_ota.written < s_ota.total) {
+        // 99 — стеля до успішного end(): фінальна перевірка образу ще попереду.
+        const uint64_t pct = static_cast<uint64_t>(s_ota.written) * 100u / s_ota.total;
+        const uint8_t p = static_cast<uint8_t>(pct > 99 ? 99 : pct);
+        AppController::setOtaProgress(p);
+        if (web_cfg::kOtaLogStepPercent != 0 &&
+            p >= s_ota.lastLoggedPct + web_cfg::kOtaLogStepPercent) {
+            s_ota.lastLoggedPct = p;
+            WEB_LOG("OTA %u%% (%u/%u bytes, %u ms)", static_cast<unsigned>(p),
+                    static_cast<unsigned>(s_ota.written), static_cast<unsigned>(s_ota.total),
+                    static_cast<unsigned>(millis() - s_ota.startMs));
+        }
+        vTaskDelay(web_cfg::kOtaChunkYieldTicks);  // дати IDLE0/іншим задачам ядра попрацювати
+        return;
+    }
+    // Останній шматок. end(true) сам по собі прийняв би й недописаний образ, тому повноту
+    // (written == total) перевірено умовою вище.
+    if (!Update.end(true)) {
+        otaFail(400, "verify_failed", Update.errorString());
+        return;
+    }
+    s_ota.updateBegun = false;
+    s_ota.state = OtaState::Succeeded;
+    AppController::setOtaProgress(100);
+    WEB_LOG("OTA written and verified: %u bytes in %u ms", static_cast<unsigned>(s_ota.written),
+            static_cast<unsigned>(millis() - s_ota.startMs));
+}
+
+void otaRestartTask(void*) {
+    vTaskDelay(pdMS_TO_TICKS(web_cfg::kOtaRestartDelayMs));
+    SettingsStore::flush();  // відкладені налаштування не повинні загубитись
+    Serial.println("[WEB] OTA: restarting");
+    Serial.flush();
+    ESP.restart();
+    vTaskDelete(nullptr);
+}
+
+void handleOtaDone(AsyncWebServerRequest* req) {
+    WEB_LOG("%s %s (%u bytes)", req->methodToString(), req->url().c_str(),
+            static_cast<unsigned>(req->contentLength()));
+
+    if (s_ota.owner != req) {
+        if (req->contentLength() == 0) {
+            if (req->hasHeader("Transfer-Encoding")) {
+                sendError(req, 411, "length_required");  // chunked не підтримуємо
+            } else {
+                sendError(req, 400, "no_body");
+            }
+        } else if (s_ota.owner != nullptr) {
+            sendError(req, 409, s_ota.state == OtaState::Succeeded ? "ota_done_restarting"
+                                                                   : "ota_busy");
+        } else {
+            sendError(req, 500, "internal");
+        }
+        return;
+    }
+
+    if (s_ota.state == OtaState::Receiving) {
+        otaFail(400, "incomplete", "body ended before Content-Length bytes");
+    }
+    if (s_ota.state == OtaState::Failed) {
+        JsonDocument doc;
+        doc["ok"] = false;
+        doc["error"] = s_ota.error;
+        doc["reason"] = s_ota.reason;
+        const int code = s_ota.httpCode;
+        memset(&s_ota, 0, sizeof(s_ota));  // слот вільний
+        sendJson(req, code, doc);
+        return;
+    }
+
+    // Succeeded. Задачу перезапуску створюємо ДО відповіді, щоб чесно сказати
+    // restarting true/false; вона спершу спить kOtaRestartDelayMs.
+    const BaseType_t ok = xTaskCreatePinnedToCore(
+        otaRestartTask, "ota_restart", web_cfg::kOtaRestartStackBytes, nullptr,
+        web_cfg::kOtaRestartTaskPriority, nullptr, web_cfg::kOtaRestartTaskCore);
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["restarting"] = (ok == pdPASS);
+    AsyncResponseStream* r = req->beginResponseStream("application/json");
+    if (r == nullptr) {
+        req->send(503);
+        return;
+    }
+    r->addHeader("Cache-Control", "no-store");
+    r->addHeader("Connection", "close");
+    serializeJson(doc, *r);
+    req->send(r);
+}
+
+// ---------------------------------------------------------------------------
 // Старт сервера
 // ---------------------------------------------------------------------------
 void registerRoutes(AsyncWebServer& server) {
@@ -1342,6 +1580,9 @@ void registerRoutes(AsyncWebServer& server) {
     server.on("/api/ir/learn/confirm-overwrite", HTTP_POST, handleIrLearnConfirm);
     server.on("/api/ir/learn/cancel", HTTP_POST, handleIrLearnCancel);
     server.on("/api/ir/learn", HTTP_POST, handleIrLearnStart, nullptr, handleJsonBody);
+
+    // [Prompt 16] OTA: сирий бінарник у тілі (не multipart).
+    server.on("/api/ota", HTTP_POST, handleOtaDone, nullptr, handleOtaBody);
 
     server.onNotFound(handleNotFound);
 }

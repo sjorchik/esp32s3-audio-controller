@@ -16,6 +16,9 @@
 //             веб-сервера до навчання IR. IR-приймач — апаратний ресурс, а навчання
 //             змінює глобальну поведінку (Mode::IrLearn), тож веб не викликає
 //             IrRc5::beginLearn() та інші напряму.
+// [Prompt 16] ДОДАНО: beginOta()/setOtaProgress()/otaFailed() — вхід для веб-сервера до
+//             OTA-оновлення. Запис прошивки веде net/web_server (Update.*), а звук
+//             зупиняє, мʼютить і відновлює AppController (веб не чіпає AudioPlayer).
 
 #include "core/events.h"
 
@@ -72,4 +75,20 @@ public:
     // (IrRc5::confirmOverwrite()). false — не в Conflict, контролер зайнятий або
     // IrRc5 відмовив.
     static bool confirmIrOverwrite();
+
+    // [Prompt 16] ДОДАНО: починає OTA. Запамʼятовує поточний Mode, мʼютить атенюатори,
+    // зупиняє потік (AudioPlayer::stop()) і ставить Mode::OtaUpdate з прогресом 0.
+    // false — контролер не запущено, мʼютекс зайнятий довше kLockTimeoutMs, іде навчання
+    // IR (Mode::IrLearn) або OTA вже триває. Тоді веб відповідає 503, нічого не починаючи.
+    static bool beginOta();
+
+    // [Prompt 16] ДОДАНО: прогрес 0..100 (значення >100 обрізається). Дешевий виклик, можна
+    // щочанк: без мʼютекса контролера, у AppState пише лише при зміні значення. Поза
+    // Mode::OtaUpdate нічого не робить.
+    static void setOtaProgress(uint8_t percent);
+
+    // [Prompt 16] ДОДАНО: невдача OTA. Лог, повернення збереженого Mode, розмʼют і
+    // перезапуск потоку (через звичайний ramp). Якщо мʼютекс контролера зайнятий, відновлення
+    // виконає найближчий tick(). Безпечно викликати, коли OTA не триває (нічого не робить).
+    static void otaFailed(const char* reason);
 };
