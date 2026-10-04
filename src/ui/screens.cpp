@@ -8,6 +8,8 @@
 #include "config/defaults.h"
 #include "config/display_config.h"
 #include "config/screens_config.h"
+#include "audio/vu_source.h"      // [Prompt 17] ДОДАНО: рівні VU (читаються напряму)
+#include "config/features.h"
 #include "core/action_names.h"  // [Prompt 15] ДОДАНО: імена дій (чисті дані)
 #include "core/app_state.h"
 #include "ui/display.h"
@@ -26,6 +28,8 @@
 // [Prompt 15] Так само читається core/action_names (таблиця імен без стану); стан навчання
 // IR береться з AppState (irLearnStatus/irLearnTarget/irLearnConflictWith), не з IrRc5.
 // [Prompt 16] Екран Mode::OtaUpdate читає лише AppState.otaProgress.
+// [Prompt 17] ВИНЯТОК З ІЗОЛЯЦІЇ: рівні VU беруться напряму з VuSourceDecodedPcm::read() (з
+// частотою кадру), МИНАЮЧИ AppState; AppStateData.vuLeft/vuRight не використовуються.
 
 namespace {
 
@@ -52,7 +56,13 @@ struct Marquee {
 Marquee s_station = {};
 Marquee s_track   = {};
 
-AppStateData s_prev;            // попередній знімок (VU обнулено)
+// [Prompt 17] VU: джерело (читає лише display-задача) і кількість засвічених сегментів
+// минулого кадру (перемальовуємо, лише коли вона змінилась).
+VuSourceDecodedPcm s_vu;
+int s_vuLitL = 0;
+int s_vuLitR = 0;
+
+AppStateData s_prev;            // попередній знімок
 bool         s_havePrev = false;
 bool         s_modeKnown = false;
 Mode         s_prevMode = Mode::Standby;
@@ -135,6 +145,41 @@ void drawTopIcons(const AppStateData& s, bool showWifi) {
     if (s.mute) D::drawIcon(IconId::Mute, c::kMuteIconX, c::kTopBarY, c::kColorAccent);
 }
 
+// [Prompt 17] VU-метр: дві сегментні смуги L (верхня) / R (нижня).
+// ENABLE_VU == 0: стара порожня рамка. Без Tiny-підписів L/R — тоді смуги довелося б
+// звужувати, а порядок «верх = L» очевидний і так.
+#if ENABLE_VU
+int vuToSegments(float level) {
+    int n = static_cast<int>(level * c::kVuSegments + 0.5f);
+    if (n < 0) n = 0;
+    if (n > c::kVuSegments) n = c::kVuSegments;
+    return n;
+}
+
+void drawVuBar(int16_t y, int lit) {
+    for (uint8_t i = 0; i < c::kVuSegments; ++i) {
+        uint16_t color;
+        if (i >= lit)                      color = c::kColorVuOff;
+        else if (i >= c::kVuRedSeg)        color = c::kColorBad;
+        else if (i >= c::kVuYellowSeg)     color = c::kColorAccent;
+        else                               color = c::kColorOk;
+        const int16_t x = static_cast<int16_t>(c::kVuBarX + i * (c::kVuSegW + c::kVuSegGap));
+        D::fillRect(x, y, c::kVuSegW, c::kVuBarH, color);
+    }
+}
+#endif
+
+void drawVu(int litL, int litR) {
+#if ENABLE_VU
+    drawVuBar(c::kVuY, litL);
+    drawVuBar(static_cast<int16_t>(c::kVuY + c::kVuBarH + c::kVuBarGap), litR);
+#else
+    (void)litL;
+    (void)litR;
+    D::drawRect(c::kVuX, c::kVuY, c::kVuW, c::kVuH, c::kColorDim);
+#endif
+}
+
 // Статус-рядок: ціль енкодера зліва, значення справа. Завжди видимий.
 void drawStatusRow(const AppStateData& s) {
     const char* label = "";
@@ -213,15 +258,14 @@ void drawStandby() {
     drawCentered("Standby", c::kStandbyCaptionY, FontSize::Tiny, c::kColorDim);
 }
 
-void drawRadio(const AppStateData& s) {
+void drawRadio(const AppStateData& s, int vuLitL, int vuLitR) {
     D::drawText(inputName(s.inputIndex), c::kMargin, c::kTopBarTextY, FontSize::Small, c::kColorDim);
     drawTopIcons(s, true);
 
     marqueeDraw(s_station, c::kStationY, FontSize::Large, dc::kColorFg);
     marqueeDraw(s_track, c::kTrackY, FontSize::Small, c::kColorDim);
 
-    // TODO (Prompt 13): VU meter
-    D::drawRect(c::kVuX, c::kVuY, c::kVuW, c::kVuH, c::kColorDim);
+    drawVu(vuLitL, vuLitR);   // [Prompt 17]
 
     // [Prompt 10] ДОДАНО: використовуємо StreamStatus замість наївної евристики
     drawStreamStatus(s);
@@ -387,13 +431,31 @@ bool frame() {
 
     handleModeChange(s.mode);
 
-    AppStateData cmp = s;
-    cmp.vuLeft  = 0.0f;   // VU поки не малюється; прибрати в Prompt 13
-    cmp.vuRight = 0.0f;
-    bool dirty = !s_havePrev || memcmp(&cmp, &s_prev, sizeof(cmp)) != 0;
+    bool dirty = !s_havePrev || memcmp(&s, &s_prev, sizeof(s)) != 0;
     if (dirty) {
-        s_prev = cmp;
+        s_prev = s;
         s_havePrev = true;
+    }
+
+    // [Prompt 17] VU: лише Radio + Playing, інакше рівні 0. read() == false (даних
+    // нема) теж дає 0. Перемальовуємо, коли змінилась кількість засвічених сегментів
+    // (під час музики це практично кожен кадр; у тиші чи на паузі екран знову статичний).
+    int litL = 0;
+    int litR = 0;
+#if ENABLE_VU
+    if (s.mode == Mode::Radio && s.streamStatus == StreamStatus::Playing) {
+        float vuL = 0.0f;
+        float vuR = 0.0f;
+        if (s_vu.read(vuL, vuR)) {
+            litL = vuToSegments(vuL);
+            litR = vuToSegments(vuR);
+        }
+    }
+#endif
+    if (litL != s_vuLitL || litR != s_vuLitR) {
+        dirty = true;
+        s_vuLitL = litL;
+        s_vuLitR = litR;
     }
 
     if (s.mode == Mode::Radio) {
@@ -407,7 +469,7 @@ bool frame() {
     D::fillScreen(dc::kColorBg);
     switch (s.mode) {
         case Mode::Standby:       drawStandby();                 break;
-        case Mode::Radio:         drawRadio(s);                  break;
+        case Mode::Radio:         drawRadio(s, litL, litR);      break;
         case Mode::ExternalInput: drawExternal(s);               break;
         case Mode::Menu:
             if (s.menuContext == MenuContext::StationList) drawStationList(s);
@@ -428,6 +490,8 @@ bool UiScreens::begin() {
     s_modeKnown = false;
     s_station.seeded = false;
     s_track.seeded   = false;
+    s_vuLitL = 0;
+    s_vuLitR = 0;
     DisplayManager::setFrameCallback(&frame);
     return true;
 }

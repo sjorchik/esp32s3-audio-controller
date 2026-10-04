@@ -20,6 +20,8 @@
 // [Prompt 16] ДОДАНО: Mode::OtaUpdate (в кінець enum) та поле otaProgress (в кінець
 // структури) — прогрес запису прошивки для екрана та веб-API. Окремого статусу
 // помилки немає: при невдачі AppController одразу повертає попередній Mode.
+// [Prompt 17] НЕ ВИКОРИСТОВУЮТЬСЯ: ui/screens читає рівні VU напряму з
+// VuSourceDecodedPcm::read() (частота кадру), минаючи AppState. Поля лишено, щоб не міняти POD-структуру.
 
 #include <Arduino.h>
 #include <stdint.h>

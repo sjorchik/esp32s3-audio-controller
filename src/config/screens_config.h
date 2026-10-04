@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "config/display_config.h"
+#include "config/vu_config.h"
 
 namespace screens_cfg {
 
@@ -38,11 +39,25 @@ constexpr int16_t kMuteIconX   = kWifiIconX - display_cfg::kIconSize - 6;
 // --- Radio ---
 constexpr int16_t kStationY   = 34;                // Large, marquee
 constexpr int16_t kTrackY     = 62;                // Small, marquee
-constexpr int16_t kVuX        = kMargin;           // TODO (Prompt 13): VU meter
+constexpr int16_t kVuX        = kMargin;           // [Prompt 17] область VU-метра
 constexpr int16_t kVuY        = 88;
 constexpr int16_t kVuW        = kContentW;
 constexpr int16_t kVuH        = 30;
 constexpr int16_t kStateY     = 122;               // Small: Playing / Stopped / No Wi-Fi
+
+// --- [Prompt 17] VU: дві горизонтальні сегментні смуги (верхня L, нижня R) в області
+// kVuX/Y/W/H. Ширина сегмента виводиться з кількості й проміжку; смуги центруються.
+// Пороги кольору — vu_cfg::kYellowFrom/kRedFrom (частка шкали).
+constexpr uint8_t  kVuSegments  = 25;
+constexpr int16_t  kVuSegGap    = 2;
+constexpr int16_t  kVuBarH      = 13;
+constexpr int16_t  kVuBarGap    = kVuH - 2 * kVuBarH;                       // між смугами
+constexpr int16_t  kVuSegW      = (kVuW - kVuSegGap * (kVuSegments - 1)) / kVuSegments;
+constexpr int16_t  kVuUsedW     = kVuSegW * kVuSegments + kVuSegGap * (kVuSegments - 1);
+constexpr int16_t  kVuBarX      = kVuX + (kVuW - kVuUsedW) / 2;
+constexpr uint8_t  kVuYellowSeg = static_cast<uint8_t>(vu_cfg::kYellowFrom * kVuSegments);
+constexpr uint8_t  kVuRedSeg    = static_cast<uint8_t>(vu_cfg::kRedFrom * kVuSegments);
+constexpr uint16_t kColorVuOff  = display_cfg::rgb565(35, 35, 35);          // непідсвічений сегмент
 
 // --- ExternalInput ---
 constexpr int16_t kExtCaptionY = 40;               // Tiny "INPUT"
@@ -109,5 +124,9 @@ static_assert(kOtaTitleY + display_cfg::kFontLargePx < kOtaPercentY &&
                   kOtaHintY + display_cfg::kFontSmallPx <= kH,
               "OtaUpdate layout overlaps or leaves the screen");
 static_assert(kMarqueeStepMs > 0 && kMarqueeStepPx > 0, "marquee step must be positive");
+static_assert(kVuBarGap >= 0 && kVuSegW >= 2 && kVuUsedW <= kVuW,
+              "VU bars do not fit into the VU area");
+static_assert(kVuYellowSeg < kVuRedSeg && kVuRedSeg < kVuSegments,
+              "VU color segment thresholds out of order");
 
 }  // namespace screens_cfg

@@ -8,7 +8,7 @@
 //   стиль 1: audio_info, audio_showstation, audio_showstreamtitle, audio_bitrate,
 //            audio_eof_stream, audio_id3data;
 //   стиль 2: Audio::audio_info_callback, Audio::msg_t, Audio::evt_info,
-//            evt_bitrate, evt_eof, evt_name, evt_streamtitle, evt_id3data.
+//            evt_bitrate, evt_eof, evt_name, evt_streamtitle, evt_id3data;
 
 #include "audio/audio_player.h"
 
@@ -762,6 +762,11 @@ void audio_bitrate(const char* info) { handleBitrate(info); }
 void audio_eof_stream(const char* info) { handleEof(info); }
 void audio_id3data(const char* info) { handleId3(info); }
 #endif
+
+// [Prompt 17] Хук перехоплення PCM для VU (audio_process_i2s) винесено в окремий файл
+// audio/vu_pcm_hook.cpp: тут Audio.h оголошує функцію як weak, і визначення в цьому
+// файлі теж стало б слабким (лінкер брав заглушку бібліотеки).
+
 
 // ===========================================================================
 // AudioPlayer

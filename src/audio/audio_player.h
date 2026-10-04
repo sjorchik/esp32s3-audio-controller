@@ -91,7 +91,8 @@ public:
     // "cp1251", "latin1" (або "none"). out завжди завершується '\0'.
     static const char* normalizeIcy(const char* in, char* out, size_t cap);
 
-    // TODO (Prompt 10, vu_source): декодовані PCM-семпли для VU можна
-    // перехопити callback-ом бібліотеки audio_process_i2s(int16_t*, int32_t, bool*)
-    // (якщо він є у вашій версії) — точка інтеграції в audio_player.cpp.
+    // [Prompt 17] Декодовані PCM-семпли для VU перехоплює вільна функція
+    // audio_process_i2s(int32_t*, int16_t, bool*) в audio/vu_pcm_hook.cpp (за VU_PCM_HOOK_STYLE
+    // та ENABLE_VU) і передає піки в VuSourceDecodedPcm::publishPeaks(). Публічний
+    // інтерфейс AudioPlayer не змінено.
 };
