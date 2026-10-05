@@ -24,6 +24,14 @@ const CONFIG = {
   marqueePxPerSec: 40,       // швидкість біжучого рядка
   marqueePauseS: 2,          // пауза на краях біжучого рядка
   resizeDebounceMs: 150,
+  // --- Станції (Prompt 20) ---
+  stationsPollMs: 3000,      // повільніше опитування /api/status на сторінці «Станції»
+  stationsWriteTimeoutMs: 10000, // POST/PUT/DELETE/move (запис у flash)
+  stationNameMaxBytes: 63,   // name: 1..63 байт UTF-8 (web_api.md §5)
+  stationUrlMaxBytes: 191,   // url: ≤ 191 байт
+  importMaxBytes: 131072,    // ліміт тіла POST /api/stations/import (≈ 128 КБ)
+  importTimeoutMs: 60000,    // імпорт довгий: запис у flash
+  searchDebounceMs: 150,
 };
 
 /* ---------- Помилки API ---------- */
@@ -78,6 +86,21 @@ const REASONS = {
   parse_error: 'Файл має помилки і не розпізнаний.',
   too_many_stations: 'У файлі забагато станцій.',
   empty: 'Файл порожній.',
+  version_mismatch: 'Непідтримувана версія формату файлу.',
+  too_big: 'Файл завеликий.',
+  file_not_found: 'Файл не знайдено на пристрої.',
+  out_of_memory: 'Пристрою бракує памʼяті.',
+  io_error: 'Помилка читання або запису.',
+  storage_write_failed: 'Не вдалося записати список у памʼять пристрою.',
+  upload_failed: 'Помилка приймання файлу.',
+  invalid_index: 'Некоректний номер станції.',
+  name_required: 'Введіть назву.',
+  name_too_long: 'Назва задовга.',
+  name_invalid: 'Назва містить недопустимі символи.',
+  url_required: 'Введіть адресу потоку.',
+  url_too_long: 'Адреса задовга.',
+  url_invalid: 'Некоректна адреса.',
+  url_invalid_scheme: 'Адреса має починатися з http:// або https://',
   // OTA
   bad_image: 'Це не образ прошивки.',
   bad_magic: 'Це не образ прошивки.',
@@ -134,6 +157,27 @@ function setAttr(node, name, value) {
   if (node.getAttribute(name) !== String(value)) node.setAttribute(name, String(value));
 }
 
+/* ---------- Помічники (Prompt 20) ---------- */
+function debounce(fn, ms) {
+  let t = null;
+  return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
+}
+/* Довжина рядка в байтах UTF-8 (сервер рахує байти, не символи). */
+function byteLength(s) { return new TextEncoder().encode(String(s)).length; }
+function formatBytes(n) { return n < 1024 ? n + ' Б' : (n / 1024).toFixed(1) + ' КБ'; }
+/* 'YYYY-MM-DD' за локальним часом - для імен файлів. */
+function fileStamp() {
+  const d = new Date(); const p = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+}
+/* Зберегти Blob як файл (працює і в dev-режимі, бо Blob уже отриманий через api.blob). */
+function downloadBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = el('a', { href: url, download: name });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
 /* ---------- Іконки (інлайн-SVG) ---------- */
 const ICONS = {
   power: ['s', 'M12 3v8M7.1 6.7a7 7 0 1 0 9.8 0'],
@@ -148,6 +192,15 @@ const ICONS = {
   plus: ['s', 'M12 5v14M5 12h14'],
   refresh: ['s', 'M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7'],
   search: ['s', 'M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM20 20l-4-4'],
+  edit: ['s', 'M4 20h4L19 9l-4-4L4 16zM13.5 6.5l4 4'],
+  trash: ['s', 'M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3'],
+  'arrow-up': ['s', 'M12 19V5M6 11l6-6 6 6'],
+  'arrow-down': ['s', 'M12 5v14M6 13l6 6 6-6'],
+  move: ['s', 'M8 20V4M4 8l4-4 4 4M16 4v16M12 16l4 4 4-4'],
+  upload: ['s', 'M12 16V4M7 9l5-5 5 5M4 20h16'],
+  download: ['s', 'M12 4v12M7 11l5 5 5-5M4 20h16'],
+  check: ['s', 'M5 12.5l4.5 4.5L19 7'],
+  close: ['s', 'M6 6l12 12M18 6L6 18'],
 };
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -201,13 +254,13 @@ const api = (() => {
     return p;
   }
 
-  async function run(method, path, body, timeoutMs) {
+  async function run(method, path, body, timeoutMs, opt) {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), timeoutMs || CONFIG.apiTimeoutMs);
     const init = { method, cache: 'no-store', signal: ctl.signal, headers: {} };
     if (body !== undefined) {
-      init.headers['Content-Type'] = 'application/json';
-      init.body = JSON.stringify(body);
+      if (opt && opt.type) { init.headers['Content-Type'] = opt.type; init.body = body; }   // сире тіло (File/Blob/рядок)
+      else { init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(body); }
     }
     let res;
     try {
@@ -216,6 +269,9 @@ const api = (() => {
       throw new ApiError(0, null, e && e.name === 'AbortError' ? 'timeout' : 'network');
     } finally {
       clearTimeout(timer);
+    }
+    if (opt && opt.blob && res.ok) {                 // завантаження файлу (експорт)
+      try { return await res.blob(); } catch (_) { throw new ApiError(res.status, null, 'network'); }
     }
     let data = null;
     try { data = await res.json(); } catch (_) { /* не JSON */ }
@@ -233,6 +289,12 @@ const api = (() => {
     base: () => base,
     get: (path, timeoutMs) => enqueue(() => run('GET', path, undefined, timeoutMs)),
     post: (path, body, timeoutMs) => enqueue(() => run('POST', path, body === undefined ? {} : body, timeoutMs)),
+    put: (path, body, timeoutMs) => enqueue(() => run('PUT', path, body === undefined ? {} : body, timeoutMs)),
+    del: (path, timeoutMs) => enqueue(() => run('DELETE', path, undefined, timeoutMs)),
+    /* Сире тіло: send('POST', path, fileOrBlob, 'audio/x-mpegurl', timeoutMs). Відповідь - JSON. */
+    send: (method, path, body, type, timeoutMs) => enqueue(() => run(method, path, body, timeoutMs, { type })),
+    /* GET файлу -> Promise<Blob>. */
+    blob: (path, timeoutMs) => enqueue(() => run('GET', path, undefined, timeoutMs, { blob: true })),
   };
 })();
 

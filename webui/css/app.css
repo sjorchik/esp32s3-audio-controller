@@ -180,3 +180,26 @@ fieldset.group[disabled] *{cursor:not-allowed}
 .vol-row{display:flex;align-items:center;gap:var(--sp-2)}
 .standby{text-align:center;display:grid;gap:var(--sp-3);justify-items:center;padding:var(--sp-6) var(--sp-4)}
 .standby-title{font-size:1.6rem}
+
+/* --- Станції (Prompt 20) --- */
+.toolbar{display:flex;flex-wrap:wrap;gap:var(--sp-2)}
+.toolbar .btn{flex:1 1 auto}
+fieldset.group.is-busy[disabled]{opacity:.75;cursor:progress}
+#search{margin-top:var(--sp-3)}
+.station-list{list-style:none;margin:0;padding:0;display:grid;gap:var(--sp-2)}
+.station{display:grid;gap:var(--sp-2);padding:var(--sp-3);background:var(--surface);border:1px solid var(--line);border-radius:var(--r-m)}
+.station[aria-current="true"]{border-color:var(--accent);box-shadow:inset 3px 0 0 var(--accent)}
+.station[aria-current="true"] .station-name{color:var(--accent)}
+.station-main{display:flex;align-items:baseline;gap:var(--sp-3);min-width:0}
+.station-main .idx{width:2.2em;flex:none;text-align:right;color:var(--muted);font-size:.85rem}
+.station-text{flex:1;min-width:0}
+.station-name{font-weight:600;overflow-wrap:anywhere}
+.station-url{font-size:.85rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.station-actions{display:flex;flex-wrap:wrap;justify-content:space-between;gap:var(--sp-1)}
+@media (min-width:600px){
+  .station{grid-template-columns:1fr auto;align-items:center}
+  .station-actions{justify-content:flex-end}
+}
+.dialog-form{width:min(440px,calc(100vw - 32px))}
+.dialog-form h2{font-size:1.1rem;margin-bottom:var(--sp-4)}
+.dialog-form .form{margin-bottom:var(--sp-4)}

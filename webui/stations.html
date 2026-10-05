@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Станції</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-row">
+    <h1 class="brand" id="brand"></h1>
+    <span id="wifi" class="wifi" role="img"></span>
+  </div>
+  <nav id="nav" class="nav" aria-label="Розділи"></nav>
+</header>
+
+<main class="page">
+  <div id="banners" class="banners"></div>
+
+  <fieldset id="grp" class="group stack">
+    <legend class="visually-hidden">Станції</legend>
+
+    <section class="card">
+      <div class="card-head">
+        <h2 class="card-title">Станції <span id="count" class="muted num"></span></h2>
+        <button class="btn btn-ghost btn-icon" type="button" data-act="refresh" data-icon="refresh" aria-label="Оновити список"></button>
+      </div>
+      <div class="toolbar">
+        <button class="btn btn-primary" type="button" data-act="add"><span data-icon="plus"></span>Додати</button>
+        <button class="btn" type="button" data-act="import"><span data-icon="upload"></span>Імпорт</button>
+        <button id="btn-export" class="btn" type="button" data-act="export"><span data-icon="download"></span>Експорт</button>
+      </div>
+      <p id="full-hint" class="hint" hidden></p>
+      <input id="file" class="visually-hidden" type="file" accept=".json,.m3u,.m3u8,.pls" tabindex="-1" aria-hidden="true">
+      <input id="search" class="input" type="search" placeholder="Пошук за назвою або адресою" aria-label="Пошук станції" autocomplete="off" hidden>
+    </section>
+
+    <div id="empty" class="card stack" hidden>
+      <p id="empty-text" class="hint"></p>
+      <div id="empty-actions" class="toolbar" hidden>
+        <button class="btn btn-primary" type="button" data-act="add"><span data-icon="plus"></span>Додати</button>
+        <button class="btn" type="button" data-act="import"><span data-icon="upload"></span>Імпорт</button>
+      </div>
+    </div>
+
+    <ul id="list" class="station-list" aria-label="Список станцій"></ul>
+  </fieldset>
+</main>
+
+<script src="/js/common.js"></script>
+<script src="/js/nav.js"></script>
+<script src="/js/stations.js"></script>
+</body>
+</html>

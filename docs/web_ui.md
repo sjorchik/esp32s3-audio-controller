@@ -1,6 +1,6 @@
-# Веб-інтерфейс: каркас фронтенду (Prompt 19)
+# Веб-інтерфейс: каркас фронтенду (Prompt 19, доповнено Prompt 20)
 
-Документ для наступних промптів (P20–P23). Нові сторінки додаються **лише змінами в `webui/`** — без правок C++.
+Документ для наступних промптів (P21–P23). Нові сторінки додаються **лише змінами в `webui/`** — без правок C++.
 Контракт API — `docs/web_api.md`.
 
 ## 1. Як це працює
@@ -24,6 +24,7 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 | `js/common.js` | спільний код (підключати ПЕРШИМ) |
 | `js/nav.js` | список сторінок + `renderNav()` (підключати ДРУГИМ) |
 | `js/home.js` | логіка Головної |
+| `stations.html`, `js/stations.js` | сторінка «Станції» (P20): список, форма, переміщення, імпорт / експорт |
 | `favicon.svg` | іконка |
 
 Скрипти — класичні (`<script src>`, не модулі): `const`/функції верхнього рівня `common.js` і `nav.js` видимі в решті скриптів.
@@ -63,7 +64,7 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 </html>
 ```
 
-   Кнопка живлення й індикатор Wi-Fi в шапці — частина каркаса; їх поведінку зараз реалізує `home.js`. Для інших сторінок або винесіть цю логіку в `common.js`, або не показуйте елементи (залиште лише `#brand` і `#nav`).
+   Кнопка живлення й індикатор Wi-Fi в шапці — частина каркаса; їх поведінку зараз реалізує `home.js`. Для інших сторінок або винесіть цю логіку в `common.js`, або не показуйте елементи. Сторінка «Станції» лишає лише `#brand`, `#nav` і `#wifi` (індикатор малює `renderWifi(node, st.wifi)` зі `status`); кнопки живлення там немає.
 2. Створіть `webui/js/<id>.js`; на початку викличте `initShell('<id>')`.
 3. У `nav.js` переведіть `enabled: false` → `true` для цієї сторінки. `href` має збігатися з файлом (`/stations.html`).
 4. `python tools/build_web.py` → збірка → прошивка.
@@ -91,6 +92,10 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 | `.form`, `.field` (`<label>` + `.input`/`.select`), `.field-error`, `.switch` | форми |
 | `.table-wrap` + `.table` | таблиця (обгортка дає горизонтальну прокрутку) |
 | `.marquee` (> `<span>`) | біжучий рядок; керується `home.js: setMarquee` |
+| `.toolbar` | ряд кнопок, що переноситься (кнопки розтягуються) |
+| `.station-list` > `li.station` | список-картки станцій: `.station-main` (`.idx`, `.station-text` > `.station-name` + `.station-url`), `.station-actions`; `aria-current="true"` = поточна |
+| `.dialog.dialog-form` | діалог із формою (`h2`, `.form` > `.field`, `.dialog-actions`) |
+| `fieldset.group.is-busy` | разом із `disabled`: «зайнято» без сильного затемнення (на час запиту) |
 | `.stack`, `.row-flex`, `.spacer`, `.muted`, `.hint`, `.num`, `.visually-hidden` | службові |
 
 Правила: цілі натискання ≥ 44 px; фокус видно через `:focus-visible`; `[hidden]` завжди ховає елемент.
@@ -115,7 +120,12 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 | `el(tag, attrs?, ...children) → Element` | будівник DOM. Рядки-діти — ЗАВЖДИ текст; `onclick: fn` додає слухач; `false/null` пропускаються |
 | `$(sel, root?)` | `querySelector` |
 | `clamp(v, lo, hi)`, `setText(node, text)`, `setAttr(node, name, value)` | `setText`/`setAttr` пишуть лише при зміні |
-| `icon(name) → SVGElement`, `setIcon(node, name)`, `hydrateIcons(root?)` | іконки: `power play pause stop prev next volume mute minus plus refresh search`; `hydrateIcons` обробляє `[data-icon]` |
+| `icon(name) → SVGElement`, `setIcon(node, name)`, `hydrateIcons(root?)` | іконки: `power play pause stop prev next volume mute minus plus refresh search edit trash arrow-up arrow-down move upload download check close`; `hydrateIcons` обробляє `[data-icon]` |
+| `api.put(path, body?, timeoutMs?)`, `api.del(path, timeoutMs?)` | PUT із JSON / DELETE без тіла (P20) |
+| `api.send(method, path, body, contentType, timeoutMs?) → Promise<json>` | СИРЕ тіло (`File`/`Blob`/рядок) із заданим `Content-Type`; відповідь — JSON. Для імпорту |
+| `api.blob(path, timeoutMs?) → Promise<Blob>` | GET файлу (експорт). Помилки — як у решти `api.*` (`ApiError`) |
+| `downloadBlob(blob, name)`, `fileStamp() → 'YYYY-MM-DD'` | зберегти Blob як файл; дата для імені файлу |
+| `byteLength(s)`, `formatBytes(n)`, `debounce(fn, ms)` | довжина в байтах UTF-8 (сервер рахує байти); «12.3 КБ»; відкладений виклик |
 | `rssiToBars(rssi) → 0..4`, `renderWifi(node, status.wifi)` | індикатор Wi-Fi |
 | `initShell(activeId)` | заголовок, іконки, навігація, dev-банер |
 
@@ -134,6 +144,17 @@ if (await confirmDialog('Перезапустити пристрій?', { okText
 ```
 
 `nav.js`: `NAV_PAGES` (`{id, href, title, enabled}`), `pageById(id)`, `renderNav(activeId)`.
+
+### 5.1. Форми, діалоги, імпорт / експорт (P20)
+
+Зразок — `js/stations.js`.
+
+- **Діалог із формою.** `<dialog class="dialog dialog-form">` > `<form novalidate>`: `h2`, `div.form` > `div.field` (`label` + `input.input` + `div.field-error[role=alert][hidden]`), `div.dialog-actions` (Скасувати + `submit`). Відкривати `showModal()`, у `close` — `dlg.remove()`. На час запиту вимикайте кнопки й блокуйте `cancel` (Esc). `openForm({title, submit, fields, validate, save})` у `stations.js` — готова обгортка (поки локальна; винесіть у `common.js`, коли знадобиться другій сторінці).
+- **Помилки полів.** Сервер повертає `field` у тілі (`name`, `url`…) → `ApiError.data.field`; показуйте `errorText(e)` у `.field-error` цього поля, решту — `toast`. Клієнтська валідація дзеркалить серверну, а числа — у `CONFIG` (`stationNameMaxBytes`, `stationUrlMaxBytes`). Довжини — **у байтах** (`byteLength`): кирилична літера = 2 байти.
+- **Позиційні списки.** Індекси зсуваються після видалення / переміщення / імпорту: після КОЖНОЇ зміни (навіть невдалої) перечитайте і список, і `/api/status` (`write()` у `stations.js`).
+- **Імпорт.** Файл → `api.send('POST', '/api/stations/import?format=json|m3u|pls', file, contentType, CONFIG.importTimeoutMs)`. Формат — за розширенням (`.m3u8` → `m3u`). Перевірте розмір (`CONFIG.importMaxBytes`) до відправки. Імпорт ЗАМІНЯЄ весь список — спершу `confirmDialog`. Режиму «додати» контракт не має. Результат — `{count, replaced}`; помилка — `ApiError` із `reason` (= `lastImportError`).
+- **Експорт.** `const b = await api.blob('/api/stations/export'); downloadBlob(b, 'stations-' + fileStamp() + '.json')` — працює і в dev-режимі (`?device=`), бо запит іде через `api`, а не посиланням.
+- **Блокування.** `<fieldset disabled>` навколо всього інтерактивного вмісту + `is-busy`, поки триває запит; у режимах OTA / IR / WifiSetup / офлайн — той самий `disabled` і банер.
 
 ## 6. Шаблон опитування
 
@@ -170,4 +191,5 @@ poller.start();
 
 - Усі сторінки й API — HTTP, без автентифікації.
 - Кожен файл віддається з `Cache-Control: no-cache` без ETag — при кожному завантаженні сторінки браузер отримує файли повністю (gzip, ≈ 17 КБ для Головної).
+- Список станцій на сторінці «Станції» опитується повільніше за Головну (`CONFIG.stationsPollMs`); якщо `station.count` у статусі не збігається з довжиною списку — список перечитується автоматично (зміна з пристрою / іншого клієнта з тією самою кількістю станцій не помітна — є кнопка «Оновити»).
 - Ресурси збільшують прошивку (розділ app0/app1 — 5 767 168 байт). Перед додаванням великих файлів дивіться таблицю, яку друкує `build_web.py`.
