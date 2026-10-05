@@ -52,6 +52,18 @@
 // видалення, імпорт) + негайно в publishStationName() при старті/виборі станції та зміні входу.
 // Публічний API, AppStateData і StationStore не змінено.
 
+// [Prompt 21b] Профілі звуку по входах. Гучність, бас, дискант, баланс, gain і loudness
+// зберігаються й застосовуються ОКРЕМО для кожного входу. s_profiles[] — повна таблиця
+// профілів (копія Settings::profiles); s_volume/s_bass/s_treble/s_balance/s_gain/s_loudness —
+// робочі значення ПОТОЧНОГО входу (те, що в чипі й у AppState). Єдине місце запису в профіль —
+// persist() (через captureActiveProfile()): усі джерела змін (енкодер, пульт, веб, setTone,
+// runWebCommand) уже закінчують шлях викликом persist(). Перемикання входу з будь-якого
+// джерела йде через changeInput(): профіль старого входу фіксується, потім під мʼютом
+// (startTransition) вхід -> профіль нового входу (тембр, баланс, gain, loudness) -> розмʼют
+// kUnmuteDelayMs -> ramp гучності до значення нового профілю. Те саме — при виході зі standby
+// і на старті (powerOnTransition). Мʼют користувача глобальний і в профіль не входить.
+// gain тепер веде сам контролер (s_gain), а не cachedState() драйвера.
+
 #include "core/app_controller.h"
 
 #include <Arduino.h>
@@ -104,7 +116,10 @@ int8_t s_bass = 0;
 int8_t s_treble = 0;
 int8_t s_balance = 0;
 int8_t s_gain = 0;
+bool s_loudness = false;  // [Prompt 21b]
 bool s_userMute = false;
+// [Prompt 21b] Профілі всіх логічних входів (включно з входом 3, якого PT2313L не має).
+InputProfile s_profiles[defaults::kInputCount] = {};
 AdjustTarget s_target = AdjustTarget::Volume;
 MenuContext s_menuCtx = MenuContext::None;
 uint16_t s_menuSel = 0;
@@ -344,6 +359,70 @@ bool targetSupported(AdjustTarget t) {
     return false;
 }
 
+// --- [Prompt 21b] Профілі входів ---------------------------------------------
+bool gainSupported() {
+    return s_caps.inputGain && s_caps.gainMax > s_caps.gainMin;
+}
+
+// Робочі значення поточного входу -> s_profiles[s_input]. Параметри, яких чип не підтримує,
+// у профілі НЕ затираються (робоча копія там 0/false).
+void captureActiveProfile() {
+    if (s_input >= defaults::kInputCount) {
+        return;
+    }
+    InputProfile& p = s_profiles[s_input];
+    p.volume = s_volume;
+    if (s_caps.bass) p.bass = s_bass;
+    if (s_caps.treble) p.treble = s_treble;
+    if (s_caps.balance) p.balance = s_balance;
+    if (gainSupported()) p.gain = s_gain;
+    if (s_caps.loudness) p.loudness = s_loudness;
+}
+
+// s_profiles[idx] -> робочі значення, обрізані за capabilities() поточного чипа.
+// Чипа не торкається й AppState не публікує (це робить викликач).
+void loadActiveFromProfile(uint8_t idx) {
+    if (idx >= defaults::kInputCount) {
+        idx = 0;
+    }
+    const InputProfile& p = s_profiles[idx];
+    s_volume = static_cast<int8_t>(clampInt(p.volume, s_caps.volumeMin, s_caps.volumeMax));
+    s_bass = s_caps.bass ? static_cast<int8_t>(clampInt(p.bass, s_caps.toneMin, s_caps.toneMax))
+                         : 0;
+    s_treble = s_caps.treble
+                   ? static_cast<int8_t>(clampInt(p.treble, s_caps.toneMin, s_caps.toneMax))
+                   : 0;
+    s_balance = s_caps.balance ? static_cast<int8_t>(clampInt(p.balance, s_caps.balanceMin,
+                                                              s_caps.balanceMax))
+                               : 0;
+    s_gain = gainSupported()
+                 ? static_cast<int8_t>(clampInt(p.gain, s_caps.gainMin, s_caps.gainMax))
+                 : 0;
+    s_loudness = s_caps.loudness ? p.loudness : false;
+}
+
+// Надсилає в чип робочі значення (БЕЗ гучності: її піднімає ramp). Викликати лише під
+// мʼютом атенюаторів. withGain=true — лише ПІСЛЯ setInput(), бо setGain() стосується
+// поточного входу чипа; без setInput() (завантаження в standby) gain не чіпаємо.
+void applyActiveToChip(bool withGain) {
+    if (s_proc == nullptr) {
+        return;
+    }
+    bool ok = true;
+    if (s_caps.bass) ok = s_proc->setBass(s_bass) && ok;
+    if (s_caps.treble) ok = s_proc->setTreble(s_treble) && ok;
+    if (s_caps.balance) ok = s_proc->setBalance(s_balance) && ok;
+    if (withGain && gainSupported()) ok = s_proc->setGain(s_gain) && ok;
+    if (s_caps.loudness) ok = s_proc->setLoudness(s_loudness) && ok;
+    if (!ok) {
+        APP_LOG("profile apply: some I2C writes FAILED\n");
+    }
+    APP_LOG("profile in%u: vol=%d bass=%d treble=%d bal=%d gain=%d loud=%d\n",
+            static_cast<unsigned>(s_input), static_cast<int>(s_volume), static_cast<int>(s_bass),
+            static_cast<int>(s_treble), static_cast<int>(s_balance), static_cast<int>(s_gain),
+            s_loudness ? 1 : 0);
+}
+
 // --- Мʼют атенюаторів ------------------------------------------------------
 // [Prompt 15] «Логічний» Standby: Standby АБО навчання IR, розпочате зі Standby. Без цього
 // вхід у IrLearn зі Standby зняв би мʼют атенюаторів (desiredMute() бачив би
@@ -386,6 +465,7 @@ struct PubCtx {
     AdjustTarget target;
     MenuContext menuCtx;
     uint16_t menuSel;
+    bool loudness;  // [Prompt 21b]
 };
 
 void applyPub(AppStateData& s, void* c) {
@@ -402,39 +482,41 @@ void applyPub(AppStateData& s, void* c) {
     s.adjustTarget = p->target;
     s.menuContext = p->menuCtx;
     s.menuSelection = p->menuSel;
+    s.loudness = p->loudness;  // [Prompt 21b]
 }
 
 void publishState() {
     PubCtx p = {s_mode,   s_input, s_volume, s_bass,    s_treble, s_balance,
-                s_gain,   s_userMute, s_station, s_target, s_menuCtx, s_menuSel};
+                s_gain,   s_userMute, s_station, s_target, s_menuCtx, s_menuSel,
+                s_loudness};
     AppState::modify(applyPub, &p);
 }
 
+// [Prompt 21b] Єдине місце запису в Settings: lastInput/lastStation/lastMute + ВСІ профілі
+// входів (профіль поточного входу перед цим оновлюється з робочих значень).
 struct PersistCtx {
     uint8_t input;
     uint16_t station;
-    int8_t volume, bass, treble, balance;
     bool mute;
-    bool saveBass, saveTreble, saveBalance;
+    const InputProfile* profiles;
 };
+
+static_assert(sizeof(s_profiles) == sizeof(Settings::profiles),
+              "controller profile table must mirror Settings::profiles");
 
 void applyPersist(Settings& s, void* c) {
     const PersistCtx* p = static_cast<const PersistCtx*>(c);
     s.lastInput = p->input;
     s.lastStation = p->station;
-    s.lastVolume = p->volume;
     s.lastMute = p->mute;
-    // Тембр/баланс не затираємо, якщо поточний чип їх не підтримує.
-    if (p->saveBass) s.bass = p->bass;
-    if (p->saveTreble) s.treble = p->treble;
-    if (p->saveBalance) s.balance = p->balance;
+    memcpy(s.profiles, p->profiles, sizeof(s.profiles));
 }
 
 // SettingsStore::modify() сама позначає кеш «брудним» (як requestSave()):
-// фактичний запис відбудеться з дебаунсом.
+// фактичний запис відбудеться з дебаунсом (не на кожен крок енкодера).
 void persist() {
-    PersistCtx p = {s_input,   s_station,     s_volume,       s_bass,        s_treble,
-                    s_balance, s_userMute,    s_caps.bass,    s_caps.treble, s_caps.balance};
+    captureActiveProfile();
+    PersistCtx p = {s_input, s_station, s_userMute, s_profiles};
     SettingsStore::modify(applyPersist, &p);
 }
 
@@ -551,12 +633,6 @@ void startTransition() {
     }
 }
 
-void refreshGainFromChip() {
-    if (s_proc != nullptr) {
-        s_gain = s_proc->cachedState().gain;
-    }
-}
-
 // Увімкнення: режим за s_input, перехід, вхід у чіпі, запуск потоку для Radio.
 // Вхід/станцію викликач уже поклав у s_input/s_station.
 void powerOnTransition() {
@@ -564,9 +640,12 @@ void powerOnTransition() {
     s_menuCtx = MenuContext::None;
     s_menuSel = 0;
     startTransition();
+    // [Prompt 21b] Усе ще під мʼютом: профіль входу -> робочі значення, вхід у чіп, потім
+    // тембр/баланс/gain/loudness цього входу. Гучність підніме ramp у tick().
+    loadActiveFromProfile(s_input);
     if (s_proc != nullptr) {
         s_proc->setInput(s_input);
-        refreshGainFromChip();
+        applyActiveToChip(true);
     }
     if (s_input == 0) {
         startStream();
@@ -590,6 +669,7 @@ void enterStandby() {
 }
 
 void leaveStandby() {
+    captureActiveProfile();  // [Prompt 21b] профіль «старого» входу, поки s_input ще його
     const Settings st = SettingsStore::snapshot();
     s_input = (st.lastInput < s_caps.inputCount) ? st.lastInput : 0;
     s_station = (st.lastStation < stationCount()) ? st.lastStation : 0;
@@ -623,15 +703,20 @@ void changeInput(uint8_t newIdx) {
             static_cast<unsigned>(newIdx),
             newIdx < defaults::kInputCount ? defaults::kInputNames[newIdx] : "?");
 
+    captureActiveProfile();  // [Prompt 21b] профіль старого входу фіксуємо ДО зміни s_input
     s_input = newIdx;
     s_mode = (newIdx == 0) ? Mode::Radio : Mode::ExternalInput;
     startTransition();  // мʼют -> гучність у мінімум
     if (leavingRadio) {
         stopStream();
     }
+    // [Prompt 21b] Під мʼютом: профіль нового входу -> робочі значення (s_volume = ціль
+    // майбутнього ramp), setInput(), потім setGain() та решта (порядок гарантує, що gain
+    // нового входу = значення профілю, а не те, що підставив драйвер).
+    loadActiveFromProfile(newIdx);
     if (s_proc != nullptr) {
         s_proc->setInput(newIdx);
-        refreshGainFromChip();  // gain нового входу підставив драйвер
+        applyActiveToChip(true);
     }
     if (enteringRadio) {
         startStream();
@@ -716,7 +801,7 @@ void adjustGain(int d) {
     if (!targetSupported(AdjustTarget::Gain) || s_proc == nullptr) {
         return;
     }
-    const int cur = s_proc->cachedState().gain;
+    const int cur = s_gain;  // [Prompt 21b] джерело правди — профіль/робоча копія, не драйвер
     const int nv = clampInt(cur + d, s_caps.gainMin, s_caps.gainMax);
     if (nv == cur) {
         return;
@@ -724,9 +809,13 @@ void adjustGain(int d) {
     s_gainHoldActive = true;
     s_gainHoldUntilMs = millis() + cfg::kGainMuteHoldMs;
     applyHardwareMute();
-    s_proc->setGain(static_cast<int8_t>(nv));
-    refreshGainFromChip();
-    APP_LOG("gain=%d (mute hold)\n", static_cast<int>(s_gain));
+    if (s_proc->setGain(static_cast<int8_t>(nv))) {
+        s_gain = static_cast<int8_t>(nv);
+        s_persistNeeded = true;  // [Prompt 21b] gain тепер зберігається в профілі входу
+        APP_LOG("gain=%d (mute hold)\n", static_cast<int>(s_gain));
+    } else {
+        APP_LOG("gain=%d FAILED (I2C), unchanged\n", nv);
+    }
 }
 
 // Один «крок» цілі t у напрямку знака d (|d| = кількість detent-ів).
@@ -1354,7 +1443,7 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
                 return WebCmdResult::OutOfRange;
             }
             // adjustGain() сам мʼютить на час стрибка й нічого не робить при рівності.
-            adjustGain(static_cast<int>(c.value) - static_cast<int>(s_proc->cachedState().gain));
+            adjustGain(static_cast<int>(c.value) - static_cast<int>(s_gain));
             break;
 
         case WebCmdType::StandbySet:
@@ -1471,7 +1560,7 @@ void AppController::handleEvent(const Event& event) {
 
 // [Prompt 13] ДОДАНО
 bool AppController::setTone(ToneUpdate& u) {
-    u.bassOk = u.trebleOk = u.balanceOk = false;
+    u.bassOk = u.trebleOk = u.balanceOk = u.loudnessOk = false;
     if (!s_started || s_lock == nullptr ||
         xSemaphoreTakeRecursive(s_lock, pdMS_TO_TICKS(cfg::kLockTimeoutMs)) != pdTRUE) {
         return false;
@@ -1496,8 +1585,14 @@ bool AppController::setTone(ToneUpdate& u) {
             u.balanceOk = true;
             APP_LOG("balance=%d (WEB)\n", static_cast<int>(s_balance));
         }
+        // [Prompt 21b] Тонкомпенсація теж через контролер: профіль поточного входу + AppState.
+        if (u.hasLoudness && s_caps.loudness && s_proc->setLoudness(u.loudness)) {
+            s_loudness = u.loudness;
+            u.loudnessOk = true;
+            APP_LOG("loudness=%d (WEB)\n", s_loudness ? 1 : 0);
+        }
     }
-    if (u.bassOk || u.trebleOk || u.balanceOk) {
+    if (u.bassOk || u.trebleOk || u.balanceOk || u.loudnessOk) {
         publishState();
         persist();
     }
@@ -1636,19 +1731,13 @@ bool AppController::begin(AudioProcessor* processorOrNull) {
 
     // Налаштування — лише з Settings; значення обрізаємо за capabilities
     // (Settings діапазони не валідує).
+    // [Prompt 21b] Профілі всіх входів — у таблицю контролера, робочі значення — з профілю
+    // останнього активного входу.
     const Settings st = SettingsStore::snapshot();
+    memcpy(s_profiles, st.profiles, sizeof(s_profiles));
     s_input = (st.lastInput < s_caps.inputCount) ? st.lastInput : 0;
     s_station = (st.lastStation < stationCount()) ? st.lastStation : 0;
-    s_volume = static_cast<int8_t>(clampInt(st.lastVolume, s_caps.volumeMin, s_caps.volumeMax));
-    s_bass = s_caps.bass
-                 ? static_cast<int8_t>(clampInt(st.bass, s_caps.toneMin, s_caps.toneMax))
-                 : 0;
-    s_treble = s_caps.treble
-                   ? static_cast<int8_t>(clampInt(st.treble, s_caps.toneMin, s_caps.toneMax))
-                   : 0;
-    s_balance = s_caps.balance ? static_cast<int8_t>(clampInt(st.balance, s_caps.balanceMin,
-                                                              s_caps.balanceMax))
-                               : 0;
+    loadActiveFromProfile(s_input);
     s_userMute = st.lastMute;
     s_target = AdjustTarget::Volume;
     s_menuCtx = MenuContext::None;
@@ -1660,19 +1749,15 @@ bool AppController::begin(AudioProcessor* processorOrNull) {
     // Спершу тиша, потім решта.
     s_hwMute = false;
     applyHardwareMute(true);
-    if (s_proc != nullptr) {
-        if (s_caps.bass) s_proc->setBass(s_bass);
-        if (s_caps.treble) s_proc->setTreble(s_treble);
-        if (s_caps.balance) s_proc->setBalance(s_balance);
-        if (s_caps.loudness) s_proc->setLoudness(st.loudness);
-    }
 
     if (cfg::kBootInStandby) {
         APP_LOG("boot in standby\n");
+        // Вхід у чіп не перемикаємо (як і раніше), тож gain (він стосується поточного входу
+        // ЧІПА) не чіпаємо: профіль входу застосується повністю при виході зі standby.
+        applyActiveToChip(false);
     } else {
-        powerOnTransition();  // режим, setInput, playUrl для Radio, ramp у tick()
+        powerOnTransition();  // режим, setInput + профіль, playUrl для Radio, ramp у tick()
     }
-    refreshGainFromChip();
     publishState();
 
     BaseType_t ok = xTaskCreatePinnedToCore(taskMain, "app_ctrl", cfg::kTaskStackBytes, nullptr,

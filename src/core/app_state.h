@@ -20,6 +20,8 @@
 // [Prompt 16] ДОДАНО: Mode::OtaUpdate (в кінець enum) та поле otaProgress (в кінець
 // структури) — прогрес запису прошивки для екрана та веб-API. Окремого статусу
 // помилки немає: при невдачі AppController одразу повертає попередній Mode.
+// [Prompt 21b] ДОДАНО: loudness (лише в кінець структури). volume/bass/treble/balance/gain/
+// loudness тепер дзеркалять ПРОФІЛЬ ПОТОЧНОГО входу (AppController міняє їх при перемиканні входу).
 // [Prompt 17] НЕ ВИКОРИСТОВУЮТЬСЯ: ui/screens читає рівні VU напряму з
 // VuSourceDecodedPcm::read() (частота кадру), минаючи AppState. Поля лишено, щоб не міняти POD-структуру.
 
@@ -138,6 +140,10 @@ struct AppStateData {
     // --- [Prompt 16] ДОДАНО ---
     // Прогрес OTA 0..100; осмислений лише при mode == Mode::OtaUpdate.
     uint8_t otaProgress;
+
+    // --- [Prompt 21b] ДОДАНО ---
+    // Тонкомпенсація профілю поточного входу (false, якщо чип її не підтримує).
+    bool loudness;
 };
 
 class AppState {

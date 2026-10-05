@@ -5,9 +5,29 @@
 // balance, loudness (наявні поля не чіпали). Додано методи SettingsStore:
 // snapshot, modify, requestSave, flush, isDirty, resetToDefaults, eraseStored,
 // writeCount.
+// [Prompt 21b] Налаштування звуку (гучність, бас, дискант, баланс, gain, loudness)
+// тепер зберігаються ОКРЕМО ДЛЯ КОЖНОГО ВХОДУ: структура InputProfile, масив
+// Settings::profiles[defaults::kInputCount]. ВИДАЛЕНО глобальні поля bass, treble,
+// balance, loudness, lastVolume (їх роль виконує профіль входу). Формат blob-а v2;
+// blob v1 мігрується в load() (див. settings.cpp). lastInput/lastStation/lastMute лишились.
 
 #include <Arduino.h>
 #include <stdint.h>
+
+#include "config/defaults.h"
+
+// [Prompt 21b] Профіль звуку одного логічного входу (шкали як в AudioProcessorCapabilities:
+// volume 0..100, тембр/баланс у кроках UI, gain — сирі апаратні кроки). Діапазони тут НЕ
+// валідуються: їх обрізає AppController за capabilities() поточного чипа. Профіль входу,
+// якого чип не має (вхід 3 для PT2313L), просто зберігається. Мʼют сюди НЕ входить.
+struct InputProfile {
+    int8_t volume;
+    int8_t bass;
+    int8_t treble;
+    int8_t balance;
+    int8_t gain;
+    bool loudness;
+};
 
 // Налаштування, які зберігаються між запусками.
 // УВАГА: зміна порядку/типів полів → збільшити settings_cfg::kFormatVersion.
@@ -26,18 +46,14 @@ struct Settings {
     // Орієнтація дисплея: true = display_cfg::kRotationFlipped.
     bool displayFlipped;
 
-    // Тембр, баланс, тонкомпенсація — у шкалі UI аудіопроцесора
-    // (AudioProcessorCapabilities). Крок і межі обрізає драйвер, а не Settings.
-    int8_t bass;
-    int8_t treble;
-    int8_t balance;
-    bool loudness;
-
     // Останній стан для відновлення.
     uint8_t lastInput;
     uint16_t lastStation;
-    int8_t lastVolume;
     bool lastMute;
+
+    // [Prompt 21b] Профілі звуку по входах (індекс = логічний вхід 0..kInputCount-1).
+    // Профіль lastInput — те, що діє зараз (AppController пише його разом з lastInput).
+    InputProfile profiles[defaults::kInputCount];
 };
 
 // Потокобезпечність: усі методи беруть внутрішній мʼютекс, КРІМ get() —
@@ -62,7 +78,9 @@ public:
     static bool begin();
 
     // Читає blob з NVS. Немає запису / інша версія / інший розмір → значення за
-    // замовчуванням + негайний save(). true — кеш містить дані з NVS або
+    // замовчуванням + негайний save(). [Prompt 21b] Виняток: blob формату v1 мігрується
+    // (усі профілі входів = колишні глобальні гучність/тембр/баланс/loudness, gain =
+    // settings_cfg::kDefaultInputGain) і одразу записується як v2. true — кеш містить дані з NVS або
     // збережені дефолти; false — запис у NVS не вдався (кеш = дефолти/попередній).
     static bool load();
 

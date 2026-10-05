@@ -35,6 +35,36 @@ static_assert(static_cast<uint8_t>(AudioProcType::Tda7318) == 0 &&
               "Settings::processorType comment assumes Tda7318=0, Pt2313l=1");
 static_assert(sizeof(StoredBlob) <= 1024, "keep the blob small");
 
+// [Prompt 21b] Формат v1 (до профілів входів): ТОЧНА копія колишньої структури Settings
+// (порядок і типи полів не змінювати!) — потрібна лише для читання старого blob-а.
+struct SettingsV1 {
+    uint8_t processorType;
+    char inputNames[4][32];
+    uint8_t brightness;
+    bool displayFlipped;
+    int8_t bass;
+    int8_t treble;
+    int8_t balance;
+    bool loudness;
+    uint8_t lastInput;
+    uint16_t lastStation;
+    int8_t lastVolume;
+    bool lastMute;
+};
+
+struct StoredBlobV1 {
+    uint8_t version;
+    uint8_t reserved;
+    uint16_t payloadSize;
+    SettingsV1 data;
+};
+
+static_assert(sizeof(SettingsV1) == 140, "SettingsV1 must match the layout written by v1 firmware");
+static_assert(sizeof(StoredBlobV1) != sizeof(StoredBlob),
+              "blob formats are told apart by stored length");
+static_assert(sizeof(SettingsV1::inputNames) == sizeof(Settings::inputNames),
+              "inputNames layout must match for migration");
+
 constexpr uint8_t kProcTypeMax = static_cast<uint8_t>(AudioProcType::Pt2313l);
 
 // ---------------------------------------------------------------------------
@@ -89,14 +119,19 @@ void fillDefaults(Settings& s) {
     }
     s.brightness = defaults::kDefaultBrightness;
     s.displayFlipped = display_cfg::kDefaultFlipped;
-    s.bass = defaults::kDefaultBass;
-    s.treble = defaults::kDefaultTreble;
-    s.balance = defaults::kDefaultBalance;
-    s.loudness = defaults::kDefaultLoudness;
     s.lastInput = defaults::kDefaultInput;
     s.lastStation = 0;
-    s.lastVolume = defaults::kDefaultVolume;
     s.lastMute = defaults::kDefaultMute;
+    // [Prompt 21b] Профіль кожного входу = типові значення (gain — settings_cfg).
+    for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+        InputProfile& p = s.profiles[i];
+        p.volume = defaults::kDefaultVolume;
+        p.bass = defaults::kDefaultBass;
+        p.treble = defaults::kDefaultTreble;
+        p.balance = defaults::kDefaultBalance;
+        p.gain = settings_cfg::kDefaultInputGain;
+        p.loudness = defaults::kDefaultLoudness;
+    }
 }
 
 // bool з некоректним бітовим патерном — UB при читанні, тому читаємо як байт.
@@ -120,8 +155,39 @@ void sanitize(Settings& s) {
         s.lastInput = defaults::kDefaultInput;
     }
     normalizeBool(s.displayFlipped);
-    normalizeBool(s.loudness);
     normalizeBool(s.lastMute);
+    for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+        normalizeBool(s.profiles[i].loudness);
+    }
+}
+
+// Читання bool з blob-а без UB при некоректному бітовому патерні.
+bool rawBool(const bool& b) {
+    uint8_t raw;
+    memcpy(&raw, &b, 1);
+    return raw != 0;
+}
+
+// [Prompt 21b] v1 -> v2: нічого не губимо; ВСІ входи успадковують колишні глобальні
+// гучність/бас/дискант/баланс/loudness, gain = значення за замовчуванням.
+void migrateFromV1(const SettingsV1& old, Settings& out) {
+    fillDefaults(out);
+    out.processorType = old.processorType;
+    memcpy(out.inputNames, old.inputNames, sizeof(out.inputNames));
+    out.brightness = old.brightness;
+    out.displayFlipped = rawBool(old.displayFlipped);
+    out.lastInput = old.lastInput;
+    out.lastStation = old.lastStation;
+    out.lastMute = rawBool(old.lastMute);
+    for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+        InputProfile& p = out.profiles[i];
+        p.volume = old.lastVolume;
+        p.bass = old.bass;
+        p.treble = old.treble;
+        p.balance = old.balance;
+        p.gain = settings_cfg::kDefaultInputGain;
+        p.loudness = rawBool(old.loudness);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -237,16 +303,14 @@ bool SettingsStore::load() {
 
     Settings loaded;
     bool haveStored = false;
+    bool migrated = false;
 
     Preferences prefs;
     if (prefs.begin(settings_cfg::kNvsNamespace, true)) {
         const size_t len = prefs.getBytesLength(settings_cfg::kNvsBlobKey);
         if (len == 0) {
             Serial.println("[SET] no stored settings (first run), using defaults");
-        } else if (len != sizeof(StoredBlob)) {
-            Serial.printf("[SET] stored size %u != %u, using defaults\n",
-                          static_cast<unsigned>(len), static_cast<unsigned>(sizeof(StoredBlob)));
-        } else {
+        } else if (len == sizeof(StoredBlob)) {
             StoredBlob blob;
             const size_t got = prefs.getBytes(settings_cfg::kNvsBlobKey, &blob, sizeof(blob));
             if (got != sizeof(blob)) {
@@ -262,6 +326,25 @@ bool SettingsStore::load() {
                 memcpy(&loaded, &blob.data, sizeof(Settings));
                 haveStored = true;
             }
+        } else if (len == sizeof(StoredBlobV1)) {
+            // [Prompt 21b] Оновлення зі старої прошивки: читаємо v1 і мігруємо.
+            StoredBlobV1 old;
+            const size_t got = prefs.getBytes(settings_cfg::kNvsBlobKey, &old, sizeof(old));
+            if (got != sizeof(old)) {
+                Serial.println("[SET] stored read failed, using defaults");
+            } else if (old.version != settings_cfg::kLegacyFormatVersion ||
+                       old.payloadSize != sizeof(SettingsV1)) {
+                Serial.printf("[SET] stored format v%u/%u unsupported, using defaults\n",
+                              static_cast<unsigned>(old.version),
+                              static_cast<unsigned>(old.payloadSize));
+            } else {
+                migrateFromV1(old.data, loaded);
+                haveStored = true;
+                migrated = true;
+            }
+        } else {
+            Serial.printf("[SET] stored size %u != %u, using defaults\n",
+                          static_cast<unsigned>(len), static_cast<unsigned>(sizeof(StoredBlob)));
         }
         prefs.end();
     } else {
@@ -273,6 +356,14 @@ bool SettingsStore::load() {
         sanitize(loaded);
         s_settings = loaded;
         s_dirty = false;
+        if (migrated) {
+            Serial.println("[SET] migrated v1 -> v2: all input profiles inherit old global values");
+            if (!writeLocked()) {  // старий blob лишається в NVS, доки запис не вдасться
+                markDirtyLocked();
+                return false;
+            }
+            return true;
+        }
         Serial.println("[SET] loaded from NVS");
         return true;
     }

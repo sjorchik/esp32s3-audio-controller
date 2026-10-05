@@ -11,6 +11,10 @@
 // [Prompt 18] ДОДАНО: до /api/status нові поля (standby, playing, otaProgress, station.count/max,
 // inputs[]); маршрути керування й системні винесено в net/web_api_player.cpp та
 // net/web_api_system.cpp (тут лише їх реєстрація в registerRoutes()).
+// [Prompt 21b] ЗМІНЕНО: звукові налаштування — по входах (профіль ПОТОЧНОГО входу, веде
+// AppController). Тонкомпенсація тепер іде через AppController::setTone() (раніше — напряму в
+// чип + Settings); /api/status бере loudness з AppState; GET /api/settings віддає значення
+// профілю lastInput під тими самими ключами (формат відповідей не змінено).
 // [Prompt 19] ДОДАНО: один рядок registerStaticRoutes() наприкінці registerRoutes() —
 // вбудовані веб-сторінки (net/web_static.*); API-маршрути лишаються першими.
 
@@ -150,9 +154,8 @@ void handleStatus(AsyncWebServerRequest* req) {
         if (inputName[0] == '\0') inputName = defaults::kInputNames[st.inputIndex];
     }
 
-    // Тонкомпенсація: фактичний запит до чипа, якщо він є; інакше з Settings.
-    bool loudness = cfg.loudness;
-    if (s_proc != nullptr) loudness = s_proc->cachedState().loudness;
+    // [Prompt 21b] Тонкомпенсація — з AppState (профіль поточного входу, веде AppController).
+    const bool loudness = st.loudness;
 
     JsonDocument doc;
     doc["mode"] = modeName(st.mode);
@@ -250,13 +253,16 @@ void handleSettingsGet(AsyncWebServerRequest* req) {
     for (uint8_t i = 0; i < defaults::kInputCount; ++i) names.add(s.inputNames[i]);
     doc["brightness"] = s.brightness;
     doc["displayFlipped"] = s.displayFlipped;
-    doc["bass"] = s.bass;
-    doc["treble"] = s.treble;
-    doc["balance"] = s.balance;
-    doc["loudness"] = s.loudness;
+    // [Prompt 21b] Звукові значення — з ЗБЕРЕЖЕНОГО профілю входу lastInput (той самий вхід, що
+    // відновиться після перезапуску); ключі й типи без змін.
+    const InputProfile& pf = s.profiles[s.lastInput < defaults::kInputCount ? s.lastInput : 0];
+    doc["bass"] = pf.bass;
+    doc["treble"] = pf.treble;
+    doc["balance"] = pf.balance;
+    doc["loudness"] = pf.loudness;
     doc["lastInput"] = s.lastInput;
     doc["lastStation"] = s.lastStation;
-    doc["lastVolume"] = s.lastVolume;
+    doc["lastVolume"] = pf.volume;
     doc["lastMute"] = s.lastMute;
 
     sendJson(req, 200, doc);
@@ -492,8 +498,7 @@ void parsePlan(JsonObjectConst root, Plan& plan, JsonArray errs, ParseFlags& f) 
 // POST /api/settings — застосування
 // ---------------------------------------------------------------------------
 struct SettingsCtx {
-    const Plan* plan;
-    bool saveLoudness;  // тембр/баланс зберігає AppController::setTone()
+    const Plan* plan;  // [Prompt 21b] тембр/баланс/loudness зберігає AppController::setTone()
 };
 
 void handleSettingsPost(AsyncWebServerRequest* req) {
@@ -551,16 +556,17 @@ void handleSettingsPost(AsyncWebServerRequest* req) {
         results["displayFlipped"]["applied"] = true;
     }
 
-    // --- Тембр/баланс: через AppController::setTone() ---
-    // AppController тримає власні копії bass/treble/balance і публікує їх у AppState та
-    // Settings після кожної події, тому пряма зміна чипа була б затерта. setTone() під
-    // його мʼютексом: чип -> копія -> AppState -> Settings.
-    SettingsCtx sc = {&plan, plan.hasLoudness};
-    if (plan.hasBass || plan.hasTreble || plan.hasBalance) {
+    // --- Тембр/баланс/тонкомпенсація: через AppController::setTone() ---
+    // AppController тримає власні копії bass/treble/balance/loudness (профіль поточного входу) і
+    // публікує їх у AppState та Settings після кожної події, тому пряма зміна чипа була б
+    // затерта. setTone() під його мʼютексом: чип -> копія -> AppState -> профіль у Settings.
+    SettingsCtx sc = {&plan};
+    if (plan.hasBass || plan.hasTreble || plan.hasBalance || plan.hasLoudness) {
         ToneUpdate tu;
-        tu.hasBass = plan.hasBass;       tu.bass = plan.bass;
-        tu.hasTreble = plan.hasTreble;   tu.treble = plan.treble;
-        tu.hasBalance = plan.hasBalance; tu.balance = plan.balance;
+        tu.hasBass = plan.hasBass;         tu.bass = plan.bass;
+        tu.hasTreble = plan.hasTreble;     tu.treble = plan.treble;
+        tu.hasBalance = plan.hasBalance;   tu.balance = plan.balance;
+        tu.hasLoudness = plan.hasLoudness; tu.loudness = plan.loudness;
         const bool handled = AppController::setTone(tu);
         auto toneResult = [&](const char* field, bool wanted, bool ok) {
             if (!wanted) return;
@@ -575,18 +581,7 @@ void handleSettingsPost(AsyncWebServerRequest* req) {
         toneResult("bass", plan.hasBass, tu.bassOk);
         toneResult("treble", plan.hasTreble, tu.trebleOk);
         toneResult("balance", plan.hasBalance, tu.balanceOk);
-    }
-
-    // --- Тонкомпенсація: AppController її не веде, у AppState поля немає ---
-    if (plan.hasLoudness) {
-        if (s_proc->setLoudness(plan.loudness)) {
-            results["loudness"]["applied"] = true;
-        } else {
-            results["loudness"]["applied"] = false;
-            results["loudness"]["error"] = "i2c_failed";
-            sc.saveLoudness = false;
-            hwFailed = true;
-        }
+        toneResult("loudness", plan.hasLoudness, tu.loudnessOk);
     }
 
     // --- Settings (один modify = один мʼютекс, один requestSave) ---
@@ -603,8 +598,7 @@ void handleSettingsPost(AsyncWebServerRequest* req) {
     for (uint8_t i = 0; i < kNames; ++i) anyName = anyName || plan.hasName[i];
     if (anyName) results["inputNames"]["applied"] = true;
 
-    const bool touchSettings = plan.hasBrightness || plan.hasFlipped || plan.hasProc || anyName ||
-                               sc.saveLoudness;
+    const bool touchSettings = plan.hasBrightness || plan.hasFlipped || plan.hasProc || anyName;
     if (touchSettings) {
         SettingsStore::modify(
             [](Settings& s, void* c) {
@@ -612,7 +606,6 @@ void handleSettingsPost(AsyncWebServerRequest* req) {
                 const Plan& p = *x->plan;
                 if (p.hasBrightness) s.brightness = p.brightness;
                 if (p.hasFlipped) s.displayFlipped = p.flipped;
-                if (x->saveLoudness) s.loudness = p.loudness;
                 if (p.hasProc) s.processorType = p.proc;
                 for (uint8_t i = 0; i < kNames; ++i) {
                     if (p.hasName[i]) memcpy(s.inputNames[i], p.names[i], sizeof(s.inputNames[i]));

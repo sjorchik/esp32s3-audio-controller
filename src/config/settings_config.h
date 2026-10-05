@@ -4,6 +4,7 @@
 // Значення за замовчуванням самих налаштувань тут не дублюються:
 // вони беруться з config/defaults.h, config/display_config.h
 // (kDefaultFlipped) та audio_cfg::kTestProcType (див. core/settings.cpp).
+// Виняток: kDefaultInputGain (у defaults.h такої константи немає, а defaults.h не чіпаємо).
 
 #include <stdint.h>
 
@@ -34,8 +35,21 @@ constexpr const char* kNvsBlobKey   = "settings";
 
 // Версія формату blob-а. Збільшувати при БУДЬ-ЯКІЙ зміні порядку/типів полів
 // Settings (зміна лише розміру ловиться ще й перевіркою sizeof). Невідповідна
-// версія → значення за замовчуванням (міграції немає).
-constexpr uint8_t kFormatVersion = 1;
+// версія → значення за замовчуванням, КРІМ єдиної підтримуваної міграції
+// kLegacyFormatVersion -> kFormatVersion (див. SettingsStore::load()).
+// [Prompt 21b] 1 -> 2: глобальні bass/treble/balance/loudness/lastVolume замінено
+// профілями по входах (Settings::profiles).
+constexpr uint8_t kFormatVersion = 2;
+
+// [Prompt 21b] Формат, який ще вміємо читати й мігрувати (усі профілі входів
+// успадковують колишні глобальні значення). Інші версії -> значення за замовчуванням.
+constexpr uint8_t kLegacyFormatVersion = 1;
+static_assert(kLegacyFormatVersion < kFormatVersion, "legacy version must be older");
+
+// [Prompt 21b] Підсилення входу за замовчуванням (сирі апаратні кроки) для нових і
+// мігрованих профілів. Раніше gain у NVS не зберігався й після старту дорівнював
+// початковому значенню драйвера (0).
+constexpr int8_t kDefaultInputGain = 0;
 
 // ---------------------------------------------------------------------------
 // Відкладений запис (дебаунс)

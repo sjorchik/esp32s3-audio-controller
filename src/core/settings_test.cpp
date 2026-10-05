@@ -1,4 +1,6 @@
 // Serial-тест Settings. Протокол — у settings_test.h.
+// [Prompt 21b] Поля звуку (bass/treble/balance/loud/vol/gain) змінюють профіль входу
+// Settings::lastInput; set.show друкує профілі всіх входів.
 
 #include "core/settings_test.h"
 
@@ -18,7 +20,7 @@ namespace {
 constexpr const char* kPrefix = "set.";
 
 enum class Field : uint8_t {
-    Proc, Bright, Flip, Bass, Treble, Balance, Loud, Input, Station, Vol, Mute, Name, RampVol,
+    Proc, Bright, Flip, Bass, Treble, Balance, Loud, Input, Station, Vol, Mute, Name, RampVol, Gain,
 };
 
 struct Edit {
@@ -31,18 +33,21 @@ struct Edit {
 // Виконується під мʼютексом SettingsStore::modify().
 void applyEdit(Settings& s, void* ctx) {
     const Edit& e = *static_cast<const Edit*>(ctx);
+    // [Prompt 21b] Профіль входу, який зараз «активний» у Settings (lastInput).
+    InputProfile& prof = s.profiles[s.lastInput < defaults::kInputCount ? s.lastInput : 0];
     switch (e.field) {
         case Field::Proc:     s.processorType = static_cast<uint8_t>(e.value); break;
         case Field::Bright:   s.brightness = static_cast<uint8_t>(e.value); break;
         case Field::Flip:     s.displayFlipped = (e.value != 0); break;
-        case Field::Bass:     s.bass = static_cast<int8_t>(e.value); break;
-        case Field::Treble:   s.treble = static_cast<int8_t>(e.value); break;
-        case Field::Balance:  s.balance = static_cast<int8_t>(e.value); break;
-        case Field::Loud:     s.loudness = (e.value != 0); break;
+        case Field::Bass:     prof.bass = static_cast<int8_t>(e.value); break;
+        case Field::Treble:   prof.treble = static_cast<int8_t>(e.value); break;
+        case Field::Balance:  prof.balance = static_cast<int8_t>(e.value); break;
+        case Field::Loud:     prof.loudness = (e.value != 0); break;
         case Field::Input:    s.lastInput = static_cast<uint8_t>(e.value); break;
         case Field::Station:  s.lastStation = static_cast<uint16_t>(e.value); break;
-        case Field::Vol:      s.lastVolume = static_cast<int8_t>(e.value); break;
-        case Field::RampVol:  s.lastVolume = static_cast<int8_t>(e.value); break;
+        case Field::Vol:      prof.volume = static_cast<int8_t>(e.value); break;
+        case Field::RampVol:  prof.volume = static_cast<int8_t>(e.value); break;
+        case Field::Gain:     prof.gain = static_cast<int8_t>(e.value); break;
         case Field::Mute:     s.lastMute = (e.value != 0); break;
         case Field::Name:
             snprintf(s.inputNames[e.index], sizeof(s.inputNames[e.index]), "%s", e.text);
@@ -68,6 +73,7 @@ const NumericCmd kNumeric[] = {
     {"input",   Field::Input,   0, defaults::kInputCount - 1},
     {"station", Field::Station, 0, 65535},
     {"vol",     Field::Vol,     -128, 127},
+    {"gain",    Field::Gain,    -128, 127},
     {"mute",    Field::Mute,    0, 1},
 };
 
@@ -75,7 +81,8 @@ void printHelp() {
     Serial.println("[SET] commands (all start with 'set.'):");
     Serial.println("[SET]   set.show | set.save | set.ramp | set.reset | set.erase | set.help");
     Serial.println("[SET]   set.proc 0|1   set.bright 0..255   set.flip 0|1   set.loud 0|1");
-    Serial.println("[SET]   set.bass|treble|balance|vol -128..127   set.mute 0|1");
+    Serial.println("[SET]   set.bass|treble|balance|vol|gain -128..127   set.mute 0|1");
+    Serial.println("[SET]   (audio fields edit the profile of input lastInput)");
     Serial.printf("[SET]   set.input 0..%u   set.station 0..65535   set.name <idx> <text>\n",
                   static_cast<unsigned>(defaults::kInputCount - 1));
 }
@@ -90,11 +97,17 @@ void printShow() {
     }
     Serial.printf("[SET] brightness=%u displayFlipped=%d\n", static_cast<unsigned>(s.brightness),
                   s.displayFlipped ? 1 : 0);
-    Serial.printf("[SET] bass=%d treble=%d balance=%d loudness=%d\n", static_cast<int>(s.bass),
-                  static_cast<int>(s.treble), static_cast<int>(s.balance), s.loudness ? 1 : 0);
-    Serial.printf("[SET] lastInput=%u lastStation=%u lastVolume=%d lastMute=%d\n",
+    Serial.printf("[SET] lastInput=%u lastStation=%u lastMute=%d\n",
                   static_cast<unsigned>(s.lastInput), static_cast<unsigned>(s.lastStation),
-                  static_cast<int>(s.lastVolume), s.lastMute ? 1 : 0);
+                  s.lastMute ? 1 : 0);
+    for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+        const InputProfile& p = s.profiles[i];
+        Serial.printf("[SET] profile[%u]%s vol=%d bass=%d treble=%d balance=%d gain=%d loud=%d\n",
+                      static_cast<unsigned>(i), i == s.lastInput ? "*" : " ",
+                      static_cast<int>(p.volume), static_cast<int>(p.bass),
+                      static_cast<int>(p.treble), static_cast<int>(p.balance),
+                      static_cast<int>(p.gain), p.loudness ? 1 : 0);
+    }
     Serial.printf("[SET] dirty=%d nvsWrites=%u\n", SettingsStore::isDirty() ? 1 : 0,
                   static_cast<unsigned>(SettingsStore::writeCount()));
 }

@@ -49,13 +49,13 @@
         <div id="gain-seg" class="seg" role="radiogroup" aria-label="Підсилення"></div>
         <p id="gain-db" class="hint num"></p>
         <p class="hint">Підсилення задається окремо для кожного входу; щоб налаштувати інший вхід — оберіть його нижче.</p>
-        <p class="hint">Підсилення не зберігається після перезапуску пристрою.</p>
+        <p class="hint">Усі значення звуку (гучність, підсилення, бас, дискант, баланс, тонкомпенсація) запамʼятовуються окремо для кожного входу й зберігаються після перезапуску.</p>
       </fieldset>
 
       <fieldset id="grp-input" class="group card">
         <legend class="card-title">Вхід</legend>
         <div id="inputs" class="seg" role="radiogroup" aria-label="Вхід"></div>
-        <p class="hint">Перемикання входу змінює джерело звуку.</p>
+        <p class="hint">Перемикання входу змінює джерело звуку й застосовує значення звуку, запамʼятовані для цього входу.</p>
       </fieldset>
     </div>
 
@@ -67,6 +67,7 @@
           <label class="switch"><input id="loud" type="checkbox"><span>Тонкомпенсація (loudness)</span></label>
         </div>
         <p id="loud-no" class="hint" hidden>Цей чип або версія корпуса не підтримує тонкомпенсацію.</p>
+        <p class="hint">Бас, дискант, баланс і тонкомпенсація діють для поточного входу й запамʼятовуються лише для нього.</p>
         <div class="toolbar param-actions">
           <button id="btn-reset" class="btn" type="button"><span data-icon="reset"></span>Скинути тембр</button>
         </div>
