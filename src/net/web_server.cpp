@@ -8,6 +8,9 @@
 // [Prompt 16] ДОДАНО: POST /api/ota (оновлення прошивки сирим тілом .bin). Запис у вільний
 // OTA-розділ веде цей файл (Update.*), а звук/режим — лише через AppController::beginOta()/
 // setOtaProgress()/otaFailed(). Перезапуск після відповіді — окрема одноразова задача.
+// [Prompt 18] ДОДАНО: до /api/status нові поля (standby, playing, otaProgress, station.count/max,
+// inputs[]); маршрути керування й системні винесено в net/web_api_player.cpp та
+// net/web_api_system.cpp (тут лише їх реєстрація в registerRoutes()).
 
 #include "net/web_server.h"
 
@@ -35,6 +38,9 @@
 #include "core/app_state.h"
 #include "core/settings.h"
 #include "input/ir_rc5.h"         // [Prompt 15] мапа кодів (прямі виклики лише для даних)
+#include "net/web_api_common.h"   // [Prompt 18] registerDevCors()
+#include "net/web_api_player.h"   // [Prompt 18] registerPlayerRoutes()
+#include "net/web_api_system.h"   // [Prompt 18] registerSystemRoutes()
 #include "net/wifi_manager.h"
 #include "stations/station_store.h"  // [Prompt 14]
 #include "ui/display.h"
@@ -156,12 +162,34 @@ void handleStatus(AsyncWebServerRequest* req) {
     doc["gain"] = st.gain;
     doc["mute"] = st.mute;
     doc["loudness"] = loudness;
+    // [Prompt 18] ДОДАНО
+    doc["standby"] = (st.mode == Mode::Standby);
+    doc["playing"] = st.streamPlaying;
+    doc["otaProgress"] = st.otaProgress;  // 0..100; осмислений лише при mode == "OtaUpdate"
 
     JsonObject station = doc["station"].to<JsonObject>();
     station["index"] = st.stationIndex;
     station["name"] = st.stationName;
+    station["count"] = StationStore::count();             // [Prompt 18]
+    station["max"] = station_store_cfg::kMaxStations;     // [Prompt 18]
     doc["track"] = st.trackTitle;
     doc["streamStatus"] = streamStatusName(st.streamStatus);
+
+    // [Prompt 18] ДОДАНО: перелік входів для вибору. Для PT2313L вхід 3 має available=false
+    // (кількість входів — з capabilities(); без процесора вважаємо всі доступними).
+    uint8_t inputsAvailable = defaults::kInputCount;
+    if (s_proc != nullptr) {
+        const uint8_t n = s_proc->capabilities().inputCount;
+        if (n < inputsAvailable) inputsAvailable = n;
+    }
+    JsonArray inputs = doc["inputs"].to<JsonArray>();
+    for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+        JsonObject o = inputs.add<JsonObject>();
+        o["index"] = i;
+        const char* nm = cfg.inputNames[i];
+        o["name"] = (nm[0] != '\0') ? nm : defaults::kInputNames[i];
+        o["available"] = (i < inputsAvailable);
+    }
 
     JsonObject wifi = doc["wifi"].to<JsonObject>();
     wifi["connected"] = WifiManager::isConnected();
@@ -1583,6 +1611,11 @@ void registerRoutes(AsyncWebServer& server) {
 
     // [Prompt 16] OTA: сирий бінарник у тілі (не multipart).
     server.on("/api/ota", HTTP_POST, handleOtaDone, nullptr, handleOtaBody);
+
+    // [Prompt 18] Команди керування, система, dev-CORS (нові файли net/web_api_*).
+    web_api::registerDevCors(server);
+    registerPlayerRoutes(server, s_proc);
+    registerSystemRoutes(server);
 
     server.onNotFound(handleNotFound);
 }

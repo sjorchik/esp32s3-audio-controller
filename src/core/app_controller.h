@@ -19,6 +19,11 @@
 // [Prompt 16] ДОДАНО: beginOta()/setOtaProgress()/otaFailed() — вхід для веб-сервера до
 //             OTA-оновлення. Запис прошивки веде net/web_server (Update.*), а звук
 //             зупиняє, мʼютить і відновлює AppController (веб не чіпає AudioPlayer).
+// [Prompt 18] ДОДАНО: runWebCommand() + типи WebCmdType/WebCommand/WebCmdResult — ЄДИНИЙ
+//             вхід для команд керування з вебу (гучність, мʼют, gain, standby, вхід, плеєр,
+//             вибір станції). Події EventBus для цього не годяться: вони не ідемпотентні
+//             (POWER/MUTE лише перемикають) і не повертають результату, а вебу треба
+//             абсолютні значення й чесний код відповіді.
 
 #include "core/events.h"
 
@@ -36,6 +41,54 @@ struct ToneUpdate {
     bool bassOk = false;
     bool trebleOk = false;
     bool balanceOk = false;
+};
+
+// [Prompt 18] ДОДАНО: команда з вебу. Семантика полів залежить від type:
+//   VolumeSet     value = нова гучність (шкала UI, volumeMin..volumeMax)
+//   VolumeStep    value = зміна гучності (знак = напрямок), результат обрізається до меж
+//   MuteSet       flag  = true -> мʼют увімкнути
+//   MuteToggle    -
+//   GainSet       value = нове підсилення ПОТОЧНОГО входу (gainMin..gainMax, сирі кроки)
+//   StandbySet    flag  = true -> перейти в standby, false -> вийти зі standby
+//   StandbyToggle -
+//   InputSet      value = індекс входу (0..inputCount-1)
+//   PlayerPlay    -   (вхід Radio; уже грає -> нічого не робить)
+//   PlayerPause   -   (вхід Radio; зупиняє потік і скасовує перепідключення)
+//   PlayerToggle  -
+//   StationPlay   value = індекс станції; flag = true -> якщо активний інший вхід, перейти на Radio
+//   StationNext   - (напрямок як у кнопки RIGHT)
+//   StationPrev   - (напрямок як у кнопки LEFT)
+enum class WebCmdType : uint8_t {
+    VolumeSet,
+    VolumeStep,
+    MuteSet,
+    MuteToggle,
+    GainSet,
+    StandbySet,
+    StandbyToggle,
+    InputSet,
+    PlayerPlay,
+    PlayerPause,
+    PlayerToggle,
+    StationPlay,
+    StationNext,
+    StationPrev,
+};
+
+struct WebCommand {
+    WebCmdType type;
+    int32_t value;
+    bool flag;
+};
+
+// [Prompt 18] ДОДАНО: результат команди -> HTTP-код у вебі.
+enum class WebCmdResult : uint8_t {
+    Ok,           // виконано (або вже було в такому стані)          -> 200
+    Busy,         // контролер не запущено / мʼютекс зайнятий         -> 503
+    NotAllowed,   // зараз недопустимо (Standby, OTA, навчання IR,
+                  // не вхід Radio, немає станцій); причина — reason   -> 409
+    OutOfRange,   // значення поза межами (вхід, станція, гучність)   -> 400
+    Unsupported,  // чип не підтримує функцію (gain)                  -> 400
 };
 
 class AppController {
@@ -91,4 +144,15 @@ public:
     // перезапуск потоку (через звичайний ramp). Якщо мʼютекс контролера зайнятий, відновлення
     // виконає найближчий tick(). Безпечно викликати, коли OTA не триває (нічого не робить).
     static void otaFailed(const char* reason);
+
+    // [Prompt 18] ДОДАНО: виконує команду з вебу під внутрішнім мʼютексом (як setTone()).
+    // Гейти узгоджені з handleEvent(): у Mode::OtaUpdate та Mode::IrLearn — завжди
+    // NotAllowed; у Standby дозволені лише StandbySet/StandbyToggle. Команди входу й
+    // станції при відкритому списку станцій на пристрої спершу закривають його.
+    // *reasonOut (якщо не nullptr) — статичний рядок snake_case для NotAllowed/OutOfRange/
+    // Unsupported/Busy: "ota_in_progress", "ir_learn_active", "standby", "not_radio_input",
+    // "wifi_setup", "no_stations", "input_unavailable", "station_out_of_range",
+    // "volume_out_of_range", "gain_out_of_range", "not_supported", "busy"; інакше nullptr.
+    // Стан публікується в AppState і (за потреби) зберігається в Settings до повернення.
+    static WebCmdResult runWebCommand(const WebCommand& cmd, const char** reasonOut = nullptr);
 };

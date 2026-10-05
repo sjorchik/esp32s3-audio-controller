@@ -37,6 +37,12 @@
 // (навіть POWER), setTone()/beginIrLearn() відмовляють. Попередній Mode запамʼятовується й
 // відновлюється лише на невдачі; на успіху пристрій перезапускає web_server. Якщо
 // otaFailed() не отримав мʼютекс, відновлення робить найближчий tickLocked().
+//
+// [Prompt 18] ДОДАНО: runWebCommand() — команди керування з вебу (абсолютна гучність, gain,
+// мʼют/standby як set, вхід, play/pause, вибір станції за індексом). Переиспользує ті самі
+// внутрішні дії, що й обробники подій (setVolumeTarget, changeInput, changeStation,
+// stepStation, togglePlayPause, enterStandby/leaveStandby, adjustGain), тож поведінка
+// (ramp, мʼют на переходах, збереження в Settings) ідентична кнопкам/пульту.
 
 #include "core/app_controller.h"
 
@@ -1218,6 +1224,189 @@ void taskMain(void*) {
     }
 }
 
+// --- [Prompt 18] Команди з вебу -----------------------------------------------
+// Викликати лише під s_lock. Перевірка меж і гейти — ДО будь-якої зміни стану, тож
+// відмова (NotAllowed/OutOfRange/Unsupported) нічого не чіпає (список станцій на
+// пристрої теж лишається відкритим).
+
+// Станційні/плеєрні команди мають сенс лише на вході Radio, і не в WifiSetup (потоку немає).
+bool webRadioGate(const char*& why) {
+    if (s_input != 0) {
+        why = "not_radio_input";
+        return false;
+    }
+    if (s_mode == Mode::WifiSetup) {
+        why = "wifi_setup";
+        return false;
+    }
+    return true;
+}
+
+// Той самий критерій «грає», що в togglePlayPause(): будь-який стан, окрім Idle, або
+// відкладений старт.
+bool playerActive() {
+    return AudioPlayer::state() != PlayerState::Idle || s_playPending;
+}
+
+WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
+    why = nullptr;
+    if (s_mode == Mode::OtaUpdate) {
+        why = "ota_in_progress";
+        return WebCmdResult::NotAllowed;
+    }
+    if (s_mode == Mode::IrLearn) {
+        why = "ir_learn_active";
+        return WebCmdResult::NotAllowed;
+    }
+    const bool powerCmd =
+        (c.type == WebCmdType::StandbySet || c.type == WebCmdType::StandbyToggle);
+    if (s_mode == Mode::Standby && !powerCmd) {
+        why = "standby";  // як і події: у Standby все, крім POWER, ігнорується
+        return WebCmdResult::NotAllowed;
+    }
+
+    switch (c.type) {
+        case WebCmdType::VolumeSet:
+            if (c.value < s_caps.volumeMin || c.value > s_caps.volumeMax) {
+                why = "volume_out_of_range";
+                return WebCmdResult::OutOfRange;
+            }
+            if (setVolumeTarget(static_cast<int>(c.value))) {
+                s_persistNeeded = true;
+                APP_LOG("volume=%d (WEB)\n", static_cast<int>(s_volume));
+            }
+            break;
+
+        case WebCmdType::VolumeStep: {
+            const int d = clampInt(static_cast<int>(c.value), -1000, 1000);
+            if (setVolumeTarget(static_cast<int>(s_volume) + d)) {  // обрізається до меж
+                s_persistNeeded = true;
+                APP_LOG("volume=%d (WEB step %d)\n", static_cast<int>(s_volume), d);
+            }
+            break;
+        }
+
+        case WebCmdType::MuteSet:
+            if (s_userMute != c.flag) {
+                toggleUserMute();
+            }
+            break;
+
+        case WebCmdType::MuteToggle:
+            toggleUserMute();
+            break;
+
+        case WebCmdType::GainSet:
+            if (s_proc == nullptr || !targetSupported(AdjustTarget::Gain)) {
+                why = "not_supported";
+                return WebCmdResult::Unsupported;
+            }
+            if (c.value < s_caps.gainMin || c.value > s_caps.gainMax) {
+                why = "gain_out_of_range";
+                return WebCmdResult::OutOfRange;
+            }
+            // adjustGain() сам мʼютить на час стрибка й нічого не робить при рівності.
+            adjustGain(static_cast<int>(c.value) - static_cast<int>(s_proc->cachedState().gain));
+            break;
+
+        case WebCmdType::StandbySet:
+            if (c.flag) {
+                if (s_mode != Mode::Standby) enterStandby();
+            } else if (s_mode == Mode::Standby) {
+                leaveStandby();
+            }
+            break;
+
+        case WebCmdType::StandbyToggle:
+            togglePower();
+            break;
+
+        case WebCmdType::InputSet:
+            if (c.value < 0 || c.value >= s_caps.inputCount) {
+                why = "input_unavailable";  // напр. вхід 3 для PT2313L
+                return WebCmdResult::OutOfRange;
+            }
+            if (s_mode == Mode::Menu) closeStationList();
+            changeInput(static_cast<uint8_t>(c.value));
+            break;
+
+        case WebCmdType::PlayerPlay:
+        case WebCmdType::PlayerPause:
+        case WebCmdType::PlayerToggle: {
+            if (!webRadioGate(why)) return WebCmdResult::NotAllowed;
+            const bool active = playerActive();
+            const bool wantPlay = (c.type == WebCmdType::PlayerPlay) ||
+                                  (c.type == WebCmdType::PlayerToggle && !active);
+            if (wantPlay) {
+                if (stationCount() == 0) {
+                    why = "no_stations";
+                    return WebCmdResult::NotAllowed;
+                }
+                if (!active) startStream();  // уже грає -> нічого не робимо
+            } else if (active) {
+                stopStream();
+            }
+            break;
+        }
+
+        case WebCmdType::StationPlay: {
+            const int n = stationCount();
+            if (n == 0) {
+                why = "no_stations";
+                return WebCmdResult::NotAllowed;
+            }
+            if (c.value < 0 || c.value >= n) {
+                why = "station_out_of_range";
+                return WebCmdResult::OutOfRange;
+            }
+            const uint16_t idx = static_cast<uint16_t>(c.value);
+            if (s_input != 0) {
+                if (!c.flag) {
+                    why = "not_radio_input";
+                    return WebCmdResult::NotAllowed;
+                }
+                if (WifiManager::isApMode()) {
+                    why = "wifi_setup";
+                    return WebCmdResult::NotAllowed;
+                }
+                s_station = idx;  // changeInput(0) сам запустить потік зі s_station
+                changeInput(0);
+            } else {
+                if (s_mode == Mode::WifiSetup) {
+                    why = "wifi_setup";
+                    return WebCmdResult::NotAllowed;
+                }
+                if (s_mode == Mode::Menu) closeStationList();
+                // Та сама станція вже грає — нічого не робимо; на паузі — запускаємо
+                // (так само, як selectFromList()).
+                if (idx != s_station || AudioPlayer::state() == PlayerState::Idle) {
+                    changeStation(idx);
+                }
+            }
+            break;
+        }
+
+        case WebCmdType::StationNext:
+        case WebCmdType::StationPrev:
+            if (!webRadioGate(why)) return WebCmdResult::NotAllowed;
+            if (stationCount() == 0) {
+                why = "no_stations";
+                return WebCmdResult::NotAllowed;
+            }
+            if (s_mode == Mode::Menu) closeStationList();
+            stepStation(c.type == WebCmdType::StationNext ? cfg::kStationRightStep
+                                                          : cfg::kStationLeftStep);
+            break;
+    }
+
+    publishState();
+    if (s_persistNeeded) {
+        persist();
+        s_persistNeeded = false;
+    }
+    return WebCmdResult::Ok;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1342,6 +1531,27 @@ void AppController::otaFailed(const char* reason) {
     }
     leaveOtaLocked();
     xSemaphoreGiveRecursive(s_lock);
+}
+
+// [Prompt 18] ДОДАНО: команди з вебу
+WebCmdResult AppController::runWebCommand(const WebCommand& cmd, const char** reasonOut) {
+    if (reasonOut != nullptr) {
+        *reasonOut = nullptr;
+    }
+    if (!s_started || s_lock == nullptr ||
+        xSemaphoreTakeRecursive(s_lock, pdMS_TO_TICKS(cfg::kLockTimeoutMs)) != pdTRUE) {
+        if (reasonOut != nullptr) {
+            *reasonOut = "busy";
+        }
+        return WebCmdResult::Busy;
+    }
+    const char* why = nullptr;
+    const WebCmdResult r = execWebCommandLocked(cmd, why);
+    xSemaphoreGiveRecursive(s_lock);
+    if (reasonOut != nullptr) {
+        *reasonOut = why;
+    }
+    return r;
 }
 
 bool AppController::begin(AudioProcessor* processorOrNull) {
