@@ -11,6 +11,8 @@
 // [Prompt 18] ДОДАНО: до /api/status нові поля (standby, playing, otaProgress, station.count/max,
 // inputs[]); маршрути керування й системні винесено в net/web_api_player.cpp та
 // net/web_api_system.cpp (тут лише їх реєстрація в registerRoutes()).
+// [Prompt 19] ДОДАНО: один рядок registerStaticRoutes() наприкінці registerRoutes() —
+// вбудовані веб-сторінки (net/web_static.*); API-маршрути лишаються першими.
 
 #include "net/web_server.h"
 
@@ -41,6 +43,7 @@
 #include "net/web_api_common.h"   // [Prompt 18] registerDevCors()
 #include "net/web_api_player.h"   // [Prompt 18] registerPlayerRoutes()
 #include "net/web_api_system.h"   // [Prompt 18] registerSystemRoutes()
+#include "net/web_static.h"       // [Prompt 19] registerStaticRoutes()
 #include "net/wifi_manager.h"
 #include "stations/station_store.h"  // [Prompt 14]
 #include "ui/display.h"
@@ -1616,6 +1619,10 @@ void registerRoutes(AsyncWebServer& server) {
     web_api::registerDevCors(server);
     registerPlayerRoutes(server, s_proc);
     registerSystemRoutes(server);
+
+    // [Prompt 19] Вбудований веб-інтерфейс (GET /, /index.html, /css/*, /js/*...). Останнім
+    // серед маршрутів: /api/* вже зареєстровані й виграють; onNotFound не чіпаємо.
+    registerStaticRoutes(server);
 
     server.onNotFound(handleNotFound);
 }

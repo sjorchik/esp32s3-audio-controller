@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Аудіоконтролер</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-row">
+    <h1 class="brand" id="brand">Аудіоконтролер</h1>
+    <span id="wifi" class="wifi" role="img"></span>
+    <button id="btn-power" class="btn btn-icon" type="button" aria-pressed="false" aria-label="Живлення" data-icon="power"></button>
+  </div>
+  <nav id="nav" class="nav" aria-label="Розділи"></nav>
+</header>
+
+<main class="page">
+  <div id="banners" class="banners"></div>
+
+  <section id="standby" class="card standby" hidden>
+    <h2 class="standby-title">Очікування</h2>
+    <p class="hint">Звук вимкнено, пристрій чекає на команду.</p>
+    <button id="btn-wake" class="btn btn-primary btn-lg" type="button"><span data-icon="power"></span>Увімкнути</button>
+  </section>
+
+  <div id="live" class="home-grid">
+    <div class="col">
+      <fieldset id="grp-player" class="group card hero">
+        <legend class="visually-hidden">Плеєр</legend>
+        <div class="hero-head">
+          <span id="badge" class="badge badge-muted">…</span>
+          <span id="input-name" class="muted"></span>
+        </div>
+        <div id="station-name" class="marquee hero-name"><span></span></div>
+        <div id="track" class="marquee hero-track"><span></span></div>
+        <div id="dial" class="dial" hidden>
+          <div class="dial-scale"><i id="dial-needle" class="dial-needle"></i></div>
+          <span id="dial-caption" class="muted dial-caption"></span>
+        </div>
+        <p id="player-hint" class="hint" hidden></p>
+        <div class="transport">
+          <button id="btn-prev" class="btn btn-icon btn-lg" type="button" aria-label="Попередня станція" data-icon="prev"></button>
+          <button id="btn-play" class="btn btn-primary btn-icon btn-xl" type="button" aria-label="Грати" data-icon="play"></button>
+          <button id="btn-next" class="btn btn-icon btn-lg" type="button" aria-label="Наступна станція" data-icon="next"></button>
+        </div>
+      </fieldset>
+
+      <fieldset id="grp-volume" class="group card">
+        <legend class="visually-hidden">Гучність</legend>
+        <div class="vol-head"><span>Гучність</span><output id="vol-out" class="num" for="vol">0</output></div>
+        <div class="vol-row">
+          <button id="vol-dn" class="btn btn-icon" type="button" aria-label="Тихіше" data-icon="minus"></button>
+          <input id="vol" class="slider" type="range" min="0" max="100" step="1" value="0" aria-label="Гучність">
+          <button id="vol-up" class="btn btn-icon" type="button" aria-label="Гучніше" data-icon="plus"></button>
+          <button id="btn-mute" class="btn btn-icon" type="button" aria-pressed="false" aria-label="Вимкнути звук" data-icon="volume"></button>
+        </div>
+      </fieldset>
+
+      <fieldset id="grp-input" class="group card">
+        <legend class="card-title">Вхід</legend>
+        <div id="inputs" class="seg" role="radiogroup" aria-label="Вхід"></div>
+      </fieldset>
+    </div>
+
+    <div class="col">
+      <fieldset id="grp-stations" class="group card">
+        <legend class="visually-hidden">Станції</legend>
+        <div class="card-head">
+          <h2 class="card-title">Станції <span id="st-count" class="muted num"></span></h2>
+          <button id="st-refresh" class="btn btn-ghost btn-icon" type="button" aria-label="Оновити список" data-icon="refresh"></button>
+        </div>
+        <input id="st-search" class="input" type="search" placeholder="Пошук станції" aria-label="Пошук станції" autocomplete="off" hidden>
+        <ul id="st-list" class="list" aria-label="Список станцій"></ul>
+        <p id="st-empty" class="hint" hidden></p>
+      </fieldset>
+    </div>
+  </div>
+</main>
+
+<script src="/js/common.js"></script>
+<script src="/js/nav.js"></script>
+<script src="/js/home.js"></script>
+</body>
+</html>

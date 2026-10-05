@@ -1,0 +1,364 @@
+'use strict';
+/* Спільний код усіх сторінок (Prompt 19). Підключати ПЕРШИМ. Опис: docs/web_ui.md. */
+
+const CONFIG = {
+  deviceName: 'Аудіоконтролер',
+  apiTimeoutMs: 6000,        // тайм-аут одного запиту
+  pollStatusMs: 1000,        // період опитування /api/status
+  pollBackoffFactor: 2,      // множник інтервалу після кожної помилки
+  pollBackoffMaxMs: 8000,    // стеля інтервалу при помилках
+  offlineAfterFailures: 3,   // стільки збоїв звʼязку поспіль -> банер «Немає звʼязку»
+  toastMs: 3500,
+  toastErrorMs: 6000,
+  toastMax: 3,
+  rssiBars: [-55, -65, -75], // межі дБм для 4/3/2 рисок (слабше = 1 риска)
+  devStorageKey: 'audioctl.device',
+  deviceParam: 'device',
+  stationsTimeoutMs: 10000,  // GET /api/stations (до 100 записів)
+  // --- Головна ---
+  volumeSendMinMs: 150,      // не частіше одного POST /api/volume за цей час під час перетягування
+  volumeHoldMs: 1500,        // стільки після відпускання повзунка ігноруємо volume зі /api/status
+  volumeButtonStep: 5,       // крок кнопок −/+ (одиниці шкали гучності)
+  stationSearchThreshold: 12,// пошук показуємо, якщо станцій більше
+  stationsRetryMs: 5000,     // пауза між невдалими автозавантаженнями списку
+  marqueePxPerSec: 40,       // швидкість біжучого рядка
+  marqueePauseS: 2,          // пауза на краях біжучого рядка
+  resizeDebounceMs: 150,
+};
+
+/* ---------- Помилки API ---------- */
+class ApiError extends Error {
+  constructor(status, data, code) {
+    super(code || 'error');
+    this.status = status;           // HTTP-код (0 = немає відповіді)
+    this.data = data || {};         // розібране JSON-тіло
+    this.code = code || (data && data.error) || 'error';
+    this.reason = (data && data.reason) || null;
+  }
+}
+
+/* Словник кодів -> українські повідомлення. Ключ: reason, потім error. */
+const REASONS = {
+  network: 'Немає звʼязку з пристроєм.',
+  timeout: 'Пристрій не відповів вчасно.',
+  bad_response: 'Пристрій надіслав незрозумілу відповідь.',
+  // Відмови керування (409)
+  standby: 'Пристрій у режимі очікування.',
+  ota_in_progress: 'Іде оновлення прошивки.',
+  ir_learn_active: 'Іде навчання пульта. Спершу завершіть або скасуйте його.',
+  not_radio_input: 'Це працює лише на вході «WiFi Radio».',
+  wifi_setup: 'Пристрій налаштовує Wi-Fi.',
+  no_stations: 'Список станцій порожній.',
+  input_unavailable: 'Цей вхід недоступний для поточного аудіопроцесора.',
+  station_out_of_range: 'Такої станції немає в списку.',
+  index_out_of_range: 'Такої станції немає в списку.',
+  volume_out_of_range: 'Гучність поза допустимими межами.',
+  gain_out_of_range: 'Підсилення поза допустимими межами.',
+  out_of_range: 'Значення поза допустимими межами.',
+  not_supported: 'Аудіопроцесор цього не підтримує.',
+  audio_unavailable: 'Аудіопроцесор недоступний.',
+  busy: 'Пристрій зайнятий. Спробуйте ще раз.',
+  restart_pending: 'Пристрій уже перезапускається.',
+  // Загальні помилки запиту
+  invalid_value: 'Недопустиме значення.',
+  invalid_json: 'Некоректний запит.',
+  unknown_field: 'Невідоме поле в запиті.',
+  conflicting_fields: 'Суперечливі поля в запиті.',
+  missing_field: 'Бракує обовʼязкового поля.',
+  no_body: 'Порожній запит.',
+  body_too_large: 'Запит завеликий.',
+  confirm_required: 'Потрібне підтвердження дії.',
+  not_found: 'Не знайдено.',
+  storage_error: 'Помилка запису в памʼять пристрою.',
+  list_full: 'Список станцій заповнений.',
+  // Станції, імпорт
+  import_failed: 'Не вдалося імпортувати файл.',
+  import_busy: 'Інший імпорт ще триває.',
+  unknown_format: 'Невідомий формат файлу.',
+  parse_error: 'Файл має помилки і не розпізнаний.',
+  too_many_stations: 'У файлі забагато станцій.',
+  empty: 'Файл порожній.',
+  // OTA
+  bad_image: 'Це не образ прошивки.',
+  bad_magic: 'Це не образ прошивки.',
+  too_small: 'Файл замалий для прошивки.',
+  image_too_large: 'Прошивка не вміщається у розділ.',
+  verify_failed: 'Прошивка не пройшла перевірку.',
+  ota_busy: 'Оновлення вже триває.',
+  length_required: 'Не вказано розмір файлу.',
+  unsupported_content_type: 'Непідтримуваний тип вмісту.',
+  // IR
+  learning_active: 'Іде навчання пульта.',
+  already_learning: 'Навчання вже розпочато.',
+  cannot_start: 'Зараз не можна почати навчання.',
+};
+
+function errorText(e) {
+  if (!(e instanceof ApiError)) return (e && e.message) || 'Невідома помилка.';
+  let t = REASONS[e.reason] || REASONS[e.code];
+  if (!t) return 'Помилка: ' + (e.reason || e.code || e.status);
+  const d = e.data;
+  if (e.code === 'out_of_range' && d.min !== undefined && d.max !== undefined) {
+    t = t.replace(/\.$/, '') + ' (' + d.min + '…' + d.max + ').';
+  }
+  return t;
+}
+
+/* ---------- Утиліти DOM ---------- */
+const $ = (sel, root) => (root || document).querySelector(sel);
+
+/* el('div', {class:'x', onclick: fn, 'aria-label':'..'}, 'текст', childNode)
+   Рядки завжди вставляються як текст (textContent), НІКОЛИ як HTML. */
+function el(tag, attrs, ...children) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === 'class') n.className = v;
+    else if (k.startsWith('on') && typeof v === 'function') n.addEventListener(k.slice(2), v);
+    else n.setAttribute(k, v === true ? '' : String(v));
+  }
+  const add = (c) => {
+    if (c === null || c === undefined || c === false) return;
+    if (Array.isArray(c)) c.forEach(add);
+    else n.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  };
+  children.forEach(add);
+  return n;
+}
+
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+/* Записує текст/атрибут лише якщо змінився (менше перемальовувань). */
+function setText(node, text) { if (node.textContent !== text) node.textContent = text; }
+function setAttr(node, name, value) {
+  if (node.getAttribute(name) !== String(value)) node.setAttribute(name, String(value));
+}
+
+/* ---------- Іконки (інлайн-SVG) ---------- */
+const ICONS = {
+  power: ['s', 'M12 3v8M7.1 6.7a7 7 0 1 0 9.8 0'],
+  play: ['f', 'M8 5v14l11-7z'],
+  pause: ['f', 'M6 5h4v14H6zM14 5h4v14h-4z'],
+  stop: ['f', 'M6 6h12v12H6z'],
+  prev: ['f', 'M6 6h2v12H6zM20 6v12L9 12z'],
+  next: ['f', 'M16 6h2v12h-2zM4 6v12l11-6z'],
+  volume: ['s', 'M4 9v6h4l5 4V5L8 9zM16.5 8.5a5 5 0 0 1 0 7'],
+  mute: ['s', 'M4 9v6h4l5 4V5L8 9zM17 9.5l4 5M21 9.5l-4 5'],
+  minus: ['s', 'M5 12h14'],
+  plus: ['s', 'M12 5v14M5 12h14'],
+  refresh: ['s', 'M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7'],
+  search: ['s', 'M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM20 20l-4-4'],
+};
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+function icon(name) {
+  const [kind, d] = ICONS[name] || ICONS.stop;
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('aria-hidden', 'true');
+  const p = document.createElementNS(SVG_NS, 'path');
+  p.setAttribute('d', d);
+  if (kind === 'f') p.setAttribute('fill', 'currentColor');
+  else {
+    p.setAttribute('fill', 'none'); p.setAttribute('stroke', 'currentColor');
+    p.setAttribute('stroke-width', '2'); p.setAttribute('stroke-linecap', 'round');
+    p.setAttribute('stroke-linejoin', 'round');
+  }
+  svg.append(p);
+  return svg;
+}
+
+function setIcon(node, name) {
+  if (node.dataset.iconName === name) return;
+  node.dataset.iconName = name;
+  node.querySelectorAll(':scope > svg').forEach((s) => s.remove());
+  node.prepend(icon(name));
+}
+
+/* Підставляє іконки в усі елементи з data-icon="імʼя". */
+function hydrateIcons(root) {
+  (root || document).querySelectorAll('[data-icon]').forEach((n) => setIcon(n, n.dataset.icon));
+}
+
+/* ---------- API-клієнт ---------- */
+const api = (() => {
+  let base = '';
+  try {
+    const p = new URLSearchParams(location.search).get(CONFIG.deviceParam);
+    if (p !== null) {
+      if (p === '') sessionStorage.removeItem(CONFIG.devStorageKey);
+      else if (/^[A-Za-z0-9.\-]+(:\d{1,5})?$/.test(p)) sessionStorage.setItem(CONFIG.devStorageKey, p);
+    }
+    const d = sessionStorage.getItem(CONFIG.devStorageKey);
+    if (d) base = 'http://' + d;
+  } catch (_) { /* sessionStorage недоступний - працюємо без dev-режиму */ }
+
+  // ОДНА послідовна черга для всіх запитів: ESP має мало одночасних зʼєднань.
+  let chain = Promise.resolve();
+  function enqueue(job) {
+    const p = chain.then(job, job);
+    chain = p.catch(() => {});
+    return p;
+  }
+
+  async function run(method, path, body, timeoutMs) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs || CONFIG.apiTimeoutMs);
+    const init = { method, cache: 'no-store', signal: ctl.signal, headers: {} };
+    if (body !== undefined) {
+      init.headers['Content-Type'] = 'application/json';
+      init.body = JSON.stringify(body);
+    }
+    let res;
+    try {
+      res = await fetch(base + path, init);
+    } catch (e) {
+      throw new ApiError(0, null, e && e.name === 'AbortError' ? 'timeout' : 'network');
+    } finally {
+      clearTimeout(timer);
+    }
+    let data = null;
+    try { data = await res.json(); } catch (_) { /* не JSON */ }
+    if (!res.ok || (data && !Array.isArray(data) && data.ok === false)) {
+      if (data && Array.isArray(data.errors) && data.errors[0]) {   // POST /api/settings
+        throw new ApiError(res.status, data, data.errors[0].code);
+      }
+      throw new ApiError(res.status, data, data ? data.error : 'bad_response');
+    }
+    if (data === null) throw new ApiError(res.status, null, 'bad_response');
+    return data;
+  }
+
+  return {
+    base: () => base,
+    get: (path, timeoutMs) => enqueue(() => run('GET', path, undefined, timeoutMs)),
+    post: (path, body, timeoutMs) => enqueue(() => run('POST', path, body === undefined ? {} : body, timeoutMs)),
+  };
+})();
+
+/* ---------- Toast ---------- */
+function toast(text, kind) {
+  let box = $('#toasts');
+  if (!box) {
+    box = el('div', { id: 'toasts', class: 'toasts', role: 'status', 'aria-live': 'polite' });
+    document.body.append(box);
+  }
+  const k = kind === 'error' || kind === 'ok' ? kind : 'info';
+  const n = el('div', { class: 'toast toast-' + k }, text);
+  box.append(n);
+  while (box.children.length > CONFIG.toastMax) box.firstChild.remove();
+  setTimeout(() => n.remove(), k === 'error' ? CONFIG.toastErrorMs : CONFIG.toastMs);
+}
+
+/* ---------- Діалог підтвердження ---------- */
+function confirmDialog(text, opts) {
+  const o = Object.assign({ okText: 'Так', cancelText: 'Скасувати', danger: false }, opts);
+  if (typeof HTMLDialogElement === 'undefined') return Promise.resolve(window.confirm(text));
+  return new Promise((resolve) => {
+    const dlg = el('dialog', { class: 'dialog' },
+      el('form', { method: 'dialog' },
+        el('p', null, text),
+        el('div', { class: 'dialog-actions' },
+          el('button', { class: 'btn', value: 'cancel', autofocus: true }, o.cancelText),
+          el('button', { class: 'btn ' + (o.danger ? 'btn-danger' : 'btn-primary'), value: 'ok' }, o.okText))));
+    dlg.addEventListener('close', () => { const ok = dlg.returnValue === 'ok'; dlg.remove(); resolve(ok); });
+    document.body.append(dlg);
+    dlg.showModal();
+  });
+}
+
+/* ---------- Банери ---------- */
+/* setBanner('id', 'текст', 'info'|'warn'|'error', {progress: 0..100}); text=null -> прибрати. */
+function setBanner(id, text, kind, opts) {
+  const box = $('#banners');
+  if (!box) return;
+  let n = box.querySelector('[data-banner="' + id + '"]');
+  if (text === null || text === undefined) { if (n) n.remove(); return; }
+  if (!n) {
+    n = el('div', { class: 'banner', role: 'status', 'data-banner': id },
+      el('span'), el('div', { class: 'progress', hidden: true }, el('i')));
+    box.append(n);
+  }
+  n.className = 'banner' + (kind === 'warn' ? ' banner-warn' : kind === 'error' ? ' banner-error' : '');
+  setText(n.firstChild, text);
+  const bar = n.lastChild;
+  const pr = opts && typeof opts.progress === 'number' ? clamp(opts.progress, 0, 100) : null;
+  bar.hidden = pr === null;
+  if (pr !== null) bar.firstChild.style.width = pr + '%';
+}
+
+/* ---------- Звʼязок з пристроєм ---------- */
+const connection = { offline: false, listeners: [] };
+function setOffline(flag) {
+  if (connection.offline === flag) return;
+  connection.offline = flag;
+  setBanner('offline', flag ? 'Немає звʼязку з пристроєм. Повторюємо спроби…' : null, 'error');
+  connection.listeners.forEach((f) => f(flag));
+}
+function onConnectionChange(fn) { connection.listeners.push(fn); }
+
+/* ---------- Опитування ---------- */
+/* createPoller(fn, {intervalMs}) -> {start, stop, now}.
+   fn: async () => {...}, кине помилку = невдача. Запити не накладаються: наступний -
+   лише після завершення попереднього. Пауза при document.hidden; інтервал росте
+   при помилках; збої ЗВʼЯЗКУ (network/timeout) вмикають банер «Немає звʼязку». */
+function createPoller(fn, opts) {
+  const base = (opts && opts.intervalMs) || CONFIG.pollStatusMs;
+  let timer = null; let running = false; let again = false; let fails = 0; let active = false;
+
+  function schedule(ms) { clearTimeout(timer); timer = setTimeout(tick, ms); }
+
+  async function tick() {
+    if (!active || document.hidden) return;       // відновиться з visibilitychange
+    if (running) { again = true; return; }
+    clearTimeout(timer);
+    running = true;
+    try {
+      await fn();
+      fails = 0;
+      setOffline(false);
+    } catch (e) {
+      fails++;
+      if (e instanceof ApiError && (e.code === 'network' || e.code === 'timeout') &&
+          fails >= CONFIG.offlineAfterFailures) setOffline(true);
+    }
+    running = false;
+    if (!active) return;
+    if (again) { again = false; schedule(0); return; }
+    schedule(fails ? Math.min(base * Math.pow(CONFIG.pollBackoffFactor, fails), CONFIG.pollBackoffMaxMs) : base);
+  }
+
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
+  return {
+    start() { active = true; tick(); },
+    stop() { active = false; clearTimeout(timer); },
+    now() { tick(); },
+  };
+}
+
+/* ---------- Wi-Fi ---------- */
+function rssiToBars(rssi) {
+  if (!rssi) return 0;
+  const [a, b, c] = CONFIG.rssiBars;
+  return rssi >= a ? 4 : rssi >= b ? 3 : rssi >= c ? 2 : 1;
+}
+/* Малює індикатор у <span class="wifi">; wifi = об'єкт status.wifi. */
+function renderWifi(node, wifi) {
+  if (!node.firstChild) for (let i = 0; i < 4; i++) node.append(el('i'));
+  const ok = !!(wifi && wifi.connected);
+  const bars = ok ? rssiToBars(wifi.rssi) : 0;
+  [...node.children].forEach((b, i) => b.classList.toggle('on', i < bars));
+  const label = ok ? 'Wi-Fi: ' + (wifi.ssid || '') + ', ' + wifi.rssi + ' дБм' : 'Wi-Fi не підключено';
+  setAttr(node, 'aria-label', label);
+  setAttr(node, 'title', label);
+}
+
+/* ---------- Каркас сторінки ---------- */
+/* initShell('home'): заголовок, іконки, навігація (nav.js), dev-банер. */
+function initShell(activeId) {
+  const brand = $('#brand');
+  if (brand) brand.textContent = CONFIG.deviceName;
+  hydrateIcons();
+  if (typeof renderNav === 'function') renderNav(activeId);
+  if (api.base()) setBanner('dev', 'Режим розробки: пристрій ' + api.base().slice(7), 'info');
+}
