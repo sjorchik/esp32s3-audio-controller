@@ -1,4 +1,4 @@
-# Веб-інтерфейс: каркас фронтенду (Prompt 19, доповнено Prompt 20)
+# Веб-інтерфейс: каркас фронтенду (Prompt 19, доповнено Prompt 20 і 21)
 
 Документ для наступних промптів (P21–P23). Нові сторінки додаються **лише змінами в `webui/`** — без правок C++.
 Контракт API — `docs/web_api.md`.
@@ -25,6 +25,7 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 | `js/nav.js` | список сторінок + `renderNav()` (підключати ДРУГИМ) |
 | `js/home.js` | логіка Головної |
 | `stations.html`, `js/stations.js` | сторінка «Станції» (P20): список, форма, переміщення, імпорт / експорт |
+| `audio.html`, `js/audio.js` | сторінка «Аудіо» (P21): гучність / мʼют, gain і вхід, бас / дискант / баланс, loudness, скидання тембру |
 | `favicon.svg` | іконка |
 
 Скрипти — класичні (`<script src>`, не модулі): `const`/функції верхнього рівня `common.js` і `nav.js` видимі в решті скриптів.
@@ -93,6 +94,7 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 | `.table-wrap` + `.table` | таблиця (обгортка дає горизонтальну прокрутку) |
 | `.marquee` (> `<span>`) | біжучий рядок; керується `home.js: setMarquee` |
 | `.toolbar` | ряд кнопок, що переноситься (кнопки розтягуються) |
+| `.param` > `.param-head` (назва + `output.param-val`) + `.param-row` (−, `.slider`, +, `.btn-zero`) | рядок параметра з повзунком (P21); `.slider-c` додає позначку центру |
 | `.station-list` > `li.station` | список-картки станцій: `.station-main` (`.idx`, `.station-text` > `.station-name` + `.station-url`), `.station-actions`; `aria-current="true"` = поточна |
 | `.dialog.dialog-form` | діалог із формою (`h2`, `.form` > `.field`, `.dialog-actions`) |
 | `fieldset.group.is-busy` | разом із `disabled`: «зайнято» без сильного затемнення (на час запиту) |
@@ -120,13 +122,15 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 | `el(tag, attrs?, ...children) → Element` | будівник DOM. Рядки-діти — ЗАВЖДИ текст; `onclick: fn` додає слухач; `false/null` пропускаються |
 | `$(sel, root?)` | `querySelector` |
 | `clamp(v, lo, hi)`, `setText(node, text)`, `setAttr(node, name, value)` | `setText`/`setAttr` пишуть лише при зміні |
-| `icon(name) → SVGElement`, `setIcon(node, name)`, `hydrateIcons(root?)` | іконки: `power play pause stop prev next volume mute minus plus refresh search edit trash arrow-up arrow-down move upload download check close`; `hydrateIcons` обробляє `[data-icon]` |
+| `icon(name) → SVGElement`, `setIcon(node, name)`, `hydrateIcons(root?)` | іконки: `power play pause stop prev next volume mute minus plus refresh search edit trash arrow-up arrow-down move upload download check close reset`; `hydrateIcons` обробляє `[data-icon]` |
 | `api.put(path, body?, timeoutMs?)`, `api.del(path, timeoutMs?)` | PUT із JSON / DELETE без тіла (P20) |
 | `api.send(method, path, body, contentType, timeoutMs?) → Promise<json>` | СИРЕ тіло (`File`/`Blob`/рядок) із заданим `Content-Type`; відповідь — JSON. Для імпорту |
 | `api.blob(path, timeoutMs?) → Promise<Blob>` | GET файлу (експорт). Помилки — як у решти `api.*` (`ApiError`) |
 | `downloadBlob(blob, name)`, `fileStamp() → 'YYYY-MM-DD'` | зберегти Blob як файл; дата для імені файлу |
 | `byteLength(s)`, `formatBytes(n)`, `debounce(fn, ms)` | довжина в байтах UTF-8 (сервер рахує байти); «12.3 КБ»; відкладений виклик |
 | `rssiToBars(rssi) → 0..4`, `renderWifi(node, status.wifi)` | індикатор Wi-Fi |
+| `createSlider(input, {send, onInput, onFail}) → {held, hold, release, send}` | повзунок з тротлінгом і утриманням (P21), див. §5.2 |
+| `fmtSigned(v) → string` | `+3` / `0` / `−3` (P21) |
 | `initShell(activeId)` | заголовок, іконки, навігація, dev-банер |
 
 **Безпека:** усе, що походить від пристрою або потоку (назви станцій, ICY-заголовок, ssid), вставляйте ТІЛЬКИ через `textContent` / `el()` / `setText`. `innerHTML` не використовується ніде і не повинен.
@@ -155,6 +159,17 @@ if (await confirmDialog('Перезапустити пристрій?', { okText
 - **Імпорт.** Файл → `api.send('POST', '/api/stations/import?format=json|m3u|pls', file, contentType, CONFIG.importTimeoutMs)`. Формат — за розширенням (`.m3u8` → `m3u`). Перевірте розмір (`CONFIG.importMaxBytes`) до відправки. Імпорт ЗАМІНЯЄ весь список — спершу `confirmDialog`. Режиму «додати» контракт не має. Результат — `{count, replaced}`; помилка — `ApiError` із `reason` (= `lastImportError`).
 - **Експорт.** `const b = await api.blob('/api/stations/export'); downloadBlob(b, 'stations-' + fileStamp() + '.json')` — працює і в dev-режимі (`?device=`), бо запит іде через `api`, а не посиланням.
 - **Блокування.** `<fieldset disabled>` навколо всього інтерактивного вмісту + `is-busy`, поки триває запит; у режимах OTA / IR / WifiSetup / офлайн — той самий `disabled` і банер.
+
+### 5.2. Повзунки параметрів (P21)
+
+Зразок — `js/audio.js` (гучність, бас, дискант, баланс).
+
+- `createSlider(input, {send, onInput, onFail})`: відправка не частіше `CONFIG.volumeSendMinMs`, остаточне значення на `change`, утримання `CONFIG.volumeHoldMs` після відпускання. `send(v)` — `async`, кидає `ApiError`; при відмові toast + `onFail()` (перемалюйте з `st`). Поки `ctl.held()`, опитування не перезаписує повзунок. Кнопки −/+/«0»: виставте `input.value`, оновіть підпис, викличте `ctl.send(v)`.
+- Межі беріть з `capabilities` у кожному рендері: `min` / `max` ставте ПЕРЕД `value`. Функції, яких чип не підтримує, ховайте (`hidden`).
+- Тембр / баланс / loudness — `POST /api/settings` з одним полем; успіх → оновіть `st[key]`. HTTP 502 (`i2c_failed`) `errorText` перетворює на «Аудіопроцесор не відповів».
+- Нейтральні значення — `CONFIG.audioNeutral` (контракт їх не наводить), `CONFIG.gainStepDb` — крок gain за типом чипа.
+- Оптимістичні gain / вхід: після кліку `refreshStatus` ~`volumeHoldMs` не перезаписує їх.
+- Гейти: у standby контракт відхиляє гучність / мʼют / gain / вхід (`409 standby`), тембр / баланс / loudness не гейтяться — лишаються активними. OTA / IR / WifiSetup / офлайн блокують усе.
 
 ## 6. Шаблон опитування
 
@@ -192,4 +207,5 @@ poller.start();
 - Усі сторінки й API — HTTP, без автентифікації.
 - Кожен файл віддається з `Cache-Control: no-cache` без ETag — при кожному завантаженні сторінки браузер отримує файли повністю (gzip, ≈ 17 КБ для Головної).
 - Список станцій на сторінці «Станції» опитується повільніше за Головну (`CONFIG.stationsPollMs`); якщо `station.count` у статусі не збігається з довжиною списку — список перечитується автоматично (зміна з пристрою / іншого клієнта з тією самою кількістю станцій не помітна — є кнопка «Оновити»).
+- Gain не зберігається в NVS і скидається після перезапуску (сторінка «Аудіо» лише попереджає про це).
 - Ресурси збільшують прошивку (розділ app0/app1 — 5 767 168 байт). Перед додаванням великих файлів дивіться таблицю, яку друкує `build_web.py`.

@@ -203,3 +203,14 @@ fieldset.group.is-busy[disabled]{opacity:.75;cursor:progress}
 .dialog-form{width:min(440px,calc(100vw - 32px))}
 .dialog-form h2{font-size:1.1rem;margin-bottom:var(--sp-4)}
 .dialog-form .form{margin-bottom:var(--sp-4)}
+
+/* --- Аудіо (Prompt 21) --- */
+.param+.param,#loud-box,#loud-no{margin-top:var(--sp-3)}
+.param-head{display:flex;justify-content:space-between;align-items:baseline;gap:var(--sp-3)}
+.param-val{font-weight:650}
+.param-row{display:flex;align-items:center;gap:var(--sp-2)}
+.btn-zero{padding:0 var(--sp-3)}
+.slider-c{background:linear-gradient(var(--muted),var(--muted)) 50% 50%/2px 16px no-repeat}
+.param-actions{margin-top:var(--sp-4)}
+#gain-seg{margin-top:var(--sp-2)}
+.seg+.hint,.hint+.hint{margin-top:var(--sp-2)}

@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Аудіо</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-row">
+    <h1 class="brand" id="brand"></h1>
+    <span id="wifi" class="wifi" role="img"></span>
+  </div>
+  <nav id="nav" class="nav" aria-label="Розділи"></nav>
+</header>
+
+<main class="page">
+  <div id="banners" class="banners"></div>
+
+  <section id="standby" class="card row-flex" hidden>
+    <p class="spacer">Пристрій у режимі очікування. Гучність, підсилення і вхід недоступні.</p>
+    <button id="btn-wake" class="btn btn-primary" type="button"><span data-icon="power"></span>Увімкнути</button>
+  </section>
+  <p id="no-proc" class="card hint" hidden>Аудіопроцесор недоступний, тому налаштувань звуку зараз немає.</p>
+
+  <div id="main" class="home-grid">
+    <div class="col">
+      <fieldset id="grp-volume" class="group card">
+        <legend class="visually-hidden">Гучність</legend>
+        <div class="card-head">
+          <h2 class="card-title">Гучність</h2>
+          <span id="chip" class="badge" title="Тип аудіопроцесора">…</span>
+        </div>
+        <div class="vol-head"><span class="muted">Рівень</span><output id="vol-out" class="num" for="vol">0</output></div>
+        <div class="vol-row">
+          <button id="vol-dn" class="btn btn-icon" type="button" aria-label="Тихіше" data-icon="minus"></button>
+          <input id="vol" class="slider" type="range" min="0" max="100" step="1" value="0" aria-label="Гучність">
+          <button id="vol-up" class="btn btn-icon" type="button" aria-label="Гучніше" data-icon="plus"></button>
+          <button id="btn-mute" class="btn btn-icon" type="button" aria-pressed="false" aria-label="Вимкнути звук" data-icon="volume"></button>
+        </div>
+      </fieldset>
+
+      <fieldset id="grp-gain" class="group card">
+        <legend class="card-title">Підсилення входу</legend>
+        <div class="vol-head"><span class="muted">Поточний вхід</span><span id="gain-input"></span></div>
+        <div id="gain-seg" class="seg" role="radiogroup" aria-label="Підсилення"></div>
+        <p id="gain-db" class="hint num"></p>
+        <p class="hint">Підсилення задається окремо для кожного входу; щоб налаштувати інший вхід — оберіть його нижче.</p>
+        <p class="hint">Підсилення не зберігається після перезапуску пристрою.</p>
+      </fieldset>
+
+      <fieldset id="grp-input" class="group card">
+        <legend class="card-title">Вхід</legend>
+        <div id="inputs" class="seg" role="radiogroup" aria-label="Вхід"></div>
+        <p class="hint">Перемикання входу змінює джерело звуку.</p>
+      </fieldset>
+    </div>
+
+    <div class="col">
+      <fieldset id="grp-tone" class="group card">
+        <legend class="card-title">Тембр і баланс</legend>
+        <div id="params"></div>
+        <div id="loud-box">
+          <label class="switch"><input id="loud" type="checkbox"><span>Тонкомпенсація (loudness)</span></label>
+        </div>
+        <p id="loud-no" class="hint" hidden>Цей чип або версія корпуса не підтримує тонкомпенсацію.</p>
+        <div class="toolbar param-actions">
+          <button id="btn-reset" class="btn" type="button"><span data-icon="reset"></span>Скинути тембр</button>
+        </div>
+      </fieldset>
+    </div>
+  </div>
+</main>
+
+<script src="/js/common.js"></script>
+<script src="/js/nav.js"></script>
+<script src="/js/audio.js"></script>
+</body>
+</html>

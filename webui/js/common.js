@@ -32,6 +32,9 @@ const CONFIG = {
   importMaxBytes: 131072,    // ліміт тіла POST /api/stations/import (≈ 128 КБ)
   importTimeoutMs: 60000,    // імпорт довгий: запис у flash
   searchDebounceMs: 150,
+  // --- Аудіо (Prompt 21); createSlider використовує volumeSendMinMs / volumeHoldMs ---
+  gainStepDb: { Tda7318: 6.25, Pt2313l: 3.75 },  // крок gain, дБ (web_api.md §2)
+  audioNeutral: { tone: 0, balance: 0, loudness: false }, // нейтраль / дефолт (контракт не наводить; settings.h)
 };
 
 /* ---------- Помилки API ---------- */
@@ -63,6 +66,7 @@ const REASONS = {
   volume_out_of_range: 'Гучність поза допустимими межами.',
   gain_out_of_range: 'Підсилення поза допустимими межами.',
   out_of_range: 'Значення поза допустимими межами.',
+  i2c_failed: 'Аудіопроцесор не відповів.',
   not_supported: 'Аудіопроцесор цього не підтримує.',
   audio_unavailable: 'Аудіопроцесор недоступний.',
   busy: 'Пристрій зайнятий. Спробуйте ще раз.',
@@ -118,6 +122,7 @@ const REASONS = {
 
 function errorText(e) {
   if (!(e instanceof ApiError)) return (e && e.message) || 'Невідома помилка.';
+  if (e.status === 502 && e.code === 'error') return REASONS.i2c_failed;   // POST /api/settings: збій I2C
   let t = REASONS[e.reason] || REASONS[e.code];
   if (!t) return 'Помилка: ' + (e.reason || e.code || e.status);
   const d = e.data;
@@ -164,6 +169,8 @@ function debounce(fn, ms) {
 }
 /* Довжина рядка в байтах UTF-8 (сервер рахує байти, не символи). */
 function byteLength(s) { return new TextEncoder().encode(String(s)).length; }
+/* +3 / 0 / −3 (справжній мінус). */
+function fmtSigned(v) { return v > 0 ? '+' + v : v < 0 ? '\u2212' + (-v) : '0'; }
 function formatBytes(n) { return n < 1024 ? n + ' Б' : (n / 1024).toFixed(1) + ' КБ'; }
 /* 'YYYY-MM-DD' за локальним часом - для імен файлів. */
 function fileStamp() {
@@ -201,6 +208,7 @@ const ICONS = {
   download: ['s', 'M12 4v12M7 11l5 5 5-5M4 20h16'],
   check: ['s', 'M5 12.5l4.5 4.5L19 7'],
   close: ['s', 'M6 6l12 12M18 6L6 18'],
+  reset: ['s', 'M4 11a8 8 0 1 1 2.3 5.7M4 4v7h7'],
 };
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -347,6 +355,43 @@ function setBanner(id, text, kind, opts) {
   const pr = opts && typeof opts.progress === 'number' ? clamp(opts.progress, 0, 100) : null;
   bar.hidden = pr === null;
   if (pr !== null) bar.firstChild.style.width = pr + '%';
+}
+
+/* ---------- Повзунок з тротлінгом (Prompt 21) ---------- */
+/* createSlider(input, {send(v) async, onInput(v), onFail()}) -> {held, hold, release, send}.
+   send кидає ApiError при відмові: toast + onFail (відкат). held() = тримають або ще
+   CONFIG.volumeHoldMs після відпускання: поки так, опитування не чіпає повзунок. */
+function createSlider(input, o) {
+  let dragging = false, holdUntil = 0, pending = null, inflight = false, lastSent = 0, timer = null;
+  const hold = () => { holdUntil = Date.now() + CONFIG.volumeHoldMs; };
+  async function flush() {
+    if (inflight || pending === null) return;
+    const v = pending;
+    pending = null; inflight = true; lastSent = Date.now();
+    try { await o.send(v); } catch (e) {
+      toast(errorText(e), 'error'); holdUntil = 0; pending = null;
+      if (o.onFail) o.onFail();
+    }
+    inflight = false;
+    if (pending !== null) queue(pending, false);
+  }
+  function queue(v, final) {
+    pending = v;
+    if (final) { clearTimeout(timer); timer = null; flush(); return; }
+    if (timer || inflight) return;
+    timer = setTimeout(() => { timer = null; flush(); }, Math.max(0, CONFIG.volumeSendMinMs - (Date.now() - lastSent)));
+  }
+  input.addEventListener('pointerdown', () => { dragging = true; });
+  ['pointerup', 'pointercancel'].forEach((ev) => window.addEventListener(ev, () => {
+    if (dragging) { dragging = false; hold(); }
+  }));
+  input.addEventListener('input', () => { const v = Number(input.value); hold(); if (o.onInput) o.onInput(v); queue(v, false); });
+  input.addEventListener('change', () => { hold(); queue(Number(input.value), true); });
+  return {
+    held: () => dragging || Date.now() < holdUntil,
+    hold, release: () => { holdUntil = 0; },
+    send: (v) => { hold(); queue(v, true); },     // для кнопок −/+/«0»
+  };
 }
 
 /* ---------- Звʼязок з пристроєм ---------- */
