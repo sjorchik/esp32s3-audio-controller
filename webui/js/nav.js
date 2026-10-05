@@ -6,7 +6,7 @@ const NAV_PAGES = [
   { id: 'home',     href: '/',                title: 'Головна',      enabled: true },
   { id: 'stations', href: '/stations.html',   title: 'Станції',      enabled: true },
   { id: 'audio',    href: '/audio.html',      title: 'Аудіо',        enabled: true },
-  { id: 'remote',   href: '/remote.html',     title: 'Пульт',        enabled: false },
+  { id: 'ir',       href: '/ir.html',         title: 'Пульт',        enabled: true  },
   { id: 'settings', href: '/settings.html',   title: 'Налаштування', enabled: false },
   { id: 'system',   href: '/system.html',     title: 'Система',      enabled: false },
 ];

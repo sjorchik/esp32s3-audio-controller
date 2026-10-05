@@ -214,3 +214,8 @@ fieldset.group.is-busy[disabled]{opacity:.75;cursor:progress}
 .param-actions{margin-top:var(--sp-4)}
 #gain-seg{margin-top:var(--sp-2)}
 .seg+.hint,.hint+.hint{margin-top:var(--sp-2)}
+
+/* --- Пульт (Prompt 22): рядки дій — це .station*, тут лише панель навчання --- */
+.ir-learn{border-color:var(--accent);margin-bottom:var(--sp-3)}
+.ir-target{font-size:1.4rem;font-weight:700;overflow-wrap:anywhere;margin:var(--sp-2) 0}
+.ir-learn .dialog-actions{margin-top:var(--sp-4);flex-wrap:wrap}

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Пульт</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-row">
+    <h1 class="brand" id="brand"></h1>
+    <span id="wifi" class="wifi" role="img"></span>
+  </div>
+  <nav id="nav" class="nav" aria-label="Розділи"></nav>
+</header>
+
+<main class="page">
+  <div id="banners" class="banners"></div>
+
+  <section id="learn" class="card ir-learn" aria-live="polite" hidden>
+    <div class="card-head">
+      <h2 class="card-title">Навчання кнопки</h2>
+      <span id="l-badge" class="badge"></span>
+    </div>
+    <p id="l-origin" class="hint" hidden>Навчання запущено на пристрої.</p>
+    <p id="l-target" class="ir-target"></p>
+    <p id="l-text"></p>
+    <div class="dialog-actions">
+      <button id="l-over" class="btn btn-primary" type="button" hidden>Перезаписати</button>
+      <button id="l-cancel" class="btn" type="button">Скасувати</button>
+    </div>
+  </section>
+
+  <fieldset id="grp" class="group stack">
+    <legend class="visually-hidden">Пульт</legend>
+
+    <section class="card">
+      <div class="card-head">
+        <h2 class="card-title">Пульт RC5 <span id="count" class="muted num"></span></h2>
+        <button class="btn btn-ghost btn-icon" type="button" data-act="refresh" data-icon="refresh" aria-label="Оновити"></button>
+      </div>
+      <div class="toolbar">
+        <button class="btn" type="button" data-act="import"><span data-icon="upload"></span>Імпорт</button>
+        <button class="btn" type="button" data-act="export"><span data-icon="download"></span>Експорт</button>
+      </div>
+      <label class="switch"><input id="only-new" type="checkbox"><span>Лише ненавчені</span></label>
+      <p class="hint">Натисніть «Навчити», а потім двічі — потрібну кнопку на пульті.</p>
+      <input id="file" class="visually-hidden" type="file" accept=".json,application/json" tabindex="-1" aria-hidden="true">
+    </section>
+
+    <p id="empty" class="hint" hidden></p>
+    <div id="groups" class="stack"></div>
+  </fieldset>
+</main>
+
+<script src="/js/common.js"></script>
+<script src="/js/nav.js"></script>
+<script src="/js/ir.js"></script>
+</body>
+</html>

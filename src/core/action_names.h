@@ -13,8 +13,8 @@ namespace action_names {
 struct Info {
     Action action;
     const char* name;
-    // true: дію має сенс навчати з пульта. OK, BACK (на пульті немає таких кнопок,
-    // MASTER SPEC розд. 5) та ENC_* (суто енкодер) — false.
+    // true: дію має сенс навчати з пульта. ENC_* (суто енкодер) — false.
+    // OK і BACK теж true (змінено за рішенням власника; раніше MASTER SPEC розд. 5 їх виключав).
     bool learnable;
 };
 

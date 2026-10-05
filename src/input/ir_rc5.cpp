@@ -29,7 +29,8 @@ constexpr uint8_t kFrameBits     = 14;              // S1 S2 T A4..A0 C5..C0
 constexpr uint8_t kFrameHalfBits = kFrameBits * 2;  // 28
 constexpr uint8_t kRc5xCmdBit    = 0x40;            // 7-й біт команди
 
-constexpr uint8_t kActionCount = static_cast<uint8_t>(Action::DIGIT_9) + 1;
+// Усі дії до останньої (GAIN_DOWN, Prompt 7) включно: BASS_UP..GAIN_DOWN ідуть у enum Action одразу після DIGIT_9.
+constexpr uint8_t kActionCount = static_cast<uint8_t>(Action::GAIN_DOWN) + 1;
 
 constexpr size_t kEntryBytes   = 3;  // action, addr, cmd
 constexpr size_t kBlobMaxBytes = 2 + ir_cfg::kMaxMapEntries * kEntryBytes + 4;
@@ -71,6 +72,14 @@ const ActionName kActionNames[] = {
     {Action::DIGIT_7, "DIGIT_7"},
     {Action::DIGIT_8, "DIGIT_8"},
     {Action::DIGIT_9, "DIGIT_9"},
+    {Action::BASS_UP, "BASS_UP"},
+    {Action::BASS_DOWN, "BASS_DOWN"},
+    {Action::TREBLE_UP, "TREBLE_UP"},
+    {Action::TREBLE_DOWN, "TREBLE_DOWN"},
+    {Action::BALANCE_UP, "BALANCE_UP"},
+    {Action::BALANCE_DOWN, "BALANCE_DOWN"},
+    {Action::GAIN_UP, "GAIN_UP"},
+    {Action::GAIN_DOWN, "GAIN_DOWN"},
 };
 static_assert(sizeof(kActionNames) / sizeof(kActionNames[0]) == kActionCount,
               "kActionNames must list every Action");
@@ -734,7 +743,10 @@ size_t IrRc5::mapSize() {
 bool IrRc5::beginLearn(Action action) {
     if (gMutex == nullptr) return false;
     const uint8_t a = static_cast<uint8_t>(action);
-    if (a >= kActionCount) return false;
+    if (a >= kActionCount) {
+        Serial.printf("[IR] WARN: action id %u is not in the IR table\n", static_cast<unsigned>(a));
+        return false;
+    }
 
     Lock lock;
     if (gMapCount >= ir_cfg::kMaxMapEntries && findAction(a) < 0) {

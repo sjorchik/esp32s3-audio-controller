@@ -39,9 +39,10 @@ const Info kTable[] = {
     {Action::BALANCE_DOWN, "BALANCE_DOWN", true},
     {Action::GAIN_UP, "GAIN_UP", true},
     {Action::GAIN_DOWN, "GAIN_DOWN", true},
-    // Не для навчання з пульта:
-    {Action::OK, "OK", false},
-    {Action::BACK, "BACK", false},
+    // OK і BACK навчаються з пульта (за рішенням власника; раніше були false).
+    {Action::OK, "OK", true},
+    {Action::BACK, "BACK", true},
+    // Не для навчання з пульта (суто енкодер):
     {Action::ENC_CW, "ENC_CW", false},
     {Action::ENC_CCW, "ENC_CCW", false},
     {Action::ENC_PRESS, "ENC_PRESS", false},

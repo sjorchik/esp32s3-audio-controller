@@ -35,6 +35,10 @@ const CONFIG = {
   // --- Аудіо (Prompt 21); createSlider використовує volumeSendMinMs / volumeHoldMs ---
   gainStepDb: { Tda7318: 6.25, Pt2313l: 3.75 },  // крок gain, дБ (web_api.md §2)
   audioNeutral: { tone: 0, balance: 0, loudness: false }, // нейтраль / дефолт (контракт не наводить; settings.h)
+  // --- Пульт (Prompt 22) ---
+  irLearnPollMs: 400,        // GET /api/ir/learn/status під час навчання (web_api.md: 300-500 мс)
+  irStatusPollMs: 2000,      // /api/status на сторінці «Пульт»
+  irImportMaxBytes: 8192,    // POST /api/ir/map/import (web_api.md §1)
 };
 
 /* ---------- Помилки API ---------- */
@@ -118,6 +122,11 @@ const REASONS = {
   learning_active: 'Іде навчання пульта.',
   already_learning: 'Навчання вже розпочато.',
   cannot_start: 'Зараз не можна почати навчання.',
+  not_learnable: 'Цю дію не можна навчити.',
+  unknown_action: 'Невідома дія.',
+  invalid_action: 'Некоректна назва дії.',
+  no_code_for_action: 'Для цієї кнопки немає навченого коду.',
+  not_in_conflict: 'Конфлікту вже немає.',
 };
 
 function errorText(e) {
