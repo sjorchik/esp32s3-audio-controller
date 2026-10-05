@@ -43,6 +43,14 @@
 // внутрішні дії, що й обробники подій (setVolumeTarget, changeInput, changeStation,
 // stepStation, togglePlayPause, enterStandby/leaveStandby, adjustGain), тож поведінка
 // (ramp, мʼют на переходах, збереження в Settings) ідентична кнопкам/пульту.
+//
+// [Prompt 20b] AppState.stationName = НАЗВА ЗІ СПИСКУ станцій (StationStore) для поточного
+// s_station; ICY-назва потоку (AudioPlayer::currentMetadata) — лише запасний варіант, якщо
+// назви у списку немає (порожній список / індекс поза межами / порожня назва). Усе вирішення
+// — у resolveStationName(); споживачі (екран, /api/status) читають готове поле. Оновлення:
+// кожен період syncPlayer() (ловить будь-яку зміну списку з вебу: перейменування, переміщення,
+// видалення, імпорт) + негайно в publishStationName() при старті/виборі станції та зміні входу.
+// Публічний API, AppStateData і StationStore не змінено.
 
 #include "core/app_controller.h"
 
@@ -258,6 +266,21 @@ void stationLabel(uint16_t i, char* out, size_t cap) {
     }
 }
 
+// [Prompt 20b] ЄДИНЕ місце вирішення назви поточної станції для AppState.stationName.
+// Пріоритет: назва зі списку для s_station; якщо її немає (порожній список, індекс поза
+// межами, порожня назва) — ICY-назва потоку (icyName, може бути nullptr); інакше "".
+// Викликати лише з задачі контролера під s_lock (StationStore бере власний короткий мʼютекс;
+// з колбека аудіо до нього звертатись не можна — тут це не так).
+void resolveStationName(const char* icyName, char* out, size_t cap) {
+    if (cap == 0) {
+        return;
+    }
+    stationLabel(s_station, out, cap);
+    if (out[0] == '\0' && icyName != nullptr) {
+        strlcpy(out, icyName, cap);
+    }
+}
+
 // --- Потік і Wi-Fi ---------------------------------------------------------
 // AudioPlayer сам Wi-Fi не перевіряє, а без піднятого мережевого стеку
 // бібліотека падає в assert (xQueueSemaphoreTake). Тому playUrl() викликаємо
@@ -415,6 +438,28 @@ void persist() {
     SettingsStore::modify(applyPersist, &p);
 }
 
+// [Prompt 20b] Негайне оновлення лише назви станції (без решти полів syncPlayer()), щоб після
+// вибору станції/входу дисплей і веб не чекали на найближчий період синхронізації.
+// Поза Radio (чи в логічному Standby) назва порожня — як і в syncPlayer().
+struct NameCtx {
+    char name[64];
+};
+
+void applyName(AppStateData& s, void* c) {
+    const NameCtx* x = static_cast<const NameCtx*>(c);
+    strlcpy(s.stationName, x->name, sizeof(s.stationName));
+}
+
+void publishStationName() {
+    NameCtx c = {};
+    if (s_input == 0 && !logicallyStandby()) {
+        char icy[sizeof(c.name)];
+        AudioPlayer::currentMetadata(icy, sizeof(icy), nullptr, 0);
+        resolveStationName(icy, c.name, sizeof(c.name));
+    }
+    AppState::modify(applyName, &c);
+}
+
 struct SyncCtx {
     char station[64];
     char title[128];
@@ -444,10 +489,10 @@ void applySync(AppStateData& s, void* c) {
 void syncPlayer() {
     SyncCtx c = {};
     if (s_input == 0 && !logicallyStandby()) {  // [Prompt 15]: було s_mode != Standby
-        AudioPlayer::currentMetadata(c.station, sizeof(c.station), c.title, sizeof(c.title));
-        if (c.station[0] == '\0') {
-            stationLabel(s_station, c.station, sizeof(c.station));
-        }
+        // [Prompt 20b] ICY-назва — лише запасний варіант; пріоритет має назва зі списку.
+        char icy[sizeof(c.station)];
+        AudioPlayer::currentMetadata(icy, sizeof(icy), c.title, sizeof(c.title));
+        resolveStationName(icy, c.station, sizeof(c.station));
     }
     c.playing = AudioPlayer::isPlaying();
     c.wifi = wifiUp();
@@ -526,6 +571,7 @@ void powerOnTransition() {
     if (s_input == 0) {
         startStream();
     }
+    publishStationName();  // [Prompt 20b]
 }
 
 // --- Дії -------------------------------------------------------------------
@@ -590,6 +636,7 @@ void changeInput(uint8_t newIdx) {
     if (enteringRadio) {
         startStream();
     }
+    publishStationName();  // [Prompt 20b]: вхід Radio -> назва зі списку, інакше порожньо
     s_persistNeeded = true;
 }
 
@@ -615,6 +662,7 @@ void changeStation(uint16_t idx) {
     s_station = idx;
     startTransition();
     startStream();
+    publishStationName();  // [Prompt 20b]
     s_persistNeeded = true;
 }
 

@@ -127,8 +127,7 @@
     renderStreamBadge();
     setText(ui.inputName, st.inputName || '');
     const sn = st.station || {};
-    const listed = radio && stations[sn.index];   // назва зі списку має пріоритет над ICY-назвою потоку
-    setMarquee(ui.name, radio ? ((listed && listed.name) || sn.name || '—') : (st.inputName || '—'));
+    setMarquee(ui.name, radio ? (sn.name || '—') : (st.inputName || '—'));  // station.name = назва зі списку (P20b)
     setMarquee(ui.track, radio ? (st.track || '') : '');
     const inputs = st.inputs || [];
     ui.hint.hidden = radio;
