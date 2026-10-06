@@ -27,6 +27,9 @@ constexpr int kI2sDin  = 8;       // резерв PCM1808, не використ
 // --- Софт-мʼют PCM5102 ---
 constexpr int kXsmt = 45;         // active-low, зовнішній pulldown 10 кОм
 
+// --- Standby підсилювача (вихід) ---
+constexpr int kAmpStby = 46;      // 1 = працює, 0 = standby; strapping-пін (pulldown 10 кОм до GND)
+
 // --- I2C (TDA7318 / PT2313L) ---
 constexpr int kI2cSda = 1;
 constexpr int kI2cScl = 2;

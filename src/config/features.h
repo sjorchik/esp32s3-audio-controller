@@ -25,3 +25,7 @@
 // Веб-інтерфейс і mDNS.
 #define ENABLE_WEB 1
 #define ENABLE_MDNS 1
+
+// Керування standby підсилювача виходом pins::kAmpStby (1 = працює, 0 = standby).
+// 0 — пін не чіпається, логіка затримок в AppController вимкнена.
+#define FEATURE_AMP_STANDBY 1

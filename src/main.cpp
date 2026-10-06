@@ -23,6 +23,8 @@
 //   піднімає mDNS після підключення.
 // - [Prompt 13] WebServerManager::begin(proc) викликається ПІСЛЯ AppController::begin()
 //   (потрібні AppState і Settings); сервер сам піднімається, коли WifiManager дасть STA.
+// - [Prompt 23c] Перший рядок setup() — AmpStandby::begin(): пін standby підсилювача в LOW
+//   до ініціалізації аудіо; HIGH ставить лише AppController (powerOnTransition()).
 
 #include <Arduino.h>
 #include <LittleFS.h>
@@ -30,6 +32,7 @@
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 
+#include "audio/amp_standby.h"        // [Prompt 23c] ДОДАНО
 #include "audio/audio_player.h"       // [Prompt 5] ДОДАНО
 #include "audio/audio_player_test.h"  // [Prompt 5] ДОДАНО
 #include "audio/audio_proc_test.h"    // [Prompt 3] ДОДАНО
@@ -333,6 +336,11 @@ static void initStationStoreTest() {
 }
 
 void setup() {
+#if FEATURE_AMP_STANDBY
+    // [Prompt 23c] Найраніше, що можна зробити в прошивці: пін standby підсилювача в LOW.
+    const bool ampPinOk = AmpStandby::begin();
+#endif
+
     Serial.begin(defaults::kSerialBaud);
 
     // Коротка пауза для стабілізації логу.
@@ -340,6 +348,12 @@ void setup() {
 
     Serial.println("[MAIN] ESP32-S3 Audio Controller skeleton");
     Serial.println("[MAIN] Build: " __DATE__ " " __TIME__);
+#if FEATURE_AMP_STANDBY
+    Serial.printf("[MAIN] Amp standby pin GPIO%d: %s\n", pins::kAmpStby,
+                  ampPinOk ? "standby level set" : "init failed");
+#else
+    Serial.println("[MAIN] Amp standby control disabled");
+#endif
 
     // Утримання OK при старті = запит скидання Wi-Fi.
     // Перевірка йде ДО запуску задач і не залежить від EventBus.

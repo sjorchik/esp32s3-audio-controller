@@ -70,16 +70,28 @@
 // закінчуються publishState()) і щоперіодно в syncPlayer() (kSyncPeriodMs): так назва, змінена
 // на веб-сторінці (/api/settings пише лише в SettingsStore і контролер не повідомляє), зʼявляється
 // на дисплеї без перемикання входу. Читання Settings — лише тут, у задачі контролера.
+//
+// [Prompt 23c] Пін standby підсилювача (AmpStandby, GPIO46: 1 = працює, 0 = standby). Пін у LOW
+// з початку setup() (main.cpp). Вмикання (powerOnTransition: старт і вихід зі standby): якщо
+// підсилювач вимкнений — пін HIGH лише ПІСЛЯ підтвердженого мʼюту атенюаторів, далі Settle не
+// завершується, доки не мине kAmpWakeMs (мʼют лишається), і лише тоді розмʼют із ramp. Якщо
+// підсилювач уже працює (зміна входу/станції, швидке повторне вмикання) — прогріву немає.
+// Standby (enterStandby): штатний мʼют, через kAmpOffDelayMs пін LOW (за непідтвердженого мʼюту —
+// не раніше kAmpOffMuteWaitMs). Усе без блокувань: стан рухає ampService() із tickLocked().
+// Мʼют користувача, гучність, вхід, станція, OTA і IR пін не чіпають.
 
 #include "core/app_controller.h"
 
 #include <Arduino.h>
 #include <string.h>
 
+#include "audio/amp_standby.h"  // [Prompt 23c]
 #include "audio/audio_player.h"
 #include "audio/audio_processor.h"
+#include "config/amp_config.h"  // [Prompt 23c]
 #include "config/app_controller_config.h"
 #include "config/defaults.h"
+#include "config/features.h"  // [Prompt 23c]
 #include "config/ir_learn_ui_config.h"  // [Prompt 15] ДОДАНО
 #include "core/app_state.h"
 #include "core/settings.h"
@@ -161,6 +173,15 @@ Action s_irPubOther = Action::POWER;
 Mode s_otaPrevMode = Mode::Radio;         // режим ДО OTA; осмислений лише при s_mode == OtaUpdate
 volatile uint8_t s_otaPubPercent = 0;     // остання опублікована цифра (читає setOtaProgress без мʼютекса)
 volatile bool s_otaAbortPending = false;  // otaFailed() не взяв мʼютекс -> tickLocked() відновить
+
+#if FEATURE_AMP_STANDBY
+// --- [Prompt 23c] Standby підсилювача ---
+bool s_ampWanted = false;         // true між powerOnTransition() і enterStandby()
+bool s_ampWaking = false;         // пін піднято, іде прогрів kAmpWakeMs
+uint32_t s_ampWakeUntilMs = 0;
+uint32_t s_ampOffAtMs = 0;        // найраніший момент пониження піна
+uint32_t s_ampOffForceAtMs = 0;   // після нього — LOW навіть без підтвердженого мʼюту
+#endif
 
 // ---------------------------------------------------------------------------
 // Допоміжне
@@ -485,6 +506,66 @@ void applyHardwareMute(bool force = false) {
     }
 }
 
+// --- [Prompt 23c] Standby підсилювача -----------------------------------------
+#if FEATURE_AMP_STANDBY
+// Єдиний рушій піна: викликається з tickLocked() (і одразу з ampRequestOn()).
+void ampService(uint32_t now) {
+    if (s_ampWanted) {
+        if (!AmpStandby::isRunning()) {
+            // Вмикаємо лише під ПІДТВЕРДЖЕНИМ мʼютом (s_hwMute = востаннє успішно надіслано).
+            if (s_hwMute) {
+                AmpStandby::set(true);
+                s_ampWaking = true;
+                s_ampWakeUntilMs = now + amp_cfg::kAmpWakeMs;
+                APP_LOG("amp on, warm-up %u ms\n", static_cast<unsigned>(amp_cfg::kAmpWakeMs));
+            }
+        } else if (s_ampWaking && reached(now, s_ampWakeUntilMs)) {
+            s_ampWaking = false;
+            APP_LOG("amp warm-up done\n");
+        }
+        return;
+    }
+    s_ampWaking = false;
+    if (AmpStandby::isRunning() && reached(now, s_ampOffAtMs) &&
+        (s_hwMute || reached(now, s_ampOffForceAtMs))) {
+        AmpStandby::set(false);
+        APP_LOG("amp standby%s\n", s_hwMute ? "" : " (mute not confirmed, forced)");
+    }
+}
+
+// Потрібен ПІСЛЯ startTransition() (мʼют уже надіслано). Повторне вмикання, поки пін ще
+// HIGH, скасовує вимкнення без прогріву.
+void ampRequestOn() {
+    s_ampWanted = true;
+    ampService(millis());
+}
+
+// Потрібен ПІСЛЯ applyHardwareMute() у enterStandby(); пін опуститься в tick().
+void ampRequestOff() {
+    const uint32_t now = millis();
+    s_ampWanted = false;
+    s_ampWaking = false;
+    s_ampOffAtMs = now + amp_cfg::kAmpOffDelayMs;
+    s_ampOffForceAtMs = now + amp_cfg::kAmpOffMuteWaitMs;
+}
+
+// Settle може завершитись (розмʼют), лише коли підсилювач не потрібен або прогрітий.
+bool ampReady() {
+    return !s_ampWanted || (AmpStandby::isRunning() && !s_ampWaking);
+}
+
+// Чекаємо на перехід піна: задача опитує чергу з активним періодом.
+bool ampBusy() {
+    return s_ampWanted ? (!AmpStandby::isRunning() || s_ampWaking) : AmpStandby::isRunning();
+}
+#else
+inline void ampService(uint32_t) {}
+inline void ampRequestOn() {}
+inline void ampRequestOff() {}
+inline bool ampReady() { return true; }
+inline bool ampBusy() { return false; }
+#endif
+
 // --- Публікація в AppState / Settings --------------------------------------
 struct PubCtx {
     Mode mode;
@@ -676,6 +757,7 @@ void powerOnTransition() {
     s_menuCtx = MenuContext::None;
     s_menuSel = 0;
     startTransition();
+    ampRequestOn();  // [Prompt 23c]: після мʼюту; прогрів іде паралельно з налаштуванням чипа
     // [Prompt 21b] Усе ще під мʼютом: профіль входу -> робочі значення, вхід у чіп, потім
     // тембр/баланс/gain/loudness цього входу. Гучність підніме ramp у tick().
     loadActiveFromProfile(s_input);
@@ -698,6 +780,7 @@ void enterStandby() {
     s_menuSel = 0;
     s_mode = Mode::Standby;
     applyHardwareMute();  // Standby входить у desiredMute(): негайно, без ramp
+    ampRequestOff();      // [Prompt 23c]: пін LOW через kAmpOffDelayMs (у tick())
     stopStream();
     persist();
     SettingsStore::flush();
@@ -1312,12 +1395,16 @@ void followWifiMode() {
 void tickLocked() {
     const uint32_t now = millis();
 
+    ampService(now);  // [Prompt 23c]
+
     if (s_otaAbortPending) {  // [Prompt 16] otaFailed() не отримав мʼютекс
         s_otaAbortPending = false;
         leaveOtaLocked();
     }
 
-    if (s_phase == Phase::Settle && reached(now, s_phaseStartMs + cfg::kUnmuteDelayMs)) {
+    // [Prompt 23c] Розмʼют лише коли підсилювач прогрітий (або не потрібен).
+    if (s_phase == Phase::Settle && reached(now, s_phaseStartMs + cfg::kUnmuteDelayMs) &&
+        ampReady()) {
         s_phase = Phase::Ramp;
         s_rampCur = s_caps.volumeMin;
         s_rampLastStepMs = now;
@@ -1386,7 +1473,8 @@ void taskMain(void*) {
         // Читаємо без мʼютекса: це лише вибір тайм-ауту, хибне значення безпечне.
         // [Prompt 15]: під час навчання IR теж активний (короткий) період опитування.
         const bool active =
-            (s_phase != Phase::None) || s_gainHoldActive || (s_mode == Mode::IrLearn);
+            (s_phase != Phase::None) || s_gainHoldActive || (s_mode == Mode::IrLearn) ||
+            ampBusy();  // [Prompt 23c]
         Event ev;
         const TickType_t timeout =
             pdMS_TO_TICKS(active ? cfg::kActivePollMs : cfg::kIdlePollMs);
