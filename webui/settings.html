@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Налаштування</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-row">
+    <h1 class="brand" id="brand"></h1>
+    <span id="wifi" class="wifi" role="img"></span>
+  </div>
+  <nav id="nav" class="nav" aria-label="Розділи"></nav>
+</header>
+
+<main class="page">
+  <div id="banners" class="banners"></div>
+
+  <fieldset id="grp" class="group stack" disabled>
+    <legend class="visually-hidden">Налаштування пристрою</legend>
+
+    <section class="card">
+      <div class="card-head">
+        <h2 class="card-title">Аудіопроцесор</h2>
+        <span class="badge badge-ok" data-saved="proc" hidden>Збережено</span>
+      </div>
+      <div class="field">
+        <label for="proc">Тип мікросхеми</label>
+        <select id="proc" class="select">
+          <option value="Tda7318">TDA7318</option>
+          <option value="Pt2313l">PT2313L</option>
+        </select>
+      </div>
+      <p class="hint">Зміна діє після перезапуску. TDA7318 має 4 входи, PT2313L — 3 (вхід 4 недоступний).</p>
+      <div id="restart-row" class="banner banner-warn" hidden>
+        <span id="restart-text"></span>
+        <button id="btn-restart" class="btn btn-primary" type="button">Перезапустити зараз</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2 class="card-title">Назви входів</h2>
+        <span class="badge badge-ok" data-saved="names" hidden>Збережено</span>
+      </div>
+      <div id="names" class="form"></div>
+      <div class="toolbar"><button id="btn-names" class="btn btn-primary" type="button">Зберегти назви</button></div>
+      <p class="hint">Назви показуються на веб-сторінках. Чи показує їх екран пристрою, залежить від прошивки.</p>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2 class="card-title">Дисплей</h2></div>
+      <div class="param">
+        <div class="param-head">
+          <span>Яскравість</span>
+          <span class="row-flex">
+            <span class="badge badge-ok" data-saved="bright" hidden>Збережено</span>
+            <output id="bright-out" class="param-val num"></output>
+          </span>
+        </div>
+        <div class="param-row">
+          <input id="bright" class="slider" type="range" min="0" max="100" step="1" value="80" aria-label="Яскравість дисплея">
+        </div>
+      </div>
+      <label class="switch">
+        <input id="flip" type="checkbox">
+        <span>Перевернути зображення</span>
+        <span class="spacer"></span>
+        <span class="badge badge-ok" data-saved="flip" hidden>Збережено</span>
+      </label>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2 class="card-title">Wi-Fi</h2></div>
+      <div class="table-wrap"><table class="table kv"><tbody id="wifi-rows"></tbody></table></div>
+      <p class="hint">Мережу можна змінити лише через <a href="/system.html">Система → Скинути Wi-Fi</a>.</p>
+    </section>
+  </fieldset>
+</main>
+
+<script src="/js/common.js"></script>
+<script src="/js/nav.js"></script>
+<script src="/js/settings.js"></script>
+</body>
+</html>

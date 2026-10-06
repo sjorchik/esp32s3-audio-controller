@@ -39,6 +39,17 @@ const CONFIG = {
   irLearnPollMs: 400,        // GET /api/ir/learn/status під час навчання (web_api.md: 300-500 мс)
   irStatusPollMs: 2000,      // /api/status на сторінці «Пульт»
   irImportMaxBytes: 8192,    // POST /api/ir/map/import (web_api.md §1)
+  // --- Налаштування / Система (Prompt 23) ---
+  settingsPollMs: 2000,      // /api/status на сторінках «Налаштування» і «Система»
+  savedMs: 1800,             // скільки висить бейдж «Збережено»
+  inputNameMaxBytes: 31,     // inputNames[i]: 1..31 байт UTF-8 (web_api.md §3.2)
+  processorInputs: { Tda7318: 4, Pt2313l: 3 },   // скільки входів має чип (MASTER_SPEC §3)
+  rebootPollMs: 1500,        // період опитування після reboot
+  rebootPingMs: 2500,        // таймаут одного запиту під час очікування
+  rebootTimeoutMs: 60000,    // скільки чекати, перш ніж здатися
+  apSsid: 'AudioCtrl-Setup', // defaults::kApSsid
+  apAddress: '192.168.4.1',  // адреса порталу в режимі AP (web_api.md §7)
+  mdnsHost: 'audio.local',   // defaults::kMdnsName + .local
 };
 
 /* ---------- Помилки API ---------- */
@@ -127,6 +138,9 @@ const REASONS = {
   invalid_action: 'Некоректна назва дії.',
   no_code_for_action: 'Для цієї кнопки немає навченого коду.',
   not_in_conflict: 'Конфлікту вже немає.',
+  invalid_name: 'Недопустима назва входу.',
+  expected_array_of_4: 'Некоректний список назв входів.',
+  empty_request: 'Порожній запит.',
 };
 
 function errorText(e) {
@@ -134,7 +148,7 @@ function errorText(e) {
   if (e.status === 502 && e.code === 'error') return REASONS.i2c_failed;   // POST /api/settings: збій I2C
   let t = REASONS[e.reason] || REASONS[e.code];
   if (!t) return 'Помилка: ' + (e.reason || e.code || e.status);
-  const d = e.data;
+  const d = (Array.isArray(e.data.errors) && e.data.errors[0]) || e.data;   // POST /api/settings кладе min/max у errors[0]
   if (e.code === 'out_of_range' && d.min !== undefined && d.max !== undefined) {
     t = t.replace(/\.$/, '') + ' (' + d.min + '…' + d.max + ').';
   }
@@ -180,7 +194,17 @@ function debounce(fn, ms) {
 function byteLength(s) { return new TextEncoder().encode(String(s)).length; }
 /* +3 / 0 / −3 (справжній мінус). */
 function fmtSigned(v) { return v > 0 ? '+' + v : v < 0 ? '\u2212' + (-v) : '0'; }
-function formatBytes(n) { return n < 1024 ? n + ' Б' : (n / 1024).toFixed(1) + ' КБ'; }
+function formatBytes(n) {
+  if (typeof n !== 'number' || isNaN(n)) return '—';
+  return n < 1024 ? n + ' Б' : n < 1048576 ? (n / 1024).toFixed(1) + ' КБ' : (n / 1048576).toFixed(1) + ' МБ';
+}
+/* Час роботи: «3 діб 4 год 5 хв», до хвилини - «42 с». */
+function formatUptime(ms) {
+  const s = Math.floor(ms / 1000), d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  if (typeof ms !== 'number' || isNaN(ms)) return '—';
+  if (!d && !h && !m) return s + ' с';
+  return [d && d + ' діб', h && h + ' год', m + ' хв'].filter(Boolean).join(' ');
+}
 /* 'YYYY-MM-DD' за локальним часом - для імен файлів. */
 function fileStamp() {
   const d = new Date(); const p = (n) => String(n).padStart(2, '0');
@@ -467,6 +491,52 @@ function renderWifi(node, wifi) {
   const label = ok ? 'Wi-Fi: ' + (wifi.ssid || '') + ', ' + wifi.rssi + ' дБм' : 'Wi-Fi не підключено';
   setAttr(node, 'aria-label', label);
   setAttr(node, 'title', label);
+}
+
+/* ---------- Перезапуск пристрою (Prompt 23) ---------- */
+/* Повноекранне очікування. set(заголовок, текст, спінер, кнопка?) змінює вміст. Сторінка під ним стає inert. */
+function waitScreen(title, text, spin) {
+  const t = el('h2'), p = el('p', { class: 'muted' }), b = el('div', { class: 'wait-act' });
+  const sp = el('i', { class: 'spinner', 'aria-hidden': 'true' });
+  document.body.append(el('div', { class: 'wait', role: 'status' }, el('div', { class: 'wait-box' }, sp, t, p, b)));
+  document.querySelectorAll('body > header, body > main').forEach((n) => { n.inert = true; });
+  const set = (ti, te, s, btn) => { setText(t, ti); setText(p, te); sp.hidden = !s; b.replaceChildren(...(btn ? [btn] : [])); };
+  set(title, text, spin);
+  return { set };
+}
+
+/* Чекає, поки пристрій знову відповість після перезапуску. true - відповів, false - таймаут.
+   «Відповів» = була недоступність АБО uptimeMs менший за час очікування (швидкий reboot не встигли побачити). */
+async function waitForDevice(o) {
+  o = Object.assign({ delayMs: 0, timeoutMs: CONFIG.rebootTimeoutMs, intervalMs: CONFIG.rebootPollMs, onTick: null }, o);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const t0 = Date.now();
+  let down = false;
+  await sleep(o.delayMs);
+  while (Date.now() - t0 < o.timeoutMs) {
+    try {
+      const s = await api.get('/api/status', CONFIG.rebootPingMs);
+      if (down || s.uptimeMs < Date.now() - t0) return true;
+    } catch (_) { down = true; }
+    if (o.onTick) o.onTick(Math.round((Date.now() - t0) / 1000));
+    await sleep(o.intervalMs);
+  }
+  return false;
+}
+
+/* POST reboot / factory-reset -> екран очікування -> перезавантаження сторінки.
+   Помилка самого запиту кидається (викликач показує toast). before() - зупинити опитування сторінки. */
+async function rebootAndWait(path, body, before) {
+  const r = body === undefined ? await api.send('POST', path) : await api.post(path, body);
+  if (before) before();
+  const w = waitScreen('Пристрій перезапускається…', 'Зазвичай це займає 10–15 секунд. Не вимикайте живлення.', true);
+  const ok = await waitForDevice({
+    delayMs: (r && r.inMs) || 0,
+    onTick: (s) => w.set('Пристрій перезапускається…', 'Очікуємо відповіді: ' + s + ' с. Не вимикайте живлення.', true),
+  });
+  if (ok) { location.reload(); return; }
+  w.set('Пристрій не відповідає', 'Перевірте живлення та мережу, потім оновіть сторінку.', false,
+    el('button', { class: 'btn btn-primary', type: 'button', onclick: () => location.reload() }, 'Оновити сторінку'));
 }
 
 /* ---------- Каркас сторінки ---------- */

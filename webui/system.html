@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Система</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-row">
+    <h1 class="brand" id="brand"></h1>
+    <span id="wifi" class="wifi" role="img"></span>
+  </div>
+  <nav id="nav" class="nav" aria-label="Розділи"></nav>
+</header>
+
+<main class="page">
+  <div id="banners" class="banners"></div>
+
+  <div class="stack">
+    <section class="card">
+      <div class="card-head">
+        <h2 class="card-title">Інформація</h2>
+        <button id="btn-refresh" class="btn btn-ghost btn-icon" type="button" data-icon="refresh" aria-label="Оновити"></button>
+      </div>
+      <div class="table-wrap"><table class="table kv"><tbody id="info"></tbody></table></div>
+      <p id="info-note" class="hint num">Завантаження…</p>
+    </section>
+
+    <!-- P24: тут додається картка «Оновлення прошивки» (OTA), перед сервісними діями -->
+
+    <fieldset id="grp" class="group" disabled>
+      <legend class="visually-hidden">Сервісні дії</legend>
+      <section class="card danger-zone">
+        <div class="card-head"><h2 class="card-title">Сервісні дії</h2></div>
+        <ul class="station-list">
+          <li class="station">
+            <div class="station-main"><div class="station-text">
+              <div class="station-name">Перезапустити</div>
+              <p class="hint">Звук зупиниться на 10–15 секунд. Налаштування не змінюються.</p>
+            </div></div>
+            <div class="station-actions"><button id="btn-reboot" class="btn" type="button">Перезапустити</button></div>
+          </li>
+          <li class="station">
+            <div class="station-main"><div class="station-text">
+              <div class="station-name">Скинути налаштування</div>
+              <p class="hint">Заводські налаштування пристрою й звуку. Станції, пульт і Wi-Fi не чіпаються.</p>
+            </div></div>
+            <div class="station-actions"><button id="btn-factory" class="btn btn-danger" type="button">Скинути налаштування</button></div>
+          </li>
+          <li class="station">
+            <div class="station-main"><div class="station-text">
+              <div class="station-name">Скинути Wi-Fi</div>
+              <p class="hint">Пристрій забуде мережу й перейде в режим точки доступу.</p>
+            </div></div>
+            <div class="station-actions"><button id="btn-wifi" class="btn btn-danger" type="button">Скинути Wi-Fi</button></div>
+          </li>
+        </ul>
+      </section>
+    </fieldset>
+  </div>
+</main>
+
+<script src="/js/common.js"></script>
+<script src="/js/nav.js"></script>
+<script src="/js/system.js"></script>
+</body>
+</html>

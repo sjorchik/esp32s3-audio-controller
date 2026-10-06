@@ -7,8 +7,8 @@ const NAV_PAGES = [
   { id: 'stations', href: '/stations.html',   title: 'Станції',      enabled: true },
   { id: 'audio',    href: '/audio.html',      title: 'Аудіо',        enabled: true },
   { id: 'ir',       href: '/ir.html',         title: 'Пульт',        enabled: true  },
-  { id: 'settings', href: '/settings.html',   title: 'Налаштування', enabled: false },
-  { id: 'system',   href: '/system.html',     title: 'Система',      enabled: false },
+  { id: 'settings', href: '/settings.html',   title: 'Налаштування', enabled: true },
+  { id: 'system',   href: '/system.html',     title: 'Система',      enabled: true },
 ];
 
 function pageById(id) { return NAV_PAGES.find((p) => p.id === id) || null; }

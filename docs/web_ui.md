@@ -1,4 +1,4 @@
-# Веб-інтерфейс: каркас фронтенду (Prompt 19, доповнено Prompt 20, 21 і 22)
+# Веб-інтерфейс: каркас фронтенду (Prompt 19, доповнено Prompt 20, 21, 22 і 23)
 
 Документ для наступних промптів (P23+). Нові сторінки додаються **лише змінами в `webui/`** — без правок C++.
 Контракт API — `docs/web_api.md`.
@@ -27,6 +27,8 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 | `stations.html`, `js/stations.js` | сторінка «Станції» (P20): список, форма, переміщення, імпорт / експорт |
 | `audio.html`, `js/audio.js` | сторінка «Аудіо» (P21): гучність / мʼют, gain і вхід, бас / дискант / баланс, loudness, скидання тембру |
 | `ir.html`, `js/ir.js` | сторінка «Пульт» (P22, `/ir`): мапа дій по групах, навчання, очищення, імпорт / експорт; зразок довгої операції з опитуванням статусу |
+| `settings.html`, `js/settings.js` | сторінка «Налаштування» (P23, `/settings`): тип процесора, назви входів, яскравість і орієнтація дисплея, Wi-Fi (лише читання); кожне поле зберігається окремим `POST /api/settings` |
+| `system.html`, `js/system.js` | сторінка «Система» (P23, `/system`): інформація з `/api/system` (за кнопкою), сервісні дії з підтвердженням; між ними — місце під картку OTA (P24) |
 | `favicon.svg` | іконка |
 
 Скрипти — класичні (`<script src>`, не модулі): `const`/функції верхнього рівня `common.js` і `nav.js` видимі в решті скриптів.
@@ -100,6 +102,9 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 | `.dialog.dialog-form` | діалог із формою (`h2`, `.form` > `.field`, `.dialog-actions`) |
 | `fieldset.group.is-busy` | разом із `disabled`: «зайнято» без сильного затемнення (на час запиту) |
 | `.ir-learn`, `.ir-target` | панель навчання кнопки пульта (P22): рамка акценту, велика назва цілі; кнопки — `.dialog-actions`. Рядки дій на сторінці «Пульт» — це `ul.station-list` / `li.station` (див. вище), групи — `section.card` |
+| `.kv` | таблиця «параметр — значення» (`table.table.kv`): перша колонка приглушена, значення переносяться по символах |
+| `.danger-zone` | картка з небезпечними діями (рамка `--err`); дії — `ul.station-list` / `li.station` + `.btn-danger` для незворотних |
+| `.wait`, `.wait-box`, `.spinner` | екран очікування перезапуску (створює `waitScreen`); `p` у ньому зберігає переноси рядків |
 | `.stack`, `.row-flex`, `.spacer`, `.muted`, `.hint`, `.num`, `.visually-hidden` | службові |
 
 Правила: цілі натискання ≥ 44 px; фокус видно через `:focus-visible`; `[hidden]` завжди ховає елемент.
@@ -129,13 +134,19 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 | `api.send(method, path, body, contentType, timeoutMs?) → Promise<json>` | СИРЕ тіло (`File`/`Blob`/рядок) із заданим `Content-Type`; відповідь — JSON. Для імпорту |
 | `api.blob(path, timeoutMs?) → Promise<Blob>` | GET файлу (експорт). Помилки — як у решти `api.*` (`ApiError`) |
 | `downloadBlob(blob, name)`, `fileStamp() → 'YYYY-MM-DD'` | зберегти Blob як файл; дата для імені файлу |
-| `byteLength(s)`, `formatBytes(n)`, `debounce(fn, ms)` | довжина в байтах UTF-8 (сервер рахує байти); «12.3 КБ»; відкладений виклик |
+| `byteLength(s)`, `formatBytes(n)`, `debounce(fn, ms)` | довжина в байтах UTF-8 (сервер рахує байти); «12.3 КБ» / «7.0 МБ» (не число → «—»); відкладений виклик |
+| `formatUptime(ms)` | «3 діб 4 год 5 хв»; менше хвилини — «42 с» |
+| `waitScreen(title, text, spin)` → `{set(title, text, spin, button?)}` | повноекранне очікування (`.wait`); сторінка під ним стає `inert`. Закрити не можна — лише `location.reload()` |
+| `waitForDevice({delayMs, timeoutMs, intervalMs, onTick})` → `Promise<bool>` | опитує `/api/status`, поки пристрій не відповість після перезапуску: була недоступність **або** `uptimeMs` менший за час очікування (швидкий reboot) |
+| `rebootAndWait(path, body, before)` | POST (`body === undefined` → без тіла) → `waitScreen` → `waitForDevice` → `location.reload()`; таймаут → кнопка «Оновити сторінку». Помилку запиту кидає (toast — у викликача); `before()` зупиняє опитування сторінки |
 | `rssiToBars(rssi) → 0..4`, `renderWifi(node, status.wifi)` | індикатор Wi-Fi |
 | `createSlider(input, {send, onInput, onFail}) → {held, hold, release, send}` | повзунок з тротлінгом і утриманням (P21), див. §5.2 |
 | `fmtSigned(v) → string` | `+3` / `0` / `−3` (P21) |
 | `initShell(activeId)` | заголовок, іконки, навігація, dev-банер |
 
 Нова в P22: `CONFIG.irLearnPollMs` (400), `irStatusPollMs` (2000), `irImportMaxBytes` (8192); у `REASONS` — `not_learnable`, `unknown_action`, `invalid_action`, `no_code_for_action`, `not_in_conflict`. Нових іконок і функцій немає.
+
+Нова в P23: `CONFIG.settingsPollMs` (2000), `savedMs` (1800), `inputNameMaxBytes` (31), `processorInputs` (`Tda7318`: 4, `Pt2313l`: 3), `rebootPollMs` (1500), `rebootPingMs` (2500), `rebootTimeoutMs` (60000), `apSsid`, `apAddress`, `mdnsHost`; у `REASONS` — `invalid_name`, `expected_array_of_4`, `empty_request`. `errorText` бере `min` / `max` з `errors[0]` для `POST /api/settings`.
 
 **Безпека:** усе, що походить від пристрою або потоку (назви станцій, ICY-заголовок, ssid), вставляйте ТІЛЬКИ через `textContent` / `el()` / `setText`. `innerHTML` не використовується ніде і не повинен.
 
@@ -187,6 +198,15 @@ if (await confirmDialog('Перезапустити пристрій?', { okText
 - **Групи за словником.** Назви / групи — словник у `ir.js` (ключ — імʼя дії з API); невідома дія → група «Інше» із сирим імʼям.
 - **Імпорт мапи.** `api.send('POST', '/api/ir/map/import', текст файлу, 'application/json', …)`; перед відправкою — розмір ≤ `CONFIG.irImportMaxBytes`, JSON-масив, `confirmDialog`. Експорт — `api.blob('/api/ir/map')` → `ir-map-YYYY-MM-DD.json`.
 
+### 5.4. Налаштування та сервісні дії (P23)
+
+- **Автозбереження.** Кожен елемент (select, перемикач, повзунок) шле власний `POST /api/settings` з одним полем і показує бейдж `.badge-ok` «Збережено» на `CONFIG.savedMs`. Помилка → toast і відкат елемента.
+- **Назви входів.** Масив завжди з 4 елементів: `null` = не змінювати. Клієнтська перевірка дзеркалить сервер (1…31 байт UTF-8, без керівних символів, `byteLength`); помилка сервера з `errors[i].index` показується під відповідним полем. Кількість полів залежить від вибраного чипа (`CONFIG.processorInputs`).
+- **Тип процесора** діє після перезапуску: збережений тип (`/api/settings`) порівнюється з працюючим (`status.processor.type`); якщо різні — банер із кнопкою «Перезапустити зараз».
+- **Деструктивні дії.** `confirmDialog` (що саме зміниться / не зміниться) → кнопки блокуються (`busy`) → запит. Перезапуск і скидання налаштувань — `rebootAndWait`; скидання Wi-Fi — `waitScreen` з інструкцією без очікування відповіді (мережа зміниться).
+- **Важкий ендпоінт.** `/api/system` не опитується: читається при відкритті та за кнопкою «Оновити».
+- **Блокування.** Лише `offline` / ще немає даних; режими `OtaUpdate` / `IrLearn` / `WifiSetup` на «Налаштуваннях» дають попередження без блокування (контракт їх не забороняє). На «Системі» під час OTA вимкнені лише сервісні дії.
+
 ## 6. Шаблон опитування
 
 ```js
@@ -224,4 +244,5 @@ poller.start();
 - Кожен файл віддається з `Cache-Control: no-cache` без ETag — при кожному завантаженні сторінки браузер отримує файли повністю (gzip, ≈ 17 КБ для Головної).
 - Список станцій на сторінці «Станції» опитується повільніше за Головну (`CONFIG.stationsPollMs`); якщо `station.count` у статусі не збігається з довжиною списку — список перечитується автоматично (зміна з пристрою / іншого клієнта з тією самою кількістю станцій не помітна — є кнопка «Оновити»).
 - Сторінка «Пульт» під час навчання опитує статус кожні `irLearnPollMs` (400 мс) паралельно з `/api/status` (послідовно, через чергу `api`); у прихованій вкладці опитування стоїть.
+- Після `reboot` / `factory-reset` сторінка чекає до `CONFIG.rebootTimeoutMs` (60 с); після скидання Wi-Fi очікування немає — адреса пристрою зміниться.
 - Ресурси збільшують прошивку (розділ app0/app1 — 5 767 168 байт). Перед додаванням великих файлів дивіться таблицю, яку друкує `build_web.py`.
