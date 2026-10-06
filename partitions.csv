@@ -1,20 +1,35 @@
-# Partition table for 16 MB flash.
-# 2 OTA slots + LittleFS.
-# App partitions are aligned to 0x10000 (64 KB) for flash erase.
-#
-# NOTE: LittleFS in Arduino-ESP32 looks for a partition named "spiffs" by default.
+# Partition table for 16 MB flash (ESP32-S3 N16R8).
+# 2 OTA slots + LittleFS. Standard Arduino-ESP32 layout of nvs/otadata (P24b).
 #
 # Layout:
-#   nvs      : 0x009000 + 0x006000 = 0x00F000
-#   otadata  : 0x00F000 + 0x002000 = 0x011000
-#   (gap to 0x020000 for app0 alignment)
+#   nvs      : 0x009000 + 0x005000 = 0x00E000
+#   otadata  : 0x00E000 + 0x002000 = 0x010000
+#   (gap 0x010000..0x01FFFF is unused, keeps app0 aligned to 64 KB)
 #   app0     : 0x020000 + 0x580000 = 0x5A0000
 #   app1     : 0x5A0000 + 0x580000 = 0xB20000
 #   spiffs   : 0xB20000 + 0x4E0000 = 0x1000000 (exactly 16 MB)
+#
+# WHY otadata IS AT 0xE000 (do not move it):
+#   On every USB upload PlatformIO writes boot_app0.bin (8 KB, an "empty
+#   otadata") to the FIXED address 0xE000, regardless of this table (confirmed
+#   by the esptool log: "0xe000 ...boot_app0.bin"). The otadata partition must
+#   therefore cover exactly 0xE000..0xFFFF, otherwise the upload either erases
+#   the tail of nvs (settings lost) or resets only half of otadata (the old
+#   OTA slot keeps being selected, e.g. "Running partition: app1").
+#   Old layout was nvs 0x9000+0x6000 / otadata 0xF000+0x2000 - do not restore.
+#
+# NOTE: LittleFS in Arduino-ESP32 looks for a partition labelled "spiffs" by
+# default, so the label stays. gen_esp32part.py prints a warning ("Partition has
+# name 'spiffs' which is a partition subtype, but this partition has non-matching
+# type 0x1 and subtype 0x83"): it is harmless - the label matches the name of
+# the SPIFFS subtype, while the real subtype here is LittleFS (0x83).
+#
+# Keep comments ASCII-only: some build tools read this file with the system
+# code page on Windows.
 
-# Name,   Type, SubType, Offset,   Size, Flags
-nvs,      data, nvs,     0x9000,   0x6000,
-otadata,  data, ota,     0xF000,   0x2000,
-app0,     app,  ota_0,   0x20000,  0x580000,
-app1,     app,  ota_1,   ,         0x580000,
-spiffs,   data, littlefs,,         0x4E0000,
+# Name,   Type, SubType, Offset,    Size,     Flags
+nvs,      data, nvs,     0x9000,    0x5000,
+otadata,  data, ota,     0xE000,    0x2000,
+app0,     app,  ota_0,   0x20000,   0x580000,
+app1,     app,  ota_1,   0x5A0000,  0x580000,
+spiffs,   data, littlefs,0xB20000,  0x4E0000,
