@@ -28,6 +28,8 @@
 // [Prompt 15] Так само читається core/action_names (таблиця імен без стану); стан навчання
 // IR береться з AppState (irLearnStatus/irLearnTarget/irLearnConflictWith), не з IrRc5.
 // [Prompt 16] Екран Mode::OtaUpdate читає лише AppState.otaProgress.
+// [Prompt 23b] Назва входу (Radio, ExternalInput) береться з AppState.inputName; Settings екрани
+// не читають. Довга назва обрізається fitText() з "..." по межі UTF-8-символу.
 // [Prompt 17] ВИНЯТОК З ІЗОЛЯЦІЇ: рівні VU беруться напряму з VuSourceDecodedPcm::read() (з
 // частотою кадру), МИНАЮЧИ AppState; AppStateData.vuLeft/vuRight не використовуються.
 
@@ -133,9 +135,31 @@ void drawCentered(const char* text, int16_t y, FontSize size, uint16_t color) {
     D::drawText(text, static_cast<int16_t>(x), y, size, color);
 }
 
-const char* inputName(uint8_t index) {
-    return (index < defaults::kInputCount) ? defaults::kInputNames[index] : "Input";
+// Вписує src у maxW пікселів: за потреби обрізає по межі UTF-8-символу й додає
+// "...". out має вміщати кінцевий текст: cap >= sizeof(Station::name) + 8.
+void fitText(const char* src, char* out, size_t cap, FontSize size, int32_t maxW) {
+    strlcpy(out, src, cap);
+    if (UiFonts::textWidth(out, size) <= maxW) return;
+    size_t len = strlen(src);
+    while (len > 0) {
+        --len;
+        while (len > 0 && (static_cast<uint8_t>(src[len]) & 0xC0) == 0x80) --len;
+        memcpy(out, src, len);
+        strcpy(out + len, "...");
+        if (UiFonts::textWidth(out, size) <= maxW) return;
+    }
 }
+
+// [Prompt 23b] Назва входу береться з AppState.inputName (її вирішує AppController: користувацька
+// з налаштувань, запасно defaults::kInputNames). Тут лише останній запасний варіант на випадок
+// порожнього поля (нульовий AppState до першої публікації): типова назва за індексом або "Input".
+const char* inputName(const AppStateData& s) {
+    if (s.inputName[0] != '\0') return s.inputName;
+    return (s.inputIndex < defaults::kInputCount) ? defaults::kInputNames[s.inputIndex] : "Input";
+}
+
+// Буфер під fitText для назви входу: cap >= sizeof(inputName) + 8.
+constexpr size_t kInputFitCap = kInputNameMax + 8;
 
 void drawTopIcons(const AppStateData& s, bool showWifi) {
     if (showWifi) {
@@ -259,7 +283,12 @@ void drawStandby() {
 }
 
 void drawRadio(const AppStateData& s, int vuLitL, int vuLitR) {
-    D::drawText(inputName(s.inputIndex), c::kMargin, c::kTopBarTextY, FontSize::Small, c::kColorDim);
+    // [Prompt 23b] Довга назва обрізається "..." до місця під іконку мʼюту (резервуємо її завжди,
+    // щоб текст не стрибав при вмиканні мʼюту).
+    char name[kInputFitCap];
+    fitText(inputName(s), name, sizeof(name), FontSize::Small,
+            c::kMuteIconX - c::kMargin - c::kTopBarNameGap);
+    D::drawText(name, c::kMargin, c::kTopBarTextY, FontSize::Small, c::kColorDim);
     drawTopIcons(s, true);
 
     marqueeDraw(s_station, c::kStationY, FontSize::Large, dc::kColorFg);
@@ -276,23 +305,10 @@ void drawRadio(const AppStateData& s, int vuLitL, int vuLitR) {
 void drawExternal(const AppStateData& s) {
     drawTopIcons(s, false);
     drawCentered("INPUT", c::kExtCaptionY, FontSize::Tiny, c::kColorDim);
-    drawCentered(inputName(s.inputIndex), c::kExtNameY, FontSize::Large, dc::kColorFg);
+    char name[kInputFitCap];  // [Prompt 23b]
+    fitText(inputName(s), name, sizeof(name), FontSize::Large, c::kContentW);
+    drawCentered(name, c::kExtNameY, FontSize::Large, dc::kColorFg);
     drawStatusRow(s);
-}
-
-// Вписує src у maxW пікселів: за потреби обрізає по межі UTF-8-символу й додає
-// "...". out має вміщати кінцевий текст: cap >= sizeof(Station::name) + 8.
-void fitText(const char* src, char* out, size_t cap, FontSize size, int32_t maxW) {
-    strlcpy(out, src, cap);
-    if (UiFonts::textWidth(out, size) <= maxW) return;
-    size_t len = strlen(src);
-    while (len > 0) {
-        --len;
-        while (len > 0 && (static_cast<uint8_t>(src[len]) & 0xC0) == 0x80) --len;
-        memcpy(out, src, len);
-        strcpy(out + len, "...");
-        if (UiFonts::textWidth(out, size) <= maxW) return;
-    }
 }
 
 void drawStationList(const AppStateData& s) {

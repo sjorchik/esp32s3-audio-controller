@@ -22,6 +22,9 @@
 // помилки немає: при невдачі AppController одразу повертає попередній Mode.
 // [Prompt 21b] ДОДАНО: loudness (лише в кінець структури). volume/bass/treble/balance/gain/
 // loudness тепер дзеркалять ПРОФІЛЬ ПОТОЧНОГО входу (AppController міняє їх при перемиканні входу).
+// [Prompt 23b] ДОДАНО: inputName (лише в кінець структури) — користувацька назва ПОТОЧНОГО входу
+// з Settings::inputNames (запасно defaults::kInputNames). Вирішує AppController (resolveInputName),
+// ui/screens лише читає поле.
 // [Prompt 17] НЕ ВИКОРИСТОВУЮТЬСЯ: ui/screens читає рівні VU напряму з
 // VuSourceDecodedPcm::read() (частота кадру), минаючи AppState. Поля лишено, щоб не міняти POD-структуру.
 
@@ -85,6 +88,10 @@ enum class IrLearnStatus : uint8_t {
     Conflict,  // код уже привʼязаний до іншої дії; чекаємо рішення з вебу
 };
 
+// [Prompt 23b] ДОДАНО: розмір буфера назви входу (байт разом із '\0'); має збігатися з
+// sizeof(Settings::inputNames[0]) (перевіряє static_assert у app_controller.cpp).
+constexpr size_t kInputNameMax = 32;
+
 // Дані стану.
 // Розміри буферів під метадані залишаються константами.
 struct AppStateData {
@@ -144,6 +151,12 @@ struct AppStateData {
     // --- [Prompt 21b] ДОДАНО ---
     // Тонкомпенсація профілю поточного входу (false, якщо чип її не підтримує).
     bool loudness;
+
+    // --- [Prompt 23b] ДОДАНО ---
+    // Назва поточного входу (UTF-8, завжди з '\0'; хвіст буфера обнулено, щоб однакові
+    // назви давали однакові байти для memcmp у screens). "" лише якщо немає ні користувацької,
+    // ні типової назви.
+    char inputName[kInputNameMax];
 };
 
 class AppState {

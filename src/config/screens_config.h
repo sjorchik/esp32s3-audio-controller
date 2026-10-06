@@ -35,6 +35,7 @@ constexpr int16_t kTopBarY     = 4;
 constexpr int16_t kTopBarTextY = 7;                // Small по центру 24-px смуги
 constexpr int16_t kWifiIconX   = kW - kMargin - display_cfg::kIconSize;
 constexpr int16_t kMuteIconX   = kWifiIconX - display_cfg::kIconSize - 6;
+constexpr int16_t kTopBarNameGap = 6;               // [Prompt 23b] проміжок між назвою входу й іконкою мʼюту
 
 // --- Radio ---
 constexpr int16_t kStationY   = 34;                // Large, marquee
@@ -110,6 +111,7 @@ static_assert(kTrackY + display_cfg::kFontSmallPx < kVuY, "track overlaps VU fra
 static_assert(kStationY + display_cfg::kFontLargePx < kTrackY, "station overlaps track");
 static_assert(kListFirstY + kListRows * kListRowH <= kH, "station list out of screen");
 static_assert(kMuteIconX > kMargin, "icons overflow top bar");
+static_assert(kMuteIconX - kMargin - kTopBarNameGap > 0, "no room for input name in top bar");
 static_assert(kWifiSetupTitleY + display_cfg::kFontLargePx < kWifiSetupSsidY &&
                   kWifiSetupSsidY + display_cfg::kFontSmallPx < kWifiSetupIpY &&
                   kWifiSetupIpY + display_cfg::kFontSmallPx <= kH,

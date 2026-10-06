@@ -63,6 +63,13 @@
 // kUnmuteDelayMs -> ramp гучності до значення нового профілю. Те саме — при виході зі standby
 // і на старті (powerOnTransition). Мʼют користувача глобальний і в профіль не входить.
 // gain тепер веде сам контролер (s_gain), а не cachedState() драйвера.
+//
+// [Prompt 23b] AppState.inputName = користувацька назва ПОТОЧНОГО входу (Settings::inputNames),
+// запасно defaults::kInputNames. ЄДИНЕ місце вирішення — resolveInputName(). Публікується в
+// publishState() (старт, зміна входу з будь-якого джерела, вихід зі standby — усі ці шляхи
+// закінчуються publishState()) і щоперіодно в syncPlayer() (kSyncPeriodMs): так назва, змінена
+// на веб-сторінці (/api/settings пише лише в SettingsStore і контролер не повідомляє), зʼявляється
+// на дисплеї без перемикання входу. Читання Settings — лише тут, у задачі контролера.
 
 #include "core/app_controller.h"
 
@@ -296,6 +303,29 @@ void resolveStationName(const char* icyName, char* out, size_t cap) {
     }
 }
 
+// [Prompt 23b] ЄДИНЕ місце вирішення назви входу для AppState.inputName.
+// Пріоритет: Settings::inputNames[idx]; порожня назва чи недійсний індекс -> defaults::kInputNames[idx]
+// (лише для idx < kInputCount); інакше "". Буфер out повністю обнуляється, а потім заповнюється
+// (однакові назви -> однакові байти). Викликати лише з задачі контролера: бере мʼютекс Settings
+// через SettingsStore::snapshot() (короткий; те саме робить leaveStandby()).
+static_assert(sizeof(Settings::inputNames[0]) == kInputNameMax,
+              "AppStateData::inputName must match Settings::inputNames[i] size");
+
+void resolveInputName(uint8_t idx, char* out, size_t cap) {
+    if (cap == 0) {
+        return;
+    }
+    memset(out, 0, cap);
+    if (idx >= defaults::kInputCount) {
+        return;
+    }
+    const Settings st = SettingsStore::snapshot();
+    strlcpy(out, st.inputNames[idx], cap);
+    if (out[0] == '\0') {
+        strlcpy(out, defaults::kInputNames[idx], cap);
+    }
+}
+
 // --- Потік і Wi-Fi ---------------------------------------------------------
 // AudioPlayer сам Wi-Fi не перевіряє, а без піднятого мережевого стеку
 // бібліотека падає в assert (xQueueSemaphoreTake). Тому playUrl() викликаємо
@@ -466,6 +496,7 @@ struct PubCtx {
     MenuContext menuCtx;
     uint16_t menuSel;
     bool loudness;  // [Prompt 21b]
+    char inputName[kInputNameMax];  // [Prompt 23b]
 };
 
 void applyPub(AppStateData& s, void* c) {
@@ -483,12 +514,14 @@ void applyPub(AppStateData& s, void* c) {
     s.menuContext = p->menuCtx;
     s.menuSelection = p->menuSel;
     s.loudness = p->loudness;  // [Prompt 21b]
+    memcpy(s.inputName, p->inputName, sizeof(s.inputName));  // [Prompt 23b]
 }
 
 void publishState() {
     PubCtx p = {s_mode,   s_input, s_volume, s_bass,    s_treble, s_balance,
                 s_gain,   s_userMute, s_station, s_target, s_menuCtx, s_menuSel,
                 s_loudness};
+    resolveInputName(s_input, p.inputName, sizeof(p.inputName));  // [Prompt 23b]
     AppState::modify(applyPub, &p);
 }
 
@@ -552,6 +585,7 @@ struct SyncCtx {
     char wifiSsid[33];
     char wifiIp[16];
     bool wifiApMode;
+    char inputName[kInputNameMax];  // [Prompt 23b]: назва могла змінитись з вебу
 };
 
 void applySync(AppStateData& s, void* c) {
@@ -566,6 +600,7 @@ void applySync(AppStateData& s, void* c) {
     memcpy(s.wifiSsid, x->wifiSsid, sizeof(s.wifiSsid));
     memcpy(s.wifiIp, x->wifiIp, sizeof(s.wifiIp));
     s.wifiApMode = x->wifiApMode;
+    memcpy(s.inputName, x->inputName, sizeof(s.inputName));  // [Prompt 23b]
 }
 
 void syncPlayer() {
@@ -581,6 +616,7 @@ void syncPlayer() {
     // [Prompt 12] ДОДАНО
     WifiManager::copyInfo(c.wifiSsid, sizeof(c.wifiSsid), c.wifiIp, sizeof(c.wifiIp));
     c.wifiApMode = WifiManager::isApMode();
+    resolveInputName(s_input, c.inputName, sizeof(c.inputName));  // [Prompt 23b]
 
     // [Prompt 10] ДОДАНО: маппінг PlayerState → StreamStatus за назвою
     // audio_player.h::PlayerState і core/app_state.h::StreamStatus мають однакові
