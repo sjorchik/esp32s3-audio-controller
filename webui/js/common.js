@@ -57,6 +57,10 @@ const CONFIG = {
   otaUploadTimeoutMs: 300000,// XHR POST /api/ota: передача + перевірка образу
   otaRebootDelayMs: 1500,    // пауза перед опитуванням: пристрій перезапускається ~через 1.5 с після відповіді
   otaRebootTimeoutMs: 90000, // скільки чекати повернення пристрою після OTA (довше, ніж після reboot)
+  // --- Рівень станції (Prompt 25b; web_api.md §5) ---
+  stationLevelMinDb: -24,    // levelDb: ціле, лише послаблення
+  stationLevelMaxDb: 0,
+  stationLevelDefaultDb: -6, // нова станція, M3U / PLS, старий список
 };
 
 /* ---------- Помилки API ---------- */
@@ -127,6 +131,8 @@ const REASONS = {
   url_too_long: 'Адреса задовга.',
   url_invalid: 'Некоректна адреса.',
   url_invalid_scheme: 'Адреса має починатися з http:// або https://',
+  level_invalid: 'Рівень має бути цілим числом.',
+  level_out_of_range: 'Рівень поза допустимими межами.',
   // OTA
   bad_image: 'Це не образ прошивки.',
   bad_magic: 'Це не образ прошивки.',
@@ -161,7 +167,7 @@ function errorText(e) {
   let t = REASONS[e.reason] || REASONS[e.code];
   if (!t) return 'Помилка: ' + (e.reason || e.code || e.status);
   const d = (Array.isArray(e.data.errors) && e.data.errors[0]) || e.data;   // POST /api/settings кладе min/max у errors[0]
-  if (e.code === 'out_of_range' && d.min !== undefined && d.max !== undefined) {
+  if ((e.code === 'out_of_range' || e.code === 'level_out_of_range') && d.min !== undefined && d.max !== undefined) {
     t = t.replace(/\.$/, '') + ' (' + d.min + '…' + d.max + ').';
   }
   return t;

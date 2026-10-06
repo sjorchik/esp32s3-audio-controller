@@ -1,5 +1,5 @@
 'use strict';
-/* Сторінка «Станції» (Prompt 20). Залежить від common.js і nav.js.
+/* Сторінка «Станції» (Prompt 20, 25b). Залежить від common.js і nav.js.
    Індекси станцій ПОЗИЦІЙНІ: після будь-якої зміни списку перечитуємо список і стан. */
 (() => {
   const g = (id) => document.getElementById(id);
@@ -14,7 +14,7 @@
 
   let st = null;                 // останній /api/status
   let stations = [];             // останній /api/stations
-  let rows = [];                 // [{li, index, name, url, key, up, dn, cur}]
+  let rows = [];                 // [{li, index, name, url, level, key, up, dn, cur}]
   let byIndex = new Map();
   let shown = 0;                 // скільки рядків видно після фільтра
   let filter = '';
@@ -102,6 +102,7 @@
       const index = typeof s.index === 'number' ? s.index : pos;
       const name = String(s.name || '');
       const url = String(s.url || '');
+      const level = Number.isInteger(s.levelDb) ? s.levelDb : null;   // стара відповідь без levelDb - без бейджа
       const btn = (act, ic, label) => el('button', {
         type: 'button', class: 'btn btn-icon', 'data-act': act, title: label, 'aria-label': label + ' «' + name + '»',
       }, icon(ic));
@@ -110,12 +111,13 @@
           el('span', { class: 'idx num' }, index + 1),
           el('div', { class: 'station-text' },
             el('div', { class: 'station-name' }, name),
-            el('div', { class: 'station-url muted', title: url }, url))),
+            el('div', { class: 'station-url muted', title: url }, url)),
+          level === null ? null : el('span', { class: 'badge station-level num', title: 'Рівень виходу декодера' }, fmtSigned(level) + ' дБ')),
         el('div', { class: 'station-actions' },
           btn('play', 'play', 'Грати'), btn('up', 'arrow-up', 'Вище'), btn('down', 'arrow-down', 'Нижче'),
           btn('move', 'move', 'На позицію…'), btn('edit', 'edit', 'Редагувати'), btn('del', 'trash', 'Видалити')));
       const row = {
-        li, index, name, url, key: (name + ' ' + url).toLowerCase(), cur: false,
+        li, index, name, url, level, key: (name + ' ' + url).toLowerCase(), cur: false,
         up: li.querySelector('[data-act="up"]'), dn: li.querySelector('[data-act="down"]'),
       };
       byIndex.set(index, row);
@@ -203,7 +205,9 @@
   }
 
   /* openForm({title, submit, fields:[{key,label,value,bytes?,type?,inputmode?,min?,max?}],
-     validate(vals)->{key:msg}, save(vals)->Promise}) -> Promise<boolean> (true = збережено). */
+     validate(vals)->{key:msg}, save(vals)->Promise, level?:{value, apply?(db)->Promise}}) -> Promise<boolean>
+     (true = збережено). level (P25b) додає поле «Рівень» -> vals.levelDb; level.apply (лише редагування)
+     додає «Застосувати»: зберігає рівень без закриття діалогу. */
   function openForm(o) {
     return new Promise((resolve) => {
       const f = {};
@@ -222,33 +226,89 @@
         return el('div', { class: 'field' }, el('label', { for: id }, fd.label), input, err, cnt);
       });
       let sending = false;
-      const cancel = el('button', { class: 'btn', type: 'button', onclick: () => { if (!sending) dlg.close('cancel'); } }, 'Скасувати');
+      let applying = false;
+      let badge = null;
+      let applyBtn = null;
+      let hideTimer = null;
+      const cancel = el('button', { class: 'btn', type: 'button', onclick: () => { if (!sending && !applying) dlg.close('cancel'); } }, 'Скасувати');
       const okBtn = el('button', { class: 'btn btn-primary', type: 'submit' }, o.submit);
+      const sync = () => {
+        const b = sending || applying;
+        okBtn.disabled = b; cancel.disabled = b;
+        if (applyBtn) applyBtn.disabled = b;
+      };
+
+      if (o.level) {
+        const lo = CONFIG.stationLevelMinDb, hi = CONFIG.stationLevelMaxDb;
+        const input = el('input', {
+          class: 'slider', type: 'range', id: 'f-levelDb', min: lo, max: hi, step: 1,
+          value: clamp(o.level.value, lo, hi), 'aria-describedby': 'f-levelDb-hint f-levelDb-err',
+        });
+        const out = el('output', { class: 'level-val num', for: 'f-levelDb' });
+        const err = el('div', { class: 'field-error', id: 'f-levelDb-err', role: 'alert', hidden: true });
+        f.levelDb = { input, err };
+        const show = () => setText(out, fmtSigned(Number(input.value)) + ' дБ');
+        const stepBtn = (ic, label, d) => el('button', {
+          class: 'btn btn-icon', type: 'button', 'aria-label': label,
+          onclick: () => { input.value = clamp(Number(input.value) + d, lo, hi); input.dispatchEvent(new Event('input')); },
+        }, icon(ic));
+        input.addEventListener('input', () => { show(); setErr(f.levelDb, ''); if (badge) badge.hidden = true; });
+        show();
+        const extra = [];
+        if (o.level.apply) {
+          badge = el('span', { class: 'badge badge-ok', role: 'status', hidden: true }, 'Застосовано');
+          applyBtn = el('button', {
+            class: 'btn', type: 'button',
+            onclick: async () => {
+              if (sending || applying) return;
+              applying = true; sync(); setErr(f.levelDb, '');
+              try {
+                await o.level.apply(Number(input.value));
+                badge.hidden = false;
+                clearTimeout(hideTimer);
+                hideTimer = setTimeout(() => { badge.hidden = true; }, CONFIG.savedMs);
+              } catch (e) { setErr(f.levelDb, errorText(e)); }
+              applying = false; sync();
+            },
+          }, 'Застосувати');
+          extra.push(el('div', { class: 'row-flex' }, applyBtn, badge),
+            el('p', { class: 'hint' }, 'Рівень звучить одразу лише якщо ця станція зараз грає, інакше застосується при її запуску. ' +
+              '«Застосувати» зберігає лише рівень; назву й адресу зберігає «Зберегти».'));
+        }
+        nodes.push(el('div', { class: 'field' },
+          el('label', { for: 'f-levelDb' }, 'Рівень, дБ'),
+          el('div', { class: 'param-row' }, stepBtn('minus', 'Рівень: тихіше', -1), input, stepBtn('plus', 'Рівень: гучніше', 1), out),
+          el('p', { class: 'hint', id: 'f-levelDb-hint' },
+            'Нижче значення — тихіше. Допомагає, якщо звук спотворений або станція гучніша за інші.'),
+          err, extra));
+      }
+
       const form = el('form', { novalidate: true },
         el('h2', null, o.title), el('div', { class: 'form' }, nodes), el('div', { class: 'dialog-actions' }, cancel, okBtn));
       const dlg = el('dialog', { class: 'dialog dialog-form' }, form);
 
       form.addEventListener('submit', async (ev) => {
         ev.preventDefault();
-        if (sending) return;
+        if (sending || applying) return;
         const vals = {};
         o.fields.forEach((fd) => { vals[fd.key] = f[fd.key].input.value; });
+        if (o.level) { vals.levelDb = Number(f.levelDb.input.value); setErr(f.levelDb, ''); }
         const errs = o.validate(vals);
         const bad = o.fields.filter((fd) => errs[fd.key]);
         o.fields.forEach((fd) => setErr(f[fd.key], errs[fd.key] || ''));
         if (bad.length) { f[bad[0].key].input.focus(); return; }
-        sending = true; okBtn.disabled = true; cancel.disabled = true;
+        sending = true; sync();
         try {
           await o.save(vals);
           dlg.close('saved');
         } catch (e) {
           const fld = e instanceof ApiError && e.data ? f[e.data.field] : null;   // помилка конкретного поля
           if (fld) { setErr(fld, errorText(e)); fld.input.focus(); } else toast(errorText(e), 'error');
-          sending = false; okBtn.disabled = false; cancel.disabled = false;
+          sending = false; sync();
         }
       });
-      dlg.addEventListener('cancel', (ev) => { if (sending) ev.preventDefault(); });
-      dlg.addEventListener('close', () => { dlg.remove(); resolve(dlg.returnValue === 'saved'); });
+      dlg.addEventListener('cancel', (ev) => { if (sending || applying) ev.preventDefault(); });
+      dlg.addEventListener('close', () => { clearTimeout(hideTimer); dlg.remove(); resolve(dlg.returnValue === 'saved'); });
       document.body.append(dlg);
       dlg.showModal();
     });
@@ -280,6 +340,7 @@
     let newIndex = null;
     const ok = await openForm({
       title: 'Нова станція', submit: 'Додати', fields: stationFields('', ''), validate: validateStation,
+      level: { value: CONFIG.stationLevelDefaultDb },
       save: async (v) => { const r = await api.post('/api/stations', v, CONFIG.stationsWriteTimeoutMs); newIndex = r.index; },
     });
     if (!ok) return;
@@ -291,6 +352,14 @@
   async function editStation(r) {
     const ok = await openForm({
       title: 'Редагувати станцію', submit: 'Зберегти', fields: stationFields(r.name, r.url), validate: validateStation,
+      level: {
+        value: r.level === null ? CONFIG.stationLevelDefaultDb : r.level,
+        // «Застосувати»: PUT зі збереженими name / url рядка (не зі значеннями форми) і рівнем форми; список - у тлі
+        apply: async (db) => {
+          await api.put('/api/stations/' + r.index, { name: r.name, url: r.url, levelDb: db }, CONFIG.stationsWriteTimeoutMs);
+          reload();
+        },
+      },
       save: (v) => api.put('/api/stations/' + r.index, v, CONFIG.stationsWriteTimeoutMs),
     });
     if (!ok) return;
@@ -416,6 +485,8 @@
   });
   ui.search.addEventListener('input', debounce(applyFilter, CONFIG.searchDebounceMs));
 
+  setText(g('import-hint'), 'JSON зберігає рівні станцій; M3U / PLS отримують значення за замовчуванням (' +
+    fmtSigned(CONFIG.stationLevelDefaultDb) + ' дБ).');
   initShell('stations');
   onConnectionChange(render);
   render();

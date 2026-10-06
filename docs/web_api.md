@@ -1,7 +1,8 @@
 # HTTP API пристрою (ESP32-S3 Audio Controller)
 
 Документ-контракт для фронтенду. Опис ПОВНИЙ і самодостатній: C++ читати не треба.
-Версія контракту: Prompt 18 (прошивка `0.18.0`, див. `GET /api/system`); семантику `station.name` уточнено в Prompt 20b.
+Версія контракту: Prompt 18 (прошивка `0.18.0`, див. `GET /api/system`); семантику `station.name` уточнено в Prompt 20b;
+Prompt 25: поле станції `levelDb` (рівень виходу декодера) у §5, зворотно сумісне.
 
 ## 1. Загальні правила
 
@@ -285,9 +286,16 @@ loudness; §1.3), тож `GET /api/status` одразу показує його 
 
 ## 5. Станції (`/api/stations*`)
 
-Станція = `{"name": "...", "url": "http(s)://..."}`. Обмеження (за розміром буферів `Station`): `name`
+Станція = `{"name": "...", "url": "http(s)://...", "levelDb": -6}`. Обмеження (за розміром буферів `Station`): `name`
 1..63 байт UTF-8 без керувальних символів і не лише з пробілів; `url` ≤ 191 байт, починається з `http://` або
 `https://` (m3u/pls-плейлисти розбирає плеєр). Максимум станцій — `station.max` у `/api/status`.
+
+**`levelDb` (Prompt 25)** — рівень виходу декодера цієї станції: **ціле, дБ, лише послаблення, `-24..0`, крок 1 дБ**;
+`0` = без послаблення. Дефолт — **`-6`**: нова станція без поля, станції зі старого збереженого списку,
+імпорт M3U / PLS. Це цифрове послаблення сигналу радіо до ЦАП; застосовується, коли станція починає грати (будь-яким
+шляхом), і **наживо** (плавно, без перепідключення), якщо змінити `levelDb` станції, що зараз грає (зміна
+підхоплюється за період синхронізації контролера, ≈ до секунди). Зовнішні входи (TV Box / Computer / Aux) не змінюються.
+Окремого глобального налаштування й `levelDb` у `/api/status` немає.
 
 > **Індекс станції ПОЗИЦІЙНИЙ.** Стабільного `id` немає. Додавання зберігає індекси попередніх; видалення,
 > переміщення й імпорт **зсувають** індекси. Після будь-якої зміни списку перечитайте `GET /api/stations`.
@@ -297,18 +305,32 @@ loudness; §1.3), тож `GET /api/status` одразу показує його 
 ### 5.1. `GET /api/stations`
 
 ```json
-[{"index": 0, "name": "Radio One", "url": "http://example.com/stream"}, {"index": 1, "name": "...", "url": "..."}]
+[{"index": 0, "name": "Radio One", "url": "http://example.com/stream", "levelDb": -6},
+ {"index": 1, "name": "...", "url": "...", "levelDb": -10}]
 ```
+
+Кожен елемент завжди містить `levelDb` (ціле `-24..0`).
 
 ### 5.2. `POST /api/stations` — додати в кінець
 
-Тіло `{"name":"...","url":"..."}` (обидва поля обовʼязкові, інших нема). `201 {"ok":true,"index":N}`.
+Тіло `{"name":"...","url":"...","levelDb":-10}`: `name` і `url` обовʼязкові, **`levelDb` необовʼязкове** (немає або
+`null` → `-6`), інших ключів нема. `201 {"ok":true,"index":N}`.
 Помилки `400` з `field`: `unknown_field`, `name_required`, `name_too_long`, `name_invalid`, `url_required`,
-`url_too_long`, `url_invalid`, `url_invalid_scheme`; `409 list_full`; `500 storage_error`.
+`url_too_long`, `url_invalid`, `url_invalid_scheme`, **`level_invalid`** (`field:"levelDb"`: не ціле число —
+рядок, дріб, булеве) і **`level_out_of_range`** (`field:"levelDb"`, поза `-24..0`; відповідь містить `min:-24`,
+`max:0`); `409 list_full`; `500 storage_error`.
+
+Приклад помилки: `POST /api/stations {"name":"X","url":"http://x","levelDb":-30}` →
+`400 {"ok":false,"error":"level_out_of_range","field":"levelDb","min":-24,"max":0}`.
 
 ### 5.3. `PUT /api/stations/{index}` — повна заміна
 
-Тіло як у 5.2. `200 {"ok":true,"index":N}`; `400 invalid_index` (не число); `404 not_found`; помилки валідації як у 5.2.
+Тіло як у 5.2 (`name` і `url` обовʼязкові, **`levelDb` необовʼязкове: відсутнє або `null` = рівень станції лишається
+без змін**; явне значення замінює його). `200 {"ok":true,"index":N}`; `400 invalid_index` (не число);
+`404 not_found`; помилки валідації як у 5.2 (включно з `level_invalid` / `level_out_of_range`). Якщо
+змінюється рівень станції, що зараз грає (її URL збігається з URL потоку), нове значення діє наживо; якщо ж
+станція з цим індексом — не та, що грає (після переміщення/видалення індекс позиційний), рівень потоку, що грає, не
+змінюється до наступного запуску станції.
 
 ### 5.4. `DELETE /api/stations/{index}`
 
@@ -329,13 +351,19 @@ index_out_of_range | unknown_field` (з `field`).
 Помилка: `{"ok":false,"error":"import_failed","reason":"<код>","format":"m3u"}` з `400` (вміст), `500`
 (`out_of_memory`, `io_error`, `storage_write_failed`, `file_not_found`) або `503` (`busy`).
 Значення `reason`: `busy`, `out_of_memory`, `file_not_found`, `empty`, `too_big`, `version_mismatch`,
-`parse_error`, `too_many_stations`, `io_error`, `storage_write_failed`.
+`parse_error`, `too_many_stations`, `io_error`, `storage_write_failed`, **`level_out_of_range`** (лише JSON: `levelDb`
+у доданій станції не ціле або поза `-24..0`; список не змінюється, `400`).
+
+Рівень станції при імпорті: **JSON** — поле `levelDb` читається, якщо є (немає → `-6`); **M3U / PLS** — завжди `-6`
+(у цих форматах поля немає).
 Інші: `400 no_body | unknown_format`, `409 import_busy` (одночасний імпорт), `413 body_too_large`, `500 upload_failed`.
 
 ### 5.7. `GET /api/stations/export`
 
-Файл `stations.json` (`Content-Disposition: attachment`): `{"version":1,"stations":[{"name":"..","url":".."}]}`.
-Той самий формат приймає `import?format=json`.
+Файл `stations.json` (`Content-Disposition: attachment`):
+`{"version":1,"stations":[{"name":"..","url":"..","levelDb":-6}]}`. Той самий формат приймає `import?format=json`
+(допускається і голий масив `[{"name","url","levelDb"},..]`); файл без `levelDb` (зокрема експорт зі старою прошивкою)
+імпортується з рівнем `-6`. `"version"` лишається `1`.
 
 ---
 
@@ -522,6 +550,8 @@ curl -X POST --data-binary @firmware.bin -H "Content-Type: application/octet-str
 - У режимі AP (портал Wi-Fi) цей API недоступний.
 - Автентифікації й HTTPS немає; пароль/токен не передавайте.
 - Індекси станцій позиційні (§5). Звукові значення — по входах (§1.3); через API доступний лише профіль поточного
-  входу. Назву/URL станції редагуйте лише повною заміною (PUT).
+  входу. Назву/URL станції редагуйте лише повною заміною (PUT); `levelDb` у PUT можна опустити (= без змін).
+- `levelDb` станції — не частина профілю входу й не гучність: це послаблення сигналу декодера перед ЦАП (§5), діє лише
+  на вході Radio.
 - Для розробки сторінок на ПК у `config/web_api_config.h` є прапорець `WEB_API_DEV_CORS` (за замовчуванням 0): при 1
   кожна відповідь отримує CORS-заголовки, а preflight `OPTIONS /api/*` — `204`. У релізі тримайте 0.

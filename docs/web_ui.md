@@ -1,4 +1,4 @@
-# Веб-інтерфейс: каркас фронтенду (Prompt 19, доповнено Prompt 20, 21, 22, 23 і 24)
+# Веб-інтерфейс: каркас фронтенду (Prompt 19, доповнено Prompt 20, 21, 22, 23, 24 і 25b)
 
 Документ для наступних промптів (P25+). Нові сторінки додаються **лише змінами в `webui/`** — без правок C++.
 Контракт API — `docs/web_api.md`.
@@ -24,7 +24,7 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 | `js/common.js` | спільний код (підключати ПЕРШИМ) |
 | `js/nav.js` | список сторінок + `renderNav()` (підключати ДРУГИМ) |
 | `js/home.js` | логіка Головної |
-| `stations.html`, `js/stations.js` | сторінка «Станції» (P20): список, форма, переміщення, імпорт / експорт |
+| `stations.html`, `js/stations.js` | сторінка «Станції» (P20): список, форма, переміщення, імпорт / експорт; рівень станції `levelDb` — поле форми, «Застосувати», бейдж у списку (P25b) |
 | `audio.html`, `js/audio.js` | сторінка «Аудіо» (P21): гучність / мʼют, gain і вхід, бас / дискант / баланс, loudness, скидання тембру |
 | `ir.html`, `js/ir.js` | сторінка «Пульт» (P22, `/ir`): мапа дій по групах, навчання, очищення, імпорт / експорт; зразок довгої операції з опитуванням статусу |
 | `settings.html`, `js/settings.js` | сторінка «Налаштування» (P23, `/settings`): тип процесора, назви входів, яскравість і орієнтація дисплея, Wi-Fi (лише читання); кожне поле зберігається окремим `POST /api/settings` |
@@ -100,6 +100,8 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 | `.param` > `.param-head` (назва + `output.param-val`) + `.param-row` (−, `.slider`, +, `.btn-zero`) | рядок параметра з повзунком (P21); `.slider-c` додає позначку центру |
 | `.station-list` > `li.station` | список-картки станцій: `.station-main` (`.idx`, `.station-text` > `.station-name` + `.station-url`), `.station-actions`; `aria-current="true"` = поточна |
 | `.dialog.dialog-form` | діалог із формою (`h2`, `.form` > `.field`, `.dialog-actions`) |
+| `.badge.station-level` | приглушений бейдж рівня в `.station-main` (P25b); без крапки, ховається < 480 px |
+| `.level-val` | підпис значення («−6 дБ») праворуч від повзунка у `.param-row` форми станції (P25b) |
 | `fieldset.group.is-busy` | разом із `disabled`: «зайнято» без сильного затемнення (на час запиту) |
 | `.ir-learn`, `.ir-target` | панель навчання кнопки пульта (P22): рамка акценту, велика назва цілі; кнопки — `.dialog-actions`. Рядки дій на сторінці «Пульт» — це `ul.station-list` / `li.station` (див. вище), групи — `section.card` |
 | `.kv` | таблиця «параметр — значення» (`table.table.kv`): перша колонка приглушена, значення переносяться по символах |
@@ -152,6 +154,8 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 
 Нова в P24: `CONFIG.otaMinBytes` (262144), `otaMaxBytes` (5767168, запасний ліміт), `otaMagic` (0xE9), `otaUploadTimeoutMs` (300000), `otaRebootDelayMs` (1500), `otaRebootTimeoutMs` (90000); у `REASONS` — `incomplete`, `begin_failed`, `write_failed`, `no_ota_partition`, `ota_done_restarting`; `formatEta`. Іконок нових немає.
 
+Нова в P25b: `CONFIG.stationLevelMinDb` (−24), `stationLevelMaxDb` (0), `stationLevelDefaultDb` (−6); у `REASONS` — `level_invalid`, `level_out_of_range`; `errorText` додає межі `min…max` до `level_out_of_range` так само, як до `out_of_range`. Нових іконок і функцій немає.
+
 **Безпека:** усе, що походить від пристрою або потоку (назви станцій, ICY-заголовок, ssid), вставляйте ТІЛЬКИ через `textContent` / `el()` / `setText`. `innerHTML` не використовується ніде і не повинен.
 
 Приклад:
@@ -172,12 +176,15 @@ if (await confirmDialog('Перезапустити пристрій?', { okText
 
 Зразок — `js/stations.js`.
 
-- **Діалог із формою.** `<dialog class="dialog dialog-form">` > `<form novalidate>`: `h2`, `div.form` > `div.field` (`label` + `input.input` + `div.field-error[role=alert][hidden]`), `div.dialog-actions` (Скасувати + `submit`). Відкривати `showModal()`, у `close` — `dlg.remove()`. На час запиту вимикайте кнопки й блокуйте `cancel` (Esc). `openForm({title, submit, fields, validate, save})` у `stations.js` — готова обгортка (поки локальна; винесіть у `common.js`, коли знадобиться другій сторінці).
+- **Діалог із формою.** `<dialog class="dialog dialog-form">` > `<form novalidate>`: `h2`, `div.form` > `div.field` (`label` + `input.input` + `div.field-error[role=alert][hidden]`), `div.dialog-actions` (Скасувати + `submit`). Відкривати `showModal()`, у `close` — `dlg.remove()`. На час запиту вимикайте кнопки й блокуйте `cancel` (Esc). `openForm({title, submit, fields, validate, save, level?})` у `stations.js` — готова обгортка (поки локальна; винесіть у `common.js`, коли знадобиться другій сторінці).
 - **Помилки полів.** Сервер повертає `field` у тілі (`name`, `url`…) → `ApiError.data.field`; показуйте `errorText(e)` у `.field-error` цього поля, решту — `toast`. Клієнтська валідація дзеркалить серверну, а числа — у `CONFIG` (`stationNameMaxBytes`, `stationUrlMaxBytes`). Довжини — **у байтах** (`byteLength`): кирилична літера = 2 байти.
 - **Позиційні списки.** Індекси зсуваються після видалення / переміщення / імпорту: після КОЖНОЇ зміни (навіть невдалої) перечитайте і список, і `/api/status` (`write()` у `stations.js`).
 - **Імпорт.** Файл → `api.send('POST', '/api/stations/import?format=json|m3u|pls', file, contentType, CONFIG.importTimeoutMs)`. Формат — за розширенням (`.m3u8` → `m3u`). Перевірте розмір (`CONFIG.importMaxBytes`) до відправки. Імпорт ЗАМІНЯЄ весь список — спершу `confirmDialog`. Режиму «додати» контракт не має. Результат — `{count, replaced}`; помилка — `ApiError` із `reason` (= `lastImportError`).
 - **Експорт.** `const b = await api.blob('/api/stations/export'); downloadBlob(b, 'stations-' + fileStamp() + '.json')` — працює і в dev-режимі (`?device=`), бо запит іде через `api`, а не посиланням.
 - **Блокування.** `<fieldset disabled>` навколо всього інтерактивного вмісту + `is-busy`, поки триває запит; у режимах OTA / IR / WifiSetup / офлайн — той самий `disabled` і банер.
+- **Рівень станції (P25b).** `openForm(..., level: {value, apply?})` додає після текстових полів блок «Рівень, дБ»: `.field` > `label` + `.param-row` (−, `.slider` `min`/`max`/`step=1` з `CONFIG.stationLevel*`, +, `output.level-val` зі `fmtSigned` і «дБ») + `.hint` + `.field-error`. Значення йде в `vals.levelDb` (число) і з `POST` / `PUT` відправляється ЗАВЖДИ; для нової станції — `stationLevelDefaultDb`, для редагування — `levelDb` рядка (немає в старій відповіді → дефолт). Помилка з `field: "levelDb"` потрапляє під повзунок тим самим механізмом, що й `name` / `url`.
+- **«Застосувати» (P25b, лише редагування).** `level.apply(db)` шле `PUT /api/stations/{index}` з ЗБЕРЕЖЕНИМИ `name` / `url` рядка (контракт вимагає обидва; значення форми не беруться, щоб правка URL не розʼїхалась зі станцією, що грає, і не зберігалась непомітно) та `levelDb` форми. Діалог не закривається; на час запиту «Зберегти», «Скасувати» й Esc вимкнені; успіх → бейдж `.badge-ok` «Застосовано» на `CONFIG.savedMs` (ховається при русі повзунка), список перечитується у тлі (`reload()` без `guarded`). Помилка — під повзунком. «Застосувати» вже записало рівень: «Скасувати» його не відкочує. Рівень звучить наживо, лише якщо станція з цим індексом зараз грає.
+- **Список (P25b).** `GET /api/stations` → `levelDb` → `.badge.station-level` («−6 дБ»); поле відсутнє — бейджа немає.
 
 ### 5.2. Повзунки параметрів (P21)
 
@@ -246,7 +253,7 @@ poller.start();
 
 ## 7. Словник `reason`
 
-Повний словник — об'єкт `REASONS` у `common.js` (коди керування: `standby`, `ota_in_progress`, `ir_learn_active`, `not_radio_input`, `wifi_setup`, `no_stations`, `input_unavailable`, `station_out_of_range`, `volume_out_of_range`, `gain_out_of_range`, `not_supported`, `busy`; а також загальні, станцій/імпорту, OTA (`bad_image`, `bad_magic`, `too_small`, `image_too_large`, `verify_failed`, `incomplete`, `begin_failed`, `write_failed`, `no_ota_partition`, `ota_busy`, `ota_done_restarting`, `length_required`, `unsupported_content_type`), IR). Невідомий код → «Помилка: <код>». Для `out_of_range` з `min`/`max` межі додаються до тексту автоматично.
+Повний словник — об'єкт `REASONS` у `common.js` (коди керування: `standby`, `ota_in_progress`, `ir_learn_active`, `not_radio_input`, `wifi_setup`, `no_stations`, `input_unavailable`, `station_out_of_range`, `volume_out_of_range`, `gain_out_of_range`, `not_supported`, `busy`; а також загальні, станцій/імпорту (з P25b — `level_invalid`, `level_out_of_range`), OTA (`bad_image`, `bad_magic`, `too_small`, `image_too_large`, `verify_failed`, `incomplete`, `begin_failed`, `write_failed`, `no_ota_partition`, `ota_busy`, `ota_done_restarting`, `length_required`, `unsupported_content_type`), IR). Невідомий код → «Помилка: <код>». Для `out_of_range` з `min`/`max` межі додаються до тексту автоматично.
 
 ## 8. Розробка на ПК
 

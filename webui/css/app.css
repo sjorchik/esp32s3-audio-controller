@@ -241,3 +241,9 @@ fieldset.group.is-busy[disabled]{opacity:.75;cursor:progress}
 .ota-prog{margin-top:var(--sp-3)}
 .ota-prog .progress{height:12px}
 .ota-prog p{margin-top:var(--sp-2)}
+
+/* --- Рівень станції (Prompt 25b) --- */
+.station-level{flex:none;padding:0 8px;font-size:.8rem}
+.station-level::before{display:none}
+@media (max-width:479px){.station-level{display:none}}
+.level-val{min-width:4.2em;text-align:right;font-weight:650}

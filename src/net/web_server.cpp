@@ -1,4 +1,8 @@
 // net/web_server.cpp (Prompt 13): інфраструктура, /api/status, /api/settings.
+// [Prompt 25] ДОДАНО: поле станції levelDb (рівень виходу декодера, дБ, -24..0) у GET/POST/PUT
+// /api/stations (parseStationObject, sendStationParseError). Нових ендпоїнтів немає; імпорт/
+// експорт передає поле через StationStore (reason "level_out_of_range" мапиться в 400 як
+// будь-яка помилка вмісту).
 // [Prompt 14] ДОДАНО: /api/stations* (список, додати, змінити, видалити,
 // перемістити, імпорт, експорт). handleSettingsBody() перейменовано на
 // handleJsonBody() (тепер спільний для всіх JSON-POST/PUT); логіку не змінено.
@@ -50,6 +54,7 @@
 #include "net/web_static.h"       // [Prompt 19] registerStaticRoutes()
 #include "net/wifi_manager.h"
 #include "stations/station_store.h"  // [Prompt 14]
+#include "config/station_level_config.h"  // [Prompt 25]
 #include "ui/display.h"
 
 #if WEB_SERVER_DEBUG
@@ -665,13 +670,18 @@ bool hasNonSpace(const char* s) {
     return false;
 }
 
-// {"name","url"} -> Station. Обидва поля обовʼязкові, інших ключів немає.
+// {"name","url"[,"levelDb"]} -> Station. name і url обовʼязкові, інших ключів немає.
+// [Prompt 25] levelDb необовʼязкове (відсутнє або null = дефолт kDefaultStationLevelDb; *levelPresent
+// каже, чи було задано явно — PUT тоді лишає поточний рівень станції). Ціле -24..0, інакше
+// "level_invalid" (не ціле) / "level_out_of_range" (поза межами), field = "levelDb".
 // nullptr — успіх; інакше код помилки й *badField (ім'я поля чи nullptr).
-const char* parseStationObject(JsonObjectConst root, Station& out, const char** badField) {
+const char* parseStationObject(JsonObjectConst root, Station& out, const char** badField,
+                               bool* levelPresent) {
     *badField = nullptr;
+    *levelPresent = false;
     for (JsonPairConst kv : root) {
         const char* k = kv.key().c_str();
-        if (strcmp(k, "name") != 0 && strcmp(k, "url") != 0) {
+        if (strcmp(k, "name") != 0 && strcmp(k, "url") != 0 && strcmp(k, "levelDb") != 0) {
             *badField = "unknown";
             return "unknown_field";
         }
@@ -713,10 +723,40 @@ const char* parseStationObject(JsonObjectConst root, Station& out, const char** 
         return "url_invalid_scheme";
     }
 
-    memset(&out, 0, sizeof(out));
+    int level = station_level_cfg::kDefaultStationLevelDb;
+    JsonVariantConst vl = root["levelDb"];
+    if (!vl.isNull()) {
+        if (!vl.is<int>()) {
+            *badField = "levelDb";
+            return "level_invalid";
+        }
+        level = vl.as<int>();
+        if (level < station_level_cfg::kLevelMinDb || level > station_level_cfg::kLevelMaxDb) {
+            *badField = "levelDb";
+            return "level_out_of_range";
+        }
+        *levelPresent = true;
+    }
+
+    memset(static_cast<void*>(&out), 0, sizeof(out));
     strlcpy(out.name, name, sizeof(out.name));
     strlcpy(out.url, url, sizeof(out.url));
+    out.levelDb = static_cast<int8_t>(level);
     return nullptr;
+}
+
+// [Prompt 25] Відповідь 400 на помилку розбору станції. Для level_out_of_range додає min/max
+// (як out_of_range в інших ендпоїнтах).
+void sendStationParseError(AsyncWebServerRequest* req, const char* err, const char* field) {
+    JsonDocument doc;
+    doc["ok"] = false;
+    doc["error"] = err;
+    if (field != nullptr) doc["field"] = field;
+    if (strcmp(err, "level_out_of_range") == 0) {
+        doc["min"] = station_level_cfg::kLevelMinDb;
+        doc["max"] = station_level_cfg::kLevelMaxDb;
+    }
+    sendJson(req, 400, doc);
 }
 
 // "/api/stations/{index}" -> index. false — не число, порожньо чи задовге.
@@ -740,7 +780,7 @@ bool exactStationsUrl(AsyncWebServerRequest* req) {
     return false;
 }
 
-// GET /api/stations -> [{"index":0,"name":"..","url":".."},..]
+// GET /api/stations -> [{"index":0,"name":"..","url":"..","levelDb":-6},..]
 // Пишемо елемент за елементом (без одного великого JsonDocument на весь список).
 void handleStationsList(AsyncWebServerRequest* req) {
     if (!exactStationsUrl(req)) return;
@@ -764,13 +804,14 @@ void handleStationsList(AsyncWebServerRequest* req) {
         d["index"] = i;
         d["name"] = st.name;
         d["url"] = st.url;
+        d["levelDb"] = static_cast<int>(st.levelDb);  // [Prompt 25]
         serializeJson(d, *r);
     }
     r->print("]");
     req->send(r);
 }
 
-// POST /api/stations {"name","url"} -> 201 {"ok":true,"index":N}
+// POST /api/stations {"name","url"[,"levelDb"]} -> 201 {"ok":true,"index":N}
 void handleStationsAdd(AsyncWebServerRequest* req) {
     if (!exactStationsUrl(req)) return;
     WEB_LOG("%s %s", req->methodToString(), req->url().c_str());
@@ -780,9 +821,10 @@ void handleStationsAdd(AsyncWebServerRequest* req) {
 
     Station st;
     const char* field = nullptr;
-    const char* err = parseStationObject(in.as<JsonObjectConst>(), st, &field);
+    bool levelPresent = false;
+    const char* err = parseStationObject(in.as<JsonObjectConst>(), st, &field, &levelPresent);
     if (err != nullptr) {
-        sendFieldError(req, 400, err, field);
+        sendStationParseError(req, err, field);
         return;
     }
     size_t idx = 0;
@@ -800,7 +842,8 @@ void handleStationsAdd(AsyncWebServerRequest* req) {
     sendJson(req, 201, doc);
 }
 
-// PUT /api/stations/{index} {"name","url"} (повна заміна) -> 200 {"ok":true,"index":N}
+// PUT /api/stations/{index} {"name","url"[,"levelDb"]} (повна заміна; levelDb відсутнє = без змін)
+// -> 200 {"ok":true,"index":N}
 void handleStationsUpdate(AsyncWebServerRequest* req) {
     WEB_LOG("%s %s", req->methodToString(), req->url().c_str());
 
@@ -818,10 +861,20 @@ void handleStationsUpdate(AsyncWebServerRequest* req) {
 
     Station st;
     const char* field = nullptr;
-    const char* err = parseStationObject(in.as<JsonObjectConst>(), st, &field);
+    bool levelPresent = false;
+    const char* err = parseStationObject(in.as<JsonObjectConst>(), st, &field, &levelPresent);
     if (err != nullptr) {
-        sendFieldError(req, 400, err, field);
+        sendStationParseError(req, err, field);
         return;
+    }
+    if (!levelPresent) {
+        // [Prompt 25] Поле не передано: лишаємо поточний рівень станції. Читання й запис не
+        // атомарні (інший клієнт міг змінити список між ними) — як і решта PUT, це «остання
+        // перемагає»; якщо станція зникла, update() нижче поверне false -> 404.
+        Station cur;
+        if (StationStore::get(idx, cur)) {
+            st.levelDb = cur.levelDb;
+        }
     }
     if (!StationStore::update(idx, st)) {
         if (idx >= StationStore::count()) {

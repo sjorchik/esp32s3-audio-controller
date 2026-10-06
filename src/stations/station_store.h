@@ -8,6 +8,9 @@
 // і struct Station НЕ змінено.
 // [Prompt 14] ДОДАНО: add/update/remove/move (редагування з вебу) та
 // lastImportError(). Наявні методи й struct Station не змінено.
+// [Prompt 25] ДОДАНО: поле Station::levelDb (В КІНЕЦЬ структури; рівень виходу декодера, дБ)
+// і код "level_out_of_range" у lastImportError(). Сигнатури методів не змінено. Формат файлу
+// сховища лишається version 1: поле необовʼязкове (немає -> дефолт), тож старі файли читаються.
 //
 // StationStore — модуль ЧИСТИХ ДАНИХ (як UiFonts/UiIcons): не апаратний, не
 // читає EventBus, не впливає на звуковий тракт. Тому його можуть читати
@@ -22,11 +25,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "config/station_level_config.h"
+
 // Опис станції.
 struct Station {
     uint16_t id;      // індекс у списку (заповнюється при читанні)
     char name[64];
     char url[192];
+    // [Prompt 25] Рівень виходу декодера для цієї станції, дБ: ціле, лише послаблення,
+    // station_level_cfg::kLevelMinDb..kLevelMaxDb (-24..0), 0 = без змін. Дефолт -6 діє для
+    // `Station st;` без явного присвоєння, але memset(&st, 0, ...) дає 0 дБ — після memset
+    // поле виставляти явно. add()/update() відхиляють значення поза межами (false).
+    int8_t levelDb = static_cast<int8_t>(station_level_cfg::kDefaultStationLevelDb);
 };
 
 class StationStore {
@@ -63,7 +73,8 @@ public:
     // запису під мʼютексом даних підміняє живий список. Якщо запис не вдався,
     // живий список не змінювався взагалі (читачі ніколи не бачать «фантомного»
     // стану), тож відкат = відкинути копію. Станція валідується як в імпорті:
-    // url починається з http:// або https:// (і вміщується в буфер), name
+    // url починається з http:// або https:// (і вміщується в буфер), levelDb у межах
+    // [Prompt 25] kLevelMinDb..kLevelMaxDb (поза ними — false), name
     // непорожнє після обрізання пробілів, довше за kNameMax-1 байт — обрізається
     // по межі UTF-8-символу. Поле st.id ігнорується.
     // Усі чотири можуть блокуватись на запис у flash (до десятків мс) — не
@@ -88,7 +99,8 @@ public:
     // Код причини останньої невдалої операції імпорту (snake_case, статичний
     // рядок): "busy", "out_of_memory", "file_not_found", "empty", "too_big",
     // "version_mismatch", "parse_error", "too_many_stations", "io_error",
-    // "storage_write_failed". Після успіху — "ok". Значення спільне для всіх
+    // "storage_write_failed", [Prompt 25] "level_out_of_range" (JSON-імпорт: levelDb не ціле чи
+    // поза -24..0). Після успіху — "ok". Значення спільне для всіх
     // викликів: читати одразу після імпорту (імпорти й так серіалізовані).
     static const char* lastImportError();
 };

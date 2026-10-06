@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "audio/audio_processor.h"
+#include "audio/output_trim.h"
 #include "config/audio_player_config.h"
 #include "config/pins.h"
 
@@ -863,6 +864,16 @@ bool AudioPlayer::stop() {
 bool AudioPlayer::isPlaying() {
     const PlayerState st = s_state;
     return st == PlayerState::Playing || st == PlayerState::Buffering;
+}
+
+// [Prompt 25] Рівень виходу декодера: чиста робота зі станом output_trim (без мʼютекса плеєра,
+// без звернень до бібліотеки Audio), тож безпечно з будь-якої задачі.
+void AudioPlayer::setOutputTrimDb(int8_t db) {
+    output_trim::setTargetDb(db);
+}
+
+int8_t AudioPlayer::outputTrimDb() {
+    return output_trim::targetDb();
 }
 
 void AudioPlayer::taskLoop() {

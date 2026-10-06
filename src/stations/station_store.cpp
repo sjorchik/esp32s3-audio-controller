@@ -11,6 +11,11 @@
 // імпорт: під s_ioLock робимо ТИМЧАСОВУ копію списку, змінюємо її, пишемо файл
 // і лише тоді під s_dataLock підміняємо живий список. Живий список не
 // змінюється до успішного запису, тож «відкат» = відкинути копію.
+//
+// [Prompt 25] Station::levelDb (рівень виходу декодера, дБ). Формат файлу лишається version 1:
+// запис {"name","url","levelDb"}; відсутнє поле -> дефолт. Файл сховища читається поблажливо
+// (не ціле -> дефолт, поза межами -> обрізання до меж), JSON-ІМПОРТ користувача — суворо
+// (не ціле чи поза межами -> "level_out_of_range", список не змінюється).
 
 #include "stations/station_store.h"
 
@@ -26,9 +31,11 @@
 #include <strings.h>
 
 #include "config/audio_player_config.h"  // лише kTestStation* для seed (не змінюється)
+#include "config/station_level_config.h"  // [Prompt 25]
 #include "config/station_store_config.h"
 
 namespace cfg = station_store_cfg;
+namespace lvl = station_level_cfg;
 
 #if STATION_STORE_DEBUG
 #define ST_LOG(...) Serial.printf("[STATIONS] " __VA_ARGS__)
@@ -66,6 +73,7 @@ enum class Res : uint8_t {
     Invalid,          // не вдалося розібрати
     Overflow,         // більше kMaxStations
     IoError,
+    LevelRange,       // [Prompt 25] levelDb не ціле / поза межами (лише суворий JSON-імпорт)
 };
 
 const char* resName(Res r) {
@@ -78,6 +86,7 @@ const char* resName(Res r) {
         case Res::Invalid:         return "parse error";
         case Res::Overflow:        return "too many stations";
         case Res::IoError:         return "I/O error";
+        case Res::LevelRange:      return "levelDb out of range";
     }
     return "?";
 }
@@ -93,6 +102,7 @@ const char* resCode(Res r) {
         case Res::Invalid:         return "parse_error";
         case Res::Overflow:        return "too_many_stations";
         case Res::IoError:         return "io_error";
+        case Res::LevelRange:      return "level_out_of_range";
     }
     return "io_error";
 }
@@ -217,10 +227,11 @@ Add addStation(Station* out, size_t& n, const char* name, const char* url, Parse
     }
     if (n >= cfg::kMaxStations) return Add::Overflow;
     Station& s = out[n];
-    memset(&s, 0, sizeof(s));
+    memset(static_cast<void*>(&s), 0, sizeof(s));  // [Prompt 25] void*: Station має ініціалізатор поля
     s.id = static_cast<uint16_t>(n);
     strcpy(s.url, u);
     fillName(s.name, name, s.url, n);
+    s.levelDb = static_cast<int8_t>(lvl::kDefaultStationLevelDb);  // [Prompt 25] memset дав 0 дБ
     ++n;
     return Add::Ok;
 }
@@ -374,6 +385,8 @@ Res parsePls(const char* path, Station* out, size_t& n, ParseStats& st) {
             }
             if (idx > cfg::kMaxStations) return Res::Overflow;
             strcpy(out[idx - 1].url, val);
+            // [Prompt 25] out обнулено (0 дБ): станція зʼявляється лише з URL — ставимо дефолт.
+            out[idx - 1].levelDb = static_cast<int8_t>(lvl::kDefaultStationLevelDb);
         } else if (strncasecmp(key, "Title", 5) == 0 && allDigits(key + 5)) {
             const unsigned long idx = strtoul(key + 5, nullptr, 10);
             if (idx == 0 || idx > cfg::kMaxStations) continue;  // без FileN марний
@@ -399,6 +412,10 @@ Res parsePls(const char* path, Station* out, size_t& n, ParseStats& st) {
 // requireVersion=true (файл сховища): без "version" — VersionMismatch.
 // requireVersion=false (імпорт користувача): допускається голий масив
 // [{"name","url"},...]; якщо "version" є — має збігатися.
+// [Prompt 25] "levelDb" необовʼязкове. requireVersion=true (файл сховища): некоректне значення
+// не валить завантаження (інакше ручна правка файлу призвела б до seed і втрати списку):
+// не ціле -> дефолт, поза межами -> обрізання. requireVersion=false (імпорт): не ціле чи поза
+// межами у ДОДАНІЙ станції -> Res::LevelRange (запис пропущеної невалідної станції не рахується).
 Res parseJson(const char* path, bool requireVersion, Station* out, size_t& n, ParseStats& st) {
     File f;
     Res r = openRead(path, f);
@@ -437,7 +454,27 @@ Res parseJson(const char* path, bool requireVersion, Station* out, size_t& n, Pa
     for (JsonVariantConst item : arr) {
         const char* name = item["name"] | "";
         const char* url = item["url"] | "";
-        if (addStation(out, n, name, url, st) == Add::Overflow) return Res::Overflow;
+        const Add added = addStation(out, n, name, url, st);
+        if (added == Add::Overflow) return Res::Overflow;
+        if (added != Add::Ok) continue;
+
+        // [Prompt 25] Рівень станції.
+        JsonVariantConst vl = item["levelDb"];
+        if (vl.isNull()) continue;  // немає поля -> дефолт (його поставив addStation)
+        if (!vl.is<int>()) {
+            if (!requireVersion) return Res::LevelRange;
+            ST_LOG("WARNING: levelDb of #%u is not an integer, default used\n",
+                   static_cast<unsigned>(n - 1));
+            continue;
+        }
+        int v = vl.as<int>();
+        if (v < lvl::kLevelMinDb || v > lvl::kLevelMaxDb) {
+            if (!requireVersion) return Res::LevelRange;
+            ST_LOG("WARNING: levelDb %d of #%u out of range, clamped\n", v,
+                   static_cast<unsigned>(n - 1));
+            v = (v < lvl::kLevelMinDb) ? lvl::kLevelMinDb : lvl::kLevelMaxDb;
+        }
+        out[n - 1].levelDb = static_cast<int8_t>(v);
     }
     return n > 0 ? Res::Ok : Res::Empty;
 }
@@ -509,6 +546,10 @@ bool writeJsonFile(const char* path, const Station* list, size_t n) {
         o.str(list[i].name);
         o.puts(",\"url\":");
         o.str(list[i].url);
+        // [Prompt 25] Рівень станції, дБ (ціле, напр. -6).
+        char lv[24];
+        snprintf(lv, sizeof(lv), ",\"levelDb\":%d", static_cast<int>(list[i].levelDb));
+        o.puts(lv);
         o.puts(i + 1 < n ? "},\n" : "}\n");
     }
     o.puts("]}\n");
@@ -614,7 +655,10 @@ bool importCommon(const char* path, Fmt fmt) {
 // Валідація й нормалізація станції від викликача (критерій як в імпорті):
 // url не довший за буфер (обрізати URL не можна — він марний), без пробілів по
 // краях, http(s)://; name обрізається по межі UTF-8 до kNameMax-1 і не порожнє.
+// [Prompt 25] levelDb поза kLevelMinDb..kLevelMaxDb -> false (веб перевіряє раніше й дає
+// детальну помилку; тут — страховка для інших викликачів).
 bool normalizeStation(const Station& in, Station& out) {
+    if (in.levelDb < lvl::kLevelMinDb || in.levelDb > lvl::kLevelMaxDb) return false;
     if (strnlen(in.url, sizeof(in.url)) >= sizeof(in.url)) return false;
     char u[cfg::kUrlMax];
     strcpy(u, in.url);
@@ -625,11 +669,12 @@ bool normalizeStation(const Station& in, Station& out) {
     memcpy(nm, in.name, cfg::kNameMax);
     nm[cfg::kNameMax] = '\0';
 
-    memset(&out, 0, sizeof(out));
+    memset(static_cast<void*>(&out), 0, sizeof(out));
     copyUtf8(out.name, cfg::kNameMax, nm);
     trimMove(out.name);
     if (out.name[0] == '\0') return false;
     strcpy(out.url, u);
+    out.levelDb = in.levelDb;  // [Prompt 25] memset обнулив поле; межі перевірено вище
     return true;
 }
 

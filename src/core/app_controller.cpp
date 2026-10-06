@@ -97,6 +97,16 @@
 #include "core/settings.h"
 #include "input/ir_rc5.h"            // [Prompt 15] ДОДАНО
 #include "net/wifi_manager.h"       // [Prompt 12] ДОДАНО
+// [Prompt 25] Рівень виходу декодера по станціях (Station::levelDb). startStream() — ЄДИНЕ місце
+// запуску потоку (старт, standby, вибір зі списку, LEFT/RIGHT, веб StationPlay, відкладений
+// старт без Wi-Fi, зміна входу): воно виставляє рівень станції через
+// AudioPlayer::setOutputTrimDb() ДО playUrl(), тож звук починається вже з потрібним рівнем.
+// Живе редагування: syncStationLevel() у періодичному блоці tickLocked() порівнює рівень
+// станції за s_station з застосованим і, якщо URL станції збігається з URL потоку, що грає,
+// змінює рівень наживо (плавно, без перепідключення). Індекси позиційні (як у P20b): після
+// move/remove станція за s_station може бути іншою, ніж та, що грає, — тоді URL не збігається
+// й рівень НЕ чіпаємо (потік і його рівень узгоджені до наступного старту станції).
+// Публічний API AppController, AppStateData, Settings і NVS не змінено.
 #include "stations/station_store.h"  // [Prompt 11] ДОДАНО
 
 namespace cfg = app_controller_cfg;
@@ -158,6 +168,11 @@ uint32_t s_lastSyncMs = 0;
 
 // true: потік потрібен, але Wi-Fi ще немає; playUrl() відкладено до зʼєднання.
 bool s_playPending = false;
+
+// [Prompt 25] Що саме запущено: URL потоку, який прийняв AudioPlayer, і застосований рівень, дБ.
+char s_playUrl[sizeof(Station::url)] = {};
+bool s_playUrlValid = false;
+int8_t s_levelDb = static_cast<int8_t>(station_level_cfg::kDefaultStationLevelDb);
 bool s_persistNeeded = false;
 
 // --- [Prompt 15] Навчання IR ---
@@ -355,9 +370,28 @@ bool wifiUp() {
     return WifiManager::isConnected();
 }
 
+// [Prompt 25] Рівень станції в межах kLevelMinDb..kLevelMaxDb (файл/імпорт/веб уже валідують,
+// тут — страховка від пошкоджених даних).
+int8_t clampLevelDb(int v) {
+    if (v < station_level_cfg::kLevelMinDb) v = station_level_cfg::kLevelMinDb;
+    if (v > station_level_cfg::kLevelMaxDb) v = station_level_cfg::kLevelMaxDb;
+    return static_cast<int8_t>(v);
+}
+
+// [Prompt 25] Виставляє рівень виходу декодера й запамʼятовує його. Один рядок логу на
+// застосування (без спаму: на старті станції й при реальній живій зміні).
+void applyStationLevel(int8_t db, uint16_t idx, const char* why) {
+    AudioPlayer::setOutputTrimDb(db);
+    s_levelDb = db;
+    APP_LOG("station level %d dB (#%u, %s)\n", static_cast<int>(db), static_cast<unsigned>(idx),
+            why);
+}
+
 void startStream() {
     if (stationCount() == 0) {
         s_playPending = false;
+        applyStationLevel(static_cast<int8_t>(station_level_cfg::kDefaultStationLevelDb),
+                          s_station, "no stations");
         APP_LOG("no stations: nothing to play\n");
         return;
     }
@@ -366,11 +400,23 @@ void startStream() {
         s_playPending = false;
         Station st;
         if (!StationStore::get(s_station, st)) {
+            applyStationLevel(static_cast<int8_t>(station_level_cfg::kDefaultStationLevelDb),
+                              s_station, "station not found");
             APP_LOG("station %u not found\n", static_cast<unsigned>(s_station));
             return;
         }
-        if (!AudioPlayer::playUrl(st.url)) {
+        // [Prompt 25] Рівень станції — ДО playUrl(): XSMT замʼючується в doPlay(), а перший
+        // новий блок прийде лише після підключення, тож звук стартує вже з цим рівнем.
+        const int8_t prevLevel = s_levelDb;
+        applyStationLevel(clampLevelDb(st.levelDb), s_station, "start");
+        if (AudioPlayer::playUrl(st.url)) {
+            strlcpy(s_playUrl, st.url, sizeof(s_playUrl));
+            s_playUrlValid = true;
+        } else {
             APP_LOG("playUrl rejected\n");
+            // Потік не змінився -> повертаємо рівень попереднього (якщо грав) без зайвого логу.
+            AudioPlayer::setOutputTrimDb(prevLevel);
+            s_levelDb = prevLevel;
         }
     } else {
         s_playPending = true;
@@ -380,6 +426,7 @@ void startStream() {
 
 void stopStream() {
     s_playPending = false;
+    s_playUrlValid = false;  // [Prompt 25]
     AudioPlayer::stop();
 }
 
@@ -682,6 +729,30 @@ void applySync(AppStateData& s, void* c) {
     memcpy(s.wifiIp, x->wifiIp, sizeof(s.wifiIp));
     s.wifiApMode = x->wifiApMode;
     memcpy(s.inputName, x->inputName, sizeof(s.inputName));  // [Prompt 23b]
+}
+
+// [Prompt 25] Жива зміна рівня станції, що грає (редагування з вебу). Викликається з
+// періодичного блоку tickLocked() під s_lock. Застосовуємо лише якщо: вхід Radio, не standby,
+// потік не зупинено, і станція за s_station — та сама (URL збігається з URL потоку). Якщо
+// URL інший (move/remove зсунули індекс, URL відредаговано) — рівень лишається рівнем потоку.
+void syncStationLevel() {
+    if (s_input != 0 || logicallyStandby() || !s_playUrlValid || s_playPending) {
+        return;
+    }
+    if (AudioPlayer::state() == PlayerState::Idle) {
+        return;
+    }
+    Station st;
+    if (!StationStore::get(s_station, st)) {
+        return;
+    }
+    if (strcmp(st.url, s_playUrl) != 0) {
+        return;
+    }
+    const int8_t want = clampLevelDb(st.levelDb);
+    if (want != s_levelDb) {
+        applyStationLevel(want, s_station, "live");
+    }
 }
 
 void syncPlayer() {
@@ -1455,6 +1526,7 @@ void tickLocked() {
             persist();
             s_persistNeeded = false;
         }
+        syncStationLevel();  // [Prompt 25]
         syncPlayer();
     }
 }

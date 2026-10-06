@@ -1,4 +1,5 @@
-// Перехоплення PCM для VU (Prompt 17), гарячий шлях аудіо (ядро 1).
+// Перехоплення PCM (гарячий шлях аудіо, ядро 1): VU-метр (Prompt 17) і рівень виходу
+// декодера по станціях (Prompt 25).
 //
 // ВАЖЛИВО: цей файл НЕ включає Audio.h. Там audio_process_i2s оголошено як
 // extern __attribute__((weak)); визначення, що йде після такого оголошення, теж стає
@@ -12,15 +13,22 @@
 //     каналу, 16-бітні дані вирівняні вліво (повна шкала 2^31);
 //   - validSamples — кількість СЛІВ int32 (обох каналів разом): кадрів = /2;
 //   - *continueI2S = true ОБОВʼЯЗКОВО: false = бібліотека пропускає запис блоку -> тиша.
-// Буфер лише читаємо. Без логування, блокувань і millis(); мінімум обчислень (пік |семпла|).
+// [Prompt 25] Буфер тепер і ЗМІНЮЄТЬСЯ: output_trim::process() послаблює блок на місці
+// (рівень поточної станції), а VU міряє вже послаблений сигнал (реальний вихід). Без логування,
+// блокувань і millis(); мінімум обчислень.
+//
+// Хук потрібен і для рівня станцій, тож компілюється при VU_PCM_HOOK_STYLE == 1 незалежно від
+// ENABLE_VU (публікація піків — лише при ENABLE_VU). При VU_PCM_HOOK_STYLE == 0 рівень станцій
+// НЕ діє (див. #warning нижче).
 
 #include <stdint.h>
 
+#include "audio/output_trim.h"
 #include "audio/vu_source.h"
 #include "config/features.h"
 #include "config/vu_config.h"
 
-#if ENABLE_VU && VU_PCM_HOOK_STYLE == 1
+#if VU_PCM_HOOK_STYLE == 1
 void audio_process_i2s(int32_t* outBuff, int16_t validSamples, bool* continueI2S) {
     if (continueI2S != nullptr) {
         *continueI2S = true;
@@ -29,6 +37,9 @@ void audio_process_i2s(int32_t* outBuff, int16_t validSamples, bool* continueI2S
         return;
     }
     int32_t frames = static_cast<int32_t>(validSamples) / 2;
+    // [Prompt 25] Рівень станції: послаблюємо ВЕСЬ блок (validSamples — довжина буфера).
+    output_trim::process(outBuff, frames);
+#if ENABLE_VU
     if (frames > vu_cfg::kMaxFramesPerBlock) {
         frames = vu_cfg::kMaxFramesPerBlock;  // захист від виходу за буфер
     }
@@ -47,5 +58,8 @@ void audio_process_i2s(int32_t* outBuff, int16_t validSamples, bool* continueI2S
     }
     // 2^31 -> 2^15: шкала vu_cfg::kFullScale (32768).
     VuSourceDecodedPcm::publishPeaks(peakL >> 16, peakR >> 16, static_cast<uint32_t>(frames));
+#endif  // ENABLE_VU
 }
+#else
+#warning "VU_PCM_HOOK_STYLE != 1: audio_process_i2s hook is absent, per-station output level (Prompt 25) will NOT be applied"
 #endif
