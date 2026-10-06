@@ -1,6 +1,6 @@
-# Веб-інтерфейс: каркас фронтенду (Prompt 19, доповнено Prompt 20, 21, 22 і 23)
+# Веб-інтерфейс: каркас фронтенду (Prompt 19, доповнено Prompt 20, 21, 22, 23 і 24)
 
-Документ для наступних промптів (P23+). Нові сторінки додаються **лише змінами в `webui/`** — без правок C++.
+Документ для наступних промптів (P25+). Нові сторінки додаються **лише змінами в `webui/`** — без правок C++.
 Контракт API — `docs/web_api.md`.
 
 ## 1. Як це працює
@@ -28,7 +28,7 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 | `audio.html`, `js/audio.js` | сторінка «Аудіо» (P21): гучність / мʼют, gain і вхід, бас / дискант / баланс, loudness, скидання тембру |
 | `ir.html`, `js/ir.js` | сторінка «Пульт» (P22, `/ir`): мапа дій по групах, навчання, очищення, імпорт / експорт; зразок довгої операції з опитуванням статусу |
 | `settings.html`, `js/settings.js` | сторінка «Налаштування» (P23, `/settings`): тип процесора, назви входів, яскравість і орієнтація дисплея, Wi-Fi (лише читання); кожне поле зберігається окремим `POST /api/settings` |
-| `system.html`, `js/system.js` | сторінка «Система» (P23, `/system`): інформація з `/api/system` (за кнопкою), сервісні дії з підтвердженням; між ними — місце під картку OTA (P24) |
+| `system.html`, `js/system.js` | сторінка «Система» (P23, `/system`): інформація з `/api/system` (за кнопкою), картка «Оновлення прошивки» (OTA, P24), сервісні дії з підтвердженням |
 | `favicon.svg` | іконка |
 
 Скрипти — класичні (`<script src>`, не модулі): `const`/функції верхнього рівня `common.js` і `nav.js` видимі в решті скриптів.
@@ -104,6 +104,7 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 | `.ir-learn`, `.ir-target` | панель навчання кнопки пульта (P22): рамка акценту, велика назва цілі; кнопки — `.dialog-actions`. Рядки дій на сторінці «Пульт» — це `ul.station-list` / `li.station` (див. вище), групи — `section.card` |
 | `.kv` | таблиця «параметр — значення» (`table.table.kv`): перша колонка приглушена, значення переносяться по символах |
 | `.danger-zone` | картка з небезпечними діями (рамка `--err`); дії — `ul.station-list` / `li.station` + `.btn-danger` для незворотних |
+| `.ota-file`, `.ota-name`, `.ota-pick`, `.ota-prog` | картка OTA (P24): рядок вибору файлу, блок передачі з `.progress` (12 px) і кнопкою «Скасувати» (поза `fieldset`) |
 | `.wait`, `.wait-box`, `.spinner` | екран очікування перезапуску (створює `waitScreen`); `p` у ньому зберігає переноси рядків |
 | `.stack`, `.row-flex`, `.spacer`, `.muted`, `.hint`, `.num`, `.visually-hidden` | службові |
 
@@ -142,11 +143,14 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 | `rssiToBars(rssi) → 0..4`, `renderWifi(node, status.wifi)` | індикатор Wi-Fi |
 | `createSlider(input, {send, onInput, onFail}) → {held, hold, release, send}` | повзунок з тротлінгом і утриманням (P21), див. §5.2 |
 | `fmtSigned(v) → string` | `+3` / `0` / `−3` (P21) |
+| `formatEta(sec) → string` | залишок часу: «8 с», «1 хв 5 с»; не число → «—» (P24) |
 | `initShell(activeId)` | заголовок, іконки, навігація, dev-банер |
 
 Нова в P22: `CONFIG.irLearnPollMs` (400), `irStatusPollMs` (2000), `irImportMaxBytes` (8192); у `REASONS` — `not_learnable`, `unknown_action`, `invalid_action`, `no_code_for_action`, `not_in_conflict`. Нових іконок і функцій немає.
 
 Нова в P23: `CONFIG.settingsPollMs` (2000), `savedMs` (1800), `inputNameMaxBytes` (31), `processorInputs` (`Tda7318`: 4, `Pt2313l`: 3), `rebootPollMs` (1500), `rebootPingMs` (2500), `rebootTimeoutMs` (60000), `apSsid`, `apAddress`, `mdnsHost`; у `REASONS` — `invalid_name`, `expected_array_of_4`, `empty_request`. `errorText` бере `min` / `max` з `errors[0]` для `POST /api/settings`.
+
+Нова в P24: `CONFIG.otaMinBytes` (262144), `otaMaxBytes` (5767168, запасний ліміт), `otaMagic` (0xE9), `otaUploadTimeoutMs` (300000), `otaRebootDelayMs` (1500), `otaRebootTimeoutMs` (90000); у `REASONS` — `incomplete`, `begin_failed`, `write_failed`, `no_ota_partition`, `ota_done_restarting`; `formatEta`. Іконок нових немає.
 
 **Безпека:** усе, що походить від пристрою або потоку (назви станцій, ICY-заголовок, ssid), вставляйте ТІЛЬКИ через `textContent` / `el()` / `setText`. `innerHTML` не використовується ніде і не повинен.
 
@@ -205,7 +209,21 @@ if (await confirmDialog('Перезапустити пристрій?', { okText
 - **Тип процесора** діє після перезапуску: збережений тип (`/api/settings`) порівнюється з працюючим (`status.processor.type`); якщо різні — банер із кнопкою «Перезапустити зараз».
 - **Деструктивні дії.** `confirmDialog` (що саме зміниться / не зміниться) → кнопки блокуються (`busy`) → запит. Перезапуск і скидання налаштувань — `rebootAndWait`; скидання Wi-Fi — `waitScreen` з інструкцією без очікування відповіді (мережа зміниться).
 - **Важкий ендпоінт.** `/api/system` не опитується: читається при відкритті та за кнопкою «Оновити».
-- **Блокування.** Лише `offline` / ще немає даних; режими `OtaUpdate` / `IrLearn` / `WifiSetup` на «Налаштуваннях» дають попередження без блокування (контракт їх не забороняє). На «Системі» під час OTA вимкнені лише сервісні дії.
+- **Блокування.** Лише `offline` / ще немає даних; режими `OtaUpdate` / `IrLearn` / `WifiSetup` на «Налаштуваннях» дають попередження без блокування (контракт їх не забороняє). На «Системі» під час OTA (з пристрою чи іншого клієнта) вимкнені сервісні дії та старт нового оновлення (див. §5.5).
+
+### 5.5. OTA-оновлення прошивки (P24)
+
+Зразок — картка «Оновлення прошивки» в `system.html` / `js/system.js`. Контракт — `web_api.md` §8.4.
+
+- **Запит.** Сире тіло `.bin`, `Content-Type: application/octet-stream`, без multipart; `Content-Length` ставить браузер (chunked пристрій не підтримує). Використовується `XMLHttpRequest` (`xhr.upload.onprogress` дає прогрес передачі; `fetch` — ні). URL — `api.base() + '/api/ota'`, тож працює і в dev-режимі. Запит **поза чергою `api.*`**, тайм-аут `CONFIG.otaUploadTimeoutMs`.
+- **Підготовка до старту.** `confirmDialog` (danger) → `uploading = true` → `poller.stop()` → `await api.get('/api/status')`: цей запит стає в чергу ПІСЛЯ вже відправлених, тож черга спорожніла; заодно режим перевіряється свіжим статусом (`OtaUpdate` / `IrLearn` / `WifiSetup` → відмова, `blockReason`).
+- **Блокування.** Поки `uploading`: усі `fieldset` сторінки `disabled`, кнопки «Оновити» (інформація) і вибору файлу вимкнені, опитувань немає, `beforeunload` просить підтвердити закриття / перехід. Блок прогресу стоїть ПОЗА `fieldset`, щоб «Скасувати» лишалась доступною (як панель навчання в §5.3).
+- **Перевірки файлу ДО відправки** (`checkImage`): розширення `.bin`; розмір > 0, ≥ `otaMinBytes` (відсікає `bootloader.bin`, `partitions.bin`), ≤ `ota.maxImageBytes` зі `/api/system` (запасно `otaMaxBytes`); перший байт = `otaMagic` (`file.slice(0, 1)`). Перевірка повторюється перед діалогом.
+- **Прогрес.** Смуга + «N% · відправлено з усього · швидкість (середня) · залишок». Коли `upload.onload` спрацював (`sent`) — смуга 100 %, текст «пристрій перевіряє образ…», «Скасувати» ховається (після повної передачі пристрій уже верифікує й перезапускається). Прогрес ЗАПИСУ на пристрої не опитується (опитування зупинені); показує лише передачу.
+- **Скасування.** `xhr.abort()` → пристрій бачить розрив зʼєднання й повертає режим і звук (за контрактом: «на помилці звук і режим відновлюються»); активний слот не змінюється, бо перемикання слота відбувається лише після успішної перевірки. Після скасування й після помилки опитування `/api/status` відновлюється.
+- **Помилки.** Відповідь із `ok:false` → `ApiError(status, data, data.error)` → `errorText` (спершу `reason`, потім `error`); результат — банер `ota-result` (error / info). Обрив `network` / `timeout` ДО кінця передачі → «стан пристрою невідомий». Обрив `network` ПІСЛЯ `upload.onload` (відповідь могла загубитись при перезапуску) → та сама гілка очікування, що й після успіху.
+- **Після успіху** (`200 {ok, restarting}`): `waitScreen` → `waitForDevice({delayMs: otaRebootDelayMs, timeoutMs: otaRebootTimeoutMs})` → `GET /api/system` → підсумок на екрані очікування: «Було» (останній `/api/system` до оновлення) / «Стало», час роботи, причина скидання; кнопка «Оновити сторінку». Висновку «успіх / невдача» за версією немає: `buildDate` — час компіляції окремого файлу і може не змінюватись. `restarting:false` → прохання перезапустити живленням (`/api/system/reboot` відхиляється, доки OTA не завершено). Таймаут → «Пристрій не відповідає… можливо, потрібна перепрошивка по USB».
+- **Безпека.** Імʼя файлу, версія, дата збірки — лише через `setText` / `textContent`.
 
 ## 6. Шаблон опитування
 
@@ -228,7 +246,7 @@ poller.start();
 
 ## 7. Словник `reason`
 
-Повний словник — об'єкт `REASONS` у `common.js` (коди керування: `standby`, `ota_in_progress`, `ir_learn_active`, `not_radio_input`, `wifi_setup`, `no_stations`, `input_unavailable`, `station_out_of_range`, `volume_out_of_range`, `gain_out_of_range`, `not_supported`, `busy`; а також загальні, станцій/імпорту, OTA, IR). Невідомий код → «Помилка: <код>». Для `out_of_range` з `min`/`max` межі додаються до тексту автоматично.
+Повний словник — об'єкт `REASONS` у `common.js` (коди керування: `standby`, `ota_in_progress`, `ir_learn_active`, `not_radio_input`, `wifi_setup`, `no_stations`, `input_unavailable`, `station_out_of_range`, `volume_out_of_range`, `gain_out_of_range`, `not_supported`, `busy`; а також загальні, станцій/імпорту, OTA (`bad_image`, `bad_magic`, `too_small`, `image_too_large`, `verify_failed`, `incomplete`, `begin_failed`, `write_failed`, `no_ota_partition`, `ota_busy`, `ota_done_restarting`, `length_required`, `unsupported_content_type`), IR). Невідомий код → «Помилка: <код>». Для `out_of_range` з `min`/`max` межі додаються до тексту автоматично.
 
 ## 8. Розробка на ПК
 
@@ -245,4 +263,5 @@ poller.start();
 - Список станцій на сторінці «Станції» опитується повільніше за Головну (`CONFIG.stationsPollMs`); якщо `station.count` у статусі не збігається з довжиною списку — список перечитується автоматично (зміна з пристрою / іншого клієнта з тією самою кількістю станцій не помітна — є кнопка «Оновити»).
 - Сторінка «Пульт» під час навчання опитує статус кожні `irLearnPollMs` (400 мс) паралельно з `/api/status` (послідовно, через чергу `api`); у прихованій вкладці опитування стоїть.
 - Після `reboot` / `factory-reset` сторінка чекає до `CONFIG.rebootTimeoutMs` (60 с); після скидання Wi-Fi очікування немає — адреса пристрою зміниться.
+- OTA (P24): прогрес — лише передача (XHR), не запис на пристрої; автоматичного відкату й перевірки підпису / хеша немає; образ LittleFS не оновлюється (сторінки вбудовані в прошивку); під час передачі решта сторінки й опитування вимкнені, закриття вкладки перериває оновлення (пристрій відновить режим).
 - Ресурси збільшують прошивку (розділ app0/app1 — 5 767 168 байт). Перед додаванням великих файлів дивіться таблицю, яку друкує `build_web.py`.

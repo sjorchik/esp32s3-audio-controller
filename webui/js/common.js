@@ -50,6 +50,13 @@ const CONFIG = {
   apSsid: 'AudioCtrl-Setup', // defaults::kApSsid
   apAddress: '192.168.4.1',  // адреса порталу в режимі AP (web_api.md §7)
   mdnsHost: 'audio.local',   // defaults::kMdnsName + .local
+  // --- OTA (Prompt 24) ---
+  otaMinBytes: 262144,       // менше 256 КБ - не прошивка (bootloader.bin, partitions.bin); сервер приймає від 4096 Б
+  otaMaxBytes: 5767168,      // запасний ліміт, якщо /api/system недоступний (ota.maxImageBytes = слот app0/app1)
+  otaMagic: 0xE9,            // перший байт образу ESP32
+  otaUploadTimeoutMs: 300000,// XHR POST /api/ota: передача + перевірка образу
+  otaRebootDelayMs: 1500,    // пауза перед опитуванням: пристрій перезапускається ~через 1.5 с після відповіді
+  otaRebootTimeoutMs: 90000, // скільки чекати повернення пристрою після OTA (довше, ніж після reboot)
 };
 
 /* ---------- Помилки API ---------- */
@@ -129,6 +136,11 @@ const REASONS = {
   ota_busy: 'Оновлення вже триває.',
   length_required: 'Не вказано розмір файлу.',
   unsupported_content_type: 'Непідтримуваний тип вмісту.',
+  incomplete: 'Пристрій отримав не весь файл: передачу обірвано.',
+  begin_failed: 'Пристрій не зміг почати запис прошивки.',
+  write_failed: 'Помилка запису прошивки в памʼять пристрою.',
+  no_ota_partition: 'На пристрої немає вільного розділу для прошивки.',
+  ota_done_restarting: 'Прошивку вже записано, пристрій перезапускається.',
   // IR
   learning_active: 'Іде навчання пульта.',
   already_learning: 'Навчання вже розпочато.',
@@ -204,6 +216,12 @@ function formatUptime(ms) {
   if (typeof ms !== 'number' || isNaN(ms)) return '—';
   if (!d && !h && !m) return s + ' с';
   return [d && d + ' діб', h && h + ' год', m + ' хв'].filter(Boolean).join(' ');
+}
+/* Залишок часу: «8 с», «1 хв 5 с» (Prompt 24). */
+function formatEta(sec) {
+  if (typeof sec !== 'number' || !isFinite(sec) || sec < 0) return '—';
+  const s = Math.ceil(sec), m = Math.floor(s / 60);
+  return m ? m + ' хв ' + (s % 60) + ' с' : s + ' с';
 }
 /* 'YYYY-MM-DD' за локальним часом - для імен файлів. */
 function fileStamp() {

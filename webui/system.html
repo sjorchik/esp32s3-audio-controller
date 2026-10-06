@@ -30,7 +30,27 @@
       <p id="info-note" class="hint num">Завантаження…</p>
     </section>
 
-    <!-- P24: тут додається картка «Оновлення прошивки» (OTA), перед сервісними діями -->
+    <section class="card" id="ota-card">
+      <div class="card-head"><h2 class="card-title">Оновлення прошивки</h2></div>
+      <p id="ota-cur" class="hint num">Завантаження…</p>
+      <p class="hint">Оберіть файл <code>firmware.bin</code> зі збірки проєкту (<code>.pio/build/&lt;оточення&gt;/firmware.bin</code>). Файл файлової системи (<code>littlefs.bin</code>) вантажити не потрібно: сторінки веб-інтерфейсу вбудовані в прошивку й оновлюються разом із нею.</p>
+      <fieldset id="ota-grp" class="group ota-pick" disabled>
+        <legend class="visually-hidden">Вибір файлу прошивки</legend>
+        <div class="ota-file">
+          <input id="ota-file" type="file" accept=".bin" hidden>
+          <button id="ota-pick" class="btn" type="button" data-icon="upload">Обрати файл…</button>
+          <span id="ota-name" class="ota-name muted num">Файл не обрано</span>
+        </div>
+        <p id="ota-err" class="field-error" role="alert" hidden></p>
+        <div class="dialog-actions"><button id="ota-start" class="btn btn-primary" type="button" disabled>Оновити</button></div>
+      </fieldset>
+      <p id="ota-note" class="hint" hidden></p>
+      <div id="ota-prog" class="ota-prog" hidden>
+        <div class="progress" role="progressbar" aria-label="Передача прошивки" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="ota-bar"></i></div>
+        <p id="ota-stat" class="num" aria-live="polite"></p>
+        <div class="dialog-actions"><button id="ota-cancel" class="btn" type="button">Скасувати</button></div>
+      </div>
+    </section>
 
     <fieldset id="grp" class="group" disabled>
       <legend class="visually-hidden">Сервісні дії</legend>
