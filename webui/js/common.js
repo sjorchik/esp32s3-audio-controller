@@ -60,7 +60,7 @@ const CONFIG = {
   // --- Рівень станції (Prompt 25b; web_api.md §5) ---
   stationLevelMinDb: -24,    // levelDb: ціле, лише послаблення
   stationLevelMaxDb: 0,
-  stationLevelDefaultDb: -6, // нова станція, M3U / PLS, старий список
+  stationLevelDefaultDb: -20, // нова станція, M3U / PLS, старий список (P25c: було -6; збігається з kDefaultStationLevelDb)
 };
 
 /* ---------- Помилки API ---------- */

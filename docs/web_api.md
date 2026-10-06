@@ -286,12 +286,12 @@ loudness; §1.3), тож `GET /api/status` одразу показує його 
 
 ## 5. Станції (`/api/stations*`)
 
-Станція = `{"name": "...", "url": "http(s)://...", "levelDb": -6}`. Обмеження (за розміром буферів `Station`): `name`
+Станція = `{"name": "...", "url": "http(s)://...", "levelDb": -20}`. Обмеження (за розміром буферів `Station`): `name`
 1..63 байт UTF-8 без керувальних символів і не лише з пробілів; `url` ≤ 191 байт, починається з `http://` або
 `https://` (m3u/pls-плейлисти розбирає плеєр). Максимум станцій — `station.max` у `/api/status`.
 
 **`levelDb` (Prompt 25)** — рівень виходу декодера цієї станції: **ціле, дБ, лише послаблення, `-24..0`, крок 1 дБ**;
-`0` = без послаблення. Дефолт — **`-6`**: нова станція без поля, станції зі старого збереженого списку,
+`0` = без послаблення. Дефолт — **`-20`**: нова станція без поля, станції зі старого збереженого списку,
 імпорт M3U / PLS. Це цифрове послаблення сигналу радіо до ЦАП; застосовується, коли станція починає грати (будь-яким
 шляхом), і **наживо** (плавно, без перепідключення), якщо змінити `levelDb` станції, що зараз грає (зміна
 підхоплюється за період синхронізації контролера, ≈ до секунди). Зовнішні входи (TV Box / Computer / Aux) не змінюються.
@@ -305,7 +305,7 @@ loudness; §1.3), тож `GET /api/status` одразу показує його 
 ### 5.1. `GET /api/stations`
 
 ```json
-[{"index": 0, "name": "Radio One", "url": "http://example.com/stream", "levelDb": -6},
+[{"index": 0, "name": "Radio One", "url": "http://example.com/stream", "levelDb": -20},
  {"index": 1, "name": "...", "url": "...", "levelDb": -10}]
 ```
 
@@ -314,7 +314,7 @@ loudness; §1.3), тож `GET /api/status` одразу показує його 
 ### 5.2. `POST /api/stations` — додати в кінець
 
 Тіло `{"name":"...","url":"...","levelDb":-10}`: `name` і `url` обовʼязкові, **`levelDb` необовʼязкове** (немає або
-`null` → `-6`), інших ключів нема. `201 {"ok":true,"index":N}`.
+`null` → `-20`), інших ключів нема. `201 {"ok":true,"index":N}`.
 Помилки `400` з `field`: `unknown_field`, `name_required`, `name_too_long`, `name_invalid`, `url_required`,
 `url_too_long`, `url_invalid`, `url_invalid_scheme`, **`level_invalid`** (`field:"levelDb"`: не ціле число —
 рядок, дріб, булеве) і **`level_out_of_range`** (`field:"levelDb"`, поза `-24..0`; відповідь містить `min:-24`,
@@ -354,16 +354,16 @@ index_out_of_range | unknown_field` (з `field`).
 `parse_error`, `too_many_stations`, `io_error`, `storage_write_failed`, **`level_out_of_range`** (лише JSON: `levelDb`
 у доданій станції не ціле або поза `-24..0`; список не змінюється, `400`).
 
-Рівень станції при імпорті: **JSON** — поле `levelDb` читається, якщо є (немає → `-6`); **M3U / PLS** — завжди `-6`
+Рівень станції при імпорті: **JSON** — поле `levelDb` читається, якщо є (немає → `-20`); **M3U / PLS** — завжди `-20`
 (у цих форматах поля немає).
 Інші: `400 no_body | unknown_format`, `409 import_busy` (одночасний імпорт), `413 body_too_large`, `500 upload_failed`.
 
 ### 5.7. `GET /api/stations/export`
 
 Файл `stations.json` (`Content-Disposition: attachment`):
-`{"version":1,"stations":[{"name":"..","url":"..","levelDb":-6}]}`. Той самий формат приймає `import?format=json`
+`{"version":1,"stations":[{"name":"..","url":"..","levelDb":-20}]}`. Той самий формат приймає `import?format=json`
 (допускається і голий масив `[{"name","url","levelDb"},..]`); файл без `levelDb` (зокрема експорт зі старою прошивкою)
-імпортується з рівнем `-6`. `"version"` лишається `1`.
+імпортується з рівнем `-20`. `"version"` лишається `1`.
 
 ---
 

@@ -33,7 +33,8 @@ struct Station {
     char name[64];
     char url[192];
     // [Prompt 25] Рівень виходу декодера для цієї станції, дБ: ціле, лише послаблення,
-    // station_level_cfg::kLevelMinDb..kLevelMaxDb (-24..0), 0 = без змін. Дефолт -6 діє для
+    // station_level_cfg::kLevelMinDb..kLevelMaxDb (-24..0), 0 = без змін. Дефолт
+    // (station_level_cfg::kDefaultStationLevelDb; [Prompt 25c] -20 дБ) діє для
     // `Station st;` без явного присвоєння, але memset(&st, 0, ...) дає 0 дБ — після memset
     // поле виставляти явно. add()/update() відхиляють значення поза межами (false).
     int8_t levelDb = static_cast<int8_t>(station_level_cfg::kDefaultStationLevelDb);

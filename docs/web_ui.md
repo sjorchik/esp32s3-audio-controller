@@ -101,7 +101,7 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 | `.station-list` > `li.station` | список-картки станцій: `.station-main` (`.idx`, `.station-text` > `.station-name` + `.station-url`), `.station-actions`; `aria-current="true"` = поточна |
 | `.dialog.dialog-form` | діалог із формою (`h2`, `.form` > `.field`, `.dialog-actions`) |
 | `.badge.station-level` | приглушений бейдж рівня в `.station-main` (P25b); без крапки, ховається < 480 px |
-| `.level-val` | підпис значення («−6 дБ») праворуч від повзунка у `.param-row` форми станції (P25b) |
+| `.level-val` | підпис значення («−20 дБ») праворуч від повзунка у `.param-row` форми станції (P25b) |
 | `fieldset.group.is-busy` | разом із `disabled`: «зайнято» без сильного затемнення (на час запиту) |
 | `.ir-learn`, `.ir-target` | панель навчання кнопки пульта (P22): рамка акценту, велика назва цілі; кнопки — `.dialog-actions`. Рядки дій на сторінці «Пульт» — це `ul.station-list` / `li.station` (див. вище), групи — `section.card` |
 | `.kv` | таблиця «параметр — значення» (`table.table.kv`): перша колонка приглушена, значення переносяться по символах |
@@ -154,7 +154,7 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 
 Нова в P24: `CONFIG.otaMinBytes` (262144), `otaMaxBytes` (5767168, запасний ліміт), `otaMagic` (0xE9), `otaUploadTimeoutMs` (300000), `otaRebootDelayMs` (1500), `otaRebootTimeoutMs` (90000); у `REASONS` — `incomplete`, `begin_failed`, `write_failed`, `no_ota_partition`, `ota_done_restarting`; `formatEta`. Іконок нових немає.
 
-Нова в P25b: `CONFIG.stationLevelMinDb` (−24), `stationLevelMaxDb` (0), `stationLevelDefaultDb` (−6); у `REASONS` — `level_invalid`, `level_out_of_range`; `errorText` додає межі `min…max` до `level_out_of_range` так само, як до `out_of_range`. Нових іконок і функцій немає.
+Нова в P25b: `CONFIG.stationLevelMinDb` (−24), `stationLevelMaxDb` (0), `stationLevelDefaultDb` (−20; P25c: було −6); у `REASONS` — `level_invalid`, `level_out_of_range`; `errorText` додає межі `min…max` до `level_out_of_range` так само, як до `out_of_range`. Нових іконок і функцій немає.
 
 **Безпека:** усе, що походить від пристрою або потоку (назви станцій, ICY-заголовок, ssid), вставляйте ТІЛЬКИ через `textContent` / `el()` / `setText`. `innerHTML` не використовується ніде і не повинен.
 
@@ -184,7 +184,7 @@ if (await confirmDialog('Перезапустити пристрій?', { okText
 - **Блокування.** `<fieldset disabled>` навколо всього інтерактивного вмісту + `is-busy`, поки триває запит; у режимах OTA / IR / WifiSetup / офлайн — той самий `disabled` і банер.
 - **Рівень станції (P25b).** `openForm(..., level: {value, apply?})` додає після текстових полів блок «Рівень, дБ»: `.field` > `label` + `.param-row` (−, `.slider` `min`/`max`/`step=1` з `CONFIG.stationLevel*`, +, `output.level-val` зі `fmtSigned` і «дБ») + `.hint` + `.field-error`. Значення йде в `vals.levelDb` (число) і з `POST` / `PUT` відправляється ЗАВЖДИ; для нової станції — `stationLevelDefaultDb`, для редагування — `levelDb` рядка (немає в старій відповіді → дефолт). Помилка з `field: "levelDb"` потрапляє під повзунок тим самим механізмом, що й `name` / `url`.
 - **«Застосувати» (P25b, лише редагування).** `level.apply(db)` шле `PUT /api/stations/{index}` з ЗБЕРЕЖЕНИМИ `name` / `url` рядка (контракт вимагає обидва; значення форми не беруться, щоб правка URL не розʼїхалась зі станцією, що грає, і не зберігалась непомітно) та `levelDb` форми. Діалог не закривається; на час запиту «Зберегти», «Скасувати» й Esc вимкнені; успіх → бейдж `.badge-ok` «Застосовано» на `CONFIG.savedMs` (ховається при русі повзунка), список перечитується у тлі (`reload()` без `guarded`). Помилка — під повзунком. «Застосувати» вже записало рівень: «Скасувати» його не відкочує. Рівень звучить наживо, лише якщо станція з цим індексом зараз грає.
-- **Список (P25b).** `GET /api/stations` → `levelDb` → `.badge.station-level` («−6 дБ»); поле відсутнє — бейджа немає.
+- **Список (P25b).** `GET /api/stations` → `levelDb` → `.badge.station-level` («−20 дБ»); поле відсутнє — бейджа немає.
 
 ### 5.2. Повзунки параметрів (P21)
 
