@@ -8,6 +8,7 @@ const NAV_PAGES = [
   { id: 'audio',    href: '/audio.html',      title: 'Аудіо',        enabled: true },
   { id: 'ir',       href: '/ir.html',         title: 'Пульт',        enabled: true  },
   { id: 'settings', href: '/settings.html',   title: 'Налаштування', enabled: true },
+  { id: 'wifi',     href: '/wifi.html',       title: 'Wi-Fi',        enabled: true },
   { id: 'system',   href: '/system.html',     title: 'Система',      enabled: true },
 ];
 

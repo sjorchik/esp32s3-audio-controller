@@ -1,4 +1,4 @@
-# Веб-інтерфейс: каркас фронтенду (Prompt 19, доповнено Prompt 20, 21, 22, 23, 24 і 25b)
+# Веб-інтерфейс: каркас фронтенду (Prompt 19, доповнено Prompt 20, 21, 22, 23, 24, 25b і 29b)
 
 Документ для наступних промптів (P25+). Нові сторінки додаються **лише змінами в `webui/`** — без правок C++.
 Контракт API — `docs/web_api.md`.
@@ -27,7 +27,8 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 | `stations.html`, `js/stations.js` | сторінка «Станції» (P20): список, форма, переміщення, імпорт / експорт; рівень станції `levelDb` — поле форми, «Застосувати», бейдж у списку (P25b) |
 | `audio.html`, `js/audio.js` | сторінка «Аудіо» (P21): гучність / мʼют, gain і вхід, тембр НЧ / тембр ВЧ / баланс, loudness, скидання тембру |
 | `ir.html`, `js/ir.js` | сторінка «Пульт» (P22, `/ir`): мапа дій по групах, навчання, очищення, імпорт / експорт; зразок довгої операції з опитуванням статусу |
-| `settings.html`, `js/settings.js` | сторінка «Налаштування» (P23, `/settings`): тип процесора, назви входів, яскравість і орієнтація дисплея, Wi-Fi (лише читання); кожне поле зберігається окремим `POST /api/settings` |
+| `settings.html`, `js/settings.js` | сторінка «Налаштування» (P23, `/settings`): тип процесора, назви входів, яскравість і орієнтація дисплея, короткий підсумок Wi-Fi з посиланням на `/wifi.html`; кожне поле зберігається окремим `POST /api/settings` |
+| `wifi.html`, `js/wifi.js` | сторінка «Wi-Fi» (P29b, `/wifi`): поточне зʼєднання, збережені мережі (пріоритет, зміна пароля, видалення, «Підключитись»), скан і додавання; зразок «скан + форма» і очікування після зміни мережі (§5.6) |
 | `system.html`, `js/system.js` | сторінка «Система» (P23, `/system`): інформація з `/api/system` (за кнопкою), картка «Оновлення прошивки» (OTA, P24), сервісні дії з підтвердженням |
 | `favicon.svg` | іконка |
 
@@ -104,6 +105,7 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 | `.level-val` | підпис значення («−20 дБ») праворуч від повзунка у `.param-row` форми станції (P25b) |
 | `fieldset.group.is-busy` | разом із `disabled`: «зайнято» без сильного затемнення (на час запиту) |
 | `.ir-learn`, `.ir-target` | панель навчання кнопки пульта (P22): рамка акценту, велика назва цілі; кнопки — `.dialog-actions`. Рядки дій на сторінці «Пульт» — це `ul.station-list` / `li.station` (див. вище), групи — `section.card` |
+| `.lock` | значок замка (`icon('lock')`) поруч із SSID захищеної мережі (P29b); списки мереж — це `ul.station-list` / `li.station`, смужки сигналу — `.wifi` усередині `.station-main` |
 | `.kv` | таблиця «параметр — значення» (`table.table.kv`): перша колонка приглушена, значення переносяться по символах |
 | `.danger-zone` | картка з небезпечними діями (рамка `--err`); дії — `ul.station-list` / `li.station` + `.btn-danger` для незворотних |
 | `.ota-file`, `.ota-name`, `.ota-pick`, `.ota-prog` | картка OTA (P24): рядок вибору файлу, блок передачі з `.progress` (12 px) і кнопкою «Скасувати» (поза `fieldset`) |
@@ -132,7 +134,7 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 | `el(tag, attrs?, ...children) → Element` | будівник DOM. Рядки-діти — ЗАВЖДИ текст; `onclick: fn` додає слухач; `false/null` пропускаються |
 | `$(sel, root?)` | `querySelector` |
 | `clamp(v, lo, hi)`, `setText(node, text)`, `setAttr(node, name, value)` | `setText`/`setAttr` пишуть лише при зміні |
-| `icon(name) → SVGElement`, `setIcon(node, name)`, `hydrateIcons(root?)` | іконки: `power play pause stop prev next volume mute minus plus refresh search edit trash arrow-up arrow-down move upload download check close reset`; `hydrateIcons` обробляє `[data-icon]` |
+| `icon(name) → SVGElement`, `setIcon(node, name)`, `hydrateIcons(root?)` | іконки: `power play pause stop prev next volume mute minus plus refresh search edit trash arrow-up arrow-down move upload download check close reset lock`; `hydrateIcons` обробляє `[data-icon]` |
 | `api.put(path, body?, timeoutMs?)`, `api.del(path, timeoutMs?)` | PUT із JSON / DELETE без тіла (P20) |
 | `api.send(method, path, body, contentType, timeoutMs?) → Promise<json>` | СИРЕ тіло (`File`/`Blob`/рядок) із заданим `Content-Type`; відповідь — JSON. Для імпорту |
 | `api.blob(path, timeoutMs?) → Promise<Blob>` | GET файлу (експорт). Помилки — як у решти `api.*` (`ApiError`) |
@@ -155,6 +157,8 @@ webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіля�
 Нова в P24: `CONFIG.otaMinBytes` (262144), `otaMaxBytes` (5767168, запасний ліміт), `otaMagic` (0xE9), `otaUploadTimeoutMs` (300000), `otaRebootDelayMs` (1500), `otaRebootTimeoutMs` (90000); у `REASONS` — `incomplete`, `begin_failed`, `write_failed`, `no_ota_partition`, `ota_done_restarting`; `formatEta`. Іконок нових немає.
 
 Нова в P25b: `CONFIG.stationLevelMinDb` (−24), `stationLevelMaxDb` (0), `stationLevelDefaultDb` (−20; P25c: було −6); у `REASONS` — `level_invalid`, `level_out_of_range`; `errorText` додає межі `min…max` до `level_out_of_range` так само, як до `out_of_range`. Нових іконок і функцій немає.
+
+Нова в P29b: `CONFIG.wifiPollMs` (3000), `wifiWriteTimeoutMs` (10000), `wifiScanPollMs` (1500), `wifiScanTimeoutMs` (20000), `wifiSwitchTimeoutMs` (60000), `wifiSsidMaxBytes` (32), `wifiPassMin` (8), `wifiPassMax` (63); у `REASONS` — `wifi_ssid_invalid`, `wifi_password_invalid`, `wifi_list_full`, `wifi_scan_busy`, `wifi_busy`; іконка `lock`. Коди `index_out_of_range` / `invalid_index` у `REASONS` написані для станцій, тому `wifi.js` підміняє їх (і `not_found`) своїм текстом про мережі через локальний `errText`.
 
 **Безпека:** усе, що походить від пристрою або потоку (назви станцій, ICY-заголовок, ssid), вставляйте ТІЛЬКИ через `textContent` / `el()` / `setText`. `innerHTML` не використовується ніде і не повинен.
 
@@ -232,6 +236,18 @@ if (await confirmDialog('Перезапустити пристрій?', { okText
 - **Після успіху** (`200 {ok, restarting}`): `waitScreen` → `waitForDevice({delayMs: otaRebootDelayMs, timeoutMs: otaRebootTimeoutMs})` → `GET /api/system` → підсумок на екрані очікування: «Було» (останній `/api/system` до оновлення) / «Стало», час роботи, причина скидання; кнопка «Оновити сторінку». Висновку «успіх / невдача» за версією немає: `buildDate` — час компіляції окремого файлу і може не змінюватись. `restarting:false` → прохання перезапустити живленням (`/api/system/reboot` відхиляється, доки OTA не завершено). Таймаут → «Пристрій не відповідає… можливо, потрібна перепрошивка по USB».
 - **Безпека.** Імʼя файлу, версія, дата збірки — лише через `setText` / `textContent`.
 
+### 5.6. Wi-Fi: скан, додавання, зміна мережі (P29b)
+
+Зразок — `js/wifi.js`. Контракт — `web_api.md` §7.
+
+- **Позиційні індекси.** Рядки зі `GET /api/wifi` мають `index`; будь-яка дія (`act()`: `busy` → запит → завжди `GET /api/wifi`) блокує `fieldset`, а після неї, навіть невдалої, список перечитується. Перемальовування списків — лише якщо дані змінились (ключ `JSON.stringify`), щоб опитування не збивало фокус.
+- **Опитування.** `GET /api/status` (режими) + `GET /api/wifi` кожні `wifiPollMs`; поки триває дія чи скан, список не опитується.
+- **Скан.** `POST /api/wifi/scan` йде через `api.send('POST', …)` без тіла (контракт: «без тіла»); далі `GET /api/wifi/scan` кожні `wifiScanPollMs` до `done` / `failed` або `wifiScanTimeoutMs`. `409 wifi_scan_busy` не помилка: просто чекаємо результат. Перед першим скануванням у сесії — `confirmDialog` про можливу просадку звуку. Статус «збережена» у результатах рахується порівнянням SSID зі свіжим списком, а не з прапорця `saved` зі скану.
+- **Форма мережі.** `openNetForm({title, submit, ssid, fixed, mode, save})` (локальна у `wifi.js`): `mode` = `required` (захищена зі скану), `none` (відкрита зі скану, поля пароля немає), `optional` (вручну; порожній = відкрита), `edit` (зміна пароля наявної; порожній пароль не дозволений, відкритою мережу робить окремий перемикач). Пароль — `type=password` + «Показати пароль», `autocomplete="new-password"`; після відправки (успіх чи ні) поле очищається, значення ніде не зберігається й не логується. Помилки сервера з `field` (`ssid`, `password`) показуються під полем, решта — `toast`.
+- **Валідація.** SSID — 1…32 БАЙТИ UTF-8 (`byteLength`), пароль — порожній або 8…63 символи, без керівних символів. Нову мережу додає `POST /api/wifi/networks` без `position` (у кінець); наявний SSID — оновлення пароля (дозволене й при заповненому списку).
+- **Після зміни мережі (`connect`).** `confirmDialog` → `POST /api/wifi/connect {index}` (відповідь надходить ДО перемикання) → якщо `switching:false` — повідомлення «вже поточна»; інакше `poller.stop()` → `waitScreen` → `waitForDevice({delayMs: inMs, timeoutMs: wifiSwitchTimeoutMs})` → `location.reload()`. Якщо пристрій не відповів за тією ж адресою (IP міг змінитись) — екран з інструкцією (`audio.local` / адреса на екрані пристрою) і кнопкою «Оновити сторінку». Відповідь `waitForDevice` «true» вимагає, щоб було помічено розрив зʼєднання; дуже швидке перемикання без розриву дасть таймаут.
+- **Гейти.** `OtaUpdate` / `IrLearn` / `WifiSetup` / офлайн → банер і `fieldset disabled`; `409 ota_in_progress`, `ir_learn_active`, `503 busy` показуються через `errorText`.
+
 ## 6. Шаблон опитування
 
 ```js
@@ -269,6 +285,7 @@ poller.start();
 - Кожен файл віддається з `Cache-Control: no-cache` без ETag — при кожному завантаженні сторінки браузер отримує файли повністю (gzip, ≈ 17 КБ для Головної).
 - Список станцій на сторінці «Станції» опитується повільніше за Головну (`CONFIG.stationsPollMs`); якщо `station.count` у статусі не збігається з довжиною списку — список перечитується автоматично (зміна з пристрою / іншого клієнта з тією самою кількістю станцій не помітна — є кнопка «Оновити»).
 - Сторінка «Пульт» під час навчання опитує статус кожні `irLearnPollMs` (400 мс) паралельно з `/api/status` (послідовно, через чергу `api`); у прихованій вкладці опитування стоїть.
-- Після `reboot` / `factory-reset` сторінка чекає до `CONFIG.rebootTimeoutMs` (60 с); після скидання Wi-Fi очікування немає — адреса пристрою зміниться.
+- Після `reboot` / `factory-reset` сторінка чекає до `CONFIG.rebootTimeoutMs` (60 с); після скидання Wi-Fi очікування немає — адреса пристрою зміниться (скидання стирає ВСІ збережені мережі).
+- Wi-Fi (P29b): під час скану звук радіо може просісти; після `connect` зʼєднання обривається, IP може змінитись; паролі API не повертає, тож «поточний пароль» показати неможливо; кількість мереж обмежує `max` з `GET /api/wifi`.
 - OTA (P24): прогрес — лише передача (XHR), не запис на пристрої; автоматичного відкату й перевірки підпису / хеша немає; образ LittleFS не оновлюється (сторінки вбудовані в прошивку); під час передачі решта сторінки й опитування вимкнені, закриття вкладки перериває оновлення (пристрій відновить режим).
 - Ресурси збільшують прошивку (розділ app0/app1 — 5 767 168 байт). Перед додаванням великих файлів дивіться таблицю, яку друкує `build_web.py`.

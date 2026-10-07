@@ -6,10 +6,14 @@
 // випадковий запит (наприклад, помилковий клік чи скрипт) нічого не стер.
 //
 // Звідки береться «скидання Wi-Fi»: WifiManager не має публічного методу скидання (лише
-// forceReset при старті, утримання OK). Тут облікові дані стирає та сама послідовність, що в
-// wifi_manager.cpp::resetCredentials() — WiFi.disconnect(false, true) — але в одноразовій
-// задачі безпосередньо перед ESP.restart(), коли WifiManager уже все одно буде перезапущено.
-// Після старту WifiManager не знаходить збереженої мережі й піднімає AP "AudioCtrl-Setup".
+// forceReset при старті, утримання OK). [Prompt 29] Тут стираються ВСІ збережені мережі:
+// WifiNetworks::clear() (порожній список у NVS) і облікові дані esp_wifi — та сама
+// послідовність, що в wifi_manager.cpp::resetCredentials() — WiFi.disconnect(false, true), але
+// в одноразовій задачі безпосередньо перед ESP.restart(), коли WifiManager уже все одно буде
+// перезапущено. Після старту збережених мереж немає — WifiManager піднімає AP "AudioCtrl-Setup".
+//
+// [Prompt 29] registerSystemRoutes() заодно реєструє /api/wifi* (net/web_api_wifi.cpp), тож
+// web_server.cpp не змінювався.
 
 #include "net/web_api_system.h"
 
@@ -27,7 +31,9 @@
 #include "core/app_state.h"
 #include "core/settings.h"
 #include "net/web_api_common.h"
+#include "net/web_api_wifi.h"
 #include "net/wifi_manager.h"
+#include "net/wifi_networks.h"
 
 namespace {
 
@@ -58,6 +64,7 @@ const char* wifiStateName(WifiState s) {
         case WifiState::Connected:         return "Connected";
         case WifiState::ApMode:            return "ApMode";
         case WifiState::ApClientConnected: return "ApClientConnected";
+        case WifiState::Off:               return "Off";  // [Prompt 29]
     }
     return "Unknown";
 }
@@ -157,11 +164,17 @@ void restartTask(void* arg) {
             break;
         case RestartKind::WifiReset:
             SettingsStore::flush();
-            WiFi.disconnect(false, true);  // стерти збережену мережу (як resetCredentials())
+            // [Prompt 29] усі збережені мережі: порожній список у NVS (НЕ видалення ключа —
+            // інакше наступний старт знову імпортував би стару мережу з esp_wifi)
+            if (WifiNetworks::clear() != WifiNetResult::Ok) {
+                Serial.println("[WEB] wifi reset: WARNING network list not erased");
+            }
+            WiFi.disconnect(false, true);  // стерти «останню мережу» esp_wifi (як resetCredentials())
             vTaskDelay(pdMS_TO_TICKS(web_api_cfg::kWifiEraseSettleMs));
-            Serial.println("[WEB] wifi reset: saved network erased");
+            Serial.println("[WEB] wifi reset: saved networks erased");
             break;
     }
+    WifiNetworks::persistIfDirty();  // [Prompt 29] відкладений запис списку не має загубитись
     Serial.println("[WEB] restarting");
     Serial.flush();
     ESP.restart();
@@ -249,4 +262,8 @@ void registerSystemRoutes(AsyncWebServer& server) {
               web_api::jsonBodyCallback);
     server.on("/api/system", HTTP_GET, handleSystem);
     server.on("/api/wifi/reset", HTTP_POST, handleWifiReset, nullptr, web_api::jsonBodyCallback);
+
+    // [Prompt 29] Скан, збережені мережі, примусове підключення. Після "/api/wifi/reset":
+    // "/api/wifi" (GET) зіставилось би й з "/api/wifi/...", обробники перевіряють url самі.
+    registerWifiRoutes(server);
 }

@@ -1,6 +1,7 @@
 'use strict';
 /* Сторінка «Налаштування» (Prompt 23). Залежить від common.js і nav.js.
-   Лише конфігурація пристрою (звук — на «Аудіо»). Кожне поле зберігається окремим POST /api/settings. */
+   Лише конфігурація пристрою (звук — на «Аудіо»). Кожне поле зберігається окремим POST /api/settings.
+   Блок Wi-Fi — короткий підсумок поточної мережі; керування мережами — сторінка «Wi-Fi» (Prompt 29b). */
 (() => {
   const g = (id) => document.getElementById(id);
   const ui = {
@@ -148,8 +149,8 @@
     poller.now();
   });
 
-  /* ---------- Wi-Fi (лише читання) ---------- */
-  const wrows = [['Стан', 'state'], ['Мережа', 'ssid'], ['IP-адреса', 'ip'], ['Сигнал', 'rssi']].map(([label, key]) => {
+  /* ---------- Wi-Fi (підсумок; керування — /wifi.html) ---------- */
+  const wrows = [['Стан', 'state'], ['Мережа', 'ssid']].map(([label, key]) => {
     const td = el('td');
     ui.wifiRows.append(el('tr', null, el('td', { class: 'muted' }, label), td));
     return [key, td];
@@ -159,8 +160,6 @@
     const v = {
       state: !w ? '—' : w.connected ? 'Підключено' : w.apMode ? 'Точка доступу' : 'Не підключено',
       ssid: (w && w.ssid) || '—',
-      ip: (w && w.ip) || '—',
-      rssi: w && w.connected && w.rssi ? w.rssi + ' дБм' : '—',
     };
     wrows.forEach(([k, td]) => setText(td, v[k]));
   }

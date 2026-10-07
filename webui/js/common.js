@@ -61,6 +61,14 @@ const CONFIG = {
   stationLevelMinDb: -24,    // levelDb: ціле, лише послаблення
   stationLevelMaxDb: 0,
   stationLevelDefaultDb: -20, // нова станція, M3U / PLS, старий список (P25c: було -6; збігається з kDefaultStationLevelDb)
+  // --- Wi-Fi (Prompt 29b; web_api.md §7) ---
+  wifiPollMs: 3000,          // /api/status + /api/wifi на сторінці «Wi-Fi»
+  wifiWriteTimeoutMs: 10000, // POST / DELETE мереж, scan, connect
+  wifiScanPollMs: 1500,      // GET /api/wifi/scan (контракт: раз на 1-2 с)
+  wifiScanTimeoutMs: 20000,  // скан зазвичай 2-5 с
+  wifiSwitchTimeoutMs: 60000,// очікування пристрою після connect
+  wifiSsidMaxBytes: 32,      // ssid: 1..32 байти UTF-8
+  wifiPassMin: 8, wifiPassMax: 63, // пароль: порожній або 8..63 символи
 };
 
 /* ---------- Помилки API ---------- */
@@ -159,6 +167,12 @@ const REASONS = {
   invalid_name: 'Недопустима назва входу.',
   expected_array_of_4: 'Некоректний список назв входів.',
   empty_request: 'Порожній запит.',
+  // Wi-Fi (P29)
+  wifi_ssid_invalid: 'Некоректна назва мережі: 1…32 байти, без керівних символів.',
+  wifi_password_invalid: 'Пароль: порожній (відкрита мережа) або 8…63 символи.',
+  wifi_list_full: 'Список мереж заповнений. Видаліть одну, щоб додати нову.',
+  wifi_scan_busy: 'Сканування вже триває.',
+  wifi_busy: 'Пристрій підключається до мережі. Спробуйте за кілька секунд.',
 };
 
 function errorText(e) {
@@ -266,6 +280,7 @@ const ICONS = {
   check: ['s', 'M5 12.5l4.5 4.5L19 7'],
   close: ['s', 'M6 6l12 12M18 6L6 18'],
   reset: ['s', 'M4 11a8 8 0 1 1 2.3 5.7M4 4v7h7'],
+  lock: ['s', 'M7 11V8a5 5 0 0 1 10 0v3M5 11h14v9H5z'],
 };
 const SVG_NS = 'http://www.w3.org/2000/svg';
 

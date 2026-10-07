@@ -233,6 +233,13 @@ fieldset.group.is-busy[disabled]{opacity:.75;cursor:progress}
 @keyframes spin{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){.spinner{animation:none}}
 
+/* --- Wi-Fi (Prompt 29b): списки мереж — це .station-list / .station --- */
+.lock{display:inline-flex;vertical-align:-3px;margin-left:var(--sp-1);color:var(--muted)}
+.lock svg{width:16px;height:16px}
+.station-main .wifi{align-self:center;flex:none}
+.input[readonly]{opacity:.7}
+.dialog-form .switch{margin-top:var(--sp-1)}
+
 /* --- OTA (Prompt 24) --- */
 .ota-file{display:flex;flex-wrap:wrap;align-items:center;gap:var(--sp-3);margin-top:var(--sp-3)}
 .ota-name{flex:1;min-width:0;overflow-wrap:anywhere}

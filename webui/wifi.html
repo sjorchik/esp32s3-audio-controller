@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Wi-Fi</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-row">
+    <h1 class="brand" id="brand"></h1>
+    <span id="wifi" class="wifi" role="img"></span>
+  </div>
+  <nav id="nav" class="nav" aria-label="Розділи"></nav>
+</header>
+
+<main class="page">
+  <div id="banners" class="banners"></div>
+
+  <fieldset id="grp" class="group stack" disabled>
+    <legend class="visually-hidden">Керування Wi-Fi</legend>
+
+    <section class="card">
+      <div class="card-head"><h2 class="card-title">Поточне зʼєднання</h2></div>
+      <div class="table-wrap"><table class="table kv"><tbody id="cur-rows"></tbody></table></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2 class="card-title">Збережені мережі</h2>
+        <span id="count" class="muted num"></span>
+      </div>
+      <ul id="nets" class="station-list"></ul>
+      <p id="nets-empty" class="hint"></p>
+      <p id="full-hint" class="hint" hidden></p>
+      <div class="toolbar"><button id="btn-add" class="btn" type="button">Додати вручну</button></div>
+      <p class="hint">Верхня мережа має найвищий пріоритет. Приховані мережі додавайте вручну. Пристрій сам не перемикається на мережу з вищим пріоритетом, поки зʼєднання працює: для цього є «Підключитись».</p>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2 class="card-title">Навколишні мережі</h2></div>
+      <div class="toolbar"><button id="btn-scan" class="btn btn-primary" type="button">Сканувати</button></div>
+      <p id="scan-text" class="hint"></p>
+      <ul id="scan-list" class="station-list"></ul>
+    </section>
+  </fieldset>
+</main>
+
+<script src="/js/common.js"></script>
+<script src="/js/nav.js"></script>
+<script src="/js/wifi.js"></script>
+</body>
+</html>
