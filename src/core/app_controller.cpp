@@ -80,6 +80,18 @@
 // не раніше kAmpOffMuteWaitMs). Усе без блокувань: стан рухає ampService() із tickLocked().
 // Мʼют користувача, гучність, вхід, станція, OTA і IR пін не чіпають.
 
+// [Prompt 28] Офлайн-режим і «тихий» перезапуск.
+// Офлайн: у Mode::WifiSetup OK (кнопка / IR) або клік енкодера викликає startOfflineLocked():
+// s_offline = true, WifiManager::stop() (AP, портал, WiFi.mode(WIFI_OFF)), далі changeInput() на
+// перший вхід, що не є радіо (мʼют -> профіль входу -> розмʼют/ramp; підсилювач уже працює).
+// «Радіо недоступне» вирішується в ОДНОМУ місці — inputAvailable(): його використовують
+// stepInput(), selectInput(), веб InputSet/StationPlay, leaveStandby() і сторожа в changeInput();
+// запуск потоку в офлайні блокує сам startStream(). Режим не зберігається в NVS.
+// Перезапуск: подія POWER з veryLongPress (драйвер кнопок, input_cfg::kPowerRestartHoldMs) у БУДЬ-ЯКОМУ
+// режимі: мʼют атенюаторів (desiredMute() через restarting()) + стоп потоку -> ampRequestOff()
+// (пін LOW через kAmpOffDelayMs, P23c) -> пауза kRestartMuteMs -> ESP.restart(). Усе кроками
+// restartService() із tickLocked(), без блокувань; kRestartMaxWaitMs — страховка.
+
 #include "core/app_controller.h"
 
 #include <Arduino.h>
@@ -110,6 +122,11 @@
 #include "stations/station_store.h"  // [Prompt 11] ДОДАНО
 
 namespace cfg = app_controller_cfg;
+
+// [Prompt 28] Страховка перезапуску має перекривати найдовше очікування піна підсилювача (P23c).
+static_assert(app_controller_cfg::kRestartMaxWaitMs >
+                  amp_cfg::kAmpOffMuteWaitMs + app_controller_cfg::kRestartMuteMs,
+              "kRestartMaxWaitMs must exceed amp off wait + restart pause");
 
 #if APP_CONTROLLER_DEBUG
 #define APP_LOG(...) Serial.printf("[APP] " __VA_ARGS__)
@@ -184,6 +201,18 @@ IrLearnStatus s_irPubStatus = IrLearnStatus::Idle;
 Action s_irPubTarget = Action::POWER;
 Action s_irPubOther = Action::POWER;
 
+// --- [Prompt 28] Офлайн-режим і «тихий» перезапуск ---
+bool s_offline = false;  // Wi-Fi вимкнено, вхід Radio недоступний (до перезапуску)
+
+enum class RestartPhase : uint8_t {
+    None,      // перезапуску немає
+    WaitAmp,   // мʼют зроблено, чекаємо LOW піна підсилювача (ampBusy() == false)
+    Pause,     // пін LOW, неблокуюча пауза kRestartMuteMs
+};
+RestartPhase s_restartPhase = RestartPhase::None;
+uint32_t s_restartDeadlineMs = 0;  // страховка: після цього моменту не чекаємо пін
+uint32_t s_restartAtMs = 0;        // момент ESP.restart() (фаза Pause)
+
 // --- [Prompt 16] OTA ---
 Mode s_otaPrevMode = Mode::Radio;         // режим ДО OTA; осмислений лише при s_mode == OtaUpdate
 volatile uint8_t s_otaPubPercent = 0;     // остання опублікована цифра (читає setOtaProgress без мʼютекса)
@@ -203,6 +232,11 @@ uint32_t s_ampOffForceAtMs = 0;   // після нього — LOW навіть 
 // ---------------------------------------------------------------------------
 inline bool reached(uint32_t now, uint32_t t) {
     return static_cast<int32_t>(now - t) >= 0;
+}
+
+// [Prompt 28] Іде «тихий» перезапуск: звук заблоковано, події ігноруються.
+inline bool restarting() {
+    return s_restartPhase != RestartPhase::None;
 }
 
 inline int clampInt(int v, int lo, int hi) {
@@ -388,6 +422,13 @@ void applyStationLevel(int8_t db, uint16_t idx, const char* why) {
 }
 
 void startStream() {
+    // [Prompt 28] ЄДИНА точка, що блокує запуск потоку в офлайні (і під час перезапуску): усі
+    // шляхи (старт, вибір станції, play/pause, відкладений старт, веб) проходять через неї.
+    if (s_offline || restarting()) {
+        s_playPending = false;
+        APP_LOG("stream start blocked (%s)\n", s_offline ? "offline" : "restarting");
+        return;
+    }
     if (stationCount() == 0) {
         s_playPending = false;
         applyStationLevel(static_cast<int8_t>(station_level_cfg::kDefaultStationLevelDb),
@@ -532,7 +573,9 @@ bool logicallyStandby() {
 
 bool desiredMute() {
     return s_userMute || logicallyStandby() || s_phase == Phase::Settle || s_gainHoldActive ||
-           s_mode == Mode::OtaUpdate;  // [Prompt 16]: під час прошивки тиша
+           s_mode == Mode::OtaUpdate ||  // [Prompt 16]: під час прошивки тиша
+           restarting() ||               // [Prompt 28]: перезапуск — тиша до кінця
+           s_mode == Mode::WifiSetup;    // [Prompt 28]: екран налаштування Wi-Fi — тиша
 }
 
 void applyHardwareMute(bool force = false) {
@@ -624,6 +667,8 @@ struct PubCtx {
     MenuContext menuCtx;
     uint16_t menuSel;
     bool loudness;  // [Prompt 21b]
+    bool offline;     // [Prompt 28]
+    bool restarting;  // [Prompt 28]
     char inputName[kInputNameMax];  // [Prompt 23b]
 };
 
@@ -642,13 +687,15 @@ void applyPub(AppStateData& s, void* c) {
     s.menuContext = p->menuCtx;
     s.menuSelection = p->menuSel;
     s.loudness = p->loudness;  // [Prompt 21b]
+    s.offline = p->offline;        // [Prompt 28]
+    s.restarting = p->restarting;  // [Prompt 28]
     memcpy(s.inputName, p->inputName, sizeof(s.inputName));  // [Prompt 23b]
 }
 
 void publishState() {
     PubCtx p = {s_mode,   s_input, s_volume, s_bass,    s_treble, s_balance,
                 s_gain,   s_userMute, s_station, s_target, s_menuCtx, s_menuSel,
-                s_loudness};
+                s_loudness, s_offline, restarting()};
     resolveInputName(s_input, p.inputName, sizeof(p.inputName));  // [Prompt 23b]
     AppState::modify(applyPub, &p);
 }
@@ -858,10 +905,30 @@ void enterStandby() {
     s_persistNeeded = false;
 }
 
+// [Prompt 28] ЄДИНЕ місце рішення «чи доступний вхід»: індекс у межах чипа (PT2313L = 3 входи) і,
+// в офлайні, не радіо (вхід 0). Усі вибори входу (кнопки, пульт, веб, вихід зі standby) йдуть
+// через цю функцію.
+bool inputAvailable(uint8_t idx) {
+    return idx < s_caps.inputCount && !(s_offline && idx == 0);
+}
+
+// Перший доступний вхід за порядком 0..inputCount-1 (в офлайні це перший не-радіо вхід).
+uint8_t firstAvailableInput() {
+    for (uint8_t i = 0; i < s_caps.inputCount; ++i) {
+        if (inputAvailable(i)) {
+            return i;
+        }
+    }
+    return 0;  // недосяжно: inputCount >= 3 на обох чипах
+}
+
 void leaveStandby() {
     captureActiveProfile();  // [Prompt 21b] профіль «старого» входу, поки s_input ще його
     const Settings st = SettingsStore::snapshot();
     s_input = (st.lastInput < s_caps.inputCount) ? st.lastInput : 0;
+    if (!inputAvailable(s_input)) {  // [Prompt 28] офлайн: lastInput = радіо -> перший не-радіо вхід
+        s_input = firstAvailableInput();
+    }
     s_station = (st.lastStation < stationCount()) ? st.lastStation : 0;
     APP_LOG("standby off: input=%u station=%u\n", static_cast<unsigned>(s_input),
             static_cast<unsigned>(s_station));
@@ -885,6 +952,11 @@ void toggleUserMute() {
 
 void changeInput(uint8_t newIdx) {
     if (newIdx == s_input) {
+        return;
+    }
+    if (!inputAvailable(newIdx)) {  // [Prompt 28] сторожа: у офлайні радіо недоступне з будь-якого шляху
+        APP_LOG("input %u unavailable (%s)\n", static_cast<unsigned>(newIdx),
+                s_offline ? "offline" : "no such input");
         return;
     }
     const bool leavingRadio = (s_input == 0 && newIdx != 0);
@@ -917,16 +989,52 @@ void changeInput(uint8_t newIdx) {
 
 void stepInput(int dir) {
     const int count = s_caps.inputCount;  // PT2313L = 3: вхід 3 пропускається
-    const int n = (static_cast<int>(s_input) + dir + count) % count;
-    changeInput(static_cast<uint8_t>(n));
+    // [Prompt 28] Недоступні входи (в офлайні — радіо) пропускаються. Без офлайну перший же
+    // крок доступний, тож поведінка не змінилась.
+    int n = s_input;
+    for (int i = 0; i < count; ++i) {
+        n = (n + dir + count) % count;
+        if (inputAvailable(static_cast<uint8_t>(n))) {
+            changeInput(static_cast<uint8_t>(n));
+            return;
+        }
+    }
 }
 
 void selectInput(uint8_t idx) {
-    if (idx >= s_caps.inputCount) {
-        APP_LOG("input %u unavailable on this processor\n", static_cast<unsigned>(idx));
+    if (!inputAvailable(idx)) {  // [Prompt 28] у межах чипа й, в офлайні, не радіо
+        APP_LOG("input %u unavailable (%s)\n", static_cast<unsigned>(idx),
+                s_offline && idx == 0 ? "offline" : "not on this processor");
         return;
     }
     changeInput(idx);
+}
+
+// [Prompt 28] Запуск офлайн-режиму. Лише з Mode::WifiSetup; викликати під s_lock. Порядок:
+// 1) s_offline (радіо одразу стає недоступним), 2) вимкнення Wi-Fi (неблокуюче, виконує задача
+// WifiManager), 3) перший не-радіо вхід через changeInput() — мʼют, профіль входу, розмʼют і ramp
+// як при звичайній зміні входу (підсилювач у WifiSetup уже працює: прогріву немає).
+bool startOfflineLocked() {
+    if (s_offline || restarting() || s_mode != Mode::WifiSetup) {
+        return false;
+    }
+    s_offline = true;
+    s_playPending = false;
+    APP_LOG("offline: requested in WifiSetup, Wi-Fi off\n");
+    WifiManager::stop();
+    // Уже на доступному не-радіо вході — лишаємось на ньому; інакше перший не-радіо вхід.
+    const uint8_t first = inputAvailable(s_input) ? s_input : firstAvailableInput();
+    APP_LOG("offline: start on input %u (%s)\n", static_cast<unsigned>(first),
+            first < defaults::kInputCount ? defaults::kInputNames[first] : "?");
+    if (first != s_input) {
+        changeInput(first);
+    } else {
+        // Той самий не-радіо вхід: changeInput() нічого б не зробив, тож виходимо з WifiSetup
+        // вручну (мʼют -> ramp, профіль входу вже застосований).
+        s_mode = Mode::ExternalInput;
+        startTransition();
+    }
+    return true;
 }
 
 void changeStation(uint16_t idx) {
@@ -1295,8 +1403,8 @@ void handleIrLearnEvent(const Event& e) {
 }
 
 bool beginIrLearnLocked(Action target) {
-    if (s_mode == Mode::OtaUpdate) {
-        return false;  // [Prompt 16]
+    if (s_mode == Mode::OtaUpdate || restarting()) {
+        return false;  // [Prompt 16]; [Prompt 28] і під час перезапуску
     }
     if (s_mode == Mode::IrLearn) {
         if (irStatusActive(mapIrStatus(IrRc5::status()))) {
@@ -1370,12 +1478,72 @@ void leaveOtaLocked() {
     publishOtaProgress(0);
 }
 
+// --- [Prompt 28] «Тихий» перезапуск -------------------------------------------
+// Викликати лише під s_lock. Послідовність (без блокувань): мʼют атенюаторів (desiredMute() уже
+// true через restarting()) -> стоп потоку (плеєр сам мʼютить XSMT) -> ampRequestOff() (пін LOW
+// через kAmpOffDelayMs, P23c) -> restartService() чекає LOW, паузу kRestartMuteMs і ESP.restart().
+void beginRestart() {
+    if (restarting()) {
+        return;
+    }
+    APP_LOG("restart: POWER held, quiet restart\n");
+    s_phase = Phase::None;  // Settle/Ramp скасовано (як у beginOta)
+    s_gainHoldActive = false;
+    s_playPending = false;
+    s_restartPhase = RestartPhase::WaitAmp;
+    s_restartDeadlineMs = millis() + cfg::kRestartMaxWaitMs;
+    applyHardwareMute();  // мʼют ПЕРШИМ (негайно, без ramp)
+    if (AudioPlayer::state() != PlayerState::Idle) {
+        stopStream();  // плеєр мʼютить XSMT ЦАП
+    } else {
+        s_playUrlValid = false;
+    }
+    ampRequestOff();  // ПІСЛЯ applyHardwareMute(), як у enterStandby()
+    // Остання зміна гучності/входу могла не дійти до NVS (запис із дебаунсом) — скидаємо зараз.
+    persist();
+    SettingsStore::flush();
+    s_persistNeeded = false;
+    publishState();  // AppState.restarting -> екран «Restarting...»
+}
+
+// Викликається щотакту з tickLocked(). ESP.restart() не повертається.
+void restartService(uint32_t now) {
+    if (s_restartPhase == RestartPhase::None) {
+        return;
+    }
+    if (s_restartPhase == RestartPhase::WaitAmp) {
+        const bool deadline = reached(now, s_restartDeadlineMs);
+        if (!ampBusy() || deadline) {  // пін LOW (або підсилювача немає) чи вичерпано страховку
+            s_restartPhase = RestartPhase::Pause;
+            s_restartAtMs = now + cfg::kRestartMuteMs;
+            APP_LOG("restart: amp %s, pause %u ms\n", deadline && ampBusy() ? "NOT low (timeout)" : "low",
+                    static_cast<unsigned>(cfg::kRestartMuteMs));
+        }
+        return;
+    }
+    if (reached(now, s_restartAtMs)) {
+        APP_LOG("restart: now\n");
+        Serial.flush();
+        ESP.restart();
+    }
+}
+
 void handleLocked(const Event& e) {
 #if APP_CONTROLLER_LOG_EVENTS && APP_CONTROLLER_DEBUG
     Serial.printf("[APP] evt %s %s%s%s delta=%d\n", sourceName(e.source), actionName(e.action),
                   e.repeat ? " repeat" : "", e.longPress ? " long" : "",
                   static_cast<int>(e.delta));
 #endif
+
+    // [Prompt 28] Довге утримання POWER = «тихий» перезапуск у БУДЬ-ЯКОМУ режимі (Standby,
+    // WifiSetup, офлайн, звичайна робота, IrLearn, OtaUpdate). Стоїть ПЕРЕД гілкою OTA.
+    if (e.action == Action::POWER && e.veryLongPress) {
+        beginRestart();
+        return;
+    }
+    if (restarting()) {
+        return;  // [Prompt 28] перезапуск іде: решту подій ігноруємо
+    }
 
     if (s_mode == Mode::OtaUpdate) {
         return;  // [Prompt 16] під час прошивки ігноруємо все, включно з POWER
@@ -1389,7 +1557,14 @@ void handleLocked(const Event& e) {
         if (!e.longPress && !e.repeat) {
             togglePower();
         } else {
-            APP_LOG("POWER long/repeat ignored\n");
+            APP_LOG("POWER long/repeat ignored\n");  // [Prompt 28]: veryLong обробляється вище
+        }
+    } else if (s_mode == Mode::WifiSetup) {
+        // [Prompt 28] Екран налаштування Wi-Fi (AP піднята, будь-який вхід): реагуємо лише на
+        // POWER (гілка вище) і коротке OK / клік енкодера = офлайн-режим; усе інше ігноруємо.
+        if (!e.repeat && !e.longPress &&
+            (e.action == Action::OK || e.action == Action::ENC_PRESS)) {
+            startOfflineLocked();
         }
     } else if (s_mode == Mode::Standby) {
         // Standby: усе, крім POWER, ігнорується.
@@ -1444,20 +1619,28 @@ void handleLocked(const Event& e) {
 // Зовнішні входи, Standby, Menu/IrLearn не чіпаємо. Режим міняється тут, у tick(),
 // тож публікуємо стан одразу (handleLocked() цього не зробить).
 void followWifiMode() {
+    if (s_offline) {
+        return;  // [Prompt 28] офлайн: Wi-Fi вимкнено, WifiSetup/Radio більше не настають
+    }
     const bool ap = WifiManager::isApMode();
     Mode want = s_mode;
-    if (ap && s_mode == Mode::Radio) {
+    // [Prompt 28] AP піднята -> екран WifiSetup на БУДЬ-ЯКОМУ вході (раніше лише на радіо);
+    // у ньому все заблоковане, крім OK/POWER, а звук замʼючено (desiredMute()).
+    if (ap && (s_mode == Mode::Radio || s_mode == Mode::ExternalInput || s_mode == Mode::Menu)) {
         want = Mode::WifiSetup;
     } else if (!ap && s_mode == Mode::WifiSetup) {
-        want = Mode::Radio;
+        want = (s_input == 0) ? Mode::Radio : Mode::ExternalInput;
     }
     if (want == s_mode) {
         return;
     }
     s_mode = want;
+    s_menuCtx = MenuContext::None;
+    s_menuSel = 0;
+    applyHardwareMute();  // [Prompt 28] вхід/вихід з WifiSetup міняє desiredMute()
     // WifiSetup: відкладений старт потоку не потрібен (AP завершується перезапуском).
     // Назад у Radio: дозволити відкладений старт, коли зʼявиться Wi-Fi.
-    s_playPending = (want == Mode::Radio);
+    s_playPending = (want == Mode::Radio) && !s_offline;
     APP_LOG("mode -> %s (Wi-Fi)\n", modeName(s_mode));
     publishState();
 }
@@ -1467,6 +1650,7 @@ void tickLocked() {
     const uint32_t now = millis();
 
     ampService(now);  // [Prompt 23c]
+    restartService(now);  // [Prompt 28] (ESP.restart() не повертається)
 
     if (s_otaAbortPending) {  // [Prompt 16] otaFailed() не отримав мʼютекс
         s_otaAbortPending = false;
@@ -1511,7 +1695,7 @@ void tickLocked() {
     followWifiMode();  // [Prompt 12] ДОДАНО
     syncIrLearn(now);  // [Prompt 15] ДОДАНО
 
-    if (s_playPending && s_input == 0 &&
+    if (s_playPending && s_input == 0 && !s_offline && !restarting() &&  // [Prompt 28]
         (s_mode == Mode::Radio || s_mode == Mode::Menu) && wifiUp()) {
         APP_LOG("Wi-Fi up: starting deferred play\n");
         startStream();
@@ -1546,7 +1730,8 @@ void taskMain(void*) {
         // [Prompt 15]: під час навчання IR теж активний (короткий) період опитування.
         const bool active =
             (s_phase != Phase::None) || s_gainHoldActive || (s_mode == Mode::IrLearn) ||
-            ampBusy();  // [Prompt 23c]
+            ampBusy() ||  // [Prompt 23c]
+            restarting();  // [Prompt 28]: чекаємо пін/паузу з активним періодом
         Event ev;
         const TickType_t timeout =
             pdMS_TO_TICKS(active ? cfg::kActivePollMs : cfg::kIdlePollMs);
@@ -1583,6 +1768,10 @@ bool playerActive() {
 
 WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
     why = nullptr;
+    if (restarting()) {  // [Prompt 28] наявний код "busy" (503): нових reason не додаємо
+        why = "busy";
+        return WebCmdResult::Busy;
+    }
     if (s_mode == Mode::OtaUpdate) {
         why = "ota_in_progress";
         return WebCmdResult::NotAllowed;
@@ -1655,7 +1844,8 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
             break;
 
         case WebCmdType::InputSet:
-            if (c.value < 0 || c.value >= s_caps.inputCount) {
+            if (c.value < 0 || c.value >= s_caps.inputCount ||
+                !inputAvailable(static_cast<uint8_t>(c.value))) {  // [Prompt 28]: офлайн -> без радіо
                 why = "input_unavailable";  // напр. вхід 3 для PT2313L
                 return WebCmdResult::OutOfRange;
             }
@@ -1693,6 +1883,10 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
                 return WebCmdResult::OutOfRange;
             }
             const uint16_t idx = static_cast<uint16_t>(c.value);
+            if (s_offline) {  // [Prompt 28] радіо недоступне (веб в офлайні й так не працює)
+                why = "input_unavailable";
+                return WebCmdResult::OutOfRange;
+            }
             if (s_input != 0) {
                 if (!c.flag) {
                     why = "not_radio_input";
@@ -1761,7 +1955,7 @@ bool AppController::setTone(ToneUpdate& u) {
         xSemaphoreTakeRecursive(s_lock, pdMS_TO_TICKS(cfg::kLockTimeoutMs)) != pdTRUE) {
         return false;
     }
-    if (s_mode == Mode::OtaUpdate) {  // [Prompt 16] під час прошивки чип не чіпаємо
+    if (s_mode == Mode::OtaUpdate || restarting()) {  // [Prompt 16] під час прошивки чип не чіпаємо; [Prompt 28] і перезапуску
         xSemaphoreGiveRecursive(s_lock);
         return false;
     }
@@ -1833,7 +2027,7 @@ bool AppController::beginOta() {
         return false;
     }
     bool ok = false;
-    if (s_mode != Mode::IrLearn && s_mode != Mode::OtaUpdate) {
+    if (s_mode != Mode::IrLearn && s_mode != Mode::OtaUpdate && !restarting()) {  // [Prompt 28]
         s_otaPrevMode = s_mode;
         s_otaAbortPending = false;
         publishOtaProgress(0);  // спершу 0, потім режим: екран не покаже старий відсоток
@@ -1891,6 +2085,24 @@ WebCmdResult AppController::runWebCommand(const WebCommand& cmd, const char** re
         *reasonOut = why;
     }
     return r;
+}
+
+// [Prompt 28] ДОДАНО: офлайн-режим
+bool AppController::startOffline() {
+    if (!s_started || s_lock == nullptr ||
+        xSemaphoreTakeRecursive(s_lock, pdMS_TO_TICKS(cfg::kLockTimeoutMs)) != pdTRUE) {
+        return false;
+    }
+    const bool ok = startOfflineLocked();
+    if (ok) {
+        publishState();
+        if (s_persistNeeded) {
+            persist();
+            s_persistNeeded = false;
+        }
+    }
+    xSemaphoreGiveRecursive(s_lock);
+    return ok;
 }
 
 bool AppController::begin(AudioProcessor* processorOrNull) {

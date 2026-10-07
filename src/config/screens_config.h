@@ -36,6 +36,7 @@ constexpr int16_t kTopBarTextY = 7;                // Small по центру 24
 constexpr int16_t kWifiIconX   = kW - kMargin - display_cfg::kIconSize;
 constexpr int16_t kMuteIconX   = kWifiIconX - display_cfg::kIconSize - 6;
 constexpr int16_t kTopBarNameGap = 6;               // [Prompt 23b] проміжок між назвою входу й іконкою мʼюту
+constexpr int16_t kOfflineMuteGap = 6;              // [Prompt 28] проміжок між позначкою "offline" і іконкою мʼюту
 
 // --- Radio ---
 constexpr int16_t kStationY   = 34;                // Large, marquee
@@ -98,6 +99,7 @@ constexpr int16_t kPlaceholderY = 73;              // Large, по центру
 constexpr int16_t kWifiSetupTitleY = 48;
 constexpr int16_t kWifiSetupSsidY  = 88;
 constexpr int16_t kWifiSetupIpY    = 112;
+constexpr int16_t kWifiSetupHintY  = 140;   // [Prompt 28] Small: підказка "OK: work offline"
 
 // --- Marquee ---
 constexpr uint32_t kMarqueeStepMs      = 40;       // крок зсуву
@@ -116,6 +118,9 @@ static_assert(kWifiSetupTitleY + display_cfg::kFontLargePx < kWifiSetupSsidY &&
                   kWifiSetupSsidY + display_cfg::kFontSmallPx < kWifiSetupIpY &&
                   kWifiSetupIpY + display_cfg::kFontSmallPx <= kH,
               "WifiSetup layout overlaps or leaves the screen");
+static_assert(kWifiSetupIpY + display_cfg::kFontSmallPx < kWifiSetupHintY &&
+                  kWifiSetupHintY + display_cfg::kFontSmallPx <= kH,
+              "WifiSetup offline hint overlaps the address or leaves the screen");
 static_assert(kIrStatusY + display_cfg::kFontSmallPx < kIrActionY &&
                   kIrActionY + display_cfg::kFontLargePx < kIrHintY &&
                   kIrHintY + display_cfg::kFontSmallPx <= kH,

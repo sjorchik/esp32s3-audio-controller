@@ -23,16 +23,17 @@ struct ButtonDef {
     const char* name;
     bool longPressEnabled;  // довге натискання (прапорець з input_config.h)
     bool repeatEnabled;     // автоповтор при утриманні (лише стрілки)
+    uint32_t veryLongMs;    // [Prompt 28] дуже довге утримання, мс (0 = немає; лише POWER)
 };
 
 constexpr ButtonDef kButtons[] = {
-    {pins::kBtnPower, Action::POWER,     EventSource::BUTTON,  "POWER",     cfg::kBtnLongPressPower,  false},
-    {pins::kBtnUp,    Action::UP,        EventSource::BUTTON,  "UP",        cfg::kBtnLongPressUp,     true},
-    {pins::kBtnDown,  Action::DOWN,      EventSource::BUTTON,  "DOWN",      cfg::kBtnLongPressDown,   true},
-    {pins::kBtnLeft,  Action::LEFT,      EventSource::BUTTON,  "LEFT",      cfg::kBtnLongPressLeft,   true},
-    {pins::kBtnRight, Action::RIGHT,     EventSource::BUTTON,  "RIGHT",     cfg::kBtnLongPressRight,  true},
-    {pins::kBtnOk,    Action::OK,        EventSource::BUTTON,  "OK",        cfg::kBtnLongPressOk,     false},
-    {pins::kEncBtn,   Action::ENC_PRESS, EventSource::ENCODER, "ENC_PRESS", cfg::kBtnLongPressEncBtn, false},
+    {pins::kBtnPower, Action::POWER,     EventSource::BUTTON,  "POWER",     cfg::kBtnLongPressPower,  false, cfg::kPowerRestartHoldMs},
+    {pins::kBtnUp,    Action::UP,        EventSource::BUTTON,  "UP",        cfg::kBtnLongPressUp,     true,  0},
+    {pins::kBtnDown,  Action::DOWN,      EventSource::BUTTON,  "DOWN",      cfg::kBtnLongPressDown,   true,  0},
+    {pins::kBtnLeft,  Action::LEFT,      EventSource::BUTTON,  "LEFT",      cfg::kBtnLongPressLeft,   true,  0},
+    {pins::kBtnRight, Action::RIGHT,     EventSource::BUTTON,  "RIGHT",     cfg::kBtnLongPressRight,  true,  0},
+    {pins::kBtnOk,    Action::OK,        EventSource::BUTTON,  "OK",        cfg::kBtnLongPressOk,     false, 0},
+    {pins::kEncBtn,   Action::ENC_PRESS, EventSource::ENCODER, "ENC_PRESS", cfg::kBtnLongPressEncBtn, false, 0},
 };
 
 constexpr size_t kButtonCount = sizeof(kButtons) / sizeof(kButtons[0]);
@@ -45,11 +46,12 @@ struct ButtonState {
     uint32_t pressedAtMs = 0;         // коли натискання було прийнято
     uint32_t lastRepeatMs = 0;        // коли відправлено останній повтор
     bool longSent = false;            // довге вже відправлено в цьому натисканні
+    bool veryLongSent = false;        // [Prompt 28] дуже довге вже відправлено в цьому натисканні
     bool repeating = false;           // почалися повтори в цьому натисканні
     bool ignoreUntilRelease = false;  // кнопка була натиснута при старті задачі
 };
 
-enum class Kind : uint8_t { Short, Repeat, Long };
+enum class Kind : uint8_t { Short, Repeat, Long, VeryLong };  // [Prompt 28] +VeryLong
 
 TaskHandle_t s_task = nullptr;
 std::atomic<uint32_t> s_dropped{0};
@@ -61,14 +63,16 @@ bool readPressed(uint8_t pin) {
 // Формує подію, логує (INPUT_DEBUG) і кладе в чергу без очікування.
 void emit(const ButtonDef& def, Kind kind) {
     const bool isRepeat = (kind == Kind::Repeat);
-    const bool isLong = (kind == Kind::Long);
+    const bool isVeryLong = (kind == Kind::VeryLong);
+    // [Prompt 28] Дуже довге — це теж довге (longPress = true): старі споживачі його ігнорують.
+    const bool isLong = (kind == Kind::Long) || isVeryLong;
 
 #if INPUT_DEBUG
     Serial.printf("[BTN] %s %s\n", def.name,
-                  isLong ? "long" : (isRepeat ? "repeat" : "short"));
+                  isVeryLong ? "very-long" : (isLong ? "long" : (isRepeat ? "repeat" : "short")));
 #endif
 
-    const Event ev{def.action, def.source, isRepeat, isLong, 0};
+    const Event ev{def.action, def.source, isRepeat, isLong, 0, isVeryLong};
     if (!EventBus::post(ev, 0)) {
         s_dropped.fetch_add(1);
 #if INPUT_DEBUG
@@ -90,6 +94,7 @@ void processButton(const ButtonDef& def, ButtonState& st, bool rawPressed, uint3
             // Натискання прийнято: починаємо відлік утримання.
             st.pressedAtMs = now;
             st.longSent = false;
+            st.veryLongSent = false;  // [Prompt 28]
             st.repeating = false;
         } else {
             // Відпускання: коротка подія лише якщо не було ні довгого, ні повторів.
@@ -123,6 +128,10 @@ void processButton(const ButtonDef& def, ButtonState& st, bool rawPressed, uint3
             st.longSent = true;
             emit(def, Kind::Long);
         }
+    } else if (def.veryLongMs != 0 && !st.veryLongSent && held >= def.veryLongMs) {
+        // [Prompt 28] Довге вже було (longSent) — тепер дуже довге, один раз за натискання.
+        st.veryLongSent = true;
+        emit(def, Kind::VeryLong);
     }
 }
 

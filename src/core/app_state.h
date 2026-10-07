@@ -25,6 +25,9 @@
 // [Prompt 23b] ДОДАНО: inputName (лише в кінець структури) — користувацька назва ПОТОЧНОГО входу
 // з Settings::inputNames (запасно defaults::kInputNames). Вирішує AppController (resolveInputName),
 // ui/screens лише читає поле.
+// [Prompt 28] ДОДАНО: offline та restarting (лише в кінець структури). offline — режим без мережі
+// (Wi-Fi вимкнено, радіо недоступне); restarting — іде «тихий» перезапуск контролера (екран
+// показує «Restarting...»). Обидва false за замовчуванням; публікує AppController.
 // [Prompt 17] НЕ ВИКОРИСТОВУЮТЬСЯ: ui/screens читає рівні VU напряму з
 // VuSourceDecodedPcm::read() (частота кадру), минаючи AppState. Поля лишено, щоб не міняти POD-структуру.
 
@@ -157,6 +160,12 @@ struct AppStateData {
     // назви давали однакові байти для memcmp у screens). "" лише якщо немає ні користувацької,
     // ні типової назви.
     char inputName[kInputNameMax];
+
+    // --- [Prompt 28] ДОДАНО ---
+    // true: офлайн-режим (Wi-Fi вимкнено, вхід Radio недоступний). Лише AppController пише.
+    bool offline;
+    // true: триває «тихий» перезапуск (мʼют -> підсилювач LOW -> ESP.restart()).
+    bool restarting;
 };
 
 class AppState {

@@ -5,6 +5,9 @@
 //
 // Облікові дані: WiFi.begin(ssid, pass) із persistent=true зберігає їх у NVS (esp_wifi),
 // WiFi.begin() без аргументів підключається до останньої збереженої мережі.
+//
+// [Prompt 28] stop(): запит на повне вимкнення Wi-Fi (офлайн-режим). Виконує задача:
+// DNS стоп, HTTP-портал end(), softAP/STA вниз, WiFi.mode(WIFI_OFF), Phase::Off.
 
 #include "net/wifi_manager.h"
 
@@ -103,6 +106,7 @@ enum class Phase : uint8_t {
     Monitor,       // підключено, стежимо за втратою звʼязку
     Reconnect,     // звʼязок втрачено під час роботи: простий повтор без переходу в AP
     Ap,            // AP + captive portal
+    Off,           // [Prompt 28] Wi-Fi вимкнено (офлайн): задача лише спить
 };
 
 enum class PortalConn : uint8_t { Idle, Trying, Failed };
@@ -116,6 +120,7 @@ struct Net {
 SemaphoreHandle_t s_lock = nullptr;
 TaskHandle_t s_task = nullptr;
 bool s_forceReset = false;
+volatile bool s_stopRequested = false;  // [Prompt 28] ставить stop(), знімає задача
 
 // --- Спільне (захищене s_lock; s_state/s_rssi читаються без нього як атомарні) ---
 volatile WifiState s_state = WifiState::Connecting;
@@ -174,6 +179,7 @@ const char* stateName(WifiState s) {
         case WifiState::Connected:         return "Connected";
         case WifiState::ApMode:            return "ApMode";
         case WifiState::ApClientConnected: return "ApClientConnected";
+        case WifiState::Off:               return "Off";  // [Prompt 28]
     }
     return "?";
 }
@@ -501,6 +507,36 @@ void enterAp() {
              static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
 }
 
+// [Prompt 28] Повне вимкнення Wi-Fi (викликає лише задача WifiManager). Порядок: спершу
+// скасовуємо запити порталу й зупиняємо DNS/HTTP, потім радіо. Збережену STA-мережу не
+// стираємо (disconnect(false, false)): наступний запуск проходить звичайний сценарій.
+void shutdownRadio() {
+    WIFI_LOG("stop: shutting down portal, AP and Wi-Fi radio\n");
+    {
+        Lock l;
+        if (l.ok()) {
+            s_scanRequested = false;
+            s_scanning = false;
+            s_connectRequested = false;
+            s_portalConn = PortalConn::Idle;
+            memset(s_reqPass, 0, sizeof(s_reqPass));
+        }
+    }
+    s_dns.stop();
+    if (s_server != nullptr) {
+        s_server->end();  // об'єкт лишаємо (його могли б ще використовувати обробники AsyncTCP)
+    }
+    WiFi.scanDelete();
+    WiFi.softAPdisconnect(true);
+    WiFi.disconnect(false, false);
+    WiFi.mode(WIFI_OFF);
+    s_rssi = 0;
+    setInfo(WifiState::Off, "", "");
+    s_phase = Phase::Off;
+    s_stopRequested = false;
+    WIFI_LOG("stop: Wi-Fi is off\n");
+}
+
 // Підключення з порталу: WiFi.begin(ssid, pass) (бібліотека сама збереже дані) ->
 // очікування -> перезапуск. Чистий перехід у STA на наступному завантаженні
 // простіший за перемикання режиму на льоту (AP, DNS і HTTP-сервер лишились би живі).
@@ -664,11 +700,15 @@ void taskMain(void*) {
     }
 
     for (;;) {
+        if (s_stopRequested && s_phase != Phase::Off) {  // [Prompt 28]
+            shutdownRadio();
+        }
         switch (s_phase) {
             case Phase::FirstConnect: staFirstConnectTick(); break;
             case Phase::Monitor:      staMonitorTick();      break;
             case Phase::Reconnect:    staReconnectTick();    break;
             case Phase::Ap:           apTick();              break;
+            case Phase::Off:          break;  // [Prompt 28] нічого: Wi-Fi вимкнено
         }
         vTaskDelay(pdMS_TO_TICKS(s_phase == Phase::Ap ? wifi_cfg::kApPollMs
                                                       : wifi_cfg::kStaPollMs));
@@ -699,6 +739,14 @@ bool WifiManager::begin(bool forceReset) {
         return false;
     }
     return true;
+}
+
+// [Prompt 28] ДОДАНО
+void WifiManager::stop() {
+    if (s_task == nullptr) {
+        return;  // begin() не викликано: вимикати нічого
+    }
+    s_stopRequested = true;
 }
 
 WifiState WifiManager::state() { return s_state; }

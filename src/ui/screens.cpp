@@ -30,6 +30,8 @@
 // [Prompt 16] Екран Mode::OtaUpdate читає лише AppState.otaProgress.
 // [Prompt 23b] Назва входу (Radio, ExternalInput) береться з AppState.inputName; Settings екрани
 // не читають. Довга назва обрізається fitText() з "..." по межі UTF-8-символу.
+// [Prompt 28] AppState.offline: замість Wi-Fi-індикатора у верхній панелі — текст "offline" (Tiny);
+// на екрані WifiSetup — підказка "OK: work offline"; AppState.restarting — екран "Restarting...".
 // [Prompt 17] ВИНЯТОК З ІЗОЛЯЦІЇ: рівні VU беруться напряму з VuSourceDecodedPcm::read() (з
 // частотою кадру), МИНАЮЧИ AppState; AppStateData.vuLeft/vuRight не використовуються.
 
@@ -162,11 +164,23 @@ const char* inputName(const AppStateData& s) {
 constexpr size_t kInputFitCap = kInputNameMax + 8;
 
 void drawTopIcons(const AppStateData& s, bool showWifi) {
-    if (showWifi) {
+    int16_t muteX = c::kMuteIconX;
+    if (s.offline) {
+        // [Prompt 28] Офлайн: у слоті Wi-Fi-індикатора — текст "offline" (нової іконки немає);
+        // іконка мʼюту зсувається ліворуч від нього. Показуємо і там, де Wi-Fi-іконки не було
+        // (ExternalInput), бо в офлайні це єдиний екран зі верхньою панеллю.
+        constexpr const char* kOfflineText = "offline";
+        const int32_t w = UiFonts::textWidth(kOfflineText, FontSize::Tiny);
+        const int16_t x = static_cast<int16_t>(c::kW - c::kMargin - w);
+        const int16_t h = static_cast<int16_t>(UiFonts::lineHeight(FontSize::Tiny));
+        const int16_t y = static_cast<int16_t>(c::kTopBarY + (dc::kIconSize - h) / 2);
+        D::drawText(kOfflineText, x, y, FontSize::Tiny, c::kColorAccent);
+        muteX = static_cast<int16_t>(x - c::kOfflineMuteGap - dc::kIconSize);
+    } else if (showWifi) {
         D::drawIcon(s.wifiConnected ? IconId::Wifi : IconId::WifiOff, c::kWifiIconX, c::kTopBarY,
                     s.wifiConnected ? dc::kColorFg : c::kColorBad);
     }
-    if (s.mute) D::drawIcon(IconId::Mute, c::kMuteIconX, c::kTopBarY, c::kColorAccent);
+    if (s.mute) D::drawIcon(IconId::Mute, muteX, c::kTopBarY, c::kColorAccent);
 }
 
 // [Prompt 17] VU-метр: дві сегментні смуги L (верхня) / R (нижня).
@@ -350,6 +364,8 @@ void drawWifiSetup(const AppStateData& s) {
     char url[32];
     snprintf(url, sizeof(url), "http://%s", s.wifiIp[0] ? s.wifiIp : "192.168.4.1");
     drawCentered(url, c::kWifiSetupIpY, FontSize::Small, c::kColorDim);
+    // [Prompt 28] Підказка: OK (кнопка / енкодер / IR) запускає офлайн-режим.
+    drawCentered("OK: work offline", c::kWifiSetupHintY, FontSize::Small, c::kColorDim);
 }
 
 // [Prompt 15] Екран Mode::IrLearn: статус (Small) над назвою дії (Large), підказка під нею.
@@ -483,6 +499,10 @@ bool frame() {
     if (!dirty) return false;   // панель лишається як була
 
     D::fillScreen(dc::kColorBg);
+    if (s.restarting) {  // [Prompt 28] «тихий» перезапуск: один рядок замість будь-якого екрана
+        drawPlaceholder("Restarting...");  // три крапки ASCII: U+2026 немає у шрифті
+        return true;
+    }
     switch (s.mode) {
         case Mode::Standby:       drawStandby();                 break;
         case Mode::Radio:         drawRadio(s, litL, litR);      break;

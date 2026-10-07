@@ -14,6 +14,8 @@
 //
 // [Prompt 12] Заглушку замінено. ЗМІНЕНО: begin() тепер приймає forceReset;
 // poll() прибрано (задача внутрішня, нічого опитувати ззовні не треба).
+// [Prompt 28] ДОДАНО: stop() і WifiState::Off — повне вимкнення Wi-Fi для офлайн-режиму
+// (AP, DNS, портал, WiFi.mode(WIFI_OFF)). Облікові дані й провізіонінг не змінено.
 
 #include <stddef.h>
 #include <stdint.h>
@@ -23,6 +25,7 @@ enum class WifiState : uint8_t {
     Connected,          // STA: є IP
     ApMode,             // AP піднято, клієнтів немає
     ApClientConnected,  // AP піднято, до нього підключений хоча б один пристрій
+    Off,                // [Prompt 28] Wi-Fi вимкнено повністю (офлайн); вихід лише перезапуском
 };
 
 class WifiManager {
@@ -30,6 +33,14 @@ public:
     // Створює задачу й одразу повертається. forceReset = true: стерти збережену
     // мережу й піднімати AP. Повторний виклик безпечний (повертає true).
     static bool begin(bool forceReset);
+
+    // [Prompt 28] ДОДАНО: просить задачу WifiManager повністю вимкнути Wi-Fi: зупинити
+    // DNS і HTTP-портал, AP, STA та викликати WiFi.mode(WIFI_OFF). НЕ блокує: лише ставить
+    // запит, а саме вимкнення робить внутрішня задача (єдиний власник WiFi.*) протягом
+    // одного періоду опитування; після цього state() == Off. Збережена мережа в NVS не
+    // стирається. Повернення в онлайн — лише перезапуск контролера. Безпечно викликати
+    // повторно й з будь-якої задачі; до begin() запит нічого не робить.
+    static void stop();
 
     static WifiState state();
     static bool isConnected();  // state() == Connected

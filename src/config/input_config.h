@@ -73,6 +73,12 @@ constexpr bool kBtnLongPressRight  = false;
 constexpr bool kBtnLongPressOk     = true;
 constexpr bool kBtnLongPressEncBtn = true;
 
+// [Prompt 28] Дуже довге утримання POWER = «тихий» перезапуск контролера. Подію
+// (Event::veryLongPress) драйвер кнопок шле, коли утримання сягнуло цього часу; сама
+// послідовність перезапуску — в AppController. Має бути ПОМІТНО довшим за kBtnLongPressMs,
+// щоб не перезапускати випадково. 0 вимикає функцію.
+constexpr uint32_t kPowerRestartHoldMs = 3000;
+
 // ---------------------------------------------------------------------------
 // Перевірка утримання кнопки при старті (Buttons::isHeldAtBoot)
 // ---------------------------------------------------------------------------
@@ -118,6 +124,9 @@ static_assert(kBtnPollMs > 0, "kBtnPollMs must be > 0");
 static_assert(kBtnDebounceMs >= kBtnPollMs, "debounce must be >= poll period");
 static_assert(kBtnRepeatPeriodMs >= kBtnPollMs, "repeat period must be >= poll period");
 static_assert(kBootSamplePeriodMs > 0, "kBootSamplePeriodMs must be > 0");
+static_assert(kPowerRestartHoldMs == 0 ||
+                  (kBtnLongPressPower && kPowerRestartHoldMs >= 2 * kBtnLongPressMs),
+              "kPowerRestartHoldMs needs POWER long press enabled and must be well above kBtnLongPressMs");
 static_assert(kEncPcntLowLimit < 0 && kEncPcntHighLimit > 0, "PCNT limits must straddle zero");
 static_assert(kEncPcntLowLimit >= -32767 && kEncPcntHighLimit <= 32767, "PCNT limits are 16-bit");
 static_assert(kEncCountsPerDetent > 0, "kEncCountsPerDetent must be > 0");

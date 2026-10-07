@@ -78,6 +78,17 @@ constexpr int8_t kStationRightStep  = +1;
 constexpr bool kBootInStandby = false;
 
 // ---------------------------------------------------------------------------
+// [Prompt 28] «Тихий» перезапуск (довге утримання POWER, див. input_cfg::kPowerRestartHoldMs)
+// ---------------------------------------------------------------------------
+// Неблокуюча пауза між моментом, коли пін підсилювача став LOW, і ESP.restart().
+constexpr uint32_t kRestartMuteMs = 300;
+
+// Страховка: найдовше чекання піна підсилювача; після цього перезапуск у будь-якому разі
+// (щоб завислий I2C не зробив неможливим вихід із завислого стану). Має перекривати
+// amp_cfg::kAmpOffMuteWaitMs — це перевіряє static_assert в app_controller.cpp.
+constexpr uint32_t kRestartMaxWaitMs = 3000;
+
+// ---------------------------------------------------------------------------
 // Перевірки на етапі компіляції
 // ---------------------------------------------------------------------------
 static_assert(kTaskCore == 0, "AppController runs on core 0 (MASTER SPEC, section 5)");
@@ -95,6 +106,8 @@ static_assert(kRampStep >= 1, "kRampStep must be >= 1");
 static_assert(kRampStepMs >= 1, "kRampStepMs must be >= 1");
 static_assert(kSyncPeriodMs >= kActivePollMs, "sync period too short");
 static_assert(kVolumeStep >= 1, "kVolumeStep must be >= 1");
+static_assert(kRestartMuteMs >= 1 && kRestartMaxWaitMs > kRestartMuteMs,
+              "restart timings: 1 <= mute pause < max wait");
 static_assert((kInputUpStep == 1 || kInputUpStep == -1) &&
                   (kInputDownStep == 1 || kInputDownStep == -1) &&
                   (kStationLeftStep == 1 || kStationLeftStep == -1) &&
