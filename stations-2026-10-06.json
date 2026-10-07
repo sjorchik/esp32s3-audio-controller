@@ -1,0 +1,14 @@
+{"version":1,"stations":[
+{"name":"Радіо ROKS","url":"https://online.radioroks.ua/RadioROKS","levelDb":-20},
+{"name":"ROKS Балади","url":"https://online.radioroks.ua/RadioROKS_Ballads","levelDb":-20},
+{"name":"ROKS Класичний Рок","url":"https://online.radioroks.ua/RadioROKS_ClassicRock","levelDb":-20},
+{"name":"ROKS Український Рок","url":"https://online.radioroks.ua/RadioROKS_Ukr","levelDb":-20},
+{"name":"Радіо З Криївки","url":"http://stream.mjoy.ua:8000/radio-z-kryjivky","levelDb":-20},
+{"name":"ROKS Новий Рок","url":"https://online.radioroks.ua/RadioROKS_NewRock","levelDb":-20},
+{"name":"ROKS Hard'n'Heavy","url":"https://online.radioroks.ua/RadioROKS_HardnHeavy","levelDb":-20},
+{"name":"Радіо Байрактар","url":"https://online.radiobayraktar.ua/RadioBayraktar","levelDb":-20},
+{"name":"Hit FM","url":"https://online.hitfm.ua/HitFM","levelDb":-20},
+{"name":"Радіо Relax","url":"https://online.radiorelax.ua/RadioRelax","levelDb":-20},
+{"name":"Наше Радіо","url":"https://online.nasheradio.ua/NasheRadio","levelDb":-20},
+{"name":"Радіо Gold","url":"https://online.radioplayer.ua/RadioGold","levelDb":-20}
+]}

@@ -74,8 +74,8 @@
 
   /* ---------- Бас, дискант, баланс ---------- */
   const DEFS = [
-    { key: 'bass', title: 'Бас', cap: 'bass', fmt: fmtSigned, n: 'tone', zero: '0', lo: 'toneMin', hi: 'toneMax' },
-    { key: 'treble', title: 'Дискант', cap: 'treble', fmt: fmtSigned, n: 'tone', zero: '0', lo: 'toneMin', hi: 'toneMax' },
+    { key: 'bass', title: 'Тембр НЧ', cap: 'bass', fmt: fmtSigned, n: 'tone', zero: '0', lo: 'toneMin', hi: 'toneMax' },
+    { key: 'treble', title: 'Тембр ВЧ', cap: 'treble', fmt: fmtSigned, n: 'tone', zero: '0', lo: 'toneMin', hi: 'toneMax' },
     { key: 'balance', title: 'Баланс', cap: 'balance', fmt: sideText, n: 'balance', zero: 'Центр', lo: 'balanceMin', hi: 'balanceMax' },
   ];
   const neutralOf = (d) => clamp(CONFIG.audioNeutral[d.n], caps()[d.lo], caps()[d.hi]);
@@ -120,7 +120,7 @@
   ui.reset.addEventListener('click', async () => {
     const c = caps();
     if (!st || !c) return;
-    const ok = await confirmDialog('Для поточного входу повернути бас, дискант і баланс до нейтральних значень, а тонкомпенсацію — до значення за замовчуванням? Гучність і підсилення не зміняться; інших входів це не торкнеться.',
+    const ok = await confirmDialog('Для поточного входу повернути тембр НЧ, тембр ВЧ і баланс до нейтральних значень, а тонкомпенсацію — до значення за замовчуванням? Гучність і підсилення не зміняться; інших входів це не торкнеться.',
       { okText: 'Скинути', danger: true });
     if (!ok) return;
     const body = {};
