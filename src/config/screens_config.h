@@ -41,6 +41,23 @@ constexpr int16_t kWifiIconX   = kW - kMargin - display_cfg::kIconSize;
 constexpr int16_t kMuteIconX   = kWifiIconX - display_cfg::kIconSize - 6;
 constexpr int16_t kOfflineMuteGap = 6;              // [Prompt 28] проміжок між позначкою "offline" і іконкою мʼюту
 
+// --- [Prompt 36] Мережа Wi-Fi у смузі іконок екрана Radio (ліворуч від іконок) ---
+// Один рядок FontSize::Tiny: "SSID  IP", по вертикалі в рівень іконок. Якщо не вміщується, обрізається
+// SSID (fitText() з "..."), IP лишається цілим. Ширина смуги рахується від іконки мʼюту (найлівіша зі
+// стаціонарних іконок), тож розкладка не стрибає, коли мʼют вмикається. Офлайн / AP — смуга порожня.
+constexpr int16_t  kNetX    = kMargin;
+constexpr int16_t  kNetY    = kTopBarY + (display_cfg::kIconSize - display_cfg::kFontTinyPx) / 2;  // верх рядка
+constexpr int16_t  kNetGap  = 6;                                   // відступ від іконки мʼюту
+constexpr int16_t  kNetTextGap = 10;                               // між SSID і IP
+constexpr int16_t  kNetW    = kMuteIconX - kNetGap - kNetX;        // ширина смуги тексту
+constexpr uint16_t kColorNet = display_cfg::rgb565(160, 160, 160); // трохи світліше за kColorDim
+// Іконка Wi-Fi за RSSI (дБм): >= kWifiRssiBar3Db -> Wifi3, >= kWifiRssiBar2Db -> Wifi2, інакше Wifi1
+// (WifiOff лише без звʼязку). Гістерезис: перехід вгору при порозі + kWifiRssiHystDb/2, вниз при
+// порозі - kWifiRssiHystDb/2.
+constexpr int8_t   kWifiRssiBar3Db  = -60;
+constexpr int8_t   kWifiRssiBar2Db  = -72;
+constexpr int8_t   kWifiRssiHystDb  = 4;
+
 // --- Radio ---
 // [Prompt 35] Назва станції — FontSize::XLarge (36 px), marquee; одразу під рядком іконок
 // (kTopBarY + kIconSize), тож іконки Wi-Fi / мʼюту / "offline" не перетинаються з назвою.
@@ -178,6 +195,12 @@ static_assert(kStationY + display_cfg::kFontXLargePx < kTrackY, "station overlap
 static_assert(kStationY >= kTopBarY + display_cfg::kIconSize, "station name overlaps the top icons row");
 static_assert(kListFirstY + kListRows * kListRowH <= kH, "station list out of screen");
 static_assert(kMuteIconX > kMargin, "icons overflow top bar");
+static_assert(kNetY >= 0 && kNetY + display_cfg::kFontTinyPx <= kStationY,
+              "Wi-Fi info row overlaps the station name or leaves the screen");
+static_assert(kNetX + kNetW + kNetGap == kMuteIconX && kNetW >= 100, "Wi-Fi info strip too narrow");
+static_assert(kWifiRssiBar3Db > kWifiRssiBar2Db && kWifiRssiHystDb >= 0 &&
+                  kWifiRssiBar3Db - kWifiRssiBar2Db > kWifiRssiHystDb,
+              "Wi-Fi RSSI thresholds must be descending and wider than the hysteresis");
 static_assert(kWifiSetupTitleY + display_cfg::kFontLargePx < kWifiSetupSsidY &&
                   kWifiSetupSsidY + display_cfg::kFontSmallPx < kWifiSetupIpY &&
                   kWifiSetupIpY + display_cfg::kFontSmallPx <= kH,

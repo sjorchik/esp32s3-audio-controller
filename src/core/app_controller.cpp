@@ -9,6 +9,8 @@
 // тестових констант плеєра.
 //
 // [Prompt 12] Стан Wi-Fi береться з WifiManager (прямі виклики WiFi.* прибрано).
+// [Prompt 36] syncPlayer() додатково публікує AppState.wifiRssi (WifiManager::rssi(), квантування
+// wifi_status_cfg) — для іконки рівня сигналу на екрані Radio.
 // Коли WifiManager піднімає AP, а вхід — Radio, контролер переходить у
 // Mode::WifiSetup (екран з назвою AP та адресою). Зовнішні входи від Wi-Fi не
 // залежать і лишаються робочими; зі WifiSetup можна перемикати вхід і міняти
@@ -114,6 +116,7 @@
 #include "config/defaults.h"
 #include "config/features.h"  // [Prompt 23c]
 #include "config/ir_learn_ui_config.h"  // [Prompt 15] ДОДАНО
+#include "config/wifi_status_config.h"  // [Prompt 36]
 #include "core/app_state.h"
 #include "core/settings.h"
 #include "input/ir_rc5.h"            // [Prompt 15] ДОДАНО
@@ -779,6 +782,7 @@ struct SyncCtx {
     char wifiIp[16];
     bool wifiApMode;
     char inputName[kInputNameMax];  // [Prompt 23b]: назва могла змінитись з вебу
+    int8_t wifiRssi;                // [Prompt 36]: квантований RSSI STA (0 = невідомо)
 };
 
 void applySync(AppStateData& s, void* c) {
@@ -794,6 +798,20 @@ void applySync(AppStateData& s, void* c) {
     memcpy(s.wifiIp, x->wifiIp, sizeof(s.wifiIp));
     s.wifiApMode = x->wifiApMode;
     memcpy(s.inputName, x->inputName, sizeof(s.inputName));  // [Prompt 23b]
+    s.wifiRssi = x->wifiRssi;  // [Prompt 36]
+}
+
+// [Prompt 36] RSSI (дБм) -> значення для AppState: 0, якщо невідомо (>= 0), інакше обрізано знизу й
+// округлено до кратного kRssiQuantDb. Від'ємний вхід ніколи не дає 0.
+int8_t quantizeRssi(int32_t rssi) {
+    if (rssi >= 0) {
+        return 0;
+    }
+    if (rssi < wifi_status_cfg::kRssiFloorDb) {
+        rssi = wifi_status_cfg::kRssiFloorDb;
+    }
+    const int32_t step = wifi_status_cfg::kRssiQuantDb;
+    return static_cast<int8_t>(-(((-rssi) + step / 2) / step) * step);
 }
 
 // [Prompt 25] Жива зміна рівня станції, що грає (редагування з вебу). Викликається з
@@ -833,6 +851,7 @@ void syncPlayer() {
     // [Prompt 12] ДОДАНО
     WifiManager::copyInfo(c.wifiSsid, sizeof(c.wifiSsid), c.wifiIp, sizeof(c.wifiIp));
     c.wifiApMode = WifiManager::isApMode();
+    c.wifiRssi = c.wifi ? quantizeRssi(WifiManager::rssi()) : 0;  // [Prompt 36]
     resolveInputName(s_input, c.inputName, sizeof(c.inputName));  // [Prompt 23b]
 
     // [Prompt 10] ДОДАНО: маппінг PlayerState → StreamStatus за назвою

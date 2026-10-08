@@ -42,6 +42,8 @@
 // піку в UI); балістику VuSource не змінено. Три крапки в статусах — ASCII "...", не «…».
 // [Prompt 35] Екран Radio: назва станції — FontSize::XLarge (під рядком іконок), обʼєднаний рядок
 // метадані / статус — FontSize::Large; метадані малюються kColorTrack (світліше за kColorDim).
+// [Prompt 36] Екран Radio: у смузі іконок ліворуч — SSID і IP (з AppState, drawNetInfo()), іконка Wi-Fi
+// за AppState.wifiRssi (Wifi1..3) з гістерезисом у UI (wifiBarsUpdate()); WifiManager екран не чіпає.
 // [Prompt 17] ВИНЯТОК З ІЗОЛЯЦІЇ: рівні VU беруться напряму з VuSourceDecodedPcm::read() (з
 // частотою кадру), МИНАЮЧИ AppState; AppStateData.vuLeft/vuRight не використовуються.
 
@@ -97,6 +99,10 @@ struct VuMark {
     int16_t x;              // лівий край тексту
 };
 VuMark s_vuMarks[c::kVuScaleMarkCount] = {};
+
+// [Prompt 36] Кількість «рисок» іконки Wi-Fi (0 = не підключено), стан гістерезису лише в UI.
+uint8_t s_wifiBars = 0;
+constexpr uint8_t kWifiBarsFull = 3;
 
 // [Prompt 32] Спливне вікно: останній побачений popupSeq і час закінчення показу.
 bool     s_popupSeqKnown = false;
@@ -202,6 +208,63 @@ const char* inputName(const AppStateData& s) {
 // Буфер під fitText для назви входу: cap >= sizeof(inputName) + 8.
 constexpr size_t kInputFitCap = kInputNameMax + 8;
 
+// [Prompt 36] Оновлює s_wifiBars за знімком. Без звʼязку — 0. Підключено, але RSSI невідомий —
+// лишається попереднє значення (початково повна іконка, як було до P36). Далі гістерезис.
+int wifiBarThreshold(uint8_t bars) {
+    return bars >= 3 ? c::kWifiRssiBar3Db : c::kWifiRssiBar2Db;   // для bars = 3 і 2
+}
+
+void wifiBarsUpdate(const AppStateData& s) {
+    if (!s.wifiConnected) {
+        s_wifiBars = 0;
+        return;
+    }
+    if (s.wifiRssi >= 0) {   // RSSI ще невідомий
+        if (s_wifiBars == 0) s_wifiBars = kWifiBarsFull;
+        return;
+    }
+    const int r = s.wifiRssi;
+    if (s_wifiBars == 0) {   // перше значення: без гістерезису
+        s_wifiBars = (r >= c::kWifiRssiBar3Db) ? 3 : (r >= c::kWifiRssiBar2Db) ? 2 : 1;
+        return;
+    }
+    const int half = c::kWifiRssiHystDb / 2;
+    while (s_wifiBars < 3 && r >= wifiBarThreshold(static_cast<uint8_t>(s_wifiBars + 1)) + half) {
+        ++s_wifiBars;
+    }
+    while (s_wifiBars > 1 && r < wifiBarThreshold(s_wifiBars) - half) {
+        --s_wifiBars;
+    }
+}
+
+// [Prompt 36] SSID і IP у смузі іконок Radio. Офлайн / AP — порожньо; немає звʼязку — "Connecting...".
+constexpr size_t kNetFitCap = sizeof(AppStateData::wifiSsid) + 8;   // запас під "..." для fitText
+
+void drawNetInfo(const AppStateData& s) {
+    if (s.offline || s.wifiApMode) return;
+    char line[kNetFitCap];
+    if (!s.wifiConnected) {
+        D::drawText("Connecting...", c::kNetX, c::kNetY, FontSize::Tiny, c::kColorNet);
+        return;
+    }
+    // Один рядок "SSID  IP": IP цілий, SSID обрізається під залишок ширини.
+    int32_t ssidMaxW = c::kNetW;
+    int32_t ipW = 0;
+    if (s.wifiIp[0] != '\0') {
+        ipW = UiFonts::textWidth(s.wifiIp, FontSize::Tiny);
+        ssidMaxW = c::kNetW - ipW - (s.wifiSsid[0] != '\0' ? c::kNetTextGap : 0);
+    }
+    int32_t x = c::kNetX;
+    if (s.wifiSsid[0] != '\0' && ssidMaxW > 0) {
+        fitText(s.wifiSsid, line, sizeof(line), FontSize::Tiny, ssidMaxW);
+        D::drawText(line, static_cast<int16_t>(x), c::kNetY, FontSize::Tiny, c::kColorNet);
+        x += UiFonts::textWidth(line, FontSize::Tiny) + c::kNetTextGap;
+    }
+    if (ipW > 0) {
+        D::drawText(s.wifiIp, static_cast<int16_t>(x), c::kNetY, FontSize::Tiny, c::kColorNet);
+    }
+}
+
 void drawTopIcons(const AppStateData& s, bool showWifi) {
     int16_t muteX = c::kMuteIconX;
     if (s.offline) {
@@ -216,8 +279,11 @@ void drawTopIcons(const AppStateData& s, bool showWifi) {
         D::drawText(kOfflineText, x, y, FontSize::Tiny, c::kColorAccent);
         muteX = static_cast<int16_t>(x - c::kOfflineMuteGap - dc::kIconSize);
     } else if (showWifi) {
-        D::drawIcon(s.wifiConnected ? IconId::Wifi : IconId::WifiOff, c::kWifiIconX, c::kTopBarY,
-                    s.wifiConnected ? dc::kColorFg : c::kColorBad);
+        // [Prompt 36] Підключено: Wifi1..3 за RSSI (s_wifiBars >= 1); немає звʼязку: червона WifiOff.
+        const IconId icon = s.wifiConnected
+                                ? UiIcons::wifiForBars(s_wifiBars ? s_wifiBars : kWifiBarsFull)
+                                : IconId::WifiOff;
+        D::drawIcon(icon, c::kWifiIconX, c::kTopBarY, s.wifiConnected ? dc::kColorFg : c::kColorBad);
     }
     if (s.mute) D::drawIcon(IconId::Mute, muteX, c::kTopBarY, c::kColorAccent);
 }
@@ -389,6 +455,7 @@ void drawStandby() {
 void drawRadio(const AppStateData& s, int vuLitL, int vuLitR, int peakL, int peakR) {
     // [Prompt 33] Назву входу прибрано; лишились лише іконки верхньої панелі.
     drawTopIcons(s, true);
+    drawNetInfo(s);   // [Prompt 36]
 
     marqueeDraw(s_station, c::kStationY, FontSize::XLarge, dc::kColorFg);   // [Prompt 35]
 
@@ -545,6 +612,7 @@ bool frame() {
     const AppStateData s = AppState::snapshot();   // один знімок на кадр
 
     handleModeChange(s.mode);
+    wifiBarsUpdate(s);   // [Prompt 36] гістерезис іконки Wi-Fi; зміна rssi вже дає dirty через memcmp
 
     bool dirty = !s_havePrev || memcmp(&s, &s_prev, sizeof(s)) != 0;
     if (dirty) {

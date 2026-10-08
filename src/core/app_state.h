@@ -31,6 +31,9 @@
 // [Prompt 32] ДОДАНО: popupTarget, popupSeq (лише в кінець структури) — подія «показати спливне вікно
 // параметра звуку». popupSeq збільшує (з переходом 255 -> 0) ЛИШЕ AppController на ЛОКАЛЬНІ зміни
 // (енкодер, кнопки, IR); веб-команди його не чіпають. Відлік показу (kPopupTimeoutMs) веде ui/screens.
+// [Prompt 36] ДОДАНО: wifiRssi (лише в кінець структури) — рівень сигналу поточної STA-мережі, дБм,
+// квантований кроком wifi_status_cfg::kRssiQuantDb; 0 = невідомо / не підключено. Публікує
+// AppController разом з іншими даними Wi-Fi (syncPlayer); ui/screens з нього виводить іконку Wi-Fi.
 // [Prompt 17] НЕ ВИКОРИСТОВУЮТЬСЯ: ui/screens читає рівні VU напряму з
 // VuSourceDecodedPcm::read() (частота кадру), минаючи AppState. Поля лишено, щоб не міняти POD-структуру.
 
@@ -175,6 +178,10 @@ struct AppStateData {
     AdjustTarget popupTarget;
     // Лічильник подій «показати вікно»; UI порівнює з попереднім баченим значенням.
     uint8_t popupSeq;
+
+    // --- [Prompt 36] ДОДАНО ---
+    // RSSI поточної STA-мережі, дБм (від'ємне, кратне kRssiQuantDb); 0 — невідомо або не підключено.
+    int8_t wifiRssi;
 };
 
 class AppState {
