@@ -6,6 +6,7 @@
 
 #include "config/display_config.h"
 #include "ui/font_data.h"  // згенеровано tools/gen_gfxfont.py
+#include "ui/font_digits_data.h"  // [Prompt 32] згенеровано tools/gen_digits_font.py
 
 // ---------------------------------------------------------------------------
 // Покриття (перевірено на залізі, фото тестового кадру):
@@ -26,6 +27,8 @@
 //   4. Звірити надруковані скриптом yAdvance із display_cfg::kFont*Px
 //      (UiFonts::begin() також друкує реальні висоти в Serial).
 //
+// [Prompt 32] Шрифт цифр спливного вікна — ОКРЕМИЙ файл ui/font_digits_data.h:
+//   python3 tools/gen_digits_font.py --ttf tools/fonts/DejaVuSans.ttf --out src/ui/font_digits_data.h --em 112
 // Конструктор lgfx::GFXfont звірено з lgfx_fonts.hpp вашої версії LovyanGFX
 // (див. блок «Обʼєкти шрифтів»). Незвірено на залізі: чи знаходить бібліотека
 // гліфи вище 0xFF (кирилиця) — це видно на тестовому кадрі DISPLAY_DEMO.
@@ -53,6 +56,7 @@ lgfx::LGFX_Sprite s_meter;
 const lgfx::GFXfont s_fontLarge = UI_MAKE_GFXFONT(kLarge);
 const lgfx::GFXfont s_fontSmall = UI_MAKE_GFXFONT(kSmall);
 const lgfx::GFXfont s_fontTiny  = UI_MAKE_GFXFONT(kTiny);
+const lgfx::GFXfont s_fontDigits = UI_MAKE_GFXFONT(kDigits);  // [Prompt 32]
 
 #undef UI_MAKE_GFXFONT
 
@@ -62,12 +66,15 @@ static_assert(font_data::kSmallYAdvance == display_cfg::kFontSmallPx,
               "display_cfg::kFontSmallPx must equal Small yAdvance in font_data.h");
 static_assert(font_data::kTinyYAdvance == display_cfg::kFontTinyPx,
               "display_cfg::kFontTinyPx must equal Tiny yAdvance in font_data.h");
+static_assert(font_data::kDigitsYAdvance == display_cfg::kFontDigitsPx,
+              "display_cfg::kFontDigitsPx must equal Digits yAdvance in font_digits_data.h");
 
 const lgfx::IFont* fontFor(FontSize size) {
     switch (size) {
         case FontSize::Large: return &s_fontLarge;
         case FontSize::Small: return &s_fontSmall;
         case FontSize::Tiny:  return &s_fontTiny;
+        case FontSize::Digits: return &s_fontDigits;  // [Prompt 32]
     }
     return &s_fontSmall;
 }
@@ -89,6 +96,7 @@ bool UiFonts::begin() {
     const int32_t hLarge = lineHeight(FontSize::Large);
     const int32_t hSmall = lineHeight(FontSize::Small);
     const int32_t hTiny  = lineHeight(FontSize::Tiny);
+    const int32_t hDigits = lineHeight(FontSize::Digits);  // [Prompt 32]
     Serial.printf("[FONT] DejaVu Sans GFXfont, line height: large=%d small=%d tiny=%d "
                   "(config %u/%u/%u)\n",
                   static_cast<int>(hLarge), static_cast<int>(hSmall), static_cast<int>(hTiny),
@@ -96,7 +104,11 @@ bool UiFonts::begin() {
                   static_cast<unsigned>(display_cfg::kFontSmallPx),
                   static_cast<unsigned>(display_cfg::kFontTinyPx));
 
-    if (hLarge <= 0 || hSmall <= 0 || hTiny <= 0) {
+    Serial.printf("[FONT] digits: line height=%d (config %u), cell width=%d\n",
+                  static_cast<int>(hDigits), static_cast<unsigned>(display_cfg::kFontDigitsPx),
+                  static_cast<int>(textWidth("0", FontSize::Digits)));
+
+    if (hLarge <= 0 || hSmall <= 0 || hTiny <= 0 || hDigits <= 0) {
         Serial.println("[FONT] font metrics invalid");
         s_ready = false;
         return false;

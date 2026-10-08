@@ -32,6 +32,9 @@
 // не читають. Довга назва обрізається fitText() з "..." по межі UTF-8-символу.
 // [Prompt 28] AppState.offline: замість Wi-Fi-індикатора у верхній панелі — текст "offline" (Tiny);
 // на екрані WifiSetup — підказка "OK: work offline"; AppState.restarting — екран "Restarting...".
+// [Prompt 32] Спливне вікно параметра: UI веде ЛИШЕ відлік показу (millis() від моменту, коли
+// AppState.popupSeq змінився); сам параметр і його значення читаються зі знімка AppState.
+// Статус-рядок з ціллю енкодера (drawStatusRow) прибрано.
 // [Prompt 17] ВИНЯТОК З ІЗОЛЯЦІЇ: рівні VU беруться напряму з VuSourceDecodedPcm::read() (з
 // частотою кадру), МИНАЮЧИ AppState; AppStateData.vuLeft/vuRight не використовуються.
 
@@ -65,6 +68,12 @@ Marquee s_track   = {};
 VuSourceDecodedPcm s_vu;
 int s_vuLitL = 0;
 int s_vuLitR = 0;
+
+// [Prompt 32] Спливне вікно: останній побачений popupSeq і час закінчення показу.
+bool     s_popupSeqKnown = false;
+uint8_t  s_popupSeqSeen  = 0;
+bool     s_popupActive   = false;
+uint32_t s_popupUntilMs  = 0;
 
 AppStateData s_prev;            // попередній знімок
 bool         s_havePrev = false;
@@ -218,27 +227,36 @@ void drawVu(int litL, int litR) {
 #endif
 }
 
-// Статус-рядок: ціль енкодера зліва, значення справа. Завжди видимий.
-void drawStatusRow(const AppStateData& s) {
+// [Prompt 32] Спливне вікно параметра звуку: підпис (Large) + значення великими цифрами.
+// Знак +/- лише для параметрів зі знаком (тембр, баланс), і лише коли значення не нуль
+// (як було в статус-рядку). Гучність і gain — без знака.
+void drawPopup(const AppStateData& s) {
     const char* label = "";
     int value = 0;
     bool signedValue = false;
-    switch (s.adjustTarget) {
-        case AdjustTarget::Volume:  label = "Volume";  value = s.volume;  break;
-        case AdjustTarget::Bass:    label = "Bass";    value = s.bass;    signedValue = true; break;
-        case AdjustTarget::Treble:  label = "Treble";  value = s.treble;  signedValue = true; break;
-        case AdjustTarget::Balance: label = "Balance"; value = s.balance; signedValue = true; break;
-        case AdjustTarget::Gain:    label = "Gain";    value = s.gain;    break;
+    switch (s.popupTarget) {
+        case AdjustTarget::Volume:  label = "Volume";    value = s.volume;  break;
+        case AdjustTarget::Bass:    label = "Bass";      value = s.bass;    signedValue = true; break;
+        case AdjustTarget::Treble:  label = "Treble";    value = s.treble;  signedValue = true; break;
+        case AdjustTarget::Balance: label = "Balance";   value = s.balance; signedValue = true; break;
+        case AdjustTarget::Gain:    label = "Gain";      value = s.gain;    break;
     }
-    char buf[12];
+    char buf[8];
     if (signedValue && value != 0) snprintf(buf, sizeof(buf), "%+d", value);
     else                           snprintf(buf, sizeof(buf), "%d", value);
 
-    D::drawLine(0, c::kStatusLineY, c::kW - 1, c::kStatusLineY, c::kColorDim);
-    D::drawText(label, c::kMargin, c::kStatusY, FontSize::Small, dc::kColorFg);
-    const int32_t w = UiFonts::textWidth(buf, FontSize::Small);
-    D::drawText(buf, static_cast<int16_t>(c::kW - c::kMargin - w), c::kStatusY, FontSize::Small,
-                c::kColorAccent);
+    D::fillRect(c::kPopupX, c::kPopupY, c::kPopupW, c::kPopupH, c::kColorPopupBorder);
+    D::fillRect(static_cast<int16_t>(c::kPopupX + c::kPopupBorder),
+                static_cast<int16_t>(c::kPopupY + c::kPopupBorder),
+                static_cast<int16_t>(c::kPopupW - 2 * c::kPopupBorder),
+                static_cast<int16_t>(c::kPopupH - 2 * c::kPopupBorder), c::kColorPopupBg);
+
+    const int32_t lw = UiFonts::textWidth(label, FontSize::Large);
+    D::drawText(label, static_cast<int16_t>(c::kPopupX + (c::kPopupW - lw) / 2), c::kPopupLabelY,
+                FontSize::Large, c::kColorPopupLabel);
+    const int32_t dw = UiFonts::textWidth(buf, FontSize::Digits);
+    D::drawText(buf, static_cast<int16_t>(c::kPopupX + (c::kPopupW - dw) / 2), c::kPopupDigitsY,
+                FontSize::Digits, c::kColorPopupDigits);
 }
 
 // [Prompt 10] ДОДАНО: малювання статусу потоку на основі StreamStatus.
@@ -312,8 +330,6 @@ void drawRadio(const AppStateData& s, int vuLitL, int vuLitR) {
 
     // [Prompt 10] ДОДАНО: використовуємо StreamStatus замість наївної евристики
     drawStreamStatus(s);
-
-    drawStatusRow(s);
 }
 
 void drawExternal(const AppStateData& s) {
@@ -322,7 +338,6 @@ void drawExternal(const AppStateData& s) {
     char name[kInputFitCap];  // [Prompt 23b]
     fitText(inputName(s), name, sizeof(name), FontSize::Large, c::kContentW);
     drawCentered(name, c::kExtNameY, FontSize::Large, dc::kColorFg);
-    drawStatusRow(s);
 }
 
 void drawStationList(const AppStateData& s) {
@@ -490,6 +505,26 @@ bool frame() {
         s_vuLitR = litR;
     }
 
+    // [Prompt 32] Спливне вікно: нова подія (popupSeq змінився) запускає/продовжує показ;
+    // поза Radio/ExternalInput (і під час перезапуску) вікно ховається й не повертається саме.
+    const bool popupMode = (s.mode == Mode::Radio || s.mode == Mode::ExternalInput) && !s.restarting;
+    if (!s_popupSeqKnown) {
+        s_popupSeqKnown = true;                 // перший кадр: не вважати старе значення подією
+        s_popupSeqSeen  = s.popupSeq;
+    } else if (s.popupSeq != s_popupSeqSeen) {
+        s_popupSeqSeen = s.popupSeq;
+        if (popupMode) {
+            s_popupActive  = true;
+            s_popupUntilMs = now + c::kPopupTimeoutMs;
+        }
+    }
+    if (!popupMode) {
+        s_popupActive = false;
+    } else if (s_popupActive && static_cast<int32_t>(now - s_popupUntilMs) >= 0) {
+        s_popupActive = false;
+        dirty = true;                           // перемалювати кадр без вікна
+    }
+
     if (s.mode == Mode::Radio) {
         dirty |= marqueeUpdate(s_station, s.stationName[0] ? s.stationName : "No station",
                                FontSize::Large, now);
@@ -516,6 +551,7 @@ bool frame() {
         case Mode::OtaUpdate:     drawOtaUpdate(s);              break;   // [Prompt 16]
         default:                  drawPlaceholder("?");          break;
     }
+    if (s_popupActive) drawPopup(s);   // [Prompt 32] останній шар кадру
     return true;
 }
 
@@ -528,6 +564,8 @@ bool UiScreens::begin() {
     s_track.seeded   = false;
     s_vuLitL = 0;
     s_vuLitR = 0;
+    s_popupSeqKnown = false;   // [Prompt 32]
+    s_popupActive   = false;
     DisplayManager::setFrameCallback(&frame);
     return true;
 }

@@ -69,6 +69,36 @@ constexpr int16_t kExtNameY    = 62;               // Large, по центру
 constexpr int16_t kStatusLineY = 143;
 constexpr int16_t kStatusY     = 148;              // Small: ціль зліва, значення справа
 
+// --- [Prompt 32] Спливне вікно параметра звуку (Vol/Bass/Treble/Bal/Gain) ---
+// Малюється ОСТАННІМ шаром поверх Radio/ExternalInput; центр екрана. Рамка — прямокутна
+// (DisplayManager не має заокруглених примітивів). Статус-рядок (kStatusLineY/kStatusY) більше не
+// малюється; константи лишено, щоб не чіпати static_assert нижче й зберегти розкладку для наступних кроків.
+constexpr uint32_t kPopupTimeoutMs = 5000;       // після ОСТАННЬОЇ події, що показує вікно
+constexpr uint8_t  kPopupMaxChars  = 3;          // найширше значення: "100", "+20", "-20"
+// Метрики шрифту FontSize::Digits (em=112, DejaVu Sans; вивід tools/gen_digits_font.py):
+constexpr int16_t  kPopupDigitsCellW    = 71;    // xAdvance цифри (моноширинний)
+constexpr int16_t  kPopupDigitsInkH     = 86;    // висота цифри (піксельних рядків)
+// Виміряно на залізі (P32, фото): LovyanGFX ставить верх цифри на верх рядка шрифту, тож відступ 0.
+constexpr int16_t  kPopupDigitsTopInset = 0;     // від верху рядка шрифту до верху цифри
+constexpr int16_t  kPopupDigitsDy       = 0;     // ручна підгонка вертикалі цифр (див. «Як перевірити»)
+constexpr int16_t  kPopupBorder    = 2;
+constexpr int16_t  kPopupPadX      = 16;
+constexpr int16_t  kPopupPadTop    = 4;
+constexpr int16_t  kPopupLabelGap  = 2;          // між підписом (Large) і цифрами
+constexpr int16_t  kPopupPadBottom = 6;
+constexpr int16_t  kPopupW = kPopupMaxChars * kPopupDigitsCellW + 2 * kPopupPadX + 2 * kPopupBorder;
+constexpr int16_t  kPopupH = kPopupBorder + kPopupPadTop + display_cfg::kFontLargePx +
+                             kPopupLabelGap + kPopupDigitsInkH + kPopupPadBottom + kPopupBorder;
+constexpr int16_t  kPopupX = (kW - kPopupW) / 2;
+constexpr int16_t  kPopupY = (kH - kPopupH) / 2;
+constexpr int16_t  kPopupLabelY  = kPopupY + kPopupBorder + kPopupPadTop;
+constexpr int16_t  kPopupDigitsY = kPopupLabelY + display_cfg::kFontLargePx + kPopupLabelGap -
+                                   kPopupDigitsTopInset + kPopupDigitsDy;   // верх рядка шрифту цифр
+constexpr uint16_t kColorPopupBg     = display_cfg::rgb565(12, 12, 20);
+constexpr uint16_t kColorPopupBorder = display_cfg::kColorYellow;
+constexpr uint16_t kColorPopupLabel  = display_cfg::kColorWhite;
+constexpr uint16_t kColorPopupDigits = display_cfg::kColorYellow;
+
 // --- Список станцій ---
 constexpr int16_t kListTitleY   = 4;               // Small
 constexpr int16_t kListLineY    = 26;
@@ -131,6 +161,11 @@ static_assert(kOtaTitleY + display_cfg::kFontLargePx < kOtaPercentY &&
                   kOtaHintY + display_cfg::kFontSmallPx <= kH,
               "OtaUpdate layout overlaps or leaves the screen");
 static_assert(kMarqueeStepMs > 0 && kMarqueeStepPx > 0, "marquee step must be positive");
+static_assert(kPopupW <= kW - 2 * kMargin, "popup is wider than the content area");
+static_assert(kPopupH * 4 <= kH * 3, "popup is taller than 3/4 of the screen");
+static_assert(kPopupDigitsY + kPopupDigitsTopInset + kPopupDigitsInkH <= kPopupY + kPopupH - kPopupBorder,
+              "popup digits do not fit inside the frame");
+static_assert(kPopupTimeoutMs > 0, "kPopupTimeoutMs must be > 0");
 static_assert(kVuBarGap >= 0 && kVuSegW >= 2 && kVuUsedW <= kVuW,
               "VU bars do not fit into the VU area");
 static_assert(kVuYellowSeg < kVuRedSeg && kVuRedSeg < kVuSegments,

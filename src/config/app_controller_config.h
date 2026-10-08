@@ -52,6 +52,11 @@ constexpr uint32_t kUnmuteDelayMs = 250;
 constexpr uint32_t kRampStepMs = 20;
 constexpr int      kRampStep   = 2;   // у одиницях шкали гучності UI (0..100)
 
+// [Prompt 31] Автоповернення цілі регулювання енкодера на гучність: скільки мс без подій
+// енкодера (обертання, клік, утримання), після чого ціль (бас/дискант/баланс/gain) знову
+// стає гучністю.
+constexpr uint32_t kAdjustTimeoutMs = 5000;
+
 // Скільки тримати мʼют атенюаторів після зміни gain (апаратний стрибок рівня).
 constexpr uint32_t kGainMuteHoldMs = 80;
 
@@ -105,6 +110,7 @@ static_assert(kActivePollMs >= 1 && kIdlePollMs >= kActivePollMs,
 static_assert(kRampStep >= 1, "kRampStep must be >= 1");
 static_assert(kRampStepMs >= 1, "kRampStepMs must be >= 1");
 static_assert(kSyncPeriodMs >= kActivePollMs, "sync period too short");
+static_assert(kAdjustTimeoutMs >= 1, "kAdjustTimeoutMs must be >= 1");
 static_assert(kVolumeStep >= 1, "kVolumeStep must be >= 1");
 static_assert(kRestartMuteMs >= 1 && kRestartMaxWaitMs > kRestartMuteMs,
               "restart timings: 1 <= mute pause < max wait");

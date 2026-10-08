@@ -28,6 +28,9 @@
 // [Prompt 28] ДОДАНО: offline та restarting (лише в кінець структури). offline — режим без мережі
 // (Wi-Fi вимкнено, радіо недоступне); restarting — іде «тихий» перезапуск контролера (екран
 // показує «Restarting...»). Обидва false за замовчуванням; публікує AppController.
+// [Prompt 32] ДОДАНО: popupTarget, popupSeq (лише в кінець структури) — подія «показати спливне вікно
+// параметра звуку». popupSeq збільшує (з переходом 255 -> 0) ЛИШЕ AppController на ЛОКАЛЬНІ зміни
+// (енкодер, кнопки, IR); веб-команди його не чіпають. Відлік показу (kPopupTimeoutMs) веде ui/screens.
 // [Prompt 17] НЕ ВИКОРИСТОВУЮТЬСЯ: ui/screens читає рівні VU напряму з
 // VuSourceDecodedPcm::read() (частота кадру), минаючи AppState. Поля лишено, щоб не міняти POD-структуру.
 
@@ -166,6 +169,12 @@ struct AppStateData {
     bool offline;
     // true: триває «тихий» перезапуск (мʼют -> підсилювач LOW -> ESP.restart()).
     bool restarting;
+
+    // --- [Prompt 32] ДОДАНО ---
+    // Параметр, який показує спливне вікно (осмислений, коли popupSeq змінився).
+    AdjustTarget popupTarget;
+    // Лічильник подій «показати вікно»; UI порівнює з попереднім баченим значенням.
+    uint8_t popupSeq;
 };
 
 class AppState {

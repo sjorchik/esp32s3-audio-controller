@@ -92,6 +92,15 @@
 // (пін LOW через kAmpOffDelayMs, P23c) -> пауза kRestartMuteMs -> ESP.restart(). Усе кроками
 // restartService() із tickLocked(), без блокувань; kRestartMaxWaitMs — страховка.
 
+// [Prompt 32] Спливне вікно параметра: notifyPopup()/popupForEvent() у handleLocked() (лише локальні
+// джерела: енкодер, кнопки, IR); AppState.popupTarget/popupSeq. Веб (runWebCommand) вікно не викликає.
+// [Prompt 31] Автоповернення цілі регулювання енкодера на гучність. Будь-яка подія енкодера
+// (ENC_CW / ENC_CCW / ENC_PRESS, зокрема довге утримання = мʼют) оновлює s_lastEncMs; коли
+// s_target != Volume і від останньої події енкодера минуло kAdjustTimeoutMs, tickLocked()
+// повертає ціль на гучність і публікує стан (екран малює ціль за AppState.adjustTarget).
+// Також ціль скидається на гучність при вході в Standby й при вмиканні (powerOnTransition).
+// Публічний інтерфейс не змінено; у NVS ціль не зберігається.
+
 #include "core/app_controller.h"
 
 #include <Arduino.h>
@@ -167,6 +176,11 @@ bool s_userMute = false;
 // [Prompt 21b] Профілі всіх логічних входів (включно з входом 3, якого PT2313L не має).
 InputProfile s_profiles[defaults::kInputCount] = {};
 AdjustTarget s_target = AdjustTarget::Volume;
+uint32_t s_lastEncMs = 0;  // [Prompt 31] millis() останньої події енкодера
+// [Prompt 32] Подія «показати спливне вікно параметра»: що показувати і лічильник подій.
+// Лічильник росте лише на ЛОКАЛЬНІ зміни (handleLocked); веб-команди (runWebCommand) його не чіпають.
+AdjustTarget s_popupTarget = AdjustTarget::Volume;
+uint8_t s_popupSeq = 0;
 MenuContext s_menuCtx = MenuContext::None;
 uint16_t s_menuSel = 0;
 
@@ -669,6 +683,8 @@ struct PubCtx {
     bool loudness;  // [Prompt 21b]
     bool offline;     // [Prompt 28]
     bool restarting;  // [Prompt 28]
+    AdjustTarget popupTarget;  // [Prompt 32]
+    uint8_t popupSeq;          // [Prompt 32]
     char inputName[kInputNameMax];  // [Prompt 23b]
 };
 
@@ -689,13 +705,15 @@ void applyPub(AppStateData& s, void* c) {
     s.loudness = p->loudness;  // [Prompt 21b]
     s.offline = p->offline;        // [Prompt 28]
     s.restarting = p->restarting;  // [Prompt 28]
+    s.popupTarget = p->popupTarget;  // [Prompt 32]
+    s.popupSeq = p->popupSeq;        // [Prompt 32]
     memcpy(s.inputName, p->inputName, sizeof(s.inputName));  // [Prompt 23b]
 }
 
 void publishState() {
     PubCtx p = {s_mode,   s_input, s_volume, s_bass,    s_treble, s_balance,
                 s_gain,   s_userMute, s_station, s_target, s_menuCtx, s_menuSel,
-                s_loudness, s_offline, restarting()};
+                s_loudness, s_offline, restarting(), s_popupTarget, s_popupSeq};
     resolveInputName(s_input, p.inputName, sizeof(p.inputName));  // [Prompt 23b]
     AppState::modify(applyPub, &p);
 }
@@ -872,6 +890,7 @@ void startTransition() {
 // Вхід/станцію викликач уже поклав у s_input/s_station.
 void powerOnTransition() {
     s_mode = (s_input == 0) ? Mode::Radio : Mode::ExternalInput;
+    s_target = AdjustTarget::Volume;  // [Prompt 31] після вмикання/виходу зі standby — гучність
     s_menuCtx = MenuContext::None;
     s_menuSel = 0;
     startTransition();
@@ -894,6 +913,7 @@ void enterStandby() {
     APP_LOG("standby on\n");
     s_phase = Phase::None;
     s_gainHoldActive = false;
+    s_target = AdjustTarget::Volume;  // [Prompt 31]
     s_menuCtx = MenuContext::None;
     s_menuSel = 0;
     s_mode = Mode::Standby;
@@ -1528,12 +1548,57 @@ void restartService(uint32_t now) {
     }
 }
 
+// [Prompt 32] Спливне вікно параметра. notifyPopup() лише фіксує, ЩО показати, і збільшує лічильник;
+// публікація — publishState() наприкінці handleLocked(). Непідтримуваний чипом параметр не
+// показуємо (значення 0 вводило б в оману).
+void notifyPopup(AdjustTarget t) {
+    if (!targetSupported(t)) {
+        return;
+    }
+    s_popupTarget = t;
+    ++s_popupSeq;  // uint8_t: перехід 255 -> 0 штатний, UI порівнює лише «змінилось чи ні»
+}
+
+// Викликається ПІСЛЯ обробки події і лише на головних екранах (Radio / ExternalInput).
+// Енкодер: обертання й коротка клавіша показують ПОТОЧНУ ціль (після cycleTarget — нову).
+// Утримання енкодера (мʼют) вікно не викликає. Прямі дії кнопок/IR показують свій параметр.
+void popupForEvent(const Event& e) {
+    switch (e.action) {
+        case Action::ENC_CW:
+        case Action::ENC_CCW:
+            notifyPopup(s_target);
+            break;
+        case Action::ENC_PRESS:
+            if (!e.longPress && !e.repeat) notifyPopup(s_target);
+            break;
+        case Action::VOL_UP:
+        case Action::VOL_DOWN:     notifyPopup(AdjustTarget::Volume);  break;
+        case Action::BASS_UP:
+        case Action::BASS_DOWN:    notifyPopup(AdjustTarget::Bass);    break;
+        case Action::TREBLE_UP:
+        case Action::TREBLE_DOWN:  notifyPopup(AdjustTarget::Treble);  break;
+        case Action::BALANCE_UP:
+        case Action::BALANCE_DOWN: notifyPopup(AdjustTarget::Balance); break;
+        case Action::GAIN_UP:
+        case Action::GAIN_DOWN:    notifyPopup(AdjustTarget::Gain);    break;
+        default:
+            break;
+    }
+}
+
 void handleLocked(const Event& e) {
 #if APP_CONTROLLER_LOG_EVENTS && APP_CONTROLLER_DEBUG
     Serial.printf("[APP] evt %s %s%s%s delta=%d\n", sourceName(e.source), actionName(e.action),
                   e.repeat ? " repeat" : "", e.longPress ? " long" : "",
                   static_cast<int>(e.delta));
 #endif
+
+    // [Prompt 31] Активність енкодера (обертання, клік, утримання) перезапускає відлік
+    // автоповернення цілі на гучність. Інші джерела (кнопки, IR) відлік не чіпають.
+    if (e.action == Action::ENC_CW || e.action == Action::ENC_CCW ||
+        e.action == Action::ENC_PRESS) {
+        s_lastEncMs = millis();
+    }
 
     // [Prompt 28] Довге утримання POWER = «тихий» перезапуск у БУДЬ-ЯКОМУ режимі (Standby,
     // WifiSetup, офлайн, звичайна робота, IrLearn, OtaUpdate). Стоїть ПЕРЕД гілкою OTA.
@@ -1604,6 +1669,10 @@ void handleLocked(const Event& e) {
             } else {
                 handleMainEvent(e);
             }
+        }
+        // [Prompt 32] Спливне вікно: лише головні екрани (у Menu енкодер рухає список).
+        if (s_mode == Mode::Radio || s_mode == Mode::ExternalInput) {
+            popupForEvent(e);
         }
     }
 
@@ -1694,6 +1763,14 @@ void tickLocked() {
 
     followWifiMode();  // [Prompt 12] ДОДАНО
     syncIrLearn(now);  // [Prompt 15] ДОДАНО
+
+    // [Prompt 31] Автоповернення цілі регулювання на гучність після kAdjustTimeoutMs без
+    // подій енкодера (працює в усіх режимах; тик іде й під час навчання IR / OTA).
+    if (s_target != AdjustTarget::Volume && reached(now, s_lastEncMs + cfg::kAdjustTimeoutMs)) {
+        s_target = AdjustTarget::Volume;
+        APP_LOG("adjust target -> volume (timeout)\n");
+        publishState();
+    }
 
     if (s_playPending && s_input == 0 && !s_offline && !restarting() &&  // [Prompt 28]
         (s_mode == Mode::Radio || s_mode == Mode::Menu) && wifiUp()) {
