@@ -118,7 +118,7 @@ constexpr uint16_t kColorVuScale    = kColorVuLit;   // усі підписи VU
 // (в межах kContentW) і по вертикалі у вільній області між смугою іконок і блоком VU.
 constexpr int16_t kExtAreaTop    = kTopBarY + display_cfg::kIconSize;   // низ смуги іконок (y=28)
 constexpr int16_t kExtAreaBottom = kVuY - kVuGapAbove;                  // верх VU мінус запас (y=90)
-constexpr int16_t kExtNameDy     = -8;   // ручна підгонка: від'ємне = вище (P38, за побажанням власника)
+constexpr int16_t kExtNameDy     = -4;   // ручна підгонка: від'ємне = вище (P38, за побажанням власника)
 constexpr int16_t kExtNameY      = kExtAreaTop +
     (kExtAreaBottom - kExtAreaTop - display_cfg::kFontXLargePx) / 2 + kExtNameDy;   // верх рядка шрифту (y=33)
 // Світлі кольори назви за номером входу 1..3 (індекс масиву = inputIndex - 1). Підібрано, щоб
@@ -126,7 +126,7 @@ constexpr int16_t kExtNameY      = kExtAreaTop +
 // з явним синім відтінком.
 constexpr uint16_t kColorInputName[] = {
     display_cfg::rgb565(120, 255, 120),   // вхід 1 — світло-зелений
-    display_cfg::rgb565(255, 235, 110),   // вхід 2 — світло-жовтий
+    display_cfg::rgb565(255, 120, 120),   // вхід 2 — світло-червоний
     display_cfg::rgb565(120, 190, 255),   // вхід 3 — світло-блакитний
 };
 constexpr uint8_t kColorInputNameCount = sizeof(kColorInputName) / sizeof(kColorInputName[0]);

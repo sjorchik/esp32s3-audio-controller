@@ -472,7 +472,9 @@ void drawRadio(const AppStateData& s, int vuLitL, int vuLitR, int peakL, int pea
 }
 
 void drawExternal(const AppStateData& s, int vuLitL, int vuLitR, int peakL, int peakR) {
-    drawTopIcons(s, false);
+    // [Prompt 38] Верхня стрічка як на Radio: іконка Wi-Fi за RSSI + «SSID  IP» ліворуч.
+    drawTopIcons(s, true);
+    drawNetInfo(s);
     // [Prompt 38] Напис "INPUT" прибрано; назва входу — XLarge, по центру вільної області, колір за
     // номером входу (1..3). Довге імʼя обрізається fitText() з "..." (marquee не потрібен: рядок
     // статичний, а центрування й прокрутка разом виглядали б гірше).
