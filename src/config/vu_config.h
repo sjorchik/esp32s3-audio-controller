@@ -41,12 +41,12 @@ constexpr int32_t  kMaxFramesPerBlock = 2048;
 // ---------------------------------------------------------------------------
 // Рівень відображається в децибелах: 0 dBFS = 1.0, kDbFloor = 0.0. Лінійна шкала
 // амплітуди для музики майже завжди була б у нижній третині смуги.
-constexpr float    kDbFloor    = -48.0f;
+constexpr float    kDbFloor    = -21.0f;
 
 // Експоненційне згладжування з урахуванням dt: швидка атака, повільний спад.
 // alpha = dt / (tau + dt).
-constexpr float    kAttackMs   = 15.0f;
-constexpr float    kReleaseMs  = 250.0f;
+constexpr float    kAttackMs   = 5.0f;
+constexpr float    kReleaseMs  = 80.0f;
 
 // Якщо нових PCM-блоків немає стільки мс — потік не грає: read() повертає false,
 // рівні скидаються в 0.
@@ -62,7 +62,7 @@ constexpr uint32_t kResumeGapMs = 250;
 constexpr uint32_t kNoDataWarnMs = 8000;
 
 // ---------------------------------------------------------------------------
-// Пороги кольору (частка шкали 0..1; з kDbFloor -48 дБ: 0.70 ≈ -14 дБ, 0.90 ≈ -5 дБ)
+// Пороги кольору (частка шкали 0..1; з kDbFloor -20 дБ: 0.70 ≈ -6 дБ, 0.90 ≈ -2 дБ)
 // ---------------------------------------------------------------------------
 constexpr float    kYellowFrom = 0.70f;
 constexpr float    kRedFrom    = 0.90f;

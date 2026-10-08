@@ -14,7 +14,7 @@
 //   - validSamples — кількість СЛІВ int32 (обох каналів разом): кадрів = /2;
 //   - *continueI2S = true ОБОВʼЯЗКОВО: false = бібліотека пропускає запис блоку -> тиша.
 // [Prompt 30] Перед рівнем станції блок проходить 5-смуговий еквалайзер (eq::process, на місці);
-// порядок: EQ -> output_trim -> VU.
+// порядок: EQ -> VU (вимір) -> output_trim [P35: VU більше не після послаблення станції].
 // [Prompt 25] Буфер тепер і ЗМІНЮЄТЬСЯ: output_trim::process() послаблює блок на місці
 // (рівень поточної станції), а VU міряє вже послаблений сигнал (реальний вихід). Без логування,
 // блокувань і millis(); мінімум обчислень.
@@ -42,16 +42,18 @@ void audio_process_i2s(int32_t* outBuff, int16_t validSamples, bool* continueI2S
     int32_t frames = static_cast<int32_t>(validSamples) / 2;
     // [Prompt 30] Еквалайзер радіо (усі смуги 0 дБ — блок не чіпається).
     eq::process(outBuff, frames);
-    // [Prompt 25] Рівень станції: послаблюємо ВЕСЬ блок (validSamples — довжина буфера).
-    output_trim::process(outBuff, frames);
 #if ENABLE_VU
-    if (frames > vu_cfg::kMaxFramesPerBlock) {
-        frames = vu_cfg::kMaxFramesPerBlock;  // захист від виходу за буфер
+    // [Prompt 35] VU міряється ПІСЛЯ еквалайзера, але ДО рівня станції: послаблення станції
+    // (типово -20 дБ) не стискає шкалу, і 0 дБ індикатора = повна шкала сигналу декодера.
+    // Раніше (P25) VU йшов після output_trim.
+    int32_t scan = frames;
+    if (scan > vu_cfg::kMaxFramesPerBlock) {
+        scan = vu_cfg::kMaxFramesPerBlock;  // захист від виходу за буфер
     }
     uint32_t peakL = 0;
     uint32_t peakR = 0;
     const int32_t* p = outBuff;
-    for (int32_t i = 0; i < frames; ++i) {
+    for (int32_t i = 0; i < scan; ++i) {
         const int32_t l = p[0];
         const int32_t r = p[1];
         p += 2;
@@ -61,8 +63,12 @@ void audio_process_i2s(int32_t* outBuff, int16_t validSamples, bool* continueI2S
         if (al > peakL) peakL = al;
         if (ar > peakR) peakR = ar;
     }
+#endif  // ENABLE_VU
+    // [Prompt 25] Рівень станції: послаблюємо ВЕСЬ блок (validSamples — довжина буфера).
+    output_trim::process(outBuff, frames);
+#if ENABLE_VU
     // 2^31 -> 2^15: шкала vu_cfg::kFullScale (32768).
-    VuSourceDecodedPcm::publishPeaks(peakL >> 16, peakR >> 16, static_cast<uint32_t>(frames));
+    VuSourceDecodedPcm::publishPeaks(peakL >> 16, peakR >> 16, static_cast<uint32_t>(scan));
 #endif  // ENABLE_VU
 }
 #else

@@ -367,7 +367,13 @@ void DisplayManager::taskLoop() {
         } else if (rotated) {
             pushBuffer((s_back ^ 1u) & 1u);
         }
-        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(display_cfg::kFramePeriodMs));
+        // [Prompt 35] xTaskDelayUntil НЕ блокує, якщо кадр тривав довше за період (повертає pdFALSE):
+        // за серії таких кадрів задача на ядрі 0 монополізувала б CPU й голодила IDLE0 -> task_wdt.
+        // Тоді примусово віддаємо процесор мінімум на один тік і перезапускаємо відлік.
+        if (xTaskDelayUntil(&lastWake, pdMS_TO_TICKS(display_cfg::kFramePeriodMs)) == pdFALSE) {
+            vTaskDelay(1);
+            lastWake = xTaskGetTickCount();
+        }
     }
 }
 

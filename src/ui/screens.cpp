@@ -38,6 +38,8 @@
 // Статус-рядок з ціллю енкодера (drawStatusRow) прибрано.
 // [Prompt 33] Екран Radio: назву входу прибрано; рядок метаданих і рядок статусу потоку обʼєднано
 // в один (слот kTrackY, marquee s_track): метадані, коли Playing і вони непорожні, інакше статус.
+// [Prompt 34] VU перемальовано під індикатор «Маяк-233» (сегментні смуги L/R, шкала в дБ, утримання
+// піку в UI); балістику VuSource не змінено. Три крапки в статусах — ASCII "...", не «…».
 // [Prompt 17] ВИНЯТОК З ІЗОЛЯЦІЇ: рівні VU беруться напряму з VuSourceDecodedPcm::read() (з
 // частотою кадру), МИНАЮЧИ AppState; AppStateData.vuLeft/vuRight не використовуються.
 
@@ -73,9 +75,26 @@ uint16_t s_trackStation      = 0;
 
 // [Prompt 17] VU: джерело (читає лише display-задача) і кількість засвічених сегментів
 // минулого кадру (перемальовуємо, лише коли вона змінилась).
+// [Prompt 34] + утримання піку по каналах (лише UI) і попередньо обчислені мітки шкали.
 VuSourceDecodedPcm s_vu;
 int s_vuLitL = 0;
 int s_vuLitR = 0;
+int s_vuPeakDrawnL = 0;   // [Prompt 34] пік, намальований минулого кадру
+int s_vuPeakDrawnR = 0;
+
+struct VuPeak {
+    int      seg;           // кількість сегментів піку (0 = немає; пік = сегмент з індексом seg-1)
+    uint32_t holdUntilMs;   // до цього моменту пік утримується
+    uint32_t lastFallMs;    // момент останнього кроку спаду
+};
+VuPeak s_peakL = {};
+VuPeak s_peakR = {};
+
+struct VuMark {
+    char    text[8];
+    int16_t x;              // лівий край тексту
+};
+VuMark s_vuMarks[c::kVuScaleMarkCount] = {};
 
 // [Prompt 32] Спливне вікно: останній побачений popupSeq і час закінчення показу.
 bool     s_popupSeqKnown = false;
@@ -201,9 +220,12 @@ void drawTopIcons(const AppStateData& s, bool showWifi) {
     if (s.mute) D::drawIcon(IconId::Mute, muteX, c::kTopBarY, c::kColorAccent);
 }
 
-// [Prompt 17] VU-метр: дві сегментні смуги L (верхня) / R (нижня).
-// ENABLE_VU == 0: стара порожня рамка. Без Tiny-підписів L/R — тоді смуги довелося б
-// звужувати, а порядок «верх = L» очевидний і так.
+// [Prompt 34] VU-метр у стилі «Маяк-233»: смуга L зверху, шкала дБ посередині, смуга R знизу.
+// Сегмент i світиться, коли i < lit; пік (peak) — окремий яскравий сегмент peak-1. Сегменти
+// малюються по одному (кожен окремим прямокутником, між ними проміжок кольору тла): групувати
+// у суцільні прямокутники не можна без додаткових ліній проміжків, а 2 × 41 малий fillRect
+// у спрайт PSRAM — копійки порівняно з передачею кадру.
+// ENABLE_VU == 0: стара порожня рамка.
 #if ENABLE_VU
 int vuToSegments(float level) {
     int n = static_cast<int>(level * c::kVuSegments + 0.5f);
@@ -212,26 +234,70 @@ int vuToSegments(float level) {
     return n;
 }
 
-void drawVuBar(int16_t y, int lit) {
+// Один крок утримання піку: нове значення >= піку — пік піднімається й утримується; після
+// kVuPeakHoldMs спадає на сегмент за kVuPeakFallMs, але не нижче поточного рівня.
+void vuPeakUpdate(VuPeak& p, int lit, uint32_t now) {
+    if (lit >= p.seg) {
+        p.seg         = lit;
+        p.holdUntilMs = now + c::kVuPeakHoldMs;
+        p.lastFallMs  = p.holdUntilMs;
+        return;
+    }
+    if (static_cast<int32_t>(now - p.holdUntilMs) < 0) return;   // ще утримується
+    const uint32_t steps = (now - p.lastFallMs) / c::kVuPeakFallMs;
+    if (steps == 0) return;
+    p.lastFallMs += steps * c::kVuPeakFallMs;
+    p.seg = (steps >= static_cast<uint32_t>(p.seg - lit)) ? lit : p.seg - static_cast<int>(steps);
+}
+
+void vuPeakReset(VuPeak& p) {
+    p.seg         = 0;
+    p.holdUntilMs = 0;
+    p.lastFallMs  = 0;
+}
+
+// Мітки шкали: позиція лінійна за дБ у тій самій шкалі, що й мапінг рівня на сегменти.
+// Викликати після DisplayManager::begin() (потрібні метрики шрифту).
+void vuScaleInit() {
+    for (uint8_t i = 0; i < c::kVuScaleMarkCount; ++i) {
+        const int db = c::kVuScaleMarksDb[i];
+        snprintf(s_vuMarks[i].text, sizeof(s_vuMarks[i].text), "%d", db);
+        const float f = (static_cast<float>(db) - vu_cfg::kDbFloor) / (-vu_cfg::kDbFloor);
+        const int32_t cx = c::kVuBarX + static_cast<int32_t>(f * c::kVuUsedW + 0.5f);
+        const int32_t w  = UiFonts::textWidth(s_vuMarks[i].text, FontSize::Tiny);
+        s_vuMarks[i].x   = static_cast<int16_t>(cx - w / 2);
+    }
+}
+
+void drawVuBar(int16_t y, int lit, int peak) {
+    const int peakIdx = peak - 1;   // -1, якщо піку немає
     for (uint8_t i = 0; i < c::kVuSegments; ++i) {
+        const bool over = i >= c::kVuRedSeg;
+        const bool on   = (i < lit) || (static_cast<int>(i) == peakIdx);
         uint16_t color;
-        if (i >= lit)                      color = c::kColorVuOff;
-        else if (i >= c::kVuRedSeg)        color = c::kColorBad;
-        else if (i >= c::kVuYellowSeg)     color = c::kColorAccent;
-        else                               color = c::kColorOk;
-        const int16_t x = static_cast<int16_t>(c::kVuBarX + i * (c::kVuSegW + c::kVuSegGap));
+        if (on) color = over ? c::kColorVuOver : c::kColorVuLit;
+        else    color = over ? c::kColorVuOverOff : c::kColorVuOff;
+        const int16_t x = static_cast<int16_t>(c::kVuBarX + i * c::kVuSegPitch);
         D::fillRect(x, y, c::kVuSegW, c::kVuBarH, color);
     }
 }
 #endif
 
-void drawVu(int litL, int litR) {
+void drawVu(int litL, int litR, int peakL, int peakR) {
 #if ENABLE_VU
-    drawVuBar(c::kVuY, litL);
-    drawVuBar(static_cast<int16_t>(c::kVuY + c::kVuBarH + c::kVuBarGap), litR);
+    drawVuBar(c::kVuLY, litL, peakL);
+    drawVuBar(c::kVuRY, litR, peakR);
+    for (uint8_t i = 0; i < c::kVuScaleMarkCount; ++i) {
+        D::drawText(s_vuMarks[i].text, s_vuMarks[i].x, c::kVuScaleY, FontSize::Tiny, c::kColorVuScale);
+    }
+    const int16_t dy = static_cast<int16_t>((c::kVuBarH - dc::kFontTinyPx) / 2);
+    D::drawText("L", c::kVuLabelX, static_cast<int16_t>(c::kVuLY + dy), FontSize::Tiny, c::kColorVuScale);
+    D::drawText("R", c::kVuLabelX, static_cast<int16_t>(c::kVuRY + dy), FontSize::Tiny, c::kColorVuScale);
 #else
     (void)litL;
     (void)litR;
+    (void)peakL;
+    (void)peakR;
     D::drawRect(c::kVuX, c::kVuY, c::kVuW, c::kVuH, c::kColorDim);
 #endif
 }
@@ -281,10 +347,10 @@ const char* statusText(StreamStatus st, uint16_t& color) {
             return "Stopped";
         case StreamStatus::Connecting:
             color = c::kColorAccent;
-            return "Connecting…";
+            return "Connecting...";
         case StreamStatus::Buffering:
             color = c::kColorAccent;
-            return "Buffering…";
+            return "Buffering...";
         case StreamStatus::Playing:
             color = c::kColorOk;
             return "Playing";
@@ -293,7 +359,7 @@ const char* statusText(StreamStatus st, uint16_t& color) {
             return "Error";
         case StreamStatus::Reconnecting:
             color = c::kColorAccent;
-            return "Reconnecting…";
+            return "Reconnecting...";
         default:
             color = c::kColorDim;
             return "?";
@@ -318,7 +384,7 @@ void drawStandby() {
     drawCentered("Standby", c::kStandbyCaptionY, FontSize::Tiny, c::kColorDim);
 }
 
-void drawRadio(const AppStateData& s, int vuLitL, int vuLitR) {
+void drawRadio(const AppStateData& s, int vuLitL, int vuLitR, int peakL, int peakR) {
     // [Prompt 33] Назву входу прибрано; лишились лише іконки верхньої панелі.
     drawTopIcons(s, true);
 
@@ -329,7 +395,7 @@ void drawRadio(const AppStateData& s, int vuLitL, int vuLitR) {
     (void)radioInfoLine(s, infoColor);
     marqueeDraw(s_track, c::kTrackY, FontSize::Small, infoColor);
 
-    drawVu(vuLitL, vuLitR);   // [Prompt 17]
+    drawVu(vuLitL, vuLitR, peakL, peakR);   // [Prompt 17], [Prompt 34] пік
 }
 
 void drawExternal(const AppStateData& s) {
@@ -487,8 +553,10 @@ bool frame() {
     // [Prompt 17] VU: лише Radio + Playing, інакше рівні 0. read() == false (даних
     // нема) теж дає 0. Перемальовуємо, коли змінилась кількість засвічених сегментів
     // (під час музики це практично кожен кадр; у тиші чи на паузі екран знову статичний).
+    // [Prompt 34] Пік утримується в UI; без даних пік скидається, перемальовуємо при його зміні.
     int litL = 0;
     int litR = 0;
+    bool vuValid = false;
 #if ENABLE_VU
     if (s.mode == Mode::Radio && s.streamStatus == StreamStatus::Playing) {
         float vuL = 0.0f;
@@ -496,13 +564,27 @@ bool frame() {
         if (s_vu.read(vuL, vuR)) {
             litL = vuToSegments(vuL);
             litR = vuToSegments(vuR);
+            vuValid = true;
         }
     }
+    // Базовий рівень: перші kVuMinSegments сегментів світяться завжди (тиша, пауза, обрив).
+    if (litL < c::kVuMinSegments) litL = c::kVuMinSegments;
+    if (litR < c::kVuMinSegments) litR = c::kVuMinSegments;
+    if (vuValid) {
+        vuPeakUpdate(s_peakL, litL, now);
+        vuPeakUpdate(s_peakR, litR, now);
+    } else {
+        vuPeakReset(s_peakL);
+        vuPeakReset(s_peakR);
+    }
 #endif
-    if (litL != s_vuLitL || litR != s_vuLitR) {
+    if (litL != s_vuLitL || litR != s_vuLitR || s_peakL.seg != s_vuPeakDrawnL ||
+        s_peakR.seg != s_vuPeakDrawnR) {
         dirty = true;
         s_vuLitL = litL;
         s_vuLitR = litR;
+        s_vuPeakDrawnL = s_peakL.seg;
+        s_vuPeakDrawnR = s_peakR.seg;
     }
 
     // [Prompt 32] Спливне вікно: нова подія (popupSeq змінився) запускає/продовжує показ;
@@ -551,7 +633,7 @@ bool frame() {
     }
     switch (s.mode) {
         case Mode::Standby:       drawStandby();                 break;
-        case Mode::Radio:         drawRadio(s, litL, litR);      break;
+        case Mode::Radio:         drawRadio(s, litL, litR, s_peakL.seg, s_peakR.seg); break;
         case Mode::ExternalInput: drawExternal(s);               break;
         case Mode::Menu:
             if (s.menuContext == MenuContext::StationList) drawStationList(s);
@@ -576,6 +658,13 @@ bool UiScreens::begin() {
     s_trackStationKnown = false;   // [Prompt 33]
     s_vuLitL = 0;
     s_vuLitR = 0;
+    s_vuPeakDrawnL = 0;   // [Prompt 34]
+    s_vuPeakDrawnR = 0;
+#if ENABLE_VU
+    vuPeakReset(s_peakL);
+    vuPeakReset(s_peakR);
+    vuScaleInit();   // [Prompt 34] після DisplayManager::begin() (метрики шрифтів)
+#endif
     s_popupSeqKnown = false;   // [Prompt 32]
     s_popupActive   = false;
     DisplayManager::setFrameCallback(&frame);

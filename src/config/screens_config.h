@@ -42,24 +42,50 @@ constexpr int16_t kStationY   = 34;                // Large, marquee
 // [Prompt 33] Обʼєднаний рядок: метадані (dim) АБО статус потоку (свій колір); Small, marquee.
 // kStateY (старий окремий рядок статусу, y=122) прибрано; це місце порожнє.
 constexpr int16_t kTrackY     = 62;
-constexpr int16_t kVuX        = kMargin;           // [Prompt 17] область VU-метра
-constexpr int16_t kVuY        = 88;
-constexpr int16_t kVuW        = kContentW;
-constexpr int16_t kVuH        = 30;
-
-// --- [Prompt 17] VU: дві горизонтальні сегментні смуги (верхня L, нижня R) в області
-// kVuX/Y/W/H. Ширина сегмента виводиться з кількості й проміжку; смуги центруються.
-// Пороги кольору — vu_cfg::kYellowFrom/kRedFrom (частка шкали).
-constexpr uint8_t  kVuSegments  = 25;
-constexpr int16_t  kVuSegGap    = 2;
-constexpr int16_t  kVuBarH      = 13;
-constexpr int16_t  kVuBarGap    = kVuH - 2 * kVuBarH;                       // між смугами
-constexpr int16_t  kVuSegW      = (kVuW - kVuSegGap * (kVuSegments - 1)) / kVuSegments;
-constexpr int16_t  kVuUsedW     = kVuSegW * kVuSegments + kVuSegGap * (kVuSegments - 1);
-constexpr int16_t  kVuBarX      = kVuX + (kVuW - kVuUsedW) / 2;
-constexpr uint8_t  kVuYellowSeg = static_cast<uint8_t>(vu_cfg::kYellowFrom * kVuSegments);
-constexpr uint8_t  kVuRedSeg    = static_cast<uint8_t>(vu_cfg::kRedFrom * kVuSegments);
-constexpr uint16_t kColorVuOff  = display_cfg::rgb565(35, 35, 35);          // непідсвічений сегмент
+// --- [Prompt 34] VU у стилі індикатора «Маяк-233» (ВЛЛ): дві сегментні смуги L (верх) / R (низ),
+// між ними нерухома шкала в дБ. Мапінг рівня на сегменти лінійний за дБ (vu_cfg::kDbFloor..0).
+// Смуги від лівого поля, підписи L/R праворуч від них; усе виводиться з констант нижче.
+constexpr int16_t  kVuX          = kMargin;          // зона блоку (лише для ENABLE_VU == 0: рамка)
+constexpr int16_t  kVuY          = 94;               // верх верхньої смуги (L)
+constexpr int16_t  kVuW          = kContentW;
+constexpr uint8_t  kVuSegments   = 41;               // сегментів на смугу
+constexpr int16_t  kVuSegW       = 5;
+constexpr int16_t  kVuSegGap     = 2;
+constexpr int16_t  kVuSegPitch   = kVuSegW + kVuSegGap;
+constexpr int16_t  kVuUsedW      = kVuSegments * kVuSegPitch - kVuSegGap;   // ширина смуги
+constexpr int16_t  kVuBarX       = kMargin;          // лівий край смуг
+constexpr int16_t  kVuLabelGap   = 6;                // між смугою і підписом L / R
+constexpr int16_t  kVuLabelX     = kVuBarX + kVuUsedW + kVuLabelGap;   // підписи L / R (Tiny) праворуч
+constexpr int16_t  kVuBarH       = 18;
+constexpr int16_t  kVuRowGap     = 3;                // між смугою і рядком шкали
+constexpr int16_t  kVuLY         = kVuY;
+constexpr int16_t  kVuScaleY     = kVuLY + kVuBarH + kVuRowGap;                         // Tiny, підписи дБ
+constexpr int16_t  kVuRY         = kVuScaleY + display_cfg::kFontTinyPx + kVuRowGap;
+constexpr int16_t  kVuH          = kVuRY + kVuBarH - kVuY;                              // висота всього блоку
+// Зона перевантаження: сегменти з номера kVuRedSeg (0-based) до кінця; поріг = vu_cfg::kRedFrom.
+constexpr uint8_t  kVuRedSeg     = static_cast<uint8_t>(vu_cfg::kRedFrom * kVuSegments + 0.5f);
+// Базовий рівень: у повній тиші (і без даних) на екрані Radio завжди світяться перші сегменти, як на ВЛЛ.
+constexpr uint8_t  kVuMinSegments = 2;
+// Утримання піку: один сегмент лишається яскравим kVuPeakHoldMs, далі спадає на сегмент за kVuPeakFallMs.
+constexpr uint32_t kVuPeakHoldMs = 100;
+constexpr uint32_t kVuPeakFallMs = 60;
+// Мітки шкали, дБFS: мусять лежати в (vu_cfg::kDbFloor, 0] і зростати. Позиція = (дБ - kDbFloor) / (-kDbFloor).
+constexpr int8_t   kVuScaleMarksDb[] = {-20, -14, -9, -5, -2, 0};
+constexpr uint8_t  kVuScaleMarkCount = sizeof(kVuScaleMarksDb) / sizeof(kVuScaleMarksDb[0]);
+constexpr bool vuMarksValid() {
+    for (uint8_t i = 0; i < kVuScaleMarkCount; ++i) {
+        if (kVuScaleMarksDb[i] <= vu_cfg::kDbFloor || kVuScaleMarksDb[i] > 0) return false;
+        if (i > 0 && kVuScaleMarksDb[i] <= kVuScaleMarksDb[i - 1]) return false;
+    }
+    return true;
+}
+// Кольори: бірюзовий люмінофор ВЛЛ (за фото), перевантаження — червоний; непідсвічені — приглушені
+// відтінки тих самих кольорів.
+constexpr uint16_t kColorVuLit      = display_cfg::rgb565(0, 235, 215);
+constexpr uint16_t kColorVuOver     = display_cfg::rgb565(255, 50, 40);
+constexpr uint16_t kColorVuOff      = display_cfg::rgb565(10, 44, 46);
+constexpr uint16_t kColorVuOverOff  = display_cfg::rgb565(52, 14, 12);
+constexpr uint16_t kColorVuScale    = kColorVuLit;   // усі підписи VU того ж бірюзового, що й підсвічені сегменти
 
 // --- ExternalInput ---
 constexpr int16_t kExtCaptionY = 40;               // Tiny "INPUT"
@@ -137,7 +163,7 @@ constexpr int16_t  kMarqueeStepPx      = 2;        // 50 px/с
 constexpr uint32_t kMarqueeEdgePauseMs = 1500;     // пауза на початку й у кінці
 
 static_assert(kStatusY + display_cfg::kFontSmallPx <= kH, "status row out of screen");
-static_assert(kVuY + kVuH < kStatusLineY, "VU frame overlaps status line");
+static_assert(kVuY + kVuH <= kH - 4, "VU block leaves the screen");
 static_assert(kTrackY + display_cfg::kFontSmallPx < kVuY, "info line overlaps VU frame");
 static_assert(kStationY + display_cfg::kFontLargePx < kTrackY, "station overlaps info line");
 static_assert(kListFirstY + kListRows * kListRowH <= kH, "station list out of screen");
@@ -164,9 +190,11 @@ static_assert(kPopupH * 4 <= kH * 3, "popup is taller than 3/4 of the screen");
 static_assert(kPopupDigitsY + kPopupDigitsTopInset + kPopupDigitsInkH <= kPopupY + kPopupH - kPopupBorder,
               "popup digits do not fit inside the frame");
 static_assert(kPopupTimeoutMs > 0, "kPopupTimeoutMs must be > 0");
-static_assert(kVuBarGap >= 0 && kVuSegW >= 2 && kVuUsedW <= kVuW,
-              "VU bars do not fit into the VU area");
-static_assert(kVuYellowSeg < kVuRedSeg && kVuRedSeg < kVuSegments,
-              "VU color segment thresholds out of order");
+static_assert(kVuSegW >= 2 && kVuSegGap >= 1 && kVuLabelX + 12 <= kW - 4,
+              "VU bars do not fit into the screen width");
+static_assert(kVuMinSegments < kVuRedSeg, "VU base level must stay below the overload zone");
+static_assert(kVuRedSeg > 0 && kVuRedSeg < kVuSegments, "VU overload segment out of range");
+static_assert(kVuPeakHoldMs > 0 && kVuPeakFallMs > 0, "VU peak timings must be positive");
+static_assert(kVuScaleMarkCount > 0 && vuMarksValid(), "VU scale marks must lie in (kDbFloor, 0] ascending");
 
 }  // namespace screens_cfg
