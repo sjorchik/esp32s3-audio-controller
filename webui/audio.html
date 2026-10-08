@@ -71,6 +71,19 @@
           <button id="btn-reset" class="btn" type="button"><span data-icon="reset"></span>Скинути тембр</button>
         </div>
       </fieldset>
+      <fieldset id="grp-eq" class="group card" hidden disabled>
+        <legend class="visually-hidden">Еквалайзер</legend>
+        <div class="card-head">
+          <h2 class="card-title">Еквалайзер радіо</h2>
+          <span class="hint">5 смуг</span>
+        </div>
+        <div id="eq-bands"></div>
+        <p id="eq-err" class="field-error" role="alert" hidden></p>
+        <p class="hint">Один набір для всіх станцій і входів. Діє лише на інтернет-радіо, тому секція видима лише на вході «WiFi Radio». «Скинути тембр» еквалайзер не чіпає.</p>
+        <div class="toolbar param-actions">
+          <button id="btn-eq-reset" class="btn" type="button"><span data-icon="reset"></span>Скинути еквалайзер</button>
+        </div>
+      </fieldset>
     </div>
   </div>
 </main>

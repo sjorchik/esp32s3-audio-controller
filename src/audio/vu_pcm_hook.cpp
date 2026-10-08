@@ -13,6 +13,8 @@
 //     каналу, 16-бітні дані вирівняні вліво (повна шкала 2^31);
 //   - validSamples — кількість СЛІВ int32 (обох каналів разом): кадрів = /2;
 //   - *continueI2S = true ОБОВʼЯЗКОВО: false = бібліотека пропускає запис блоку -> тиша.
+// [Prompt 30] Перед рівнем станції блок проходить 5-смуговий еквалайзер (eq::process, на місці);
+// порядок: EQ -> output_trim -> VU.
 // [Prompt 25] Буфер тепер і ЗМІНЮЄТЬСЯ: output_trim::process() послаблює блок на місці
 // (рівень поточної станції), а VU міряє вже послаблений сигнал (реальний вихід). Без логування,
 // блокувань і millis(); мінімум обчислень.
@@ -23,6 +25,7 @@
 
 #include <stdint.h>
 
+#include "audio/eq.h"
 #include "audio/output_trim.h"
 #include "audio/vu_source.h"
 #include "config/features.h"
@@ -37,6 +40,8 @@ void audio_process_i2s(int32_t* outBuff, int16_t validSamples, bool* continueI2S
         return;
     }
     int32_t frames = static_cast<int32_t>(validSamples) / 2;
+    // [Prompt 30] Еквалайзер радіо (усі смуги 0 дБ — блок не чіпається).
+    eq::process(outBuff, frames);
     // [Prompt 25] Рівень станції: послаблюємо ВЕСЬ блок (validSamples — довжина буфера).
     output_trim::process(outBuff, frames);
 #if ENABLE_VU
@@ -61,5 +66,5 @@ void audio_process_i2s(int32_t* outBuff, int16_t validSamples, bool* continueI2S
 #endif  // ENABLE_VU
 }
 #else
-#warning "VU_PCM_HOOK_STYLE != 1: audio_process_i2s hook is absent, per-station output level (Prompt 25) will NOT be applied"
+#warning "VU_PCM_HOOK_STYLE != 1: audio_process_i2s hook is absent, per-station output level (Prompt 25) and radio EQ (Prompt 30) will NOT be applied"
 #endif

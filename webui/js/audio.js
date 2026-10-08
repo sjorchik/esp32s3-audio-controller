@@ -8,6 +8,7 @@
     chip: g('chip'), vol: g('vol'), volOut: g('vol-out'), volDn: g('vol-dn'), volUp: g('vol-up'), mute: g('btn-mute'),
     gainName: g('gain-input'), gainSeg: g('gain-seg'), gainDb: g('gain-db'), inputs: g('inputs'),
     params: g('params'), loudBox: g('loud-box'), loud: g('loud'), loudNo: g('loud-no'), reset: g('btn-reset'),
+    grpEq: g('grp-eq'), eqBands: g('eq-bands'), eqErr: g('eq-err'), eqReset: g('btn-eq-reset'),
   };
   const CHIP = { Tda7318: 'TDA7318', Pt2313l: 'PT2313L' };
 
@@ -15,6 +16,8 @@
   let gainSig = '';
   let inputsSig = '';
   let optUntil = 0;       // до цього часу опитування не перезаписує оптимістичні gain / input
+  // Еквалайзер (P30b): глобальний пресет, видимий лише на радіо-вході
+  const eq = { vals: null, ready: false, busy: false, nextTry: 0, input: null };
 
   const caps = () => (st && st.processor && st.processor.ready ? st.processor.capabilities : null);
   const isStandby = () => !!st && (st.standby === true || st.mode === 'Standby');
@@ -139,6 +142,94 @@
     poller.now();
   });
 
+  /* ---------- Еквалайзер радіо (Prompt 30b; web_api.md §11) ---------- */
+  const fmtDb = (v) => fmtSigned(v) + ' дБ';
+  const fmtFreq = (f) => (f >= 1000 ? String(f / 1000).replace('.', ',') + ' кГц' : f + ' Гц');
+  const eqCount = CONFIG.eqBandFreqHz.length;
+
+  const eqBands = CONFIG.eqBandFreqHz.map((f, i) => {
+    const input = el('input', { class: 'slider slider-c', type: 'range', min: CONFIG.eqMinDb, max: CONFIG.eqMaxDb,
+      step: CONFIG.eqStepDb, value: 0, 'aria-label': fmtFreq(f) });
+    const title = el('span', null, fmtFreq(f));
+    const val = el('output', { class: 'param-val num' }, fmtDb(0));
+    const b = { i, input, title, val };
+    b.ctl = createSlider(input, {
+      send: async (v) => { applyEq(await api.post('/api/eq', { band: i, gainDb: v })); },
+      onInput: (v) => setText(val, fmtDb(v)),
+      onFail: () => renderEq(),
+    });
+    const set = (v) => {
+      v = clamp(v, Number(input.min), Number(input.max));
+      input.value = v; setText(val, fmtDb(v));
+      b.ctl.send(v);
+    };
+    b.row = el('div', { class: 'param' },
+      el('div', { class: 'param-head' }, title, val),
+      el('div', { class: 'param-row' },
+        iconBtn('minus', 'Еквалайзер ' + fmtFreq(f) + ': менше', () => set(Number(input.value) - CONFIG.eqStepDb)),
+        input,
+        iconBtn('plus', 'Еквалайзер ' + fmtFreq(f) + ': більше', () => set(Number(input.value) + CONFIG.eqStepDb)),
+        el('button', { class: 'btn btn-zero', type: 'button', onclick: () => set(0) }, '0')));
+    ui.eqBands.append(b.row);
+    return b;
+  });
+
+  const isNum = (n) => typeof n === 'number' && isFinite(n);
+  // Приймає відповідь GET / POST /api/eq: значення, а також межі й частоти (контракт: брати з відповіді).
+  function applyEq(d) {
+    if (!d || !Array.isArray(d.gainsDb) || d.gainsDb.length !== eqCount) return;
+    eq.vals = d.gainsDb.slice();
+    eqBands.forEach((b) => {
+      if (isNum(d.minDb) && isNum(d.maxDb)) { setAttr(b.input, 'min', d.minDb); setAttr(b.input, 'max', d.maxDb); }
+      if (isNum(d.stepDb) && d.stepDb > 0) setAttr(b.input, 'step', d.stepDb);
+      const f = Array.isArray(d.freqHz) ? d.freqHz[b.i] : null;
+      if (isNum(f)) { setText(b.title, fmtFreq(f)); setAttr(b.input, 'aria-label', fmtFreq(f)); }
+    });
+    renderEq();
+  }
+
+  function setEqErr(text) {
+    setText(ui.eqErr, text || '');
+    ui.eqErr.hidden = !text;
+  }
+
+  function renderEq() {
+    ui.grpEq.disabled = lockKind() !== null || !eq.ready;
+    eqBands.forEach((b) => {
+      if (b.ctl.held()) return;
+      const v = eq.vals ? eq.vals[b.i] : 0;
+      b.input.value = v;
+      setText(b.val, fmtDb(v));
+    });
+  }
+
+  async function eqLoad() {
+    const at = eq.input;
+    eq.busy = true;
+    try {
+      applyEq(await api.get('/api/eq'));
+      eq.ready = !!eq.vals && at === eq.input;   // вхід змінився під час запиту: перечитаємо
+      setEqErr(null);
+    } catch (e) {
+      eq.nextTry = Date.now() + CONFIG.eqRetryMs;
+      setEqErr(errorText(e));
+    }
+    eq.busy = false;
+    renderEq();
+  }
+
+  ui.eqReset.addEventListener('click', async () => {
+    try {
+      const r = await api.post('/api/eq', { gainsDb: new Array(eqCount).fill(0) });
+      eqBands.forEach((b) => b.ctl.release());
+      applyEq(r);
+      toast('Еквалайзер скинуто', 'ok');
+    } catch (e) {
+      toast(errorText(e), 'error');
+    }
+    renderEq();
+  });
+
   /* ---------- Підсилення та вхід ---------- */
   ui.gainSeg.addEventListener('click', async (ev) => {
     const b = ev.target.closest('button[data-n]');
@@ -239,6 +330,13 @@
     ui.loudNo.hidden = !!c.loudness;
     ui.loud.checked = !!st.loudness;
     ui.reset.hidden = !(c.bass || c.treble || c.balance || c.loudness);
+
+    // Еквалайзер: секція лише на радіо-вході; пресет глобальний, тож перечитуємо при зміні входу
+    const radio = st.input === CONFIG.eqRadioInput;
+    if (st.input !== eq.input) { eq.input = st.input; eq.ready = false; }
+    ui.grpEq.hidden = !radio;
+    renderEq();
+    if (radio && !eq.ready && !eq.busy && lock === null && Date.now() >= eq.nextTry) eqLoad();
   }
 
   /* ---------- Опитування ---------- */

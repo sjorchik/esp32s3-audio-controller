@@ -39,12 +39,18 @@ constexpr const char* kNvsBlobKey   = "settings";
 // kLegacyFormatVersion -> kFormatVersion (див. SettingsStore::load()).
 // [Prompt 21b] 1 -> 2: глобальні bass/treble/balance/loudness/lastVolume замінено
 // профілями по входах (Settings::profiles).
-constexpr uint8_t kFormatVersion = 2;
+// [Prompt 30] 2 -> 3: у кінець Settings додано eqGainsDb (пресет еквалайзера радіо).
+constexpr uint8_t kFormatVersion = 3;
 
 // [Prompt 21b] Формат, який ще вміємо читати й мігрувати (усі профілі входів
 // успадковують колишні глобальні значення). Інші версії -> значення за замовчуванням.
 constexpr uint8_t kLegacyFormatVersion = 1;
-static_assert(kLegacyFormatVersion < kFormatVersion, "legacy version must be older");
+
+// [Prompt 30] Попередній формат v2 (профілі входів, без еквалайзера): читається й мігрується
+// (усе зберігається, еквалайзер = плоский 0 дБ).
+constexpr uint8_t kPrevFormatVersion = 2;
+static_assert(kLegacyFormatVersion < kPrevFormatVersion && kPrevFormatVersion < kFormatVersion,
+              "format versions must be strictly increasing");
 
 // [Prompt 21b] Підсилення входу за замовчуванням (сирі апаратні кроки) для нових і
 // мігрованих профілів. Раніше gain у NVS не зберігався й після старту дорівнював

@@ -1,5 +1,8 @@
 // net/web_api_player.cpp (Prompt 18): POST /api/power, /api/mute, /api/volume, /api/gain,
 // /api/input, /api/player/*, /api/player/station.
+// [Prompt 30] + GET/POST /api/eq (5-смуговий еквалайзер радіо). На відміну від решти, /api/eq НЕ
+// йде через AppController::runWebCommand(): це чисто програмний фільтр у хуку PCM (audio/eq.*),
+// без заліза й без стану контролера; обробник кладе значення в eq::* і в Settings (NVS, дебаунс).
 //
 // Усе, що міняє стан пристрою, виконує AppController::runWebCommand() під його мʼютексом
 // (те саме, що кнопки/пульт: ramp, мʼют на переходах, збереження в Settings). Тут лише:
@@ -16,8 +19,11 @@
 #include <string.h>
 
 #include "audio/audio_processor.h"
+#include "audio/eq.h"
+#include "config/eq_config.h"
 #include "core/app_controller.h"
 #include "core/app_state.h"
+#include "core/settings.h"
 #include "net/web_api_common.h"
 #include "stations/station_store.h"
 
@@ -317,6 +323,140 @@ void handlePlayerStation(AsyncWebServerRequest* req) {
     runCommand(req, {WebCmdType::StationPlay, idx, switchInput});
 }
 
+// ---------------------------------------------------------------------------
+// [Prompt 30] GET /api/eq, POST /api/eq — 5-смуговий еквалайзер радіо
+//   GET : {"gainsDb":[0,0,0,0,0],"freqHz":[60,250,1000,4000,12000],"minDb":-12,"maxDb":12,"stepDb":1}
+//   POST: {"gainsDb":[a,b,c,d,e]}  (рівно 5 елементів; null = смугу не чіпати)
+//         або {"band":N,"gainDb":X}  (одна смуга, N = 0..4)
+//         -> 200 {"ok":true, ...те саме, що GET}
+// Пресет глобальний (не по входах і не по станціях) і діє лише на потік радіо.
+// ---------------------------------------------------------------------------
+void fillEqState(JsonDocument& doc) {
+    int8_t g[eq_cfg::kBandCount];
+    eq::getAllDb(g);
+    JsonArray gains = doc["gainsDb"].to<JsonArray>();
+    JsonArray freqs = doc["freqHz"].to<JsonArray>();
+    for (uint8_t i = 0; i < eq_cfg::kBandCount; ++i) {
+        gains.add(static_cast<int>(g[i]));
+        freqs.add(static_cast<unsigned>(eq_cfg::kBandFreqHz[i]));
+    }
+    doc["minDb"] = eq_cfg::kGainMinDb;
+    doc["maxDb"] = eq_cfg::kGainMaxDb;
+    doc["stepDb"] = eq_cfg::kGainStepDb;
+}
+
+// Зберігає пресет у Settings (запис у NVS — з дебаунсом, лише коли значення справді змінились).
+void storeEqPreset(Settings& s, void* ctx) {
+    memcpy(s.eqGainsDb, ctx, sizeof(s.eqGainsDb));
+}
+
+void handleEqGet(AsyncWebServerRequest* req) {
+    if (!exactUrl(req, "/api/eq")) return;
+    WEB_API_LOG("%s %s", req->methodToString(), req->url().c_str());
+    JsonDocument doc;
+    fillEqState(doc);
+    sendJson(req, 200, doc);
+}
+
+void handleEqPost(AsyncWebServerRequest* req) {
+    if (!exactUrl(req, "/api/eq")) return;
+    WEB_API_LOG("%s %s", req->methodToString(), req->url().c_str());
+
+    if (AppState::snapshot().mode == Mode::OtaUpdate) {
+        sendError(req, 409, "ota_in_progress");
+        return;
+    }
+    JsonDocument in;
+    if (!readJsonObjectBody(req, in)) return;
+    JsonObjectConst root = in.as<JsonObjectConst>();
+    for (JsonPairConst kv : root) {
+        const char* k = kv.key().c_str();
+        if (strcmp(k, "gainsDb") != 0 && strcmp(k, "band") != 0 && strcmp(k, "gainDb") != 0) {
+            sendFieldError(req, 400, "unknown_field", "unknown");
+            return;
+        }
+    }
+
+    int8_t cur[eq_cfg::kBandCount];
+    int8_t next[eq_cfg::kBandCount];
+    eq::getAllDb(cur);
+    memcpy(next, cur, sizeof(next));
+
+    JsonVariantConst vArr = root["gainsDb"];
+    JsonVariantConst vBand = root["band"];
+    JsonVariantConst vGain = root["gainDb"];
+
+    if (!vArr.isNull()) {
+        if (!vBand.isNull() || !vGain.isNull()) {
+            sendFieldError(req, 400, "conflicting_fields", "gainsDb");
+            return;
+        }
+        if (!vArr.is<JsonArrayConst>()) {
+            sendFieldError(req, 400, "invalid_value", "gainsDb");
+            return;
+        }
+        JsonArrayConst a = vArr.as<JsonArrayConst>();
+        if (a.size() != eq_cfg::kBandCount) {
+            sendFieldError(req, 400, "invalid_value", "gainsDb");
+            return;
+        }
+        for (uint8_t i = 0; i < eq_cfg::kBandCount; ++i) {
+            JsonVariantConst v = a[i];
+            if (v.isNull()) continue;  // null = лишити без змін
+            if (!v.is<int>()) {
+                sendFieldError(req, 400, "invalid_value", "gainsDb");
+                return;
+            }
+            const int x = v.as<int>();
+            if (x < eq_cfg::kGainMinDb || x > eq_cfg::kGainMaxDb) {
+                sendRangeError(req, "gainsDb", eq_cfg::kGainMinDb, eq_cfg::kGainMaxDb);
+                return;
+            }
+            next[i] = static_cast<int8_t>(x);
+        }
+    } else if (!vBand.isNull() || !vGain.isNull()) {
+        if (vBand.isNull()) {
+            sendFieldError(req, 400, "missing_field", "band");
+            return;
+        }
+        if (vGain.isNull()) {
+            sendFieldError(req, 400, "missing_field", "gainDb");
+            return;
+        }
+        if (!vBand.is<int>()) {
+            sendFieldError(req, 400, "invalid_value", "band");
+            return;
+        }
+        if (!vGain.is<int>()) {
+            sendFieldError(req, 400, "invalid_value", "gainDb");
+            return;
+        }
+        const int b = vBand.as<int>();
+        if (b < 0 || b >= eq_cfg::kBandCount) {
+            sendRangeError(req, "band", 0, eq_cfg::kBandCount - 1);
+            return;
+        }
+        const int x = vGain.as<int>();
+        if (x < eq_cfg::kGainMinDb || x > eq_cfg::kGainMaxDb) {
+            sendRangeError(req, "gainDb", eq_cfg::kGainMinDb, eq_cfg::kGainMaxDb);
+            return;
+        }
+        next[b] = static_cast<int8_t>(x);
+    } else {
+        sendFieldError(req, 400, "missing_field", "gainsDb");
+        return;
+    }
+
+    if (memcmp(cur, next, sizeof(next)) != 0) {
+        eq::setAllDb(next);                          // звук змінюється одразу
+        SettingsStore::modify(storeEqPreset, next);  // NVS — з дебаунсом
+    }
+    JsonDocument doc;
+    doc["ok"] = true;
+    fillEqState(doc);
+    sendJson(req, 200, doc);
+}
+
 }  // namespace
 
 void registerPlayerRoutes(AsyncWebServer& server, AudioProcessor* proc) {
@@ -332,4 +472,8 @@ void registerPlayerRoutes(AsyncWebServer& server, AudioProcessor* proc) {
     server.on("/api/volume", HTTP_POST, handleVolume, nullptr, web_api::jsonBodyCallback);
     server.on("/api/gain", HTTP_POST, handleGain, nullptr, web_api::jsonBodyCallback);
     server.on("/api/input", HTTP_POST, handleInput, nullptr, web_api::jsonBodyCallback);
+
+    // [Prompt 30] Еквалайзер радіо.
+    server.on("/api/eq", HTTP_GET, handleEqGet);
+    server.on("/api/eq", HTTP_POST, handleEqPost, nullptr, web_api::jsonBodyCallback);
 }

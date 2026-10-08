@@ -69,6 +69,11 @@ const CONFIG = {
   wifiSwitchTimeoutMs: 60000,// очікування пристрою після connect
   wifiSsidMaxBytes: 32,      // ssid: 1..32 байти UTF-8
   wifiPassMin: 8, wifiPassMax: 63, // пароль: порожній або 8..63 символи
+  // --- Еквалайзер радіо (Prompt 30b; web_api.md §11). Реальні межі й частоти повертає GET /api/eq ---
+  eqMinDb: -12, eqMaxDb: 12, eqStepDb: 1,          // запасні значення до першої відповіді
+  eqBandFreqHz: [60, 250, 1000, 4000, 12000],      // запасні підписи смуг (eq_cfg::kBandFreqHz)
+  eqRadioInput: 0,           // секція видима лише на цьому вході (0 = WiFi Radio)
+  eqRetryMs: 5000,           // пауза перед повтором невдалого GET /api/eq
 };
 
 /* ---------- Помилки API ---------- */

@@ -4,7 +4,8 @@
 // ESP32-audioI2S (їх треба звірити з Audio.h вашої версії при першій збірці):
 //   Audio(), setPinout(), setBufsize() [лише при AUDIO_PLAYER_HAS_SETBUFSIZE],
 //   setConnectionTimeout(), setVolume(), connecttohost(), stopSong(), loop(),
-//   isRunning(), inBufferFilled(), inBufferFree(), а також callback-и (стиль обирає AUDIO_PLAYER_CB_STYLE):
+//   isRunning(), inBufferFilled(), inBufferFree(), getSampleRate() [P30, лише при
+//   EQ_SAMPLE_RATE_FROM_LIB], а також callback-и (стиль обирає AUDIO_PLAYER_CB_STYLE):
 //   стиль 1: audio_info, audio_showstation, audio_showstreamtitle, audio_bitrate,
 //            audio_eof_stream, audio_id3data;
 //   стиль 2: Audio::audio_info_callback, Audio::msg_t, Audio::evt_info,
@@ -19,8 +20,10 @@
 #include <string.h>
 
 #include "audio/audio_processor.h"
+#include "audio/eq.h"
 #include "audio/output_trim.h"
 #include "config/audio_player_config.h"
+#include "config/eq_config.h"
 #include "config/pins.h"
 
 #if AUDIO_PLAYER_DEBUG
@@ -882,6 +885,12 @@ void AudioPlayer::taskLoop() {
 #if AUDIO_PLAYER_CALL_LOOP
         // Бібліотека сама блокує там, де потрібно (внутрішній буфер).
         s_audio->loop();
+#endif
+#if EQ_SAMPLE_RATE_FROM_LIB
+        // [Prompt 30] Частота дискретизації потоку для еквалайзера (хук audio_process_i2s її не
+        // отримує). Викликається з тієї ж задачі, що й loop(), тож гонки з бібліотекою немає.
+        // eq::setSampleRate() ігнорує значення поза межами (0 до розбору заголовка).
+        eq::setSampleRate(s_audio->getSampleRate());
 #endif
         updateState(millis());
         vTaskDelay(msToTicksAtLeastOne(player_cfg::kLoopDelayMs));

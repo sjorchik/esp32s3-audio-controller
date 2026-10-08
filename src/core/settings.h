@@ -10,11 +10,14 @@
 // Settings::profiles[defaults::kInputCount]. ВИДАЛЕНО глобальні поля bass, treble,
 // balance, loudness, lastVolume (їх роль виконує профіль входу). Формат blob-а v2;
 // blob v1 мігрується в load() (див. settings.cpp). lastInput/lastStation/lastMute лишились.
+// [Prompt 30] У КІНЕЦЬ структури додано eqGainsDb[5] (глобальний пресет еквалайзера радіо).
+// Формат blob-а v3; blob v2 (без еквалайзера) і v1 мігруються в load().
 
 #include <Arduino.h>
 #include <stdint.h>
 
 #include "config/defaults.h"
+#include "config/eq_config.h"
 
 // [Prompt 21b] Профіль звуку одного логічного входу (шкали як в AudioProcessorCapabilities:
 // volume 0..100, тембр/баланс у кроках UI, gain — сирі апаратні кроки). Діапазони тут НЕ
@@ -54,6 +57,12 @@ struct Settings {
     // [Prompt 21b] Профілі звуку по входах (індекс = логічний вхід 0..kInputCount-1).
     // Профіль lastInput — те, що діє зараз (AppController пише його разом з lastInput).
     InputProfile profiles[defaults::kInputCount];
+
+    // [Prompt 30] Глобальний пресет 5-смугового еквалайзера радіо, дБ
+    // (eq_cfg::kGainMinDb..kGainMaxDb, 0 = плоска АЧХ). НЕ по входах і НЕ по станціях.
+    // Поле стоїть ПІСЛЯ profiles: зсуву наявних полів немає. Застосовується до eq::* у
+    // SettingsStore::load()/resetToDefaults(); змінює веб-обробник /api/eq.
+    int8_t eqGainsDb[eq_cfg::kBandCount];
 };
 
 // Потокобезпечність: усі методи беруть внутрішній мʼютекс, КРІМ get() —
@@ -80,8 +89,9 @@ public:
     // Читає blob з NVS. Немає запису / інша версія / інший розмір → значення за
     // замовчуванням + негайний save(). [Prompt 21b] Виняток: blob формату v1 мігрується
     // (усі профілі входів = колишні глобальні гучність/тембр/баланс/loudness, gain =
-    // settings_cfg::kDefaultInputGain) і одразу записується як v2. true — кеш містить дані з NVS або
-    // збережені дефолти; false — запис у NVS не вдався (кеш = дефолти/попередній).
+    // settings_cfg::kDefaultInputGain) і одразу записується як v3. [Prompt 30] Blob v2 мігрується
+    // так само (еквалайзер = 0 дБ). Після load() пресет еквалайзера одразу йде в eq::setAllDb().
+    // true — кеш містить дані з NVS або збережені дефолти; false — запис у NVS не вдався (кеш = дефолти/попередній).
     static bool load();
 
     // Негайно записати всю структуру. false — NVS не відповіла.
