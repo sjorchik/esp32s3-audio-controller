@@ -32,6 +32,7 @@
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 
+#include "audio/adc_vu.h"             // [Prompt 37] ДОДАНО
 #include "audio/amp_standby.h"        // [Prompt 23c] ДОДАНО
 #include "audio/audio_player.h"       // [Prompt 5] ДОДАНО
 #include "audio/audio_player_test.h"  // [Prompt 5] ДОДАНО
@@ -304,6 +305,18 @@ static void initAppController() {
     }
 }
 
+// [Prompt 37] ДОДАНО: VU зовнішніх входів через PCM1808. Після AppController (задача читає AppState)
+// і після AudioPlayer::begin() (там I2S0 отримує піни й MCLK). Помилка не зупиняє старт.
+static void initAdcVu() {
+#if ADC_VU_ENABLE
+    if (AdcVu::begin()) {
+        Serial.println("[MAIN] ADC VU ready");
+    } else {
+        Serial.println("[MAIN] ADC VU init failed (external input VU disabled)");
+    }
+#endif
+}
+
 // [Prompt 13] ДОДАНО: веб-сервер. Вказівник на процесор — як для плеєра та AppController.
 // begin() лише створює задачу-стартер; HTTP піднімається, коли WifiManager дасть STA.
 static void initWebServer() {
@@ -412,6 +425,9 @@ void setup() {
 
     // [Prompt 8] ДОДАНО: AppController після процесора, плеєра й Settings.
     initAppController();
+
+    // [Prompt 37] ДОДАНО
+    initAdcVu();
 
     // [Prompt 13] ДОДАНО: веб-сервер після AppController (AppState::begin() уже виконано).
     initWebServer();

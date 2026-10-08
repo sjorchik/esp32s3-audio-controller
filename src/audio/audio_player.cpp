@@ -22,6 +22,7 @@
 #include "audio/audio_processor.h"
 #include "audio/eq.h"
 #include "audio/output_trim.h"
+#include "config/adc_vu_config.h"  // [Prompt 37] ADC_VU_ENABLE
 #include "config/audio_player_config.h"
 #include "config/eq_config.h"
 #include "config/pins.h"
@@ -798,13 +799,19 @@ bool AudioPlayer::begin(AudioProcessor* processorOrNull) {
     s_pendingUrl[0] = '\0';
     s_url[0] = '\0';
 
-    // I2S ініціалізує бібліотека (конструктор + setPinout). MCLK/DIN не чіпаємо.
+    // I2S ініціалізує бібліотека (конструктор + setPinout). DIN не чіпаємо.
+    // [Prompt 37] MCLK (GPIO16, 256·fs) виводиться ЛИШЕ для АЦП PCM1808 (SCKI); PCM5102 його не
+    // використовує (SCK на GND), тож на звук він не впливає. Без АЦП (ADC_VU_ENABLE 0) — як раніше.
     s_audio = new (std::nothrow) Audio();
     if (s_audio == nullptr) {
         Serial.println("[PLAYER] Audio object alloc failed");
         return false;
     }
+#if ADC_VU_ENABLE
+    s_audio->setPinout(pins::kI2sBclk, pins::kI2sWs, pins::kI2sDout, pins::kI2sMclk);
+#else
     s_audio->setPinout(pins::kI2sBclk, pins::kI2sWs, pins::kI2sDout);
+#endif
 #if AUDIO_PLAYER_HAS_SETBUFSIZE
     s_audio->setBufsize(player_cfg::kStreamBufRamBytes, player_cfg::kStreamBufPsramBytes);
 #endif

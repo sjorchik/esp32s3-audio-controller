@@ -8,6 +8,7 @@
 #include "config/defaults.h"
 #include "config/display_config.h"
 #include "config/screens_config.h"
+#include "audio/adc_vu.h"         // [Prompt 37] ДОДАНО: VuSourceAdc (зовнішні входи)
 #include "audio/vu_source.h"      // [Prompt 17] ДОДАНО: рівні VU (читаються напряму)
 #include "config/features.h"
 #include "core/action_names.h"  // [Prompt 15] ДОДАНО: імена дій (чисті дані)
@@ -81,6 +82,7 @@ uint16_t s_trackStation      = 0;
 // минулого кадру (перемальовуємо, лише коли вона змінилась).
 // [Prompt 34] + утримання піку по каналах (лише UI) і попередньо обчислені мітки шкали.
 VuSourceDecodedPcm s_vu;
+VuSourceAdc s_vuAdc;   // [Prompt 37] VU входів 1..3 з PCM1808
 int s_vuLitL = 0;
 int s_vuLitR = 0;
 int s_vuPeakDrawnL = 0;   // [Prompt 34] пік, намальований минулого кадру
@@ -467,12 +469,14 @@ void drawRadio(const AppStateData& s, int vuLitL, int vuLitR, int peakL, int pea
     drawVu(vuLitL, vuLitR, peakL, peakR);   // [Prompt 17], [Prompt 34] пік
 }
 
-void drawExternal(const AppStateData& s) {
+void drawExternal(const AppStateData& s, int vuLitL, int vuLitR, int peakL, int peakR) {
     drawTopIcons(s, false);
     drawCentered("INPUT", c::kExtCaptionY, FontSize::Tiny, c::kColorDim);
     char name[kInputFitCap];  // [Prompt 23b]
     fitText(inputName(s), name, sizeof(name), FontSize::Large, c::kContentW);
     drawCentered(name, c::kExtNameY, FontSize::Large, dc::kColorFg);
+    // [Prompt 37] Той самий блок VU, що й у Radio (y = kVuY..): назва входу закінчується вище.
+    drawVu(vuLitL, vuLitR, peakL, peakR);
 }
 
 void drawStationList(const AppStateData& s) {
@@ -637,6 +641,19 @@ bool frame() {
             vuValid = true;
         }
     }
+#if ADC_VU_ENABLE
+    // [Prompt 37] Зовнішні входи 1..3: рівні з АЦП (VuSourceAdc). Немає даних / АЦП не готовий —
+    // як у радіо: два базові сегменти, пік скинуто.
+    else if (s.mode == Mode::ExternalInput && s.inputIndex != 0 && !s.restarting) {
+        float vuL = 0.0f;
+        float vuR = 0.0f;
+        if (s_vuAdc.read(vuL, vuR)) {
+            litL = vuToSegments(vuL);
+            litR = vuToSegments(vuR);
+            vuValid = true;
+        }
+    }
+#endif
     // Базовий рівень: перші kVuMinSegments сегментів світяться завжди (тиша, пауза, обрив).
     if (litL < c::kVuMinSegments) litL = c::kVuMinSegments;
     if (litR < c::kVuMinSegments) litR = c::kVuMinSegments;
@@ -704,7 +721,7 @@ bool frame() {
     switch (s.mode) {
         case Mode::Standby:       drawStandby();                 break;
         case Mode::Radio:         drawRadio(s, litL, litR, s_peakL.seg, s_peakR.seg); break;
-        case Mode::ExternalInput: drawExternal(s);               break;
+        case Mode::ExternalInput: drawExternal(s, litL, litR, s_peakL.seg, s_peakR.seg); break;   // [Prompt 37]
         case Mode::Menu:
             if (s.menuContext == MenuContext::StationList) drawStationList(s);
             else                                           drawPlaceholder("Menu (TODO)");
