@@ -40,6 +40,8 @@
 // в один (слот kTrackY, marquee s_track): метадані, коли Playing і вони непорожні, інакше статус.
 // [Prompt 34] VU перемальовано під індикатор «Маяк-233» (сегментні смуги L/R, шкала в дБ, утримання
 // піку в UI); балістику VuSource не змінено. Три крапки в статусах — ASCII "...", не «…».
+// [Prompt 35] Екран Radio: назва станції — FontSize::XLarge (під рядком іконок), обʼєднаний рядок
+// метадані / статус — FontSize::Large; метадані малюються kColorTrack (світліше за kColorDim).
 // [Prompt 17] ВИНЯТОК З ІЗОЛЯЦІЇ: рівні VU беруться напряму з VuSourceDecodedPcm::read() (з
 // частотою кадру), МИНАЮЧИ AppState; AppStateData.vuLeft/vuRight не використовуються.
 
@@ -370,7 +372,7 @@ const char* statusText(StreamStatus st, uint16_t& color) {
 // Повертає вказівник або на s.trackTitle, або на літерал; color — колір відповідного тексту.
 const char* radioInfoLine(const AppStateData& s, uint16_t& color) {
     if (s.streamStatus == StreamStatus::Playing && s.trackTitle[0] != '\0') {
-        color = c::kColorDim;   // як було в рядка метаданих
+        color = c::kColorTrack;   // [Prompt 35] світліше за kColorDim
         return s.trackTitle;
     }
     return statusText(s.streamStatus, color);
@@ -388,12 +390,12 @@ void drawRadio(const AppStateData& s, int vuLitL, int vuLitR, int peakL, int pea
     // [Prompt 33] Назву входу прибрано; лишились лише іконки верхньої панелі.
     drawTopIcons(s, true);
 
-    marqueeDraw(s_station, c::kStationY, FontSize::Large, dc::kColorFg);
+    marqueeDraw(s_station, c::kStationY, FontSize::XLarge, dc::kColorFg);   // [Prompt 35]
 
     // [Prompt 33] Обʼєднаний рядок «метадані / статус» (текст у s_track оновлює frame()).
-    uint16_t infoColor = c::kColorDim;
+    uint16_t infoColor = c::kColorTrack;
     (void)radioInfoLine(s, infoColor);
-    marqueeDraw(s_track, c::kTrackY, FontSize::Small, infoColor);
+    marqueeDraw(s_track, c::kTrackY, FontSize::Large, infoColor);   // [Prompt 35] Large
 
     drawVu(vuLitL, vuLitR, peakL, peakR);   // [Prompt 17], [Prompt 34] пік
 }
@@ -609,7 +611,7 @@ bool frame() {
 
     if (s.mode == Mode::Radio) {
         dirty |= marqueeUpdate(s_station, s.stationName[0] ? s.stationName : "No station",
-                               FontSize::Large, now);
+                               FontSize::XLarge, now);   // [Prompt 35]
 
         // [Prompt 33] Зміна станції — рядок «метадані / статус» починається спочатку (навіть якщо
         // текст не змінився). Зміну самого тексту (метадані ↔ статус, нові метадані) marqueeUpdate
@@ -619,9 +621,9 @@ bool frame() {
             s_trackStation      = s.stationIndex;
             s_track.seeded      = false;
         }
-        uint16_t infoColor = c::kColorDim;   // колір тут не потрібен, лише текст
+        uint16_t infoColor = c::kColorTrack;   // колір тут не потрібен, лише текст
         const char* info = radioInfoLine(s, infoColor);
-        dirty |= marqueeUpdate(s_track, info, FontSize::Small, now);
+        dirty |= marqueeUpdate(s_track, info, FontSize::Large, now);   // [Prompt 35]
     }
 
     if (!dirty) return false;   // панель лишається як була

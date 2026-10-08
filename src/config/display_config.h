@@ -115,13 +115,17 @@ constexpr uint8_t  kBufferCount = 2;
 // tools/gen_gfxfont.py). Значення — висота рядка (yAdvance) у пікселях; вони
 // мусять збігатися з тими, що надрукує UiFonts::begin() у Serial.
 // ---------------------------------------------------------------------------
-constexpr uint8_t kFontLargePx = 24;   // FontSize::Large — назва станції, заголовок меню
+constexpr uint8_t kFontLargePx = 24;   // FontSize::Large — рядок метаданих/статусу (P35), заголовок меню
 constexpr uint8_t kFontSmallPx = 17;   // FontSize::Small — статус-рядок, тембр
 constexpr uint8_t kFontTinyPx  = 14;   // FontSize::Tiny  — підписи, дрібні позначки
 // [Prompt 32] FontSize::Digits — великі цифри спливного вікна (ui/font_digits_data.h,
 // tools/gen_digits_font.py, em = 112). Лише символи ' ', '+', '-', '0'..'9'.
 // Значення — yAdvance згенерованого шрифту (звіряє static_assert у ui/fonts.cpp).
 constexpr uint8_t kFontDigitsPx = 131;
+// [Prompt 35] FontSize::XLarge — назва станції на екрані Radio (ui/font_xlarge_data.h,
+// tools/gen_xlarge_font.py, em = 30, DejaVu Sans, той самий набір символів, що й Large).
+// Значення — yAdvance згенерованого шрифту (звіряє static_assert у ui/fonts.cpp).
+constexpr uint8_t kFontXLargePx = 36;
 
 // ---------------------------------------------------------------------------
 // Іконки: 1-бітна маска kIconSize × kIconSize, рядки по (kIconSize+7)/8 байт,

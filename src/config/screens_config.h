@@ -1,7 +1,8 @@
 #pragma once
 
 // Константи модуля ui/screens (розкладка 320×170, кольори, marquee, standby).
-// Шрифти: Large 24 px, Small 17 px, Tiny 14 px; іконка 24×24 (display_config.h).
+// Шрифти: XLarge 36 px (назва станції, P35), Large 24 px, Small 17 px, Tiny 14 px; іконка 24×24
+// (display_config.h).
 
 #include <stdint.h>
 
@@ -20,6 +21,9 @@ constexpr int16_t kContentW = kW - 2 * kMargin;   // ширина області
 // --- Кольори ---
 constexpr uint16_t kColorAccent      = display_cfg::kColorYellow;
 constexpr uint16_t kColorDim         = display_cfg::kColorGray;
+// [Prompt 35] Метадані треку: світло-сірий (світліший за kColorDim, але не білий — ієрархія з
+// назвою станції, що білою). Колір статусів потоку (statusText) цієї константи НЕ використовує.
+constexpr uint16_t kColorTrack       = display_cfg::rgb565(210, 210, 210);
 constexpr uint16_t kColorOk          = display_cfg::kColorGreen;
 constexpr uint16_t kColorBad         = display_cfg::kColorRed;
 constexpr uint16_t kColorSelectionBg = display_cfg::rgb565(0, 70, 150);
@@ -38,10 +42,15 @@ constexpr int16_t kMuteIconX   = kWifiIconX - display_cfg::kIconSize - 6;
 constexpr int16_t kOfflineMuteGap = 6;              // [Prompt 28] проміжок між позначкою "offline" і іконкою мʼюту
 
 // --- Radio ---
-constexpr int16_t kStationY   = 34;                // Large, marquee
-// [Prompt 33] Обʼєднаний рядок: метадані (dim) АБО статус потоку (свій колір); Small, marquee.
-// kStateY (старий окремий рядок статусу, y=122) прибрано; це місце порожнє.
-constexpr int16_t kTrackY     = 62;
+// [Prompt 35] Назва станції — FontSize::XLarge (36 px), marquee; одразу під рядком іконок
+// (kTopBarY + kIconSize), тож іконки Wi-Fi / мʼюту / "offline" не перетинаються з назвою.
+// Нижче — обʼєднаний рядок FontSize::Large. Усе вертикально вкладається над VU із запасом kVuGapAbove.
+constexpr int16_t kStationY   = kTopBarY + display_cfg::kIconSize;         // XLarge, marquee (y=28)
+constexpr int16_t kStationGap = 2;                                         // між назвою й рядком інфо
+// [Prompt 33] Обʼєднаний рядок: метадані (kColorTrack) АБО статус потоку (свій колір), marquee.
+// [Prompt 35] Шрифт Large (раніше Small). kStateY (старий окремий рядок статусу) прибрано.
+constexpr int16_t kTrackY     = kStationY + display_cfg::kFontXLargePx + kStationGap;   // y=66
+constexpr int16_t kVuGapAbove = 4;                 // мінімальний проміжок між рядком інфо й VU
 // --- [Prompt 34] VU у стилі індикатора «Маяк-233» (ВЛЛ): дві сегментні смуги L (верх) / R (низ),
 // між ними нерухома шкала в дБ. Мапінг рівня на сегменти лінійний за дБ (vu_cfg::kDbFloor..0).
 // Смуги від лівого поля, підписи L/R праворуч від них; усе виводиться з констант нижче.
@@ -164,8 +173,9 @@ constexpr uint32_t kMarqueeEdgePauseMs = 1500;     // пауза на почат
 
 static_assert(kStatusY + display_cfg::kFontSmallPx <= kH, "status row out of screen");
 static_assert(kVuY + kVuH <= kH - 4, "VU block leaves the screen");
-static_assert(kTrackY + display_cfg::kFontSmallPx < kVuY, "info line overlaps VU frame");
-static_assert(kStationY + display_cfg::kFontLargePx < kTrackY, "station overlaps info line");
+static_assert(kTrackY + display_cfg::kFontLargePx + kVuGapAbove <= kVuY, "info line overlaps VU frame");
+static_assert(kStationY + display_cfg::kFontXLargePx < kTrackY, "station overlaps info line");
+static_assert(kStationY >= kTopBarY + display_cfg::kIconSize, "station name overlaps the top icons row");
 static_assert(kListFirstY + kListRows * kListRowH <= kH, "station list out of screen");
 static_assert(kMuteIconX > kMargin, "icons overflow top bar");
 static_assert(kWifiSetupTitleY + display_cfg::kFontLargePx < kWifiSetupSsidY &&
