@@ -1,7 +1,7 @@
 #pragma once
 
 // Константи модуля ui/screens (розкладка 320×170, кольори, marquee, standby).
-// Шрифти: XLarge 36 px (назва станції, P35), Large 24 px, Small 17 px, Tiny 14 px; іконка 24×24
+// Шрифти: XLarge 36 px (назва станції P35, назва зовнішнього входу P38), Large 24 px, Small 17 px, Tiny 14 px; іконка 24×24
 // (display_config.h).
 
 #include <stdint.h>
@@ -114,8 +114,22 @@ constexpr uint16_t kColorVuOverOff  = display_cfg::rgb565(52, 14, 12);
 constexpr uint16_t kColorVuScale    = kColorVuLit;   // усі підписи VU того ж бірюзового, що й підсвічені сегменти
 
 // --- ExternalInput ---
-constexpr int16_t kExtCaptionY = 40;               // Tiny "INPUT"
-constexpr int16_t kExtNameY    = 62;               // Large, по центру
+// [Prompt 38] Напис "INPUT" прибрано. Назва входу (FontSize::XLarge) центрується по горизонталі
+// (в межах kContentW) і по вертикалі у вільній області між смугою іконок і блоком VU.
+constexpr int16_t kExtAreaTop    = kTopBarY + display_cfg::kIconSize;   // низ смуги іконок (y=28)
+constexpr int16_t kExtAreaBottom = kVuY - kVuGapAbove;                  // верх VU мінус запас (y=90)
+constexpr int16_t kExtNameDy     = -8;   // ручна підгонка: від'ємне = вище (P38, за побажанням власника)
+constexpr int16_t kExtNameY      = kExtAreaTop +
+    (kExtAreaBottom - kExtAreaTop - display_cfg::kFontXLargePx) / 2 + kExtNameDy;   // верх рядка шрифту (y=33)
+// Світлі кольори назви за номером входу 1..3 (індекс масиву = inputIndex - 1). Підібрано, щоб
+// відрізнятись від бірюзового VU (kColorVuLit = 0,235,215): зелений — без синьої складової, блакитний —
+// з явним синім відтінком.
+constexpr uint16_t kColorInputName[] = {
+    display_cfg::rgb565(120, 255, 120),   // вхід 1 — світло-зелений
+    display_cfg::rgb565(255, 235, 110),   // вхід 2 — світло-жовтий
+    display_cfg::rgb565(120, 190, 255),   // вхід 3 — світло-блакитний
+};
+constexpr uint8_t kColorInputNameCount = sizeof(kColorInputName) / sizeof(kColorInputName[0]);
 
 // --- Статус-рядок (Radio і ExternalInput) ---
 constexpr int16_t kStatusLineY = 143;
@@ -193,6 +207,8 @@ static_assert(kVuY + kVuH <= kH - 4, "VU block leaves the screen");
 static_assert(kTrackY + display_cfg::kFontLargePx + kVuGapAbove <= kVuY, "info line overlaps VU frame");
 static_assert(kStationY + display_cfg::kFontXLargePx < kTrackY, "station overlaps info line");
 static_assert(kStationY >= kTopBarY + display_cfg::kIconSize, "station name overlaps the top icons row");
+static_assert(kExtNameY >= kExtAreaTop && kExtNameY + display_cfg::kFontXLargePx <= kExtAreaBottom,
+              "ExternalInput name must fit between the icons row and the VU block");
 static_assert(kListFirstY + kListRows * kListRowH <= kH, "station list out of screen");
 static_assert(kMuteIconX > kMargin, "icons overflow top bar");
 static_assert(kNetY >= 0 && kNetY + display_cfg::kFontTinyPx <= kStationY,

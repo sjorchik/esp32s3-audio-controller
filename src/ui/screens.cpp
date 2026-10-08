@@ -45,6 +45,8 @@
 // метадані / статус — FontSize::Large; метадані малюються kColorTrack (світліше за kColorDim).
 // [Prompt 36] Екран Radio: у смузі іконок ліворуч — SSID і IP (з AppState, drawNetInfo()), іконка Wi-Fi
 // за AppState.wifiRssi (Wifi1..3) з гістерезисом у UI (wifiBarsUpdate()); WifiManager екран не чіпає.
+// [Prompt 38] Екран ExternalInput: напис "INPUT" прибрано; назва входу — FontSize::XLarge, по центру
+// вільної області між смугою іконок і VU (kExtNameY), колір за номером входу (kColorInputName).
 // [Prompt 17] ВИНЯТОК З ІЗОЛЯЦІЇ: рівні VU беруться напряму з VuSourceDecodedPcm::read() (з
 // частотою кадру), МИНАЮЧИ AppState; AppStateData.vuLeft/vuRight не використовуються.
 
@@ -471,10 +473,15 @@ void drawRadio(const AppStateData& s, int vuLitL, int vuLitR, int peakL, int pea
 
 void drawExternal(const AppStateData& s, int vuLitL, int vuLitR, int peakL, int peakR) {
     drawTopIcons(s, false);
-    drawCentered("INPUT", c::kExtCaptionY, FontSize::Tiny, c::kColorDim);
+    // [Prompt 38] Напис "INPUT" прибрано; назва входу — XLarge, по центру вільної області, колір за
+    // номером входу (1..3). Довге імʼя обрізається fitText() з "..." (marquee не потрібен: рядок
+    // статичний, а центрування й прокрутка разом виглядали б гірше).
     char name[kInputFitCap];  // [Prompt 23b]
-    fitText(inputName(s), name, sizeof(name), FontSize::Large, c::kContentW);
-    drawCentered(name, c::kExtNameY, FontSize::Large, dc::kColorFg);
+    fitText(inputName(s), name, sizeof(name), FontSize::XLarge, c::kContentW);
+    const uint16_t color = (s.inputIndex >= 1 && s.inputIndex <= c::kColorInputNameCount)
+                               ? c::kColorInputName[s.inputIndex - 1]
+                               : dc::kColorFg;   // запасний колір, якщо індекс поза 1..3
+    drawCentered(name, c::kExtNameY, FontSize::XLarge, color);
     // [Prompt 37] Той самий блок VU, що й у Radio (y = kVuY..): назва входу закінчується вище.
     drawVu(vuLitL, vuLitR, peakL, peakR);
 }
