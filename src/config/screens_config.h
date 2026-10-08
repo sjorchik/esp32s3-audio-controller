@@ -30,22 +30,22 @@ constexpr int16_t kStandbyIconX    = (kW - display_cfg::kIconSize) / 2;
 constexpr int16_t kStandbyIconY    = 73;
 constexpr int16_t kStandbyCaptionY = 105;          // Tiny, по центру
 
-// --- Верхній рядок (Radio, ExternalInput): назва входу + іконки ---
+// --- Верхній рядок (Radio, ExternalInput): іконки Wi-Fi / мʼюту ---
+// [Prompt 33] Назву входу з екрана Radio прибрано: kTopBarTextY і kTopBarNameGap видалено.
 constexpr int16_t kTopBarY     = 4;
-constexpr int16_t kTopBarTextY = 7;                // Small по центру 24-px смуги
 constexpr int16_t kWifiIconX   = kW - kMargin - display_cfg::kIconSize;
 constexpr int16_t kMuteIconX   = kWifiIconX - display_cfg::kIconSize - 6;
-constexpr int16_t kTopBarNameGap = 6;               // [Prompt 23b] проміжок між назвою входу й іконкою мʼюту
 constexpr int16_t kOfflineMuteGap = 6;              // [Prompt 28] проміжок між позначкою "offline" і іконкою мʼюту
 
 // --- Radio ---
 constexpr int16_t kStationY   = 34;                // Large, marquee
-constexpr int16_t kTrackY     = 62;                // Small, marquee
+// [Prompt 33] Обʼєднаний рядок: метадані (dim) АБО статус потоку (свій колір); Small, marquee.
+// kStateY (старий окремий рядок статусу, y=122) прибрано; це місце порожнє.
+constexpr int16_t kTrackY     = 62;
 constexpr int16_t kVuX        = kMargin;           // [Prompt 17] область VU-метра
 constexpr int16_t kVuY        = 88;
 constexpr int16_t kVuW        = kContentW;
 constexpr int16_t kVuH        = 30;
-constexpr int16_t kStateY     = 122;               // Small: Playing / Stopped / No Wi-Fi
 
 // --- [Prompt 17] VU: дві горизонтальні сегментні смуги (верхня L, нижня R) в області
 // kVuX/Y/W/H. Ширина сегмента виводиться з кількості й проміжку; смуги центруються.
@@ -137,13 +137,11 @@ constexpr int16_t  kMarqueeStepPx      = 2;        // 50 px/с
 constexpr uint32_t kMarqueeEdgePauseMs = 1500;     // пауза на початку й у кінці
 
 static_assert(kStatusY + display_cfg::kFontSmallPx <= kH, "status row out of screen");
-static_assert(kStateY + display_cfg::kFontSmallPx < kStatusLineY, "state text overlaps status line");
-static_assert(kVuY + kVuH < kStateY, "VU frame overlaps state text");
-static_assert(kTrackY + display_cfg::kFontSmallPx < kVuY, "track overlaps VU frame");
-static_assert(kStationY + display_cfg::kFontLargePx < kTrackY, "station overlaps track");
+static_assert(kVuY + kVuH < kStatusLineY, "VU frame overlaps status line");
+static_assert(kTrackY + display_cfg::kFontSmallPx < kVuY, "info line overlaps VU frame");
+static_assert(kStationY + display_cfg::kFontLargePx < kTrackY, "station overlaps info line");
 static_assert(kListFirstY + kListRows * kListRowH <= kH, "station list out of screen");
 static_assert(kMuteIconX > kMargin, "icons overflow top bar");
-static_assert(kMuteIconX - kMargin - kTopBarNameGap > 0, "no room for input name in top bar");
 static_assert(kWifiSetupTitleY + display_cfg::kFontLargePx < kWifiSetupSsidY &&
                   kWifiSetupSsidY + display_cfg::kFontSmallPx < kWifiSetupIpY &&
                   kWifiSetupIpY + display_cfg::kFontSmallPx <= kH,

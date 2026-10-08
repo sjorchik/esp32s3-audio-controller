@@ -28,13 +28,16 @@
 // [Prompt 15] Так само читається core/action_names (таблиця імен без стану); стан навчання
 // IR береться з AppState (irLearnStatus/irLearnTarget/irLearnConflictWith), не з IrRc5.
 // [Prompt 16] Екран Mode::OtaUpdate читає лише AppState.otaProgress.
-// [Prompt 23b] Назва входу (Radio, ExternalInput) береться з AppState.inputName; Settings екрани
-// не читають. Довга назва обрізається fitText() з "..." по межі UTF-8-символу.
+// [Prompt 23b] Назва входу (лише ExternalInput; з Radio її прибрано в P33) береться з
+// AppState.inputName; Settings екрани не читають. Довга назва обрізається fitText() з "..."
+// по межі UTF-8-символу.
 // [Prompt 28] AppState.offline: замість Wi-Fi-індикатора у верхній панелі — текст "offline" (Tiny);
 // на екрані WifiSetup — підказка "OK: work offline"; AppState.restarting — екран "Restarting...".
 // [Prompt 32] Спливне вікно параметра: UI веде ЛИШЕ відлік показу (millis() від моменту, коли
 // AppState.popupSeq змінився); сам параметр і його значення читаються зі знімка AppState.
 // Статус-рядок з ціллю енкодера (drawStatusRow) прибрано.
+// [Prompt 33] Екран Radio: назву входу прибрано; рядок метаданих і рядок статусу потоку обʼєднано
+// в один (слот kTrackY, marquee s_track): метадані, коли Playing і вони непорожні, інакше статус.
 // [Prompt 17] ВИНЯТОК З ІЗОЛЯЦІЇ: рівні VU беруться напряму з VuSourceDecodedPcm::read() (з
 // частотою кадру), МИНАЮЧИ AppState; AppStateData.vuLeft/vuRight не використовуються.
 
@@ -61,7 +64,12 @@ struct Marquee {
 };
 
 Marquee s_station = {};
-Marquee s_track   = {};
+Marquee s_track   = {};   // [Prompt 33] обʼєднаний рядок «метадані / статус»
+
+// [Prompt 33] Остання побачена станція: зміна індексу скидає s_track на початок, навіть якщо
+// текст рядка (напр. статус) лишився тим самим.
+bool     s_trackStationKnown = false;
+uint16_t s_trackStation      = 0;
 
 // [Prompt 17] VU: джерело (читає лише display-задача) і кількість засвічених сегментів
 // минулого кадру (перемальовуємо, лише коли вона змінилась).
@@ -164,6 +172,7 @@ void fitText(const char* src, char* out, size_t cap, FontSize size, int32_t maxW
 // [Prompt 23b] Назва входу береться з AppState.inputName (її вирішує AppController: користувацька
 // з налаштувань, запасно defaults::kInputNames). Тут лише останній запасний варіант на випадок
 // порожнього поля (нульовий AppState до першої публікації): типова назва за індексом або "Input".
+// [Prompt 33] Використовується лише екраном ExternalInput.
 const char* inputName(const AppStateData& s) {
     if (s.inputName[0] != '\0') return s.inputName;
     return (s.inputIndex < defaults::kInputCount) ? defaults::kInputNames[s.inputIndex] : "Input";
@@ -259,51 +268,46 @@ void drawPopup(const AppStateData& s) {
                 FontSize::Digits, c::kColorPopupDigits);
 }
 
-// [Prompt 10] ДОДАНО: малювання статусу потоку на основі StreamStatus.
-// Виводить текст і колір залежно від статусу:
-//   Idle           → сірий "Stopped"
-//   Connecting     → жовтий "Connecting…"
-//   Buffering      → жовтий "Buffering…"
-//   Playing        → зелений "Playing"
-//   Error          → червоний "Error"
-//   Reconnecting   → жовтий "Reconnecting…"
+// [Prompt 10] Текст і колір статусу потоку за StreamStatus.
+// [Prompt 33] Раніше drawStreamStatus() малювала це окремим рядком (y=122); тепер це лише
+// вибір тексту й кольору (тексти БЕЗ змін), а малює обʼєднаний рядок drawRadio().
+//   Idle → сірий "Stopped"; Connecting/Buffering/Reconnecting → жовті;
+//   Playing → зелений "Playing"; Error → червоний "Error".
 // Wi-Fi статус показується окремою іконкою (не змінюється).
-void drawStreamStatus(const AppStateData& s) {
-    const char* state;
-    uint16_t color;
-
-    switch (s.streamStatus) {
+const char* statusText(StreamStatus st, uint16_t& color) {
+    switch (st) {
         case StreamStatus::Idle:
-            state = "Stopped";
             color = c::kColorDim;
-            break;
+            return "Stopped";
         case StreamStatus::Connecting:
-            state = "Connecting…";
-            color = c::kColorAccent;  // жовтий
-            break;
+            color = c::kColorAccent;
+            return "Connecting…";
         case StreamStatus::Buffering:
-            state = "Buffering…";
-            color = c::kColorAccent;  // жовтий
-            break;
+            color = c::kColorAccent;
+            return "Buffering…";
         case StreamStatus::Playing:
-            state = "Playing";
-            color = c::kColorOk;  // зелений
-            break;
+            color = c::kColorOk;
+            return "Playing";
         case StreamStatus::Error:
-            state = "Error";
-            color = c::kColorBad;  // червоний
-            break;
+            color = c::kColorBad;
+            return "Error";
         case StreamStatus::Reconnecting:
-            state = "Reconnecting…";
-            color = c::kColorAccent;  // жовтий
-            break;
+            color = c::kColorAccent;
+            return "Reconnecting…";
         default:
-            state = "?";
             color = c::kColorDim;
-            break;
+            return "?";
     }
+}
 
-    D::drawText(state, c::kMargin, c::kStateY, FontSize::Small, color);
+// [Prompt 33] Обʼєднаний рядок екрана Radio: метадані, коли потік грає й вони є; інакше статус.
+// Повертає вказівник або на s.trackTitle, або на літерал; color — колір відповідного тексту.
+const char* radioInfoLine(const AppStateData& s, uint16_t& color) {
+    if (s.streamStatus == StreamStatus::Playing && s.trackTitle[0] != '\0') {
+        color = c::kColorDim;   // як було в рядка метаданих
+        return s.trackTitle;
+    }
+    return statusText(s.streamStatus, color);
 }
 
 // ---------------------------------------------------------------------------
@@ -315,21 +319,17 @@ void drawStandby() {
 }
 
 void drawRadio(const AppStateData& s, int vuLitL, int vuLitR) {
-    // [Prompt 23b] Довга назва обрізається "..." до місця під іконку мʼюту (резервуємо її завжди,
-    // щоб текст не стрибав при вмиканні мʼюту).
-    char name[kInputFitCap];
-    fitText(inputName(s), name, sizeof(name), FontSize::Small,
-            c::kMuteIconX - c::kMargin - c::kTopBarNameGap);
-    D::drawText(name, c::kMargin, c::kTopBarTextY, FontSize::Small, c::kColorDim);
+    // [Prompt 33] Назву входу прибрано; лишились лише іконки верхньої панелі.
     drawTopIcons(s, true);
 
     marqueeDraw(s_station, c::kStationY, FontSize::Large, dc::kColorFg);
-    marqueeDraw(s_track, c::kTrackY, FontSize::Small, c::kColorDim);
+
+    // [Prompt 33] Обʼєднаний рядок «метадані / статус» (текст у s_track оновлює frame()).
+    uint16_t infoColor = c::kColorDim;
+    (void)radioInfoLine(s, infoColor);
+    marqueeDraw(s_track, c::kTrackY, FontSize::Small, infoColor);
 
     drawVu(vuLitL, vuLitR);   // [Prompt 17]
-
-    // [Prompt 10] ДОДАНО: використовуємо StreamStatus замість наївної евристики
-    drawStreamStatus(s);
 }
 
 void drawExternal(const AppStateData& s) {
@@ -528,7 +528,18 @@ bool frame() {
     if (s.mode == Mode::Radio) {
         dirty |= marqueeUpdate(s_station, s.stationName[0] ? s.stationName : "No station",
                                FontSize::Large, now);
-        dirty |= marqueeUpdate(s_track, s.trackTitle, FontSize::Small, now);
+
+        // [Prompt 33] Зміна станції — рядок «метадані / статус» починається спочатку (навіть якщо
+        // текст не змінився). Зміну самого тексту (метадані ↔ статус, нові метадані) marqueeUpdate
+        // ловить сам через strcmp.
+        if (!s_trackStationKnown || s.stationIndex != s_trackStation) {
+            s_trackStationKnown = true;
+            s_trackStation      = s.stationIndex;
+            s_track.seeded      = false;
+        }
+        uint16_t infoColor = c::kColorDim;   // колір тут не потрібен, лише текст
+        const char* info = radioInfoLine(s, infoColor);
+        dirty |= marqueeUpdate(s_track, info, FontSize::Small, now);
     }
 
     if (!dirty) return false;   // панель лишається як була
@@ -562,6 +573,7 @@ bool UiScreens::begin() {
     s_modeKnown = false;
     s_station.seeded = false;
     s_track.seeded   = false;
+    s_trackStationKnown = false;   // [Prompt 33]
     s_vuLitL = 0;
     s_vuLitR = 0;
     s_popupSeqKnown = false;   // [Prompt 32]
