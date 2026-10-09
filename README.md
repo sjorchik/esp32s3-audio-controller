@@ -1,28 +1,381 @@
 # ESP32-S3 Audio Controller
 
-Internet radio + external analog inputs for ESP32-S3 (N16R8):
-6 buttons, rotary encoder (PCNT), IR remote (RC5/RC5X, learning mode),
-ST7789 320x170 color display (LovyanGFX), PCM5102 DAC (I2S),
-TDA7318 / PT2313L audio processor (I2C), web interface + mDNS.
+Інтернет-радіо та аудіоконтролер на ESP32-S3: потокове радіо через ЦАП PCM5102, три зовнішні аналогові входи, апаратний аудіопроцесор (TDA7318 або PT2313L) для гучності, тембру й вибору входу. Керування — енкодером, кнопками та ІЧ-пультом RC5, кольоровий дисплей ST7789 із VU-метром, веб-інтерфейс для налаштувань. Збірка — VS Code + PlatformIO, Arduino framework.
 
-## Hardware
+Репозиторій: https://github.com/sjorchik/esp32s3-audio-controller
 
-- MCU: ESP32-S3 N16R8 (16 MB flash, 8 MB octal PSRAM)
-- DAC: PCM5102 (I2S), XSMT soft-mute
-- Audio processor: TDA7318 or PT2313L (I2C 0x44, selected in NVS)
-- Display: ST7789 170x320, horizontal 320x170, SPI2 (FSPI), LEDC backlight
-- Controls: 6 buttons, encoder with button, VS1838B IR receiver
-- Pin map: single source of truth in `src/config/pins.h`
+## Зміст
 
-## Build
+1. [Можливості](#можливості)
+2. [Апаратна частина](#апаратна-частина)
+3. [Швидкий старт](#швидкий-старт)
+4. [Керування](#керування)
+5. [Веб-інтерфейс](#веб-інтерфейс)
+6. [Конфігурація](#конфігурація)
+7. [Архітектура](#архітектура)
+8. [Оновлення прошивки та скидання](#оновлення-прошивки-та-скидання)
+9. [Відомі обмеження](#відомі-обмеження)
+10. [Структура репозиторію](#структура-репозиторію)
+11. [Залежності](#залежності)
 
-Toolchain: VS Code + PlatformIO, platform pioarduino 55.03.37
-(Arduino-ESP32 3.3.7 / IDF 5.5.2), board `esp32-s3-devkitc-1`,
-flash 16 MB, octal PSRAM (`qio_opi`), console on UART0.
+## Можливості
+
+**Радіо**
+- Потокове відтворення через ESP32-audioI2S, метадані (ICY), автоперепідключення.
+- Список станцій у LittleFS (`stations.json`): додавання, редагування, переміщення, імпорт JSON / M3U / PLS, експорт.
+- Рівень виходу декодера по станціях (`levelDb`, −24…0 дБ, за замовчуванням −20 дБ) — цифрове послаблення перед ЦАП.
+- 5-смуговий цифровий еквалайзер (±12 дБ, один глобальний пресет), діє лише на радіо.
+
+**Входи**
+- Чотири логічні входи: 0 — WiFi Radio, 1 — TV Box, 2 — Computer, 3 — Aux. Назви редагуються у вебі.
+- Входи 1–3 можна вимкнути (вимкнені пропускаються при перемиканні й ховаються у вебі); радіо вимкнути не можна.
+- Профіль звуку (гучність, бас, дискант, баланс, gain, loudness) зберігається окремо для кожного входу.
+- З PT2313L доступні лише 3 входи (вхід 3 / Aux недоступний).
+
+**Звук**
+- Гучність, тембр НЧ / ВЧ, баланс, gain входу, loudness (залежно від чипа) через TDA7318 або PT2313L по I2C. Тип чипа обирається у вебі й зберігається в NVS (автовизначення неможливе).
+- М'який мʼют і керований вихід STBY підсилювача.
+
+**Дисплей**
+- ST7789 170×320 (горизонтально 320×170), україномовний растровий шрифт на основі DejaVu Sans (написи на дисплеї — англійською).
+- Екран Radio: назва станції, рядок метаданих / статусу потоку, рядок `SSID  IP`, іконка Wi-Fi за рівнем сигналу, VU-метр.
+- Екран зовнішнього входу: назва входу (колір залежить від входу), та сама верхня стрічка й VU.
+- VU «Маяк-233»: 2×41 сегмент, шкала −21…0 дБ. Радіо — з декодованих PCM, входи 1–3 — з АЦП PCM1808.
+- Спливне вікно параметра (Vol / Bass / Treble / Bal / Gain) з великими цифрами.
+
+**Керування**
+- Енкодер (апаратний PCNT) з кнопкою, 6 кнопок, ІЧ-пульт RC5 / RC5X, кнопки пульта навчаються користувачем.
+
+**Веб**
+- Сім сторінок (українською), без CDN і фреймворків, вбудовані в прошивку. Повний REST API.
+
+**Wi-Fi**
+- До 5 збережених мереж із пріоритетом, режим AP з captive portal для першого налаштування, офлайн-режим.
+
+**Система**
+- Standby (з холодного старту пристрій стартує у standby), «тихий» перезапуск, OTA через веб, factory reset, налаштування в NVS.
+
+## Апаратна частина
+
+| Компонент | Призначення |
+|---|---|
+| ESP32-S3 N16R8 | 16 МБ flash, 8 МБ octal PSRAM |
+| PCM5102 | ЦАП (I2S); SCK заземлений (внутрішній PLL, MCLK не потрібен) |
+| PCM1808 | АЦП для VU зовнішніх входів (I2S slave) |
+| TDA7318 або PT2313L | Аудіопроцесор, I2C, адреса 0x44, 100 кГц, зчитування немає |
+| ST7789 170×320 | Дисплей, SPI2 (FSPI), підсвітка — LEDC PWM |
+| VS1838B | ІЧ-приймач (RMT RX), протокол RC5 / RC5X |
+| Енкодер + 6 кнопок | POWER, UP, DOWN, LEFT, RIGHT, OK |
+| Підсилювач | Вивід STBY керується прошивкою |
+
+Живлення: одне джерело 12 В → 9 В (аудіопроцесор), 5 В, 3.3 В.
+
+### Мапа пінів
+
+Єдине джерело — `src/config/pins.h`. Заборонені піни ESP32-S3: GPIO 26–37 (flash / PSRAM), 19 / 20 (USB).
+
+| Блок | Сигнал | GPIO |
+|---|---|---:|
+| ST7789 | SCLK / MOSI / CS | 12 / 11 / 10 |
+| | DC / RST / BLK | 9 / 13 / 14 |
+| I2S | BCLK | 15 |
+| | WS (LRCLK) | 17 |
+| | DOUT → DIN PCM5102 | 18 |
+| | MCLK (для PCM1808) | 16 |
+| | DIN ← PCM1808 | 8 |
+| PCM5102 | XSMT (active-low, pulldown 10 кОм) | 45 |
+| Підсилювач | STBY (1 = працює, 0 = standby) | 46 |
+| I2C | SDA / SCL | 1 / 2 |
+| Енкодер | A / B / кнопка | 4 / 5 / 6 |
+| Кнопки | POWER | 7 |
+| | UP / DOWN | 21 / 38 |
+| | LEFT / RIGHT / OK | 39 / 40 / 41 |
+| IR | VS1838B OUT | 47 |
+| Резерв BT | UART1 TX / RX | 42 / 48 |
+| Консоль | UART0 TX / RX | 43 / 44 |
+
+### Примітки до схеми
+
+- **BCLK (GPIO15) і LRCLK (GPIO17) спільні** для PCM5102 і PCM1808. MCLK (GPIO16) виводить I2S0 для АЦП.
+- **PCM1808** у slave-режимі: стрепи MD0 = MD1 = FMT = GND (I2S 24 біти, MCLK/fs автоматично).
+- **Вхід АЦП** знімається з виходів селектора TDA7318 (піни 17 і 7 *мікросхеми*, не GPIO) — сигнал до регулятора гучності й тембру. Тому VU зовнішніх входів залежить від вибору входу й gain, але не від гучності. VU із PCM1808 не підтримується для PT2313L.
+- **XSMT** краще тримати під керуванням прошивки: постійне підключення до +3.3 В прибирає захист від клацань при завантаженні, зміні станції, standby й OTA.
+- **GPIO46 (STBY)** — strapping-пін: при скиданні підсилювач у standby; рекомендовано зовнішній резистор 10 кОм до GND.
+- Прапорець `ENABLE_PCM1808` у `features.h` залишився з першої версії; VU зовнішніх входів вмикається прапорцем `ADC_VU_ENABLE` (`config/adc_vu_config.h`).
+
+## Швидкий старт
+
+### Вимоги
+
+- VS Code з розширенням PlatformIO (або PlatformIO Core).
+- Python 3 (скрипт `tools/build_web.py` використовує лише стандартну бібліотеку; запускається автоматично перед кожною збіркою).
+- USB-підключення до плати. Консоль — UART0 (USB CDC вимкнено), швидкість 115200.
+
+Платформа — pioarduino 55.03.37 (Arduino-ESP32 3.3.7 / IDF 5.5.2), плата `esp32-s3-devkitc-1`, `qio_opi`. Середовище PlatformIO одне — `esp32s3`.
+
+### Збірка й прошивка
 
 ```bash
-pio run                 # build
-pio run -t upload       # flash
-pio device monitor      # serial monitor, 115200
-pio run -t buildfs      # build LittleFS image from data/
-pio run -t uploadfs     # flash LittleFS image
+git clone https://github.com/sjorchik/esp32s3-audio-controller.git
+cd esp32s3-audio-controller
+
+pio run -e esp32s3                 # збірка
+pio run -e esp32s3 -t upload       # прошивка по USB
+pio device monitor                 # Serial-монітор (115200)
+```
+
+Веб-сторінки окремо заливати не потрібно: `webui/` стискається gzip і вбудовується в прошивку (`tools/build_web.py` → `src/net/web_assets_gen.cpp`, файл у `.gitignore`). Після зміни `webui/` достатньо перепрошити пристрій. Вручну: `python tools/build_web.py`.
+
+> Не використовуйте `pio run -t uploadfs`: він стирає розділ LittleFS разом зі списком станцій. Сторінки там не зберігаються.
+
+Таблиця розділів (`partitions.csv`, 16 МБ): `nvs`, `otadata`, два OTA-слоти `app0` / `app1` по 0x580000 і LittleFS (розділ з міткою `spiffs`). `otadata` має лишатися на 0xE000, бо збірка пише туди `boot_app0.bin`. Процедури міграції й відновлення — [`docs/flashing.md`](docs/flashing.md).
+
+### Перший запуск
+
+1. Після подачі живлення пристрій стартує у **standby** — натисніть **POWER**.
+2. Якщо збереженої Wi-Fi-мережі немає (або три спроби підключення невдалі), пристрій піднімає точку доступу **`AudioCtrl-Setup`** і captive portal. Підключіться до неї, відкрийте сторінку порталу (адреса `192.168.4.1`), оберіть мережу зі скану, введіть пароль. Дані зберігаються в NVS, пристрій перезапускається в режимі STA.
+3. Поки піднята AP, пристрій у режимі «Setup Wi-Fi»; **OK** вмикає офлайн-режим (Wi-Fi вимкнено, доступні всі входи, крім радіо).
+4. Після підключення веб-інтерфейс доступний за `http://audio.local/` або за IP (його показано на дисплеї).
+5. Скинути всі збережені мережі: утримувати **OK** під час старту, або «Система → Скинути Wi-Fi» у вебі.
+
+> Після холодного старту (подача живлення, brownout) пристрій у standby, тому налаштування Wi-Fi через AP потребує натискання POWER.
+
+## Керування
+
+### Енкодер
+
+| Дія | Результат |
+|---|---|
+| Обертання | Зміна поточної цілі; за замовчуванням — гучність |
+| Клік | Перемикання цілі: гучність → бас → дискант → баланс → gain → гучність |
+| Утримання | Мʼют (миттєвий, без ramp) |
+
+Ціль регулювання автоматично повертається на гучність через 5 с без подій енкодера (`app_controller_cfg::kAdjustTimeoutMs`). При зміні параметра на дисплеї 5 с показується спливне вікно з його значенням.
+
+### Кнопки
+
+| Кнопка | Головний екран |
+|---|---|
+| UP / DOWN | Перемикання входу (вимкнені входи й недоступний за апаратною причиною пропускаються) |
+| LEFT / RIGHT | Перемикання станції (лише вхід Radio) |
+| OK, коротко | Play / pause (лише Radio) |
+| OK, утримання | Список станцій (лише Radio) |
+| POWER | Standby вкл / викл |
+| POWER, утримання ≥ 3 с | «Тихий» перезапуск (мʼют → STBY підсилювача → перезапуск) |
+| OK під час старту | Скидання збережених мереж Wi-Fi |
+
+Режим «Setup Wi-Fi» (AP): реагують лише POWER і коротке OK / клік енкодера.
+
+### ІЧ-пульт
+
+Протокол RC5 / RC5X. Кнопки пульта навчаються: на сторінці «Пульт» у вебі. Навчаються дії керування звуком і навігацією (зокрема OK і BACK, прямі кнопки бас / дискант / баланс / gain); дії енкодера (`ENC_*`) не навчаються. Коди зберігаються в NVS; мапу можна експортувати й імпортувати як JSON.
+
+## Веб-інтерфейс
+
+Адреса: `http://audio.local/` або IP пристрою, порт 80. HTTPS і автентифікації немає.
+
+| Сторінка | Шлях | Що можна робити |
+|---|---|---|
+| Головна | `/` | Now playing, кнопки плеєра, гучність і мʼют, вибір входу, станції, standby |
+| Станції | `/stations` | Список із пошуком, додавання, редагування, переміщення, рівень станції, імпорт / експорт |
+| Аудіо | `/audio` | Гучність, тембр, баланс, loudness, gain поточного входу; еквалайзер (лише для входу Radio) |
+| Пульт | `/ir` | Навчання кнопок ІЧ-пульта, очищення, імпорт / експорт мапи |
+| Налаштування | `/settings` | Тип процесора, назви входів, відключення входів 1–3, яскравість, орієнтація дисплея |
+| Wi-Fi | `/wifi` | Збережені мережі (пріоритет, видалення), скан, додавання, підключення |
+| Система | `/system` | Інформація про пристрій, перезапуск, скидання, скидання Wi-Fi, оновлення прошивки (OTA) |
+
+Для кожної `x.html` є псевдонім `/x`.
+
+Документація:
+- [`docs/web_ui.md`](docs/web_ui.md) — каркас фронтенду, як додати сторінку, компоненти CSS, функції `common.js`.
+- [`docs/web_api.md`](docs/web_api.md) — повний контракт HTTP API.
+
+Огляд API (усі шляхи починаються з `/api/`):
+
+| Група | Ендпоїнти |
+|---|---|
+| Стан і налаштування | `status`, `settings` |
+| Керування | `power`, `mute`, `volume`, `gain`, `input`, `player/{play,pause,stop,toggle,next,prev,station}` |
+| Входи | `inputs` |
+| Станції | `stations*` (CRUD, move, import, export) |
+| Еквалайзер | `eq` |
+| IR | `ir*` |
+| Wi-Fi | `wifi*` |
+| Система | `system`, `system/reboot`, `system/factory-reset`, `ota` |
+
+Для швидкої перевірки API є `tools/web_api_smoke.py` (лише стандартна бібліотека):
+
+```bash
+python tools/web_api_smoke.py audio.local          # лише читання
+python tools/web_api_smoke.py audio.local --write  # з POST-перевірками
+```
+
+## Конфігурація
+
+Усі піни, таймінги, розміри буферів і прапорці — у `src/config/`. Значення дивіться в самих файлах.
+
+| Файл | Що налаштовується |
+|---|---|
+| `pins.h` | Мапа пінів |
+| `features.h` | `ENABLE_VU`, `ENABLE_TDA7318`, `ENABLE_PT2313L`, `ENABLE_WEB`, `ENABLE_MDNS`, `FEATURE_AMP_STANDBY`, застарілі `ENABLE_PCM1808` / `ENABLE_BT_UART` |
+| `defaults.h` | Загальні константи (черга подій, кількість входів, швидкість Serial тощо) |
+| `app_controller_config.h` | Пріоритети, пороги, ramp гучності, `kAdjustTimeoutMs`, холодний старт у standby (`kStandbyOnColdStart`, `kColdStartResetReasons`) |
+| `adc_vu_config.h` | `ADC_VU_ENABLE`, параметри I2S1 / DMA, калібрування `kAdcVuOffsetDb` |
+| `vu_config.h` | Шкала й балістика VU (`kDbFloor`, `kAttackMs`, `kReleaseMs`) |
+| `screens_config.h` | Розкладка екранів 320×170, кольори, спливне вікно |
+| `display_config.h` | Параметри панелі, розміри шрифтів |
+| `eq_config.h` | Частоти смуг, діапазон ±12 дБ, Q |
+| `station_level_config.h` | Діапазон і типове значення `levelDb` |
+| `wifi_config.h` | Таймаути STA / AP, ліміт збережених мереж |
+| `web_server_config.h`, `web_api_config.h`, `web_static_config.h` | Порт, ліміти тіла, `WEB_API_DEV_CORS`, кешування |
+| `input_config.h`, `ir_config.h`, `ir_learn_ui_config.h` | Кнопки, енкодер, IR |
+| `audio_config.h`, `audio_player_config.h` | Аудіопроцесор, плеєр |
+| `settings_config.h`, `station_store_config.h` | NVS і сховище станцій |
+
+Типові зміни:
+- **Холодний старт не в standby** — `kStandbyOnColdStart = false` у `app_controller_config.h`.
+- **Вимкнути VU зовнішніх входів** — `ADC_VU_ENABLE 0`.
+- **Калібрування VU входів 1–3** — `kAdcVuOffsetDb` (за замовчуванням 20).
+- **Діапазон шкали VU** — `vu_cfg::kDbFloor` (за замовчуванням −21).
+
+### Де зберігаються дані
+
+- **NVS** (namespace `audioctl`): тип процесора, назви входів, яскравість, орієнтація, профілі звуку по входах, маска ввімкнених входів, останній вхід і станція, пресет еквалайзера. Формат — версійований blob із автоматичною міграцією зі старих версій.
+- **NVS** (namespace `wifinets`): список до 5 мереж Wi-Fi.
+- **NVS**: мапа ІЧ-пульта.
+- **LittleFS**: `stations.json`.
+
+## Архітектура
+
+### Модулі `src/`
+
+| Папка | Роль |
+|---|---|
+| `config/` | Усі константи й прапорці |
+| `core/` | `events` (черга подій), `app_state`, `app_controller`, `settings` (NVS), `action_names` |
+| `input/` | `buttons`, `encoder` (PCNT), `ir_rc5` (RMT, декодер, навчання) |
+| `audio/` | `audio_player` (ESP32-audioI2S), драйвери `tda7318` / `pt2313l`, `audio_i2c`, `eq`, `output_trim`, `vu_source`, `vu_pcm_hook`, `adc_vu`, `amp_standby` |
+| `stations/` | `station_store` (LittleFS JSON, імпорт M3U / PLS / JSON) |
+| `ui/` | `display` (LovyanGFX), `fonts`, `icons`, `screens` |
+| `net/` | `wifi_manager`, `wifi_networks`, `mdns`, `web_server`, `web_api_*`, `web_static` |
+| `main.cpp` | Ініціалізація модулів |
+
+### Потоки керування
+
+Джерела (кнопки, енкодер, IR) → `EventBus` (одна FreeRTOS-черга) → `AppController` → модулі. Стан зберігається в `AppState` (потокобезпечний доступ). Веб-команди виконує `AppController::runWebCommand()`, не `EventBus`; з HTTP-хендлерів залізо не чіпається напряму.
+
+### Ядра
+
+- **Ядро 0:** введення, `AppController`, UI / дисплей, Wi-Fi, веб-сервер, задача `adc_vu`.
+- **Ядро 1:** лише аудіо (ESP32-audioI2S, декодування, I2S). `loop()` порожній.
+
+### Інваріанти (не ламати)
+
+- Порядок у PCM-хуку радіо: `eq::process` → вимір VU → `output_trim::process` → I2S.
+- `audio/vu_pcm_hook.cpp` не підключає `Audio.h`.
+- Єдине джерело пінів — `config/pins.h`; піни не змінювати без потреби.
+- Модулі не викликають один одного для керування — лише через події й `AppState`.
+- I2S напряму не чіпати: ним володіє ESP32-audioI2S. Використовувати лише нові драйвери IDF 5.x (PCNT, RMT, LEDC через `ledcAttach`).
+- Великі буфери й спрайти — у PSRAM.
+- Написи на дисплеї — англійською; веб-інтерфейс і документація — українською. Логи Serial — англійською з тегом модуля (`[IR] ...`).
+- Звук зберігається по входах; зміна звуку проходить через одне місце в `AppController`.
+
+### Генератори шрифтів
+
+Шрифт — DejaVu Sans (`tools/fonts/DejaVuSans.ttf`), потрібні Python 3 і Pillow. Результати вже є в репозиторії (`src/ui/font_*.h`); запускати генератори треба лише при зміні розмірів. Команди з кореня проєкту:
+
+```bash
+# Large / Small / Tiny (+ необовʼязково прев'ю)
+python3 tools/gen_gfxfont.py --ttf tools/fonts/DejaVuSans.ttf --out src/ui/font_data.h --preview tools/font_preview.png
+
+# XLarge — назва станції (yAdvance 36)
+python3 tools/gen_xlarge_font.py --ttf tools/fonts/DejaVuSans.ttf --out src/ui/font_xlarge_data.h --em 30
+
+# Digits — цифри спливного вікна
+python3 tools/gen_digits_font.py --ttf tools/fonts/DejaVuSans.ttf --out src/ui/font_digits_data.h --em 112
+```
+
+Надрукований `yAdvance` має збігатися з відповідною константою в `display_config.h` (`kFontXLargePx`, `kFontDigitsPx`).
+
+## Оновлення прошивки та скидання
+
+**OTA.** Сторінка «Система → Оновлення прошивки» завантажує `.bin` (збірка `.pio/build/esp32s3/firmware.bin`) з індикацією прогресу. Те саме через API:
+
+```bash
+curl -X POST --data-binary @firmware.bin -H "Content-Type: application/octet-stream" http://audio.local/api/ota
+```
+
+Під час OTA звук зупиняється, екран показує прогрес; після успіху пристрій перезапускається приблизно через 1.5 с. Оновлюється лише прошивка (веб-сторінки вбудовані в неї, окремого оновлення не потребують). Автоматичного відкату на попередню прошивку немає.
+
+**Скидання.**
+
+| Дія | Що робить |
+|---|---|
+| Система → «Скинути налаштування» (`factory-reset`) | Налаштування (тип процесора, назви входів, яскравість, орієнтація, профілі звуку, останній вхід / станція, еквалайзер) — до заводських. Станції, мапа IR і мережі Wi-Fi не чіпаються |
+| Система → «Скинути Wi-Fi» або утримання OK при старті | Стирає ВСІ збережені мережі, пристрій стартує в режимі AP |
+
+## Відомі обмеження
+
+- Веб-API без автентифікації й без HTTPS: reboot, factory-reset, OTA і список Wi-Fi доступні будь-кому в мережі. Використовуйте лише в довіреній локальній мережі.
+- Паролі Wi-Fi зберігаються в NVS у відкритому вигляді; WPA2-Enterprise не підтримується.
+- OTA без автовідкату.
+- Для PT2313L вхід 3 (Aux) недоступний; VU зовнішніх входів з PCM1808 для PT2313L не підтримується.
+- Еквалайзер діє лише на радіо (зовнішні входи йдуть аналоговим трактом).
+- Індекс станції позиційний; стабільного id немає.
+- Пресет еквалайзера у вебі не опитується: зміна з іншого клієнта видна після зміни входу або перезавантаження сторінки.
+- Режим AP: основний API недоступний, відповідає лише портал налаштування.
+- Офлайн-режим не зберігається, вихід з нього — перезапуск.
+
+### Діагностика
+
+Логи йдуть в Serial (UART0, 115200) з тегами модулів, наприклад `[MAIN]`, `[IR]`. Додаткові повідомлення вмикаються прапорцями в `src/config/`: `INPUT_DEBUG`, `IR_DEBUG`, `APP_CONTROLLER_DEBUG`, `WIFI_MANAGER_DEBUG`, `VU_DEBUG`, `ADC_VU_DEBUG`, `AMP_DEBUG`, `EQ_DEBUG`, `STATION_STORE_DEBUG`. Тестові Serial-режими: `AUDIO_PROC_TEST`, `AUDIO_PLAYER_TEST`, `SETTINGS_TEST`, `STATION_STORE_TEST` (діляться одним Serial, тому за замовчуванням одночасно не запускаються); `DISPLAY_DEMO` — тестовий кадр дисплея. Для розробки сторінок на ПК є `WEB_API_DEV_CORS` (у релізі 0).
+
+## Структура репозиторію
+
+```
+.
+├── data/               # порожня (.gitkeep); сторінки вбудовані в прошивку
+├── docs/
+│   ├── flashing.md     # прошивка USB / OTA, слоти, відновлення
+│   ├── web_api.md      # контракт HTTP API
+│   └── web_ui.md       # каркас фронтенду
+├── include/, lib/, test/   # стандартні папки PlatformIO (README)
+├── src/
+│   ├── audio/          # плеєр, процесори, EQ, VU, АЦП, STBY
+│   ├── config/         # піни, прапорці, константи модулів
+│   ├── core/           # події, стан, AppController, налаштування
+│   ├── input/          # кнопки, енкодер, IR
+│   ├── net/            # Wi-Fi, mDNS, веб-сервер, API
+│   ├── stations/       # сховище станцій
+│   ├── ui/             # дисплей, шрифти, іконки, екрани
+│   └── main.cpp
+├── tools/
+│   ├── fonts/DejaVuSans.ttf
+│   ├── build_web.py        # webui/ → src/net/web_assets_gen.cpp
+│   ├── gen_gfxfont.py, gen_xlarge_font.py, gen_digits_font.py
+│   ├── font_preview.png
+│   └── web_api_smoke.py    # smoke-тест API
+├── webui/              # вихідники сторінок (HTML / CSS / JS)
+│   ├── css/app.css
+│   ├── js/             # common, nav, home, stations, audio, ir, settings, wifi, system
+│   └── *.html, favicon.svg
+├── partitions.csv
+├── platformio.ini
+└── README.md
+```
+
+У корені також лежать допоміжні файли: `add.json`, `move.json`, `put.json`, `stations-2026-10-06.json`, `ir-map-2026-10-06.json`, `git_cheat_sheet.txt`, `.gitignore`. Файл `src/net/web_assets_gen.cpp` генерується при збірці й не комітиться.
+
+## Залежності
+
+З `platformio.ini`:
+
+| Бібліотека | Роль |
+|---|---|
+| [LovyanGFX](https://github.com/lovyan03/LovyanGFX) `^1.2.0` | Драйвер дисплея ST7789, спрайти |
+| [ESP32-audioI2S](https://github.com/schreibfaul1/ESP32-audioI2S) (git) | Декодування потоків, I2S |
+| [ESPAsyncWebServer](https://github.com/ESP32Async/ESPAsyncWebServer) (git) | HTTP-сервер |
+| [AsyncTCP](https://github.com/ESP32Async/AsyncTCP) (git) | Транспорт для веб-сервера |
+| [ArduinoJson](https://github.com/bblanchon/ArduinoJson) `^7.4.1` | JSON |
+
+Шрифти згенеровано з DejaVu Sans (вільна ліцензія DejaVu / Bitstream Vera, текст повідомлення вбудовано в шапки згенерованих `src/ui/font_*.h`).
