@@ -8,6 +8,10 @@
 // (те саме, що кнопки/пульт: ramp, мʼют на переходах, збереження в Settings). Тут лише:
 // розбір і валідація тіла, перевірка меж за capabilities(), мапінг WebCmdResult -> HTTP-код.
 //
+// [Prompt 39] + GET/POST /api/inputs: доступність і відключення зовнішніх входів 1..3 (радіо — завжди
+// дозволене). Зміна йде через AppController::runWebCommand(InputsEnabledSet), бо контролер має
+// перемкнути активний вхід, якщо його вимкнено; сам обробник лише валідує тіло й будує відповідь.
+//
 // Коди: 200 ok | 400 помилка клієнта (інвалідне значення/поза межами/не підтримується) |
 //       404 невідомий підшлях | 409 зараз недопустимо (standby, OTA, навчання IR, не вхід
 //       Radio, немає станцій) | 503 контролер зайнятий або немає аудіопроцесора.
@@ -20,7 +24,9 @@
 
 #include "audio/audio_processor.h"
 #include "audio/eq.h"
+#include "config/defaults.h"         // [Prompt 39]
 #include "config/eq_config.h"
+#include "config/settings_config.h"  // [Prompt 39] normalizeInputMask
 #include "core/app_controller.h"
 #include "core/app_state.h"
 #include "core/settings.h"
@@ -457,6 +463,139 @@ void handleEqPost(AsyncWebServerRequest* req) {
     sendJson(req, 200, doc);
 }
 
+// ---------------------------------------------------------------------------
+// [Prompt 39] GET /api/inputs, POST /api/inputs — доступність і відключення входів
+//   GET : {"inputs":[{"index":0,"name":"WiFi Radio","available":true,"enabled":true,
+//                     "selectable":true,"canDisable":false}, ... 4 входи ...],
+//          "enabledMask":15,"input":0}
+//         available  = вхід апаратно є (processor.capabilities.inputCount; PT2313L не має входу 3);
+//         enabled    = дозволено користувачем (маска); selectable = available && enabled;
+//         canDisable = false лише для радіо (вхід 0).
+//   POST: {"enabled":[a,b,c,d]}      рівно 4 елементи: true | false | null (= не змінювати);
+//                                    елемент 0 (радіо) ігнорується: радіо завжди дозволене
+//         або {"index":N,"enabled":true|false}   (одне поле, N = 0..3)
+//         -> 200 {"ok":true, ...те саме, що GET}; 409 ota_in_progress | ir_learn_active; 503 busy.
+// Дозволено і в Standby. Зберігається в NVS (з дебаунсом, лише при зміні) і діє після перезапуску.
+// ---------------------------------------------------------------------------
+// ВАЖЛИВО: імена в doc (char-масиви Settings) ArduinoJson може лише ПОСИЛАТИ, а не копіювати, тож
+// Settings `st` мусить жити в викликача, поки doc не серіалізовано (sendJson() — синхронний).
+void fillInputsState(JsonDocument& doc, const Settings& st) {
+    const uint8_t mask = settings_cfg::normalizeInputMask(st.inputEnabledMask);
+    uint8_t hw = defaults::kInputCount;  // апаратно доступні входи (без процесора — усі 4, як у контролері)
+    if (s_proc != nullptr) {
+        const uint8_t n = s_proc->capabilities().inputCount;
+        if (n < hw) hw = n;
+    }
+    JsonArray arr = doc["inputs"].to<JsonArray>();
+    for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+        const bool available = (i < hw);
+        const bool enabled = ((mask >> i) & 1u) != 0;
+        JsonObject o = arr.add<JsonObject>();
+        o["index"] = i;
+        o["name"] = (st.inputNames[i][0] != '\0') ? st.inputNames[i] : defaults::kInputNames[i];
+        o["available"] = available;
+        o["enabled"] = enabled;
+        o["selectable"] = available && enabled;
+        o["canDisable"] = (i != 0);
+    }
+    doc["enabledMask"] = mask;
+    doc["input"] = AppState::snapshot().inputIndex;  // активний вхід (міг змінитись після вимкнення)
+}
+
+void handleInputsGet(AsyncWebServerRequest* req) {
+    if (!exactUrl(req, "/api/inputs")) return;
+    WEB_API_LOG("%s %s", req->methodToString(), req->url().c_str());
+    const Settings st = SettingsStore::snapshot();
+    JsonDocument doc;
+    fillInputsState(doc, st);
+    sendJson(req, 200, doc);
+}
+
+void handleInputsPost(AsyncWebServerRequest* req) {
+    if (!exactUrl(req, "/api/inputs")) return;
+    WEB_API_LOG("%s %s", req->methodToString(), req->url().c_str());
+
+    JsonDocument in;
+    if (!readJsonObjectBody(req, in)) return;
+    JsonObjectConst root = in.as<JsonObjectConst>();
+    if (!allowKeys(req, root, "enabled", "index")) return;
+
+    JsonVariantConst vEn = root["enabled"];
+    JsonVariantConst vIdx = root["index"];
+    if (vEn.isNull()) {
+        sendFieldError(req, 400, "missing_field", "enabled");
+        return;
+    }
+
+    const uint8_t cur =
+        settings_cfg::normalizeInputMask(SettingsStore::snapshot().inputEnabledMask);
+    uint8_t next = cur;
+
+    if (vEn.is<JsonArrayConst>()) {
+        if (!vIdx.isNull()) {
+            sendFieldError(req, 400, "conflicting_fields", "enabled");
+            return;
+        }
+        JsonArrayConst a = vEn.as<JsonArrayConst>();
+        if (a.size() != defaults::kInputCount) {
+            sendFieldError(req, 400, "invalid_value", "enabled");
+            return;
+        }
+        for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+            JsonVariantConst v = a[i];
+            if (v.isNull()) continue;  // null = лишити без змін
+            if (!v.is<bool>()) {
+                sendFieldError(req, 400, "invalid_value", "enabled");
+                return;
+            }
+            if (v.as<bool>()) {
+                next = static_cast<uint8_t>(next | (1u << i));
+            } else {
+                next = static_cast<uint8_t>(next & ~(1u << i));
+            }
+        }
+    } else if (vEn.is<bool>()) {
+        if (vIdx.isNull()) {
+            sendFieldError(req, 400, "missing_field", "index");
+            return;
+        }
+        if (!vIdx.is<int>()) {
+            sendFieldError(req, 400, "invalid_value", "index");
+            return;
+        }
+        const int idx = vIdx.as<int>();
+        if (idx < 0 || idx >= defaults::kInputCount) {
+            sendRangeError(req, "index", 0, defaults::kInputCount - 1);
+            return;
+        }
+        if (vEn.as<bool>()) {
+            next = static_cast<uint8_t>(next | (1u << idx));
+        } else {
+            next = static_cast<uint8_t>(next & ~(1u << idx));
+        }
+    } else {
+        sendFieldError(req, 400, "invalid_value", "enabled");
+        return;
+    }
+    next = settings_cfg::normalizeInputMask(next);  // радіо (біт 0) лишається дозволеним
+
+    // Завжди через контролер (навіть без змін): ті самі гейти (OTA, IR) і одна точка запису.
+    const char* why = nullptr;
+    const WebCmdResult r = AppController::runWebCommand(
+        {WebCmdType::InputsEnabledSet, static_cast<int32_t>(next), false}, &why);
+    WEB_API_LOG("inputs mask 0x%02X -> result %d (%s)", static_cast<unsigned>(next),
+                static_cast<int>(r), why != nullptr ? why : "-");
+    if (r != WebCmdResult::Ok) {
+        sendResult(req, r, why);
+        return;
+    }
+    const Settings st = SettingsStore::snapshot();  // контролер уже записав маску синхронно
+    JsonDocument doc;
+    doc["ok"] = true;
+    fillInputsState(doc, st);
+    sendJson(req, 200, doc);
+}
+
 }  // namespace
 
 void registerPlayerRoutes(AsyncWebServer& server, AudioProcessor* proc) {
@@ -476,4 +615,9 @@ void registerPlayerRoutes(AsyncWebServer& server, AudioProcessor* proc) {
     // [Prompt 30] Еквалайзер радіо.
     server.on("/api/eq", HTTP_GET, handleEqGet);
     server.on("/api/eq", HTTP_POST, handleEqPost, nullptr, web_api::jsonBodyCallback);
+
+    // [Prompt 39] Доступність і відключення входів. "/api/inputs" не плутається з "/api/input":
+    // ESPAsyncWebServer зіставляє "/x" лише з "/x" і "/x/...", а не з "/xs".
+    server.on("/api/inputs", HTTP_GET, handleInputsGet);
+    server.on("/api/inputs", HTTP_POST, handleInputsPost, nullptr, web_api::jsonBodyCallback);
 }

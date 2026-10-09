@@ -73,11 +73,11 @@
 
   /* ---------- Рендер ---------- */
   function renderInputs() {
-    const list = st.inputs || [];
-    const sig = JSON.stringify(list.map((i) => [i.index, i.name, i.available]));
+    const list = (st.inputs || []).filter((i) => i.available && isInputEnabled(i.index));   // вимкнені входи ховаємо (P39b)
+    const sig = JSON.stringify(list.map((i) => [i.index, i.name]));
     if (sig !== inputsSig) {
       inputsSig = sig;
-      ui.inputs.replaceChildren(...list.filter((i) => i.available).map((i) =>
+      ui.inputs.replaceChildren(...list.map((i) =>
         el('button', { type: 'button', role: 'radio', 'data-i': i.index }, i.name)));
     }
     [...ui.inputs.children].forEach((b) => setAttr(b, 'aria-checked', Number(b.dataset.i) === st.input));
@@ -170,6 +170,7 @@
       return r;
     } catch (e) {
       toast(errorText(e), 'error');
+      noteInputError(e);
       render();
       poller.now();
       return null;
@@ -340,6 +341,7 @@
   /* ---------- Опитування ---------- */
   async function refreshStatus() {
     st = await api.get('/api/status');
+    syncInputs(st.input);
     render();
     maybeLoadStations();
   }
@@ -347,6 +349,7 @@
 
   initShell('home');
   onConnectionChange(render);
+  onInputsChange(() => { if (st) render(); });
   render();
   poller.start();
 })();

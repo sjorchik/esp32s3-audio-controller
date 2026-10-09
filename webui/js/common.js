@@ -74,6 +74,9 @@ const CONFIG = {
   eqBandFreqHz: [60, 250, 1000, 4000, 12000],      // запасні підписи смуг (eq_cfg::kBandFreqHz)
   eqRadioInput: 0,           // секція видима лише на цьому вході (0 = WiFi Radio)
   eqRetryMs: 5000,           // пауза перед повтором невдалого GET /api/eq
+  // --- Відключення входів (Prompt 39b; web_api.md §12) ---
+  inputsRefreshMs: 10000,    // як часто перечитувати GET /api/inputs (зміна з іншого клієнта); зміна активного входу перечитує одразу
+  inputsRetryMs: 5000,       // пауза після невдалого GET /api/inputs
 };
 
 /* ---------- Помилки API ---------- */
@@ -100,6 +103,7 @@ const REASONS = {
   wifi_setup: 'Пристрій налаштовує Wi-Fi.',
   no_stations: 'Список станцій порожній.',
   input_unavailable: 'Цей вхід недоступний для поточного аудіопроцесора.',
+  input_disabled: 'Цей вхід вимкнено в налаштуваннях.',
   station_out_of_range: 'Такої станції немає в списку.',
   index_out_of_range: 'Такої станції немає в списку.',
   volume_out_of_range: 'Гучність поза допустимими межами.',
@@ -581,6 +585,71 @@ async function rebootAndWait(path, body, before) {
   if (ok) { location.reload(); return; }
   w.set('Пристрій не відповідає', 'Перевірте живлення та мережу, потім оновіть сторінку.', false,
     el('button', { class: 'btn btn-primary', type: 'button', onclick: () => location.reload() }, 'Оновити сторінку'));
+}
+
+/* ---------- Вимкнені входи (Prompt 39b; web_api.md §12) ---------- */
+/* Спільний кеш GET /api/inputs для «Головної», «Аудіо» і «Налаштувань».
+   /api/status.inputs[] не містить enabled, тож сторінки фільтрують списки входів через isInputEnabled(). */
+const inputsState = { data: null, sig: '', input: null, busy: null, dirty: false, nextAt: 0, listeners: [] };
+
+/* Підписка на зміну списку входів (дані реально змінилися). */
+function onInputsChange(fn) { inputsState.listeners.push(fn); }
+/* Останні дані {inputs:[{index,name,available,enabled,selectable,canDisable}], enabledMask, input} або null. */
+function getInputs() { return inputsState.data; }
+/* true, якщо вхід не вимкнено. Невідомо (кеш ще не завантажено) -> true; радіо (0) -> завжди true. */
+function isInputEnabled(index) {
+  const d = inputsState.data;
+  if (!d || index === 0) return true;
+  const r = d.inputs.find((x) => x.index === index);
+  return r ? r.enabled !== false : true;
+}
+/* Приймає тіло GET / POST /api/inputs. */
+function applyInputs(d) {
+  if (!d || !Array.isArray(d.inputs) || !d.inputs.every((x) => x && typeof x.index === 'number')) {
+    throw new ApiError(200, null, 'bad_response');
+  }
+  const sig = JSON.stringify(d.inputs);
+  inputsState.data = d;
+  if (sig === inputsState.sig) return;
+  inputsState.sig = sig;
+  inputsState.listeners.forEach((f) => f(d));
+}
+/* GET /api/inputs. Паралельні виклики зливаються; виклик під час запиту ставить повторне читання. Кидає ApiError. */
+function loadInputs() {
+  const s = inputsState;
+  if (s.busy) { s.dirty = true; return s.busy; }
+  s.busy = (async () => {
+    try {
+      applyInputs(await api.get('/api/inputs'));
+      s.nextAt = Date.now() + CONFIG.inputsRefreshMs;
+    } catch (e) {
+      s.nextAt = Date.now() + CONFIG.inputsRetryMs;
+      throw e;
+    } finally {
+      s.busy = null;
+    }
+    if (s.dirty) { s.dirty = false; loadInputs().catch(() => {}); }
+  })();
+  return s.busy;
+}
+/* Викликати з кожного циклу опитування статусу: читає список при першому виклику, при зміні активного
+   входу й не рідше ніж раз на CONFIG.inputsRefreshMs. Помилки глушить (повтор через inputsRetryMs). */
+function syncInputs(currentInput) {
+  const s = inputsState;
+  const changed = currentInput !== s.input;
+  s.input = currentInput;
+  if (s.busy) { if (changed) s.dirty = true; return; }
+  if (changed || !s.data || Date.now() >= s.nextAt) loadInputs().catch(() => {});
+}
+/* POST /api/inputs {index, enabled}; відповідь одразу потрапляє в кеш. Кидає ApiError. */
+async function setInputEnabled(index, enabled) {
+  const d = await api.post('/api/inputs', { index, enabled }, CONFIG.stationsWriteTimeoutMs);
+  applyInputs(d);
+  return d;
+}
+/* Після невдалої команди: якщо вхід виявився вимкненим (гонка з іншим клієнтом) - перечитати список. */
+function noteInputError(e) {
+  if (e instanceof ApiError && (e.reason === 'input_disabled' || e.code === 'input_disabled')) loadInputs().catch(() => {});
 }
 
 /* ---------- Каркас сторінки ---------- */

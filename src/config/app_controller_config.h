@@ -4,6 +4,7 @@
 // Піни тут не дублюються (їх немає: AppController не чіпає залізо напряму).
 // Усі часові значення — у мілісекундах, якщо не вказано інше.
 
+#include <esp_system.h>  // [Prompt 39] esp_reset_reason_t
 #include <stdint.h>
 
 #include "config/audio_player_config.h"  // player_cfg::kTaskPriority, ir_cfg, input_cfg
@@ -78,9 +79,38 @@ constexpr int8_t kInputDownStep     = +1;
 constexpr int8_t kStationLeftStep   = -1;
 constexpr int8_t kStationRightStep  = +1;
 
-// true: після старту лишатись у Standby (мʼют, потік не запускається);
-// false: відновити останній вхід/станцію й увімкнутись з ramp.
+// true: після БУДЬ-ЯКОГО старту (також після перезапусків) лишатись у Standby (мʼют, потік не
+// запускається); false: відновити останній вхід/станцію й увімкнутись з ramp. [Prompt 39] Холодний
+// старт (див. нижче) іде в Standby незалежно від цього прапорця.
 constexpr bool kBootInStandby = false;
+
+// ---------------------------------------------------------------------------
+// [Prompt 39] Холодний старт у standby
+// ---------------------------------------------------------------------------
+// true: після ВВІМКНЕННЯ ЖИВЛЕННЯ (причина скидання з kColdStartResetReasons) пристрій стартує у
+// Standby так, ніби натиснули POWER: підсилювач вимкнено, мʼют, потік не запускається. Усі інші
+// скидання (ESP.restart() = веб reboot / OTA / «тихий» перезапуск, паніка, watchdog, deep sleep...)
+// поводяться як раніше: пристрій вмикається й відновлює lastInput/lastStation.
+constexpr bool kStandbyOnColdStart = true;
+
+// Причини скидання, що вважаються «холодним стартом». Власник може додати сюди, наприклад,
+// ESP_RST_EXT або ESP_RST_USB, якщо його спосіб перезапуску повідомляє іншу причину.
+// УВАГА: на ESP32-S3 апаратне скидання кнопкою EN / DTR-RTS при прошивці по UART зазвичай
+// теж повідомляється як ESP_RST_POWERON (відрізнити його від подачі живлення неможливо), тож
+// такі скидання теж підуть у standby. Фактичну причину друкує лог `[APP] ... reset reason N`.
+constexpr esp_reset_reason_t kColdStartResetReasons[] = {
+    ESP_RST_POWERON,
+    ESP_RST_BROWNOUT,
+};
+
+inline bool isColdStartReason(esp_reset_reason_t reason) {
+    for (const esp_reset_reason_t r : kColdStartResetReasons) {
+        if (r == reason) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // [Prompt 28] «Тихий» перезапуск (довге утримання POWER, див. input_cfg::kPowerRestartHoldMs)

@@ -8,6 +8,8 @@
 
 #include <stdint.h>
 
+#include "config/defaults.h"  // [Prompt 39] defaults::kInputCount (маска входів)
+
 // ---------------------------------------------------------------------------
 // Прапорці умовної компіляції
 // ---------------------------------------------------------------------------
@@ -40,17 +42,36 @@ constexpr const char* kNvsBlobKey   = "settings";
 // [Prompt 21b] 1 -> 2: глобальні bass/treble/balance/loudness/lastVolume замінено
 // профілями по входах (Settings::profiles).
 // [Prompt 30] 2 -> 3: у кінець Settings додано eqGainsDb (пресет еквалайзера радіо).
-constexpr uint8_t kFormatVersion = 3;
+// [Prompt 39] 3 -> 4: у кінець Settings додано inputEnabledMask (дозволені входи).
+constexpr uint8_t kFormatVersion = 4;
 
 // [Prompt 21b] Формат, який ще вміємо читати й мігрувати (усі профілі входів
 // успадковують колишні глобальні значення). Інші версії -> значення за замовчуванням.
 constexpr uint8_t kLegacyFormatVersion = 1;
 
-// [Prompt 30] Попередній формат v2 (профілі входів, без еквалайзера): читається й мігрується
-// (усе зберігається, еквалайзер = плоский 0 дБ).
+// [Prompt 30] Формат v2 (профілі входів, без еквалайзера): читається й мігрується
+// (усе зберігається, еквалайзер = плоский 0 дБ, [Prompt 39] усі входи дозволені).
 constexpr uint8_t kPrevFormatVersion = 2;
-static_assert(kLegacyFormatVersion < kPrevFormatVersion && kPrevFormatVersion < kFormatVersion,
+
+// [Prompt 39] Формат v3 (з еквалайзером, без маски входів): читається й мігрується
+// (усе зберігається, усі входи дозволені).
+constexpr uint8_t kPrev3FormatVersion = 3;
+static_assert(kLegacyFormatVersion < kPrevFormatVersion && kPrevFormatVersion < kPrev3FormatVersion &&
+                  kPrev3FormatVersion < kFormatVersion,
               "format versions must be strictly increasing");
+
+// [Prompt 39] Маска дозволених логічних входів (Settings::inputEnabledMask): біт i = вхід i.
+// Усі входи за замовчуванням дозволені; біт 0 (радіо) завжди 1 — вимкнути можна лише входи 1..3.
+// Апаратна доступність (AudioProcessorCapabilities::inputCount) від маски не залежить:
+// вхід «ефективний» = апаратно є І біт у масці.
+static_assert(defaults::kInputCount <= 8, "inputEnabledMask is a single byte");
+constexpr uint8_t kInputMaskAll = static_cast<uint8_t>((1u << defaults::kInputCount) - 1u);
+constexpr uint8_t kInputMaskRadioBit = 0x01;
+
+// Єдине місце нормалізації маски: зайві біти (≥ kInputCount) скидаються, біт радіо = 1.
+constexpr uint8_t normalizeInputMask(uint8_t m) {
+    return static_cast<uint8_t>((m & kInputMaskAll) | kInputMaskRadioBit);
+}
 
 // [Prompt 21b] Підсилення входу за замовчуванням (сирі апаратні кроки) для нових і
 // мігрованих профілів. Раніше gain у NVS не зберігався й після старту дорівнював

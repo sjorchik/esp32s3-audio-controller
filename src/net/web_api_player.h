@@ -16,6 +16,9 @@
 //   POST /api/player/station   {"index":N[,"switchInput":true]}
 //   GET  /api/eq               (P30) пресет еквалайзера радіо
 //   POST /api/eq               (P30) {"gainsDb":[a,b,c,d,e]} або {"band":N,"gainDb":X}
+//   GET  /api/inputs           (P39) входи: назва, апаратна доступність, дозвіл (маска)
+//   POST /api/inputs           (P39) {"enabled":[b|null x4]} або {"index":N,"enabled":bool}; йде через
+//                              AppController::runWebCommand(InputsEnabledSet)
 
 #include <ESPAsyncWebServer.h>
 

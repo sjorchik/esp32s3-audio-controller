@@ -34,6 +34,9 @@
 // [Prompt 28] ДОДАНО: startOffline() — запуск офлайн-режиму (Wi-Fi вимкнено, усі входи, крім
 //             радіо). Також (без зміни публічного інтерфейсу) довге утримання POWER
 //             (Event::veryLongPress) запускає «тихий» перезапуск у будь-якому режимі.
+// [Prompt 39] ДОДАНО: WebCmdType::InputsEnabledSet (маска дозволених входів 1..3, лише з вебу) і
+//             reason "input_disabled" для InputSet. Холодний старт (скидання за живленням) тепер
+//             одразу в Standby: логіка — у begin() (публічний інтерфейс не змінено).
 
 #include "core/events.h"
 
@@ -72,6 +75,10 @@ struct ToneUpdate {
 //   StationPlay   value = індекс станції; flag = true -> якщо активний інший вхід, перейти на Radio
 //   StationNext   - (напрямок як у кнопки RIGHT)
 //   StationPrev   - (напрямок як у кнопки LEFT)
+//   InputsEnabledSet  value = нова МАСКА дозволених входів (біт i = вхід i; значення нормалізується:
+//                     біт 0 завжди 1, зайві біти скидаються) [Prompt 39]. Єдина команда, дозволена
+//                     в Standby (крім живлення). Якщо активний вхід став вимкненим — перехід на
+//                     перший доступний (радіо) штатним changeInput(); зберігається в Settings.
 enum class WebCmdType : uint8_t {
     VolumeSet,
     VolumeStep,
@@ -87,6 +94,7 @@ enum class WebCmdType : uint8_t {
     StationPlay,
     StationNext,
     StationPrev,
+    InputsEnabledSet,  // [Prompt 39] ДОДАНО (лише в кінець enum)
 };
 
 struct WebCommand {
@@ -167,7 +175,8 @@ public:
     // *reasonOut (якщо не nullptr) — статичний рядок snake_case для NotAllowed/OutOfRange/
     // Unsupported/Busy: "ota_in_progress", "ir_learn_active", "standby", "not_radio_input",
     // "wifi_setup", "no_stations", "input_unavailable", "station_out_of_range",
-    // "volume_out_of_range", "gain_out_of_range", "not_supported", "busy"; інакше nullptr.
+    // "volume_out_of_range", "gain_out_of_range", "not_supported", "busy"; [Prompt 39] + "input_disabled"
+    // (InputSet на вхід, вимкнений маскою входів -> NotAllowed); інакше nullptr.
     // Стан публікується в AppState і (за потреби) зберігається в Settings до повернення.
     static WebCmdResult runWebCommand(const WebCommand& cmd, const char** reasonOut = nullptr);
 

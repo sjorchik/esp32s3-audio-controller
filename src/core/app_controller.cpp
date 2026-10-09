@@ -103,9 +103,26 @@
 // Також ціль скидається на гучність при вході в Standby й при вмиканні (powerOnTransition).
 // Публічний інтерфейс не змінено; у NVS ціль не зберігається.
 
+// [Prompt 39] Холодний старт у standby і відключення зовнішніх входів.
+// 1) begin(): якщо esp_reset_reason() ∈ app_controller_cfg::kColdStartResetReasons (подача живлення,
+//    brownout) — гілка «boot in standby» (та сама, що для kBootInStandby): мʼют, пін підсилювача LOW
+//    (з setup()), потік не запускається, жодного powerOnTransition(). Вихід — POWER штатно
+//    (leaveStandby: lastInput/lastStation/профіль входу). ESP.restart() (веб reboot / OTA / «тихий»
+//    перезапуск), паніка, watchdog тощо — поведінка без змін. Стан живлення в NVS НЕ зберігається.
+// 2) Маска дозволених входів (Settings::inputEnabledMask, біт 0 = радіо завжди 1) живе в s_inputMask
+//    (дзеркало Settings; пише лише цей файл через WebCmdType::InputsEnabledSet). ЄДИНЕ місце рішення
+//    «чи доступний вхід» лишається inputAvailable(): тепер = апаратно є (inputCount) І дозволено маскою
+//    І (в офлайні) не радіо. Тому циклічне перемикання (UP/DOWN), пряме вибирання (INPUT_*), веб
+//    InputSet, відновлення lastInput (begin, leaveStandby) автоматично пропускають вимкнені входи.
+//    Якщо вимикається активний вхід — перехід на перший доступний (радіо) через changeInput()
+//    (у Standby — лише s_input і профіль, без чіпа). Веб InputSet на вимкнений вхід -> NotAllowed
+//    "input_disabled" (409). Офлайн-режим не запускається, коли жодного зовнішнього входу не дозволено
+//    (інакше пристрій лишився б без звуку на екрані WifiSetup до перезапуску).
+
 #include "core/app_controller.h"
 
 #include <Arduino.h>
+#include <esp_system.h>  // [Prompt 39] esp_reset_reason()
 #include <string.h>
 
 #include "audio/amp_standby.h"  // [Prompt 23c]
@@ -116,6 +133,7 @@
 #include "config/defaults.h"
 #include "config/features.h"  // [Prompt 23c]
 #include "config/ir_learn_ui_config.h"  // [Prompt 15] ДОДАНО
+#include "config/settings_config.h"  // [Prompt 39] normalizeInputMask, kInputMaskAll
 #include "config/wifi_status_config.h"  // [Prompt 36]
 #include "core/app_state.h"
 #include "core/settings.h"
@@ -220,6 +238,11 @@ Action s_irPubOther = Action::POWER;
 
 // --- [Prompt 28] Офлайн-режим і «тихий» перезапуск ---
 bool s_offline = false;  // Wi-Fi вимкнено, вхід Radio недоступний (до перезапуску)
+
+// --- [Prompt 39] Маска входів, дозволених користувачем (дзеркало Settings::inputEnabledMask) ---
+// Біт i = вхід i; біт 0 (радіо) завжди 1. Завантажується в begin(), міняється лише веб-командою
+// InputsEnabledSet (під s_lock). Апаратну доступність входу цей прапорець не замінює (див. inputAvailable()).
+uint8_t s_inputMask = settings_cfg::kInputMaskAll;
 
 enum class RestartPhase : uint8_t {
     None,      // перезапуску немає
@@ -688,6 +711,7 @@ struct PubCtx {
     bool restarting;  // [Prompt 28]
     AdjustTarget popupTarget;  // [Prompt 32]
     uint8_t popupSeq;          // [Prompt 32]
+    uint8_t inputEnabledMask;  // [Prompt 39]
     char inputName[kInputNameMax];  // [Prompt 23b]
 };
 
@@ -710,13 +734,14 @@ void applyPub(AppStateData& s, void* c) {
     s.restarting = p->restarting;  // [Prompt 28]
     s.popupTarget = p->popupTarget;  // [Prompt 32]
     s.popupSeq = p->popupSeq;        // [Prompt 32]
+    s.inputEnabledMask = p->inputEnabledMask;  // [Prompt 39]
     memcpy(s.inputName, p->inputName, sizeof(s.inputName));  // [Prompt 23b]
 }
 
 void publishState() {
     PubCtx p = {s_mode,   s_input, s_volume, s_bass,    s_treble, s_balance,
                 s_gain,   s_userMute, s_station, s_target, s_menuCtx, s_menuSel,
-                s_loudness, s_offline, restarting(), s_popupTarget, s_popupSeq};
+                s_loudness, s_offline, restarting(), s_popupTarget, s_popupSeq, s_inputMask};
     resolveInputName(s_input, p.inputName, sizeof(p.inputName));  // [Prompt 23b]
     AppState::modify(applyPub, &p);
 }
@@ -747,6 +772,12 @@ void persist() {
     captureActiveProfile();
     PersistCtx p = {s_input, s_station, s_userMute, s_profiles};
     SettingsStore::modify(applyPersist, &p);
+}
+
+// [Prompt 39] Запис маски входів у Settings (окремо від persist(): маску пише лише команда вебу,
+// а applyPersist() її не чіпає). SettingsStore::modify() — NVS з дебаунсом.
+void applyMaskPersist(Settings& s, void* c) {
+    s.inputEnabledMask = *static_cast<const uint8_t*>(c);
 }
 
 // [Prompt 20b] Негайне оновлення лише назви станції (без решти полів syncPlayer()), щоб після
@@ -947,8 +978,31 @@ void enterStandby() {
 // [Prompt 28] ЄДИНЕ місце рішення «чи доступний вхід»: індекс у межах чипа (PT2313L = 3 входи) і,
 // в офлайні, не радіо (вхід 0). Усі вибори входу (кнопки, пульт, веб, вихід зі standby) йдуть
 // через цю функцію.
+// [Prompt 39] + дозволено маскою входів (вхід 0 завжди дозволений: біт 0 нормалізується).
+bool inputEnabled(uint8_t idx) {
+    return idx < defaults::kInputCount && ((s_inputMask >> idx) & 1u) != 0;
+}
+
 bool inputAvailable(uint8_t idx) {
-    return idx < s_caps.inputCount && !(s_offline && idx == 0);
+    return idx < s_caps.inputCount && inputEnabled(idx) && !(s_offline && idx == 0);
+}
+
+// Текстова причина недоступності входу для логів (лише коли inputAvailable(idx) == false).
+const char* inputUnavailableWhy(uint8_t idx) {
+    if (idx >= s_caps.inputCount) return "no such input";
+    if (!inputEnabled(idx)) return "disabled";
+    return "offline";
+}
+
+// [Prompt 39] Чи є хоч один дозволений зовнішній вхід (1..inputCount-1) — потрібен офлайн-режиму,
+// де радіо недоступне. Офлайн-стан сюди не входить (зовнішні входи від нього не залежать).
+bool anyExternalInputEnabled() {
+    for (uint8_t i = 1; i < s_caps.inputCount; ++i) {
+        if (inputEnabled(i)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Перший доступний вхід за порядком 0..inputCount-1 (в офлайні це перший не-радіо вхід).
@@ -958,7 +1012,9 @@ uint8_t firstAvailableInput() {
             return i;
         }
     }
-    return 0;  // недосяжно: inputCount >= 3 на обох чипах
+    // [Prompt 39] Недосяжно: радіо (0) дозволене завжди, а офлайн-режим не стартує без дозволеного
+    // зовнішнього входу (startOfflineLocked()).
+    return 0;
 }
 
 void leaveStandby() {
@@ -995,7 +1051,7 @@ void changeInput(uint8_t newIdx) {
     }
     if (!inputAvailable(newIdx)) {  // [Prompt 28] сторожа: у офлайні радіо недоступне з будь-якого шляху
         APP_LOG("input %u unavailable (%s)\n", static_cast<unsigned>(newIdx),
-                s_offline ? "offline" : "no such input");
+                inputUnavailableWhy(newIdx));  // [Prompt 39]: + disabled
         return;
     }
     const bool leavingRadio = (s_input == 0 && newIdx != 0);
@@ -1042,8 +1098,8 @@ void stepInput(int dir) {
 
 void selectInput(uint8_t idx) {
     if (!inputAvailable(idx)) {  // [Prompt 28] у межах чипа й, в офлайні, не радіо
-        APP_LOG("input %u unavailable (%s)\n", static_cast<unsigned>(idx),
-                s_offline && idx == 0 ? "offline" : "not on this processor");
+        APP_LOG("input %u unavailable (%s) - ignored\n", static_cast<unsigned>(idx),
+                inputUnavailableWhy(idx));  // [Prompt 39]: no such input / disabled / offline
         return;
     }
     changeInput(idx);
@@ -1055,6 +1111,12 @@ void selectInput(uint8_t idx) {
 // як при звичайній зміні входу (підсилювач у WifiSetup уже працює: прогріву немає).
 bool startOfflineLocked() {
     if (s_offline || restarting() || s_mode != Mode::WifiSetup) {
+        return false;
+    }
+    // [Prompt 39] Офлайн без радіо потребує хоч одного дозволеного зовнішнього входу, інакше звуку
+    // не буде взагалі, а екран лишився б у WifiSetup до перезапуску.
+    if (!anyExternalInputEnabled()) {
+        APP_LOG("offline refused: no external input enabled\n");
         return false;
     }
     s_offline = true;
@@ -1878,7 +1940,9 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
     }
     const bool powerCmd =
         (c.type == WebCmdType::StandbySet || c.type == WebCmdType::StandbyToggle);
-    if (s_mode == Mode::Standby && !powerCmd) {
+    // [Prompt 39] Налаштування масок входів дозволено і в Standby (після холодного старту пристрій
+    // саме там, а сторінка налаштувань має працювати): стан звуку воно не чіпає.
+    if (s_mode == Mode::Standby && !powerCmd && c.type != WebCmdType::InputsEnabledSet) {
         why = "standby";  // як і події: у Standby все, крім POWER, ігнорується
         return WebCmdResult::NotAllowed;
     }
@@ -1940,14 +2004,56 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
             break;
 
         case WebCmdType::InputSet:
-            if (c.value < 0 || c.value >= s_caps.inputCount ||
-                !inputAvailable(static_cast<uint8_t>(c.value))) {  // [Prompt 28]: офлайн -> без радіо
+            if (c.value < 0 || c.value >= s_caps.inputCount) {
                 why = "input_unavailable";  // напр. вхід 3 для PT2313L
+                return WebCmdResult::OutOfRange;
+            }
+            // [Prompt 39] Вхід вимкнено користувачем (маска) — не помилка значення, а стан
+            // налаштувань: 409 input_disabled (на відміну від апаратно відсутнього входу -> 400).
+            if (!inputEnabled(static_cast<uint8_t>(c.value))) {
+                why = "input_disabled";
+                return WebCmdResult::NotAllowed;
+            }
+            if (!inputAvailable(static_cast<uint8_t>(c.value))) {  // [Prompt 28]: офлайн -> без радіо
+                why = "input_unavailable";
                 return WebCmdResult::OutOfRange;
             }
             if (s_mode == Mode::Menu) closeStationList();
             changeInput(static_cast<uint8_t>(c.value));
             break;
+
+        case WebCmdType::InputsEnabledSet: {
+            // [Prompt 39] value = нова маска; нормалізується тут ще раз (біт радіо = 1, зайві біти
+            // скинуто) — валідацію запиту робить веб-обробник, тут лише страховка.
+            const uint8_t want =
+                settings_cfg::normalizeInputMask(static_cast<uint8_t>(c.value & 0xFF));
+            if (want == s_inputMask) {
+                break;  // нічого не змінилось: ні запису в NVS, ні перемикань
+            }
+            APP_LOG("inputs enabled mask 0x%02X -> 0x%02X (WEB)\n",
+                    static_cast<unsigned>(s_inputMask), static_cast<unsigned>(want));
+            s_inputMask = want;
+            uint8_t maskToStore = want;  // modify() приймає void* ctx (fn викликається синхронно)
+            SettingsStore::modify(applyMaskPersist, &maskToStore);  // NVS з дебаунсом; лише при зміні
+            if (!inputAvailable(s_input)) {
+                // Активний вхід щойно вимкнено (або lastInput у Standby): на перший доступний (радіо).
+                const uint8_t fb = firstAvailableInput();
+                APP_LOG("active input %u disabled -> input %u\n", static_cast<unsigned>(s_input),
+                        static_cast<unsigned>(fb));
+                if (s_mode == Mode::Standby) {
+                    // Standby: чіп і потік не чіпаємо (профіль застосує leaveStandby()); лише
+                    // тримаємо s_input / профіль / AppState узгодженими.
+                    captureActiveProfile();
+                    s_input = fb;
+                    loadActiveFromProfile(fb);
+                    s_persistNeeded = true;
+                } else {
+                    if (s_mode == Mode::Menu) closeStationList();
+                    changeInput(fb);  // мʼют -> профіль -> розмʼют/ramp, зупинка/запуск потоку; persist
+                }
+            }
+            break;
+        }
 
         case WebCmdType::PlayerPlay:
         case WebCmdType::PlayerPause:
@@ -2239,7 +2345,10 @@ bool AppController::begin(AudioProcessor* processorOrNull) {
     // останнього активного входу.
     const Settings st = SettingsStore::snapshot();
     memcpy(s_profiles, st.profiles, sizeof(s_profiles));
-    s_input = (st.lastInput < s_caps.inputCount) ? st.lastInput : 0;
+    // [Prompt 39] Маска входів — ДО вибору s_input: lastInput, вимкнений (або апаратно відсутній),
+    // замінюється на перший доступний вхід (радіо).
+    s_inputMask = settings_cfg::normalizeInputMask(st.inputEnabledMask);
+    s_input = inputAvailable(st.lastInput) ? st.lastInput : firstAvailableInput();
     s_station = (st.lastStation < stationCount()) ? st.lastStation : 0;
     loadActiveFromProfile(s_input);
     s_userMute = st.lastMute;
@@ -2254,7 +2363,18 @@ bool AppController::begin(AudioProcessor* processorOrNull) {
     s_hwMute = false;
     applyHardwareMute(true);
 
-    if (cfg::kBootInStandby) {
+    // [Prompt 39] Причина скидання: подача живлення / brownout (cfg::kColdStartResetReasons) —
+    // стартуємо у Standby, як після POWER. Інші причини (ESP.restart(), паніка, watchdog, ...) —
+    // як раніше (kBootInStandby = false -> увімкнутись і відновити lastInput/lastStation).
+    const esp_reset_reason_t resetReason = esp_reset_reason();
+    const bool coldStart = cfg::kStandbyOnColdStart && cfg::isColdStartReason(resetReason);
+    if (coldStart) {
+        APP_LOG("cold start (reset reason %d) -> standby\n", static_cast<int>(resetReason));
+    } else {
+        APP_LOG("reset reason %d (not a cold start)\n", static_cast<int>(resetReason));
+    }
+
+    if (cfg::kBootInStandby || coldStart) {
         APP_LOG("boot in standby\n");
         // Вхід у чіп не перемикаємо (як і раніше), тож gain (він стосується поточного входу
         // ЧІПА) не чіпаємо: профіль входу застосується повністю при виході зі standby.
@@ -2272,8 +2392,8 @@ bool AppController::begin(AudioProcessor* processorOrNull) {
     }
 
     s_started = true;
-    APP_LOG("ready: mode=%s input=%u station=%u vol=%d mute=%d\n", modeName(s_mode),
+    APP_LOG("ready: mode=%s input=%u station=%u vol=%d mute=%d inputMask=0x%02X\n", modeName(s_mode),
             static_cast<unsigned>(s_input), static_cast<unsigned>(s_station),
-            static_cast<int>(s_volume), s_userMute ? 1 : 0);
+            static_cast<int>(s_volume), s_userMute ? 1 : 0, static_cast<unsigned>(s_inputMask));
     return true;
 }

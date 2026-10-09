@@ -53,6 +53,7 @@
       return r;
     } catch (e) {
       toast(errorText(e), 'error');
+      noteInputError(e);
       render();
       poller.now();
       return null;
@@ -275,7 +276,7 @@
   }
 
   function renderInputs(c) {
-    const list = (st.inputs || []).filter((i) => i.available && i.index < c.inputCount);
+    const list = (st.inputs || []).filter((i) => i.available && i.index < c.inputCount && isInputEnabled(i.index));   // вимкнені ховаємо (P39b)
     const sig = JSON.stringify(list.map((i) => [i.index, i.name]));
     if (sig !== inputsSig) {
       inputsSig = sig;
@@ -344,12 +345,14 @@
     const prev = st;
     st = await api.get('/api/status');
     if (prev && Date.now() < optUntil) { st.gain = prev.gain; st.input = prev.input; }
+    syncInputs(st.input);
     render();
   }
   const poller = createPoller(refreshStatus, { intervalMs: CONFIG.pollStatusMs });
 
   initShell('audio');
   onConnectionChange(render);
+  onInputsChange(() => render());
   render();
   poller.start();
 })();

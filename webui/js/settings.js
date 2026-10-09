@@ -8,6 +8,7 @@
     wifi: g('wifi'), grp: g('grp'), proc: g('proc'), restart: g('restart-row'), restartText: g('restart-text'),
     btnRestart: g('btn-restart'), names: g('names'), btnNames: g('btn-names'),
     bright: g('bright'), brightOut: g('bright-out'), flip: g('flip'), wifiRows: g('wifi-rows'),
+    inputsList: g('inputs-list'), inputsLoad: g('inputs-load'),
   };
   const CTRL = /[\u0000-\u001f\u007f]/;
   const CHIP = { Tda7318: 'TDA7318', Pt2313l: 'PT2313L' };
@@ -103,6 +104,7 @@
         saved('names');
       } catch (e) { showNameErrors(e); }
       await loadSettings();
+      loadInputs().catch(() => {});                       // назви в блоці «Входи» теж оновити
     });
   }
   ui.btnNames.addEventListener('click', saveNames);
@@ -127,6 +129,52 @@
     if (!(await confirmDialog('Перезапустити пристрій зараз? Звук зупиниться приблизно на 10–15 секунд.', { okText: 'Перезапустити', danger: true }))) return;
     run(() => rebootAndWait('/api/system/reboot', undefined, () => poller.stop()));
   });
+
+  /* ---------- Входи (P39b; web_api.md §12) ---------- */
+  let inputsBusy = false;     // триває POST /api/inputs: перемикачі заблоковані, checked не перезаписується
+  const inRows = [0, 1, 2, 3].map((i) => {
+    const box = el('input', { type: 'checkbox', id: 'inen-' + i });
+    const name = el('span');
+    const note = el('p', { class: 'hint', hidden: true });
+    const wrap = el('div', { class: 'param', hidden: true }, el('label', { class: 'switch' }, box, name), note);
+    box.addEventListener('change', () => toggleInput(i, box.checked));
+    ui.inputsList.append(wrap);
+    return { box, name, note, wrap };
+  });
+
+  function renderInputsCard() {
+    const d = getInputs();
+    ui.inputsLoad.hidden = !!d;
+    inRows.forEach((r, i) => {
+      const x = d && d.inputs.find((v) => v.index === i);
+      r.wrap.hidden = !x;
+      if (!x) return;
+      const radio = i === 0;
+      const avail = x.available !== false;
+      setText(r.name, x.name || 'Вхід ' + (i + 1));
+      if (!inputsBusy) r.box.checked = radio ? true : x.enabled !== false;
+      r.box.disabled = radio || !avail || inputsBusy;
+      const t = radio ? 'Радіо завжди доступне.' : !avail ? 'Недоступний для цього аудіопроцесора.' : '';
+      setText(r.note, t);
+      r.note.hidden = !t;
+    });
+  }
+
+  async function toggleInput(i, want) {
+    if (inputsBusy) return;
+    const wasActive = !want && !!st && st.input === i;
+    inputsBusy = true; renderInputsCard();
+    try {
+      await setInputEnabled(i, want);
+      saved('inputs');
+      if (wasActive) toast('Активний вхід вимкнено: пристрій перемкнувся на радіо.', 'ok');
+    } catch (e) {
+      toast(errorText(e), 'error');                       // 409 / 400 / 503: перемикач повернеться зі збереженого стану
+    }
+    inputsBusy = false;
+    renderInputsCard();
+    poller.now();
+  }
 
   /* ---------- Дисплей ---------- */
   const brightCtl = createSlider(ui.bright, {
@@ -190,6 +238,7 @@
 
   async function refreshStatus() {
     st = await api.get('/api/status');
+    syncInputs(st.input);
     if (!cfg) loadSettings();
     render();
   }
@@ -219,10 +268,12 @@
       if (!flipBusy) ui.flip.checked = !!st.displayFlipped;
     }
     renderWifiRows();
+    renderInputsCard();
   }
 
   initShell('settings');
   onConnectionChange(render);
+  onInputsChange(renderInputsCard);
   render();
   loadSettings();
   poller.start();

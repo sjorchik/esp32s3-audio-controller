@@ -1,4 +1,4 @@
-# Веб-інтерфейс: каркас фронтенду (Prompt 19, доповнено Prompt 20, 21, 22, 23, 24, 25b і 29b)
+# Веб-інтерфейс: каркас фронтенду (Prompt 19, доповнено Prompt 20, 21, 22, 23, 24, 25b, 29b і 39b)
 
 Документ для наступних промптів (P25+). Нові сторінки додаються **лише змінами в `webui/`** — без правок C++.
 Контракт API — `docs/web_api.md`.
@@ -258,6 +258,16 @@ if (await confirmDialog('Перезапустити пристрій?', { okText
 - **Скинути.** `POST /api/eq {gainsDb:[0,0,0,0,0]}` без діалогу підтвердження (дія безпечна й оборотна); «Скинути тембр» еквалайзер НЕ чіпає, і навпаки.
 - **Гейти.** OTA / IR / WifiSetup / офлайн → `fieldset disabled` (банери вже показує сторінка); standby не гейтить (`GET` / `POST /api/eq` доступні завжди, `409 ota_in_progress` — під час OTA).
 
+### 5.8. Відключення зовнішніх входів (P39b)
+
+Зразки — `js/settings.js` (блок «Входи»), `js/home.js` і `js/audio.js` (`renderInputs`). Контракт — `web_api.md` §12 (`GET` / `POST /api/inputs`, `409 input_disabled` для `POST /api/input`).
+
+- **Спільний кеш у `common.js`.** `GET /api/status.inputs[]` не містить `enabled`, тому список вимкнених входів читається окремо й живе в одному кеші на сторінку: `getInputs()` (дані або `null`), `isInputEnabled(index)` (невідомо → `true`; радіо → завжди `true`), `loadInputs()` (злиті паралельні виклики, кидає `ApiError`), `syncInputs(currentInput)`, `setInputEnabled(index, enabled)` (`POST /api/inputs`, відповідь одразу в кеш), `onInputsChange(fn)` (виклик лише коли дані реально змінились), `noteInputError(e)`. Нові ключі `CONFIG.inputsRefreshMs` (10000) і `inputsRetryMs` (5000); `REASONS.input_disabled`.
+- **Оновлення списку.** Окремого пулера немає: кожна сторінка викликає `syncInputs(st.input)` у своєму `refreshStatus`. Список перечитується при першому виклику, одразу при зміні активного входу (в т.ч. коли пристрій сам перейшов на радіо після вимкнення активного входу) і не рідше ніж раз на `inputsRefreshMs`. Зміна з іншого клієнта видна не пізніше цього інтервалу; у прихованій вкладці опитування (а з ним і оновлення) стоїть. Помилка `GET /api/inputs` не показується (повтор через `inputsRetryMs`), доки список не завантажено, вхід вважається ввімкненим.
+- **«Головна» і «Аудіо».** Вимкнені входи ПРИХОВУЮТЬСЯ (не дизейблються): фільтр `available && isInputEnabled(index)` (на «Аудіо» ще `index < inputCount`). Підпис списку (`inputsSig`) тепер лише з видимих входів, `onInputsChange` викликає `render()`. На невдалу команду входу `command()` викликає `noteInputError(e)`: для `input_disabled` показується toast і список перечитується одразу. Секція еквалайзера (P30b) і сторінка «Пульт» не змінені.
+- **«Налаштування → Входи».** Радіо — завжди ввімкнено, перемикач неактивний («Радіо завжди доступне»). Входи 1–3 — перемикачі з поточними назвами з `GET /api/inputs`; зміна → `POST /api/inputs {index, enabled}`. Вхід, недоступний апаратно (`available:false`, PT2313L: вхід 3), показується неактивним із поясненням «Недоступний для цього аудіопроцесора». Під час запиту всі перемикачі заблоковані; при помилці (`409 ota_in_progress` / `ir_learn_active`, `503 busy`, `400`) — toast через `errorText`, перемикач повертається до збереженого стану з кешу. Якщо вимкнено активний вхід — toast «пристрій перемкнувся на радіо». Секція працює й у standby, і під час OTA / IR / WifiSetup (щоб помилка пояснювалась сервером), лише offline вимикає весь `fieldset`.
+- **Обмеження.** Назви входів у блоці «Входи» оновлюються після «Зберегти назви» та за періодичним оновленням; зовнішня зміна маски з пристрою неможлива (на дисплеї й пульті керування немає).
+
 ## 6. Шаблон опитування
 
 ```js
@@ -279,7 +289,7 @@ poller.start();
 
 ## 7. Словник `reason`
 
-Повний словник — об'єкт `REASONS` у `common.js` (коди керування: `standby`, `ota_in_progress`, `ir_learn_active`, `not_radio_input`, `wifi_setup`, `no_stations`, `input_unavailable`, `station_out_of_range`, `volume_out_of_range`, `gain_out_of_range`, `not_supported`, `busy`; а також загальні, станцій/імпорту (з P25b — `level_invalid`, `level_out_of_range`), OTA (`bad_image`, `bad_magic`, `too_small`, `image_too_large`, `verify_failed`, `incomplete`, `begin_failed`, `write_failed`, `no_ota_partition`, `ota_busy`, `ota_done_restarting`, `length_required`, `unsupported_content_type`), IR). Невідомий код → «Помилка: <код>». Для `out_of_range` з `min`/`max` межі додаються до тексту автоматично.
+Повний словник — об'єкт `REASONS` у `common.js` (коди керування: `standby`, `ota_in_progress`, `ir_learn_active`, `not_radio_input`, `wifi_setup`, `no_stations`, `input_unavailable`, `station_out_of_range`, `volume_out_of_range`, `gain_out_of_range`, `not_supported`, `busy`, `input_disabled` (P39b); а також загальні, станцій/імпорту (з P25b — `level_invalid`, `level_out_of_range`), OTA (`bad_image`, `bad_magic`, `too_small`, `image_too_large`, `verify_failed`, `incomplete`, `begin_failed`, `write_failed`, `no_ota_partition`, `ota_busy`, `ota_done_restarting`, `length_required`, `unsupported_content_type`), IR). Невідомий код → «Помилка: <код>». Для `out_of_range` з `min`/`max` межі додаються до тексту автоматично.
 
 ## 8. Розробка на ПК
 

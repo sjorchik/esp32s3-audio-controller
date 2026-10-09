@@ -102,6 +102,46 @@ static_assert(offsetof(Settings, eqGainsDb) ==
                   offsetof(SettingsV2, profiles) + sizeof(SettingsV2::profiles),
               "eqGainsDb must directly follow profiles");
 
+// [Prompt 39] Формат v3 (з еквалайзером, БЕЗ маски входів): ТОЧНА копія колишньої структури Settings
+// (порядок і типи полів не змінювати!) — потрібна лише для читання старого blob-а.
+struct SettingsV3 {
+    uint8_t processorType;
+    char inputNames[4][32];
+    uint8_t brightness;
+    bool displayFlipped;
+    uint8_t lastInput;
+    uint16_t lastStation;
+    bool lastMute;
+    InputProfile profiles[defaults::kInputCount];
+    int8_t eqGainsDb[eq_cfg::kBandCount];
+};
+
+struct StoredBlobV3 {
+    uint8_t version;
+    uint8_t reserved;
+    uint16_t payloadSize;
+    SettingsV3 data;
+};
+
+static_assert(sizeof(SettingsV3) == 164, "SettingsV3 must match the layout written by v3 firmware");
+// Усі чотири формати розрізняються за довжиною збереженого blob-а (див. SettingsStore::load()).
+static_assert(sizeof(StoredBlobV1) != sizeof(StoredBlobV2) &&
+                  sizeof(StoredBlobV1) != sizeof(StoredBlobV3) &&
+                  sizeof(StoredBlobV1) != sizeof(StoredBlob) &&
+                  sizeof(StoredBlobV2) != sizeof(StoredBlobV3) &&
+                  sizeof(StoredBlobV2) != sizeof(StoredBlob) &&
+                  sizeof(StoredBlobV3) != sizeof(StoredBlob),
+              "blob formats are told apart by stored length");
+// Нове поле стоїть ПІСЛЯ eqGainsDb: усі поля v3 лишились на своїх місцях й заповнюють рівно
+// sizeof(SettingsV3) байт (без внутрішнього padding перед новим полем).
+static_assert(offsetof(Settings, eqGainsDb) == offsetof(SettingsV3, eqGainsDb) &&
+                  offsetof(Settings, profiles) == offsetof(SettingsV3, profiles) &&
+                  offsetof(Settings, lastStation) == offsetof(SettingsV3, lastStation) &&
+                  offsetof(Settings, inputNames) == offsetof(SettingsV3, inputNames),
+              "Settings must keep the v3 field layout (new fields only at the end)");
+static_assert(offsetof(Settings, inputEnabledMask) == sizeof(SettingsV3),
+              "inputEnabledMask must directly follow eqGainsDb (end of SettingsV3)");
+
 constexpr uint8_t kProcTypeMax = static_cast<uint8_t>(AudioProcType::Pt2313l);
 
 // ---------------------------------------------------------------------------
@@ -173,6 +213,8 @@ void fillDefaults(Settings& s) {
     for (uint8_t i = 0; i < eq_cfg::kBandCount; ++i) {
         s.eqGainsDb[i] = 0;
     }
+    // [Prompt 39] Усі входи дозволені.
+    s.inputEnabledMask = settings_cfg::kInputMaskAll;
 }
 
 // bool з некоректним бітовим патерном — UB при читанні, тому читаємо як байт.
@@ -205,6 +247,8 @@ void sanitize(Settings& s) {
         if (s.eqGainsDb[i] < eq_cfg::kGainMinDb) s.eqGainsDb[i] = eq_cfg::kGainMinDb;
         if (s.eqGainsDb[i] > eq_cfg::kGainMaxDb) s.eqGainsDb[i] = eq_cfg::kGainMaxDb;
     }
+    // [Prompt 39] Маска входів: зайві біти скидаємо, радіо (біт 0) завжди дозволене.
+    s.inputEnabledMask = settings_cfg::normalizeInputMask(s.inputEnabledMask);
 }
 
 // Читання bool з blob-а без UB при некоректному бітовому патерні.
@@ -242,6 +286,15 @@ void migrateFromV1(const SettingsV1& old, Settings& out) {
 void migrateFromV2(const SettingsV2& old, Settings& out) {
     fillDefaults(out);
     memcpy(&out, &old, offsetof(Settings, eqGainsDb));
+}
+
+// [Prompt 39] v3 -> v4: усе зберігається без змін (включно з еквалайзером), inputEnabledMask =
+// «усі входи дозволені» (з fillDefaults). Копіюємо рівно sizeof(SettingsV3) = offsetof(inputEnabledMask)
+// байт: нове поле не торкаємось. v2 -> v4 і v1 -> v4 йдуть через migrateFromV2()/migrateFromV1(),
+// які теж починають з fillDefaults(), тож маска там теж «усі дозволені».
+void migrateFromV3(const SettingsV3& old, Settings& out) {
+    fillDefaults(out);
+    memcpy(&out, &old, offsetof(Settings, inputEnabledMask));
 }
 
 // [Prompt 30] Передає пресет еквалайзера в DSP (хук радіо). Безпечно з будь-якої задачі
@@ -387,6 +440,23 @@ bool SettingsStore::load() {
                 memcpy(&loaded, &blob.data, sizeof(Settings));
                 haveStored = true;
             }
+        } else if (len == sizeof(StoredBlobV3)) {
+            // [Prompt 39] Оновлення з прошивки до маски входів: читаємо v3 і мігруємо.
+            StoredBlobV3 old;
+            const size_t got = prefs.getBytes(settings_cfg::kNvsBlobKey, &old, sizeof(old));
+            if (got != sizeof(old)) {
+                Serial.println("[SET] stored read failed, using defaults");
+            } else if (old.version != settings_cfg::kPrev3FormatVersion ||
+                       old.payloadSize != sizeof(SettingsV3)) {
+                Serial.printf("[SET] stored format v%u/%u unsupported, using defaults\n",
+                              static_cast<unsigned>(old.version),
+                              static_cast<unsigned>(old.payloadSize));
+            } else {
+                migrateFromV3(old.data, loaded);
+                haveStored = true;
+                migrated = true;
+                migratedFrom = settings_cfg::kPrev3FormatVersion;
+            }
         } else if (len == sizeof(StoredBlobV2)) {
             // [Prompt 30] Оновлення з прошивки до еквалайзера: читаємо v2 і мігруємо.
             StoredBlobV2 old;
@@ -438,9 +508,11 @@ bool SettingsStore::load() {
         applyEqLocked();  // [Prompt 30] пресет еквалайзера -> DSP (і при міграції)
         if (migrated) {
             if (migratedFrom == settings_cfg::kLegacyFormatVersion) {
-                Serial.println("[SET] migrated v1 -> v3: all input profiles inherit old global values, EQ flat");
+                Serial.println("[SET] migrated v1 -> v4: all input profiles inherit old global values, EQ flat, all inputs enabled");
+            } else if (migratedFrom == settings_cfg::kPrevFormatVersion) {
+                Serial.println("[SET] migrated v2 -> v4: EQ flat, all inputs enabled");
             } else {
-                Serial.println("[SET] migrated v2 -> v3: EQ flat");
+                Serial.println("[SET] migrated v3 -> v4: all inputs enabled");
             }
             if (!writeLocked()) {  // старий blob лишається в NVS, доки запис не вдасться
                 markDirtyLocked();

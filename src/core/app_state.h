@@ -34,6 +34,10 @@
 // [Prompt 36] ДОДАНО: wifiRssi (лише в кінець структури) — рівень сигналу поточної STA-мережі, дБм,
 // квантований кроком wifi_status_cfg::kRssiQuantDb; 0 = невідомо / не підключено. Публікує
 // AppController разом з іншими даними Wi-Fi (syncPlayer); ui/screens з нього виводить іконку Wi-Fi.
+// [Prompt 39] ДОДАНО: inputEnabledMask (лише в кінець структури) — маска входів, дозволених
+// користувачем (біт i = вхід i, біт 0 завжди 1). Публікує AppController (старт, зміна з вебу);
+// апаратну доступність входів (inputCount чипа) вона НЕ враховує. До першого publishState() у
+// AppController::begin() значення 0 (нульова ініціалізація) не має сенсу — не читати раніше.
 // [Prompt 17] НЕ ВИКОРИСТОВУЮТЬСЯ: ui/screens читає рівні VU напряму з
 // VuSourceDecodedPcm::read() (частота кадру), минаючи AppState. Поля лишено, щоб не міняти POD-структуру.
 
@@ -182,6 +186,10 @@ struct AppStateData {
     // --- [Prompt 36] ДОДАНО ---
     // RSSI поточної STA-мережі, дБм (від'ємне, кратне kRssiQuantDb); 0 — невідомо або не підключено.
     int8_t wifiRssi;
+
+    // --- [Prompt 39] ДОДАНО ---
+    // Маска дозволених користувачем входів (біт i = вхід i; біт 0 завжди 1). Лише AppController пише.
+    uint8_t inputEnabledMask;
 };
 
 class AppState {

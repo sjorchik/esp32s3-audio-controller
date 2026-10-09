@@ -12,6 +12,8 @@
 // blob v1 мігрується в load() (див. settings.cpp). lastInput/lastStation/lastMute лишились.
 // [Prompt 30] У КІНЕЦЬ структури додано eqGainsDb[5] (глобальний пресет еквалайзера радіо).
 // Формат blob-а v3; blob v2 (без еквалайзера) і v1 мігруються в load().
+// [Prompt 39] У КІНЕЦЬ структури додано inputEnabledMask (маска дозволених входів, відключення
+// входів 1..3 з вебу). Формат blob-а v4; blobs v3, v2 і v1 мігруються в load() (усі входи дозволені).
 
 #include <Arduino.h>
 #include <stdint.h>
@@ -63,6 +65,13 @@ struct Settings {
     // Поле стоїть ПІСЛЯ profiles: зсуву наявних полів немає. Застосовується до eq::* у
     // SettingsStore::load()/resetToDefaults(); змінює веб-обробник /api/eq.
     int8_t eqGainsDb[eq_cfg::kBandCount];
+
+    // [Prompt 39] Маска дозволених логічних входів: біт i = вхід i (0 = радіо ... 3 = Aux), 1 = дозволено.
+    // За замовчуванням усі дозволені (settings_cfg::kInputMaskAll). Біт 0 ЗАВЖДИ 1: нормалізується в
+    // load()/sanitize() і в AppController (settings_cfg::normalizeInputMask). Пише лише AppController
+    // (команда вебу WebCmdType::InputsEnabledSet). Апаратну доступність входу (PT2313L не має входу 3)
+    // маска не змінює: ефективний вхід = апаратно є І біт у масці. Поле стоїть ПІСЛЯ eqGainsDb.
+    uint8_t inputEnabledMask;
 };
 
 // Потокобезпечність: усі методи беруть внутрішній мʼютекс, КРІМ get() —
@@ -89,8 +98,8 @@ public:
     // Читає blob з NVS. Немає запису / інша версія / інший розмір → значення за
     // замовчуванням + негайний save(). [Prompt 21b] Виняток: blob формату v1 мігрується
     // (усі профілі входів = колишні глобальні гучність/тембр/баланс/loudness, gain =
-    // settings_cfg::kDefaultInputGain) і одразу записується як v3. [Prompt 30] Blob v2 мігрується
-    // так само (еквалайзер = 0 дБ). Після load() пресет еквалайзера одразу йде в eq::setAllDb().
+    // settings_cfg::kDefaultInputGain) і одразу записується як v4. [Prompt 30] Blob v2 мігрується
+    // так само (еквалайзер = 0 дБ). [Prompt 39] Blob v3 мігрується без втрат (inputEnabledMask = усі входи). Після load() пресет еквалайзера одразу йде в eq::setAllDb().
     // true — кеш містить дані з NVS або збережені дефолти; false — запис у NVS не вдався (кеш = дефолти/попередній).
     static bool load();
 
