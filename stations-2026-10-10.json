@@ -1,5 +1,7 @@
 {"version":1,"stations":[
 {"name":"Радіо ROKS","url":"https://online.radioroks.ua/RadioROKS","levelDb":-20},
+{"name":"Радіо Такт","url":"https://play.radiotakt.com.ua:8443/takt","levelDb":-20},
+{"name":"Рок Радіо","url":"https://rockradioua.online:8433/rock_256","levelDb":-20},
 {"name":"ROKS Балади","url":"https://online.radioroks.ua/RadioROKS_Ballads","levelDb":-20},
 {"name":"ROKS Класичний Рок","url":"https://online.radioroks.ua/RadioROKS_ClassicRock","levelDb":-20},
 {"name":"ROKS Український Рок","url":"https://online.radioroks.ua/RadioROKS_Ukr","levelDb":-20},
