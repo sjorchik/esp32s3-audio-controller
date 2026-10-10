@@ -88,12 +88,6 @@ static void printChipInfo() {
     Serial.printf("[MAIN] Free heap: %u bytes\n",
                   static_cast<unsigned>(ESP.getFreeHeap()));
 
-#if ENABLE_PCM1808
-    Serial.println("[MAIN] Feature PCM1808 enabled");
-#else
-    Serial.println("[MAIN] Feature PCM1808 disabled");
-#endif
-
 #if ENABLE_BT_UART
     Serial.println("[MAIN] Feature BT-UART enabled");
 #else

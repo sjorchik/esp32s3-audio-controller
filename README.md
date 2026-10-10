@@ -101,7 +101,7 @@
 - **Вхід АЦП** знімається з виходів селектора TDA7318 (піни 17 і 7 *мікросхеми*, не GPIO) — сигнал до регулятора гучності й тембру. Тому VU зовнішніх входів залежить від вибору входу й gain, але не від гучності. VU із PCM1808 не підтримується для PT2313L.
 - **XSMT** краще тримати під керуванням прошивки: постійне підключення до +3.3 В прибирає захист від клацань при завантаженні, зміні станції, standby й OTA.
 - **GPIO46 (STBY)** — strapping-пін: при скиданні підсилювач у standby; рекомендовано зовнішній резистор 10 кОм до GND.
-- Прапорець `ENABLE_PCM1808` у `features.h` залишився з першої версії; VU зовнішніх входів вмикається прапорцем `ADC_VU_ENABLE` (`config/adc_vu_config.h`).
+- VU зовнішніх входів вмикається прапорцем `ADC_VU_ENABLE` (`config/adc_vu_config.h`, потребує `ENABLE_VU`).
 
 ## Швидкий старт
 
@@ -217,7 +217,7 @@ python tools/web_api_smoke.py audio.local --write  # з POST-перевірка�
 | Файл | Що налаштовується |
 |---|---|
 | `pins.h` | Мапа пінів |
-| `features.h` | `ENABLE_VU`, `ENABLE_TDA7318`, `ENABLE_PT2313L`, `ENABLE_WEB`, `ENABLE_MDNS`, `FEATURE_AMP_STANDBY`, застарілі `ENABLE_PCM1808` / `ENABLE_BT_UART` |
+| `features.h` | `ENABLE_VU`, `ENABLE_TDA7318`, `ENABLE_PT2313L`, `ENABLE_WEB`, `ENABLE_MDNS`, `FEATURE_AMP_STANDBY`, `ENABLE_BT_UART` (резерв) |
 | `defaults.h` | Загальні константи (черга подій, кількість входів, швидкість Serial тощо) |
 | `app_controller_config.h` | Пріоритети, пороги, ramp гучності, `kAdjustTimeoutMs`, холодний старт у standby (`kStandbyOnColdStart`, `kColdStartResetReasons`) |
 | `adc_vu_config.h` | `ADC_VU_ENABLE`, параметри I2S1 / DMA, калібрування `kAdcVuOffsetDb` |

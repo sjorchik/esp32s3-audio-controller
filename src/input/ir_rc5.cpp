@@ -457,7 +457,7 @@ void postAction(Action a, bool repeat) {
     e.repeat = repeat;
     e.longPress = false;
     e.delta = 0;
-    if (!EventBus::post(e, 0)) ++gDropped;
+    if (!EventBus::post(e, 0)) gDropped = gDropped + 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -603,7 +603,7 @@ void irTask(void*) {
                 frame.timestampMs = millis();
                 handleFrame(frame, tracker);
             } else {
-                ++gErrors;
+                gErrors = gErrors + 1; 
             }
             armed = armReceive();  // буфер вільний лише після обробки
         }
