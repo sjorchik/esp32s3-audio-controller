@@ -6,7 +6,10 @@
 щоб значення не «стрибало». Використовує build() із tools/gen_gfxfont.py.
 
 Використання (з кореня проєкту, одним рядком):
-    python3 tools/gen_digits_font.py --ttf tools/fonts/DejaVuSans.ttf --out src/ui/font_digits_data.h --em 80
+    python3 tools/gen_digits_font.py --ttf tools/fonts/DejaVuSans.ttf --out src/ui/font_digits_data.h --em 112
+
+Увага: значення --em за замовчуванням у скрипті — 80, а проєкт використовує 112 (FontSize::Digits;
+yAdvance звіряє static_assert у ui/fonts.cpp з display_cfg::kFontDigitsPx), тому --em 112 вказуйте явно.
 """
 import argparse
 import sys
