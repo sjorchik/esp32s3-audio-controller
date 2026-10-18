@@ -33,6 +33,7 @@
 #include <esp_partition.h>
 
 #include "audio/adc_vu.h"             // [Prompt 37] ДОДАНО
+#include "audio/line_path.h"          // [Prompt 44] ДОДАНО
 #include "audio/amp_standby.h"        // [Prompt 23c] ДОДАНО
 #include "audio/audio_player.h"       // [Prompt 5] ДОДАНО
 #include "audio/audio_player_test.h"  // [Prompt 5] ДОДАНО
@@ -44,6 +45,7 @@
 #include "config/display_config.h"  // [Prompt 6] ДОДАНО (display_cfg::kDefaultFlipped)
 #include "config/features.h"
 #include "config/input_config.h"
+#include "config/line_path_config.h"  // [Prompt 44] ДОДАНО
 #include "config/pins.h"
 #include "config/settings_config.h"  // [Prompt 6] ДОДАНО
 #include "config/station_store_config.h"  // [Prompt 11] ДОДАНО
@@ -302,11 +304,31 @@ static void initAppController() {
 // [Prompt 37] ДОДАНО: VU зовнішніх входів через PCM1808. Після AppController (задача читає AppState)
 // і після AudioPlayer::begin() (там I2S0 отримує піни й MCLK). Помилка не зупиняє старт.
 static void initAdcVu() {
-#if ADC_VU_ENABLE
+#if ADC_VU_ENABLE && !LINE_PATH_ENABLE  // [Prompt 44] ЗМІНЕНО: при LINE_PATH_ENABLE I2S1 належить line_path
     if (AdcVu::begin()) {
         Serial.println("[MAIN] ADC VU ready");
     } else {
         Serial.println("[MAIN] ADC VU init failed (external input VU disabled)");
+    }
+#endif
+}
+
+// [Prompt 44] ДОДАНО: прототип проходу PCM1808 -> PCM5102 (I2S1 duplex slave). Після AudioPlayer::begin()
+// (там I2S0 отримує піни й MCLK, а XSMT переходить у мʼют). Запуск лише з Serial-тесту (lp.*).
+static void initLinePath() {
+#if LINE_PATH_ENABLE
+#if LINE_PATH_TEST && (AUDIO_PROC_TEST || AUDIO_PLAYER_TEST)
+    Serial.println("[MAIN] WARNING: line path test shares Serial with another test (lp.* lines are ignored by others)");
+#endif
+#if LINE_PATH_TEST && STATION_STORE_TEST && !STATION_STORE_TEST_SHARE_SERIAL
+    // Два читачі Serial забирають байти один в одного: частина lp.* команд «зникає».
+    Serial.println("[MAIN] WARNING: STATION_STORE_TEST reads Serial too - set it to 0 in "
+                   "station_store_config.h, otherwise some lp.* commands are lost");
+#endif
+    if (LinePath::begin()) {
+        Serial.println("[MAIN] Line path ready");
+    } else {
+        Serial.println("[MAIN] Line path init failed");
     }
 #endif
 }
@@ -422,6 +444,9 @@ void setup() {
 
     // [Prompt 37] ДОДАНО
     initAdcVu();
+
+    // [Prompt 44] ДОДАНО
+    initLinePath();
 
     // [Prompt 13] ДОДАНО: веб-сервер після AppController (AppState::begin() уже виконано).
     initWebServer();

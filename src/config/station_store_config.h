@@ -20,7 +20,7 @@
 // (кожен байт дістається лише одному читачу), тому за замовчуванням тест НЕ
 // стартує, поки активний AUDIO_PROC_TEST / AUDIO_PLAYER_TEST / SETTINGS_TEST.
 // 1 у STATION_STORE_TEST_SHARE_SERIAL знімає це обмеження (на свій ризик).
-#define STATION_STORE_TEST 1
+#define STATION_STORE_TEST 0
 #define STATION_STORE_TEST_SHARE_SERIAL 0
 
 namespace station_store_cfg {

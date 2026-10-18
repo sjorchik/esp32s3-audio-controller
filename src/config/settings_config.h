@@ -16,7 +16,7 @@
 
 // Serial-тестовий режим Settings (команди з префіксом `set.`, див. settings_test.h).
 // Вимкнути (0), коли зʼявиться AppController / веб-інтерфейс налаштувань.
-#define SETTINGS_TEST 1
+#define SETTINGS_TEST 0
 
 // AudioProcTest і AudioPlayerTest читають той самий Serial, і байти між двома
 // читачами ділились би випадково (префікс команди цього не лікує — байт

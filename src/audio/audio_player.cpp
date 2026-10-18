@@ -4,7 +4,7 @@
 // ESP32-audioI2S (їх треба звірити з Audio.h вашої версії при першій збірці):
 //   Audio(), setPinout(), setBufsize() [лише при AUDIO_PLAYER_HAS_SETBUFSIZE],
 //   setConnectionTimeout(), setVolume(), connecttohost(), stopSong(), loop(),
-//   isRunning(), inBufferFilled(), inBufferFree(), getSampleRate() [P30, лише при
+//   isRunning(), inBufferFilled(), inBufferFree(), setOutputSampleRate() [P44], getSampleRate() [P30, лише при
 //   EQ_SAMPLE_RATE_FROM_LIB], а також callback-и (стиль обирає AUDIO_PLAYER_CB_STYLE):
 //   стиль 1: audio_info, audio_showstation, audio_showstreamtitle, audio_bitrate,
 //            audio_eof_stream, audio_id3data;
@@ -361,6 +361,11 @@ void copyUtf8Trunc(char* dst, size_t cap, const char* src) {
 
 enum class Cmd : uint8_t { None, Play, Stop };
 
+// [Prompt 44] Запит на зміну фіксації частоти I2S0: 0 — немає, 1 — 48 кГц, 2 — частота джерела.
+// Пише setFixedOutputRate() (будь-яка задача), виконує й скидає задача плеєра.
+volatile uint8_t s_clkReq = 0;
+volatile bool s_clkFixed = false;
+
 Audio* s_audio = nullptr;
 AudioProcessor* s_proc = nullptr;  // не володіємо; setMute() не викликаємо
 SemaphoreHandle_t s_mutex = nullptr;
@@ -629,6 +634,23 @@ void processCommands() {
     }
 }
 
+// [Prompt 44] Виконується в задачі плеєра (там само, де loop()), лише при Idle.
+void processClockRequest() {
+    const uint8_t req = s_clkReq;
+    if (req == 0) {
+        return;
+    }
+    s_clkReq = 0;
+    if (s_state != PlayerState::Idle || s_wantPlaying) {
+        PLAYER_LOG("[PLAYER] output rate request ignored: player is not idle\n");
+        return;
+    }
+    const bool fixed = (req == 1);
+    s_audio->setOutputSampleRate(fixed ? Audio::SR_48000 : Audio::SR_ORIGIN);
+    s_clkFixed = fixed;
+    PLAYER_LOG("[PLAYER] output rate: %s\n", fixed ? "fixed 48 kHz" : "source rate");
+}
+
 uint8_t readBufferPercent() {
     // Загальний розмір = зайняте + вільне (inBufferSize() є не в усіх версіях).
     const uint32_t filled = s_audio->inBufferFilled();
@@ -886,8 +908,22 @@ int8_t AudioPlayer::outputTrimDb() {
     return output_trim::targetDb();
 }
 
+// [Prompt 44] Фіксація частоти I2S0 (див. audio_player.h).
+bool AudioPlayer::setFixedOutputRate(bool fixed48k) {
+    if (s_task == nullptr || s_state != PlayerState::Idle) {
+        return false;
+    }
+    s_clkReq = fixed48k ? 1 : 2;
+    return true;
+}
+
+bool AudioPlayer::fixedOutputRate() {
+    return s_clkFixed;
+}
+
 void AudioPlayer::taskLoop() {
     for (;;) {
+        processClockRequest();  // [Prompt 44]
         processCommands();
 #if AUDIO_PLAYER_CALL_LOOP
         // Бібліотека сама блокує там, де потрібно (внутрішній буфер).
