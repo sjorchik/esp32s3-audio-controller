@@ -315,21 +315,29 @@ static void initAdcVu() {
 
 // [Prompt 44] ДОДАНО: прототип проходу PCM1808 -> PCM5102 (I2S1 duplex slave). Після AudioPlayer::begin()
 // (там I2S0 отримує піни й MCLK, а XSMT переходить у мʼют). Запуск лише з Serial-тесту (lp.*).
+// [Prompt 44b] ЗМІНЕНО: begin() більше не створює канали I2S1, задачу й буфери (їх створює start() і
+// звільняє returnToRadio()); при LINE_PATH_ENABLE == 0 і LINE_PATH_TEST == 1 стартує лише Serial-тест
+// з командою lp.heap (еталонний замір RAM без line_path).
 static void initLinePath() {
-#if LINE_PATH_ENABLE
-#if LINE_PATH_TEST && (AUDIO_PROC_TEST || AUDIO_PLAYER_TEST)
+#if LINE_PATH_TEST
+#if (AUDIO_PROC_TEST || AUDIO_PLAYER_TEST)
     Serial.println("[MAIN] WARNING: line path test shares Serial with another test (lp.* lines are ignored by others)");
 #endif
-#if LINE_PATH_TEST && STATION_STORE_TEST && !STATION_STORE_TEST_SHARE_SERIAL
+#if STATION_STORE_TEST && !STATION_STORE_TEST_SHARE_SERIAL
     // Два читачі Serial забирають байти один в одного: частина lp.* команд «зникає».
     Serial.println("[MAIN] WARNING: STATION_STORE_TEST reads Serial too - set it to 0 in "
                    "station_store_config.h, otherwise some lp.* commands are lost");
 #endif
+#endif
+#if LINE_PATH_ENABLE
     if (LinePath::begin()) {
-        Serial.println("[MAIN] Line path ready");
+        Serial.println("[MAIN] Line path ready (I2S1 resources are created on start())");
     } else {
         Serial.println("[MAIN] Line path init failed");
     }
+#elif LINE_PATH_TEST
+    LinePath::begin();  // лише Serial-тест (lp.heap); сам модуль вимкнено
+    Serial.println("[MAIN] Line path disabled (LINE_PATH_ENABLE = 0): test mode has lp.heap only");
 #endif
 }
 
