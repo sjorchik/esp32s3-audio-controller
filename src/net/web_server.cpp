@@ -41,6 +41,7 @@
 #include <new>
 
 #include "audio/audio_processor.h"
+#include "config/audio_config.h"  // [Prompt 46b] logicalInputCount()
 #include "config/defaults.h"
 #include "config/web_server_config.h"
 #include "core/action_names.h"   // [Prompt 15]
@@ -186,12 +187,13 @@ void handleStatus(AsyncWebServerRequest* req) {
     doc["track"] = st.trackTitle;
     doc["streamStatus"] = streamStatusName(st.streamStatus);
 
-    // [Prompt 18] ДОДАНО: перелік входів для вибору. Для PT2313L вхід 3 має available=false
-    // (кількість входів — з capabilities(); без процесора вважаємо всі доступними).
+    // [Prompt 18] ДОДАНО: перелік входів для вибору. [Prompt 46b] 5 логічних входів (0 радіо, 1..4 зовнішні):
+    // для PT2313L логічний вхід 4 має available=false (кількість — radio + входи чіпа; без процесора —
+    // усі доступні).
     uint8_t inputsAvailable = defaults::kInputCount;
     if (s_proc != nullptr) {
-        const uint8_t n = s_proc->capabilities().inputCount;
-        if (n < inputsAvailable) inputsAvailable = n;
+        const uint8_t chip = s_proc->capabilities().inputCount;
+        if (chip != 0) inputsAvailable = audio_cfg::logicalInputCount(chip);
     }
     JsonArray inputs = doc["inputs"].to<JsonArray>();
     for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
@@ -220,7 +222,7 @@ void handleStatus(AsyncWebServerRequest* req) {
         caps["treble"] = c.treble;
         caps["balance"] = c.balance;
         caps["loudness"] = c.loudness;
-        caps["inputCount"] = c.inputCount;
+        caps["inputCount"] = audio_cfg::logicalInputCount(c.inputCount);  // [Prompt 46b] логічні входи (радіо + чіп)
         caps["volumeMin"] = c.volumeMin;
         caps["volumeMax"] = c.volumeMax;
         caps["toneMin"] = c.toneMin;
@@ -261,10 +263,11 @@ void handleSettingsGet(AsyncWebServerRequest* req) {
     // [Prompt 21b] Звукові значення — з ЗБЕРЕЖЕНОГО профілю входу lastInput (той самий вхід, що
     // відновиться після перезапуску); ключі й типи без змін.
     const InputProfile& pf = s.profiles[s.lastInput < defaults::kInputCount ? s.lastInput : 0];
-    doc["bass"] = pf.bass;
-    doc["treble"] = pf.treble;
-    doc["balance"] = pf.balance;
-    doc["loudness"] = pf.loudness;
+    // [P46a] Тембр/баланс/loudness більше не регулюються: віддаємо нейтральні значення (поля лишено для сумісності з вебом).
+    doc["bass"] = 0;
+    doc["treble"] = 0;
+    doc["balance"] = 0;
+    doc["loudness"] = false;
     doc["lastInput"] = s.lastInput;
     doc["lastStation"] = s.lastStation;
     doc["lastVolume"] = pf.volume;
@@ -462,7 +465,7 @@ void parsePlan(JsonObjectConst root, Plan& plan, JsonArray errs, ParseFlags& f) 
             ++f.fields;
         } else if (strcmp(key, "inputNames") == 0) {
             if (!v.is<JsonArrayConst>() || v.as<JsonArrayConst>().size() != kNames) {
-                addErr(errs, "inputNames", "expected_array_of_4");
+                addErr(errs, "inputNames", "expected_array_of_5");
                 f.invalid = true;
                 continue;
             }

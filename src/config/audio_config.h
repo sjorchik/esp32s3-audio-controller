@@ -3,6 +3,8 @@
 // Константи модуля audio/ (драйвери TDA7318 і PT2313L, тестовий режим).
 // Піни тут не дублюються: вони лише в config/pins.h (pins::kI2cSda / kI2cScl).
 // Адреса й швидкість I2C — у config/defaults.h (kAudioProcessorI2cAddr, kI2cClockHz).
+//
+// [Prompt 47a] ДОДАНО: kRadioMaxVolumeDb, kVolStepDb, radioVolumeDb() — крива ЦИФРОВОЇ гучності радіо.
 
 #include <stddef.h>
 #include <stdint.h>
@@ -115,20 +117,57 @@ constexpr bool volCurveValid() {
 }
 
 // ---------------------------------------------------------------------------
+// [Prompt 47a] ЦИФРОВА гучність радіо (audio/radio_volume): UI (0..100) -> послаблення, дБ
+// ---------------------------------------------------------------------------
+// Форма кривої ТА САМА, що була в аналоговій гілці (volumeAttSteps, крок 1.25 дБ); змінюється лише
+// прив'язка верху шкали. Максимум UI = kRadioMaxVolumeDb (0 дБ: цифра нічого не підсилює, стара гілка
+// теж давала 0 дБ на максимумі, бо gain входу = 0). Лише послаблення: значення > 0 заборонено.
+// Щоб зробити радіо тихішим чи гучнішим за все (підгонка під підсилювач), міняти ЛИШЕ kRadioMaxVolumeDb
+// (≤ 0; нижчі кроки зсуваються разом із ним) або діапазон рівня станцій (station_level_config.h).
+constexpr float kRadioMaxVolumeDb = 0.0f;
+constexpr float kVolStepDb = 1.25f;   // крок атенюатора чипів (обидва драйвери)
+
+constexpr float radioVolumeDb(int ui) {
+    return kRadioMaxVolumeDb - static_cast<float>(volumeAttSteps(ui)) * kVolStepDb;
+}
+static_assert(kRadioMaxVolumeDb <= 0.0f, "radio digital volume must not boost (attenuation only)");
+static_assert(radioVolumeDb(kVolumeUiMax) == kRadioMaxVolumeDb, "UI max must map to kRadioMaxVolumeDb");
+static_assert(radioVolumeDb(kVolumeUiMin) == kRadioMaxVolumeDb - 78.75f,
+              "UI min = 63 steps * 1.25 dB below the top");
+
+// ---------------------------------------------------------------------------
 // Входи
 // ---------------------------------------------------------------------------
 // Фізичні стерео-входи чипів (за даташитами):
 //   TDA7318 — 4 (Stereo 1..4);
 //   PT2313L — 3 (Stereo 1..3; код Stereo 4 у чипі не виведений назовні).
-// Логічний індекс 0..N-1 = Stereo (N+1). У проєкті 4 логічні входи (defaults::kInputCount),
-// тож з PT2313L доступні лише 0..2; вхід 3 (Aux) — див. «Відомі обмеження».
+// [Prompt 46b] Вхід ЧІПА 0..N-1 = Stereo (N+1). Логічні входи проєкту (defaults::kInputCount = 5):
+// 0 = радіо, 1..4 = зовнішні; логічний k -> вхід чіпа k - 1 (chipInputFor()), тож PT2313L (3 входи)
+// дає логічні 1..3, а логічний 4 для нього недоступний.
 constexpr uint8_t kTda7318InputCount = 4;
 constexpr uint8_t kPt2313lInputCount = 3;
+
+// [Prompt 46b] Відображення логічних входів на входи чіпа-селектора.
+//   логічний 0 (радіо)      -> вхід чіпа 0 (ЛЕГАСІ: у старому залізі радіо ще йде через вхід 0 чіпа;
+//                              ПРИБРАТИ в P47 — після перепаювання радіо цифрове, селектор не потрібен);
+//   логічний k = 1..4       -> вхід чіпа k - 1.
+constexpr uint8_t chipInputFor(uint8_t logical) {
+    return logical == 0 ? 0 : static_cast<uint8_t>(logical - 1);
+}
+// Кількість ЛОГІЧНИХ входів для чіпа з chipInputs фізичними входами: радіо + зовнішні (не більше kInputCount).
+// TDA7318 (4) -> 5, PT2313L (3) -> 4.
+constexpr uint8_t logicalInputCount(uint8_t chipInputs) {
+    return static_cast<uint8_t>((chipInputs + 1u) < defaults::kInputCount ? (chipInputs + 1u)
+                                                                           : defaults::kInputCount);
+}
+static_assert(logicalInputCount(kTda7318InputCount) == 5 && logicalInputCount(kPt2313lInputCount) == 4,
+              "TDA7318: radio + 4 external; PT2313L: radio + 3 external");
+static_assert(chipInputFor(0) == 0 && chipInputFor(1) == 0 && chipInputFor(4) == 3, "logical k -> chip k-1");
 
 // Підсилення входу в КРОКАХ над 0 дБ (0..3), по одному значенню на логічний вхід.
 //   TDA7318: крок 6.25 дБ (0, +6.25, +12.5, +18.75)
 //   PT2313L: крок 3.75 дБ (0, +3.75, +7.5,  +11.25)
-constexpr uint8_t kInputGainSteps[defaults::kInputCount] = {0, 0, 0, 0};
+constexpr uint8_t kInputGainSteps[defaults::kInputCount] = {0, 0, 0, 0, 0};
 
 // ---------------------------------------------------------------------------
 // Варіант корпусу PT2313L
@@ -166,7 +205,7 @@ static_assert(kBalanceUiMax <= 30, "speaker attenuator: 30 steps max before mute
 static_assert(kTda7318InputCount <= defaults::kInputCount, "more chip inputs than logical inputs");
 static_assert(kPt2313lInputCount <= defaults::kInputCount, "more chip inputs than logical inputs");
 static_assert(kInputGainSteps[0] <= 3 && kInputGainSteps[1] <= 3 &&
-              kInputGainSteps[2] <= 3 && kInputGainSteps[3] <= 3,
+              kInputGainSteps[2] <= 3 && kInputGainSteps[3] <= 3 && kInputGainSteps[4] <= 3,
               "input gain is a 2-bit field: 0..3 steps");
 static_assert(kI2cTimeoutMs > 0, "kI2cTimeoutMs must be > 0");
 static_assert(kTestLineMax >= 8, "kTestLineMax too small");

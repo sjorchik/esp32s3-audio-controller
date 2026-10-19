@@ -1,5 +1,8 @@
 // Реалізація SettingsStore: один blob у NVS з версією формату, кеш у RAM,
 // відкладений запис з дебаунсом у власній легкій задачі.
+// [Prompt 46b] Формат v6: 5 логічних входів (0 = радіо, 1..4 = зовнішні), профіль = {volume, eqGainsDb[5]}.
+// МІГРАЦІЙ НЕМАЄ (рішення власника: прошивка на стертий flash): blob із будь-якою іншою версією, довжиною
+// чи payload-ом ігнорується з логом, і діють значення за замовчуванням (одразу записуються в NVS).
 
 #include "core/settings.h"
 
@@ -38,111 +41,17 @@ static_assert(static_cast<uint8_t>(AudioProcType::Tda7318) == 0 &&
               "Settings::processorType comment assumes Tda7318=0, Pt2313l=1");
 static_assert(sizeof(StoredBlob) <= 1024, "keep the blob small");
 
-// [Prompt 21b] Формат v1 (до профілів входів): ТОЧНА копія колишньої структури Settings
-// (порядок і типи полів не змінювати!) — потрібна лише для читання старого blob-а.
-struct SettingsV1 {
-    uint8_t processorType;
-    char inputNames[4][32];
-    uint8_t brightness;
-    bool displayFlipped;
-    int8_t bass;
-    int8_t treble;
-    int8_t balance;
-    bool loudness;
-    uint8_t lastInput;
-    uint16_t lastStation;
-    int8_t lastVolume;
-    bool lastMute;
-};
-
-struct StoredBlobV1 {
-    uint8_t version;
-    uint8_t reserved;
-    uint16_t payloadSize;
-    SettingsV1 data;
-};
-
-static_assert(sizeof(SettingsV1) == 140, "SettingsV1 must match the layout written by v1 firmware");
-static_assert(sizeof(StoredBlobV1) != sizeof(StoredBlob),
-              "blob formats are told apart by stored length");
-static_assert(sizeof(SettingsV1::inputNames) == sizeof(Settings::inputNames),
-              "inputNames layout must match for migration");
-
-// [Prompt 30] Формат v2 (профілі входів, БЕЗ еквалайзера): ТОЧНА копія колишньої структури
-// Settings (порядок і типи полів не змінювати!) — потрібна лише для читання старого blob-а.
-struct SettingsV2 {
-    uint8_t processorType;
-    char inputNames[4][32];
-    uint8_t brightness;
-    bool displayFlipped;
-    uint8_t lastInput;
-    uint16_t lastStation;
-    bool lastMute;
-    InputProfile profiles[defaults::kInputCount];
-};
-
-struct StoredBlobV2 {
-    uint8_t version;
-    uint8_t reserved;
-    uint16_t payloadSize;
-    SettingsV2 data;
-};
-
-static_assert(sizeof(SettingsV2) == 160, "SettingsV2 must match the layout written by v2 firmware");
-static_assert(sizeof(StoredBlobV1) != sizeof(StoredBlobV2) &&
-                  sizeof(StoredBlobV2) != sizeof(StoredBlob),
-              "blob formats are told apart by stored length");
-// Нове поле стоїть ПІСЛЯ profiles: усі поля v2 лишились на своїх місцях.
-static_assert(offsetof(Settings, profiles) == offsetof(SettingsV2, profiles) &&
-                  offsetof(Settings, lastMute) == offsetof(SettingsV2, lastMute) &&
-                  offsetof(Settings, lastStation) == offsetof(SettingsV2, lastStation) &&
-                  offsetof(Settings, inputNames) == offsetof(SettingsV2, inputNames),
-              "Settings must keep the v2 field layout (new fields only at the end)");
-static_assert(offsetof(Settings, eqGainsDb) ==
-                  offsetof(SettingsV2, profiles) + sizeof(SettingsV2::profiles),
-              "eqGainsDb must directly follow profiles");
-
-// [Prompt 39] Формат v3 (з еквалайзером, БЕЗ маски входів): ТОЧНА копія колишньої структури Settings
-// (порядок і типи полів не змінювати!) — потрібна лише для читання старого blob-а.
-struct SettingsV3 {
-    uint8_t processorType;
-    char inputNames[4][32];
-    uint8_t brightness;
-    bool displayFlipped;
-    uint8_t lastInput;
-    uint16_t lastStation;
-    bool lastMute;
-    InputProfile profiles[defaults::kInputCount];
-    int8_t eqGainsDb[eq_cfg::kBandCount];
-};
-
-struct StoredBlobV3 {
-    uint8_t version;
-    uint8_t reserved;
-    uint16_t payloadSize;
-    SettingsV3 data;
-};
-
-static_assert(sizeof(SettingsV3) == 164, "SettingsV3 must match the layout written by v3 firmware");
-// Усі чотири формати розрізняються за довжиною збереженого blob-а (див. SettingsStore::load()).
-static_assert(sizeof(StoredBlobV1) != sizeof(StoredBlobV2) &&
-                  sizeof(StoredBlobV1) != sizeof(StoredBlobV3) &&
-                  sizeof(StoredBlobV1) != sizeof(StoredBlob) &&
-                  sizeof(StoredBlobV2) != sizeof(StoredBlobV3) &&
-                  sizeof(StoredBlobV2) != sizeof(StoredBlob) &&
-                  sizeof(StoredBlobV3) != sizeof(StoredBlob),
-              "blob formats are told apart by stored length");
-// Нове поле стоїть ПІСЛЯ eqGainsDb: усі поля v3 лишились на своїх місцях й заповнюють рівно
-// sizeof(SettingsV3) байт (без внутрішнього padding перед новим полем).
-static_assert(offsetof(Settings, eqGainsDb) == offsetof(SettingsV3, eqGainsDb) &&
-                  offsetof(Settings, profiles) == offsetof(SettingsV3, profiles) &&
-                  offsetof(Settings, lastStation) == offsetof(SettingsV3, lastStation) &&
-                  offsetof(Settings, inputNames) == offsetof(SettingsV3, inputNames),
-              "Settings must keep the v3 field layout (new fields only at the end)");
-static_assert(offsetof(Settings, inputEnabledMask) == sizeof(SettingsV3),
-              "inputEnabledMask must directly follow eqGainsDb (end of SettingsV3)");
+// ---------------------------------------------------------------------------
+// Перевірки розкладки (формат v6)
+// ---------------------------------------------------------------------------
+static_assert(defaults::kInputCount == 5, "format v6 is laid out for 5 logical inputs (radio + 4 external)");
+static_assert(sizeof(InputProfile) == 1 + eq_cfg::kBandCount, "InputProfile = volume + EQ bands, no padding");
+static_assert(sizeof(Settings) == 198, "Settings v6 is 198 bytes");
+static_assert(sizeof(StoredBlob) == 202, "v6 blob is 202 bytes (differs from every earlier format: 144/164/168/170)");
+static_assert(defaults::kInputCount >= 1, "profiles[0] (radio) must exist");
 
 constexpr uint8_t kProcTypeMax = static_cast<uint8_t>(AudioProcType::Pt2313l);
+
 
 // ---------------------------------------------------------------------------
 // Стан модуля
@@ -199,22 +108,16 @@ void fillDefaults(Settings& s) {
     s.lastInput = defaults::kDefaultInput;
     s.lastStation = 0;
     s.lastMute = defaults::kDefaultMute;
-    // [Prompt 21b] Профіль кожного входу = типові значення (gain — settings_cfg).
+    // [Prompt 46a] Профіль кожного входу: типова гучність, еквалайзер плоский (0 дБ; memset вище).
     for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
         InputProfile& p = s.profiles[i];
         p.volume = defaults::kDefaultVolume;
-        p.bass = defaults::kDefaultBass;
-        p.treble = defaults::kDefaultTreble;
-        p.balance = defaults::kDefaultBalance;
-        p.gain = settings_cfg::kDefaultInputGain;
-        p.loudness = defaults::kDefaultLoudness;
+        for (uint8_t b = 0; b < eq_cfg::kBandCount; ++b) {
+            p.eqGainsDb[b] = 0;
+        }
     }
-    // [Prompt 30] Еквалайзер: плоска АЧХ.
-    for (uint8_t i = 0; i < eq_cfg::kBandCount; ++i) {
-        s.eqGainsDb[i] = 0;
-    }
-    // [Prompt 39] Усі входи дозволені.
-    s.inputEnabledMask = settings_cfg::kInputMaskAll;
+    // [Prompt 46b] Дозволені входи 0..3; додатковий вхід 4 вимкнений (вмикається у вебі).
+    s.inputEnabledMask = settings_cfg::kInputMaskDefault;
 }
 
 // bool з некоректним бітовим патерном — UB при читанні, тому читаємо як байт.
@@ -225,8 +128,8 @@ void normalizeBool(bool& b) {
 }
 
 // Перевірка даних, прочитаних з NVS (захист від пошкодженого, але формально
-// валідного blob-а). Діапазони тембру/гучності тут НЕ перевіряються: їх обрізає
-// драйвер за capabilities() конкретного чіпа.
+// валідного blob-а). Діапазон гучності тут НЕ перевіряється: його обрізає AppController
+// за capabilities() конкретного чіпа. Пресети EQ обрізаються тут (eq_cfg::kGainMinDb..kGainMaxDb).
 void sanitize(Settings& s) {
     if (s.processorType > kProcTypeMax) {
         s.processorType = static_cast<uint8_t>(audio_cfg::kTestProcType);
@@ -239,68 +142,22 @@ void sanitize(Settings& s) {
     }
     normalizeBool(s.displayFlipped);
     normalizeBool(s.lastMute);
+    // [Prompt 30/46a] Пошкоджений пресет еквалайзера (будь-якого входу) не повинен потрапити в DSP.
     for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
-        normalizeBool(s.profiles[i].loudness);
-    }
-    // [Prompt 30] Пошкоджений пресет еквалайзера не повинен потрапити в DSP.
-    for (uint8_t i = 0; i < eq_cfg::kBandCount; ++i) {
-        if (s.eqGainsDb[i] < eq_cfg::kGainMinDb) s.eqGainsDb[i] = eq_cfg::kGainMinDb;
-        if (s.eqGainsDb[i] > eq_cfg::kGainMaxDb) s.eqGainsDb[i] = eq_cfg::kGainMaxDb;
+        for (uint8_t b = 0; b < eq_cfg::kBandCount; ++b) {
+            int8_t& g = s.profiles[i].eqGainsDb[b];
+            if (g < eq_cfg::kGainMinDb) g = eq_cfg::kGainMinDb;
+            if (g > eq_cfg::kGainMaxDb) g = eq_cfg::kGainMaxDb;
+        }
     }
     // [Prompt 39] Маска входів: зайві біти скидаємо, радіо (біт 0) завжди дозволене.
     s.inputEnabledMask = settings_cfg::normalizeInputMask(s.inputEnabledMask);
 }
 
-// Читання bool з blob-а без UB при некоректному бітовому патерні.
-bool rawBool(const bool& b) {
-    uint8_t raw;
-    memcpy(&raw, &b, 1);
-    return raw != 0;
-}
-
-// [Prompt 21b] v1 -> v2: нічого не губимо; ВСІ входи успадковують колишні глобальні
-// гучність/бас/дискант/баланс/loudness, gain = значення за замовчуванням.
-void migrateFromV1(const SettingsV1& old, Settings& out) {
-    fillDefaults(out);
-    out.processorType = old.processorType;
-    memcpy(out.inputNames, old.inputNames, sizeof(out.inputNames));
-    out.brightness = old.brightness;
-    out.displayFlipped = rawBool(old.displayFlipped);
-    out.lastInput = old.lastInput;
-    out.lastStation = old.lastStation;
-    out.lastMute = rawBool(old.lastMute);
-    for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
-        InputProfile& p = out.profiles[i];
-        p.volume = old.lastVolume;
-        p.bass = old.bass;
-        p.treble = old.treble;
-        p.balance = old.balance;
-        p.gain = settings_cfg::kDefaultInputGain;
-        p.loudness = rawBool(old.loudness);
-    }
-}
-
-// [Prompt 30] v2 -> v3: усе зберігається без змін, еквалайзер = плоский (0 дБ).
-// Копіюємо рівно ту частину, що збігається за розкладкою (до eqGainsDb): байт вирівнювання
-// в кінці SettingsV2 лежить на місці eqGainsDb[0] і не повинен потрапити в нове поле.
-void migrateFromV2(const SettingsV2& old, Settings& out) {
-    fillDefaults(out);
-    memcpy(&out, &old, offsetof(Settings, eqGainsDb));
-}
-
-// [Prompt 39] v3 -> v4: усе зберігається без змін (включно з еквалайзером), inputEnabledMask =
-// «усі входи дозволені» (з fillDefaults). Копіюємо рівно sizeof(SettingsV3) = offsetof(inputEnabledMask)
-// байт: нове поле не торкаємось. v2 -> v4 і v1 -> v4 йдуть через migrateFromV2()/migrateFromV1(),
-// які теж починають з fillDefaults(), тож маска там теж «усі дозволені».
-void migrateFromV3(const SettingsV3& old, Settings& out) {
-    fillDefaults(out);
-    memcpy(&out, &old, offsetof(Settings, inputEnabledMask));
-}
-
-// [Prompt 30] Передає пресет еквалайзера в DSP (хук радіо). Безпечно з будь-якої задачі
-// й до старту плеєра: eq::* — атомарні слова, мʼютекси не потрібні.
+// [Prompt 30/46a] Передає пресет ВХОДУ 0 (радіо) в екземпляр еквалайзера радіо. Пресети інших входів
+// сюди не потрапляють (їх застосує P47 / line_path). Безпечно з будь-якої задачі й до старту плеєра.
 void applyEqLocked() {
-    eq::setAllDb(s_settings.eqGainsDb);
+    eq::setAllDb(s_settings.profiles[0].eqGainsDb);
 }
 
 // ---------------------------------------------------------------------------
@@ -416,84 +273,36 @@ bool SettingsStore::load() {
 
     Settings loaded;
     bool haveStored = false;
-    bool migrated = false;
-    uint8_t migratedFrom = 0;
 
     Preferences prefs;
     if (prefs.begin(settings_cfg::kNvsNamespace, true)) {
         const size_t len = prefs.getBytesLength(settings_cfg::kNvsBlobKey);
         if (len == 0) {
             Serial.println("[SET] no stored settings (first run), using defaults");
-        } else if (len == sizeof(StoredBlob)) {
-            StoredBlob blob;
-            const size_t got = prefs.getBytes(settings_cfg::kNvsBlobKey, &blob, sizeof(blob));
-            if (got != sizeof(blob)) {
-                Serial.println("[SET] stored read failed, using defaults");
-            } else if (blob.version != settings_cfg::kFormatVersion ||
-                       blob.payloadSize != sizeof(Settings)) {
-                Serial.printf("[SET] stored format v%u/%u != v%u/%u, using defaults\n",
-                              static_cast<unsigned>(blob.version),
-                              static_cast<unsigned>(blob.payloadSize),
-                              static_cast<unsigned>(settings_cfg::kFormatVersion),
-                              static_cast<unsigned>(sizeof(Settings)));
-            } else {
-                memcpy(&loaded, &blob.data, sizeof(Settings));
-                haveStored = true;
-            }
-        } else if (len == sizeof(StoredBlobV3)) {
-            // [Prompt 39] Оновлення з прошивки до маски входів: читаємо v3 і мігруємо.
-            StoredBlobV3 old;
-            const size_t got = prefs.getBytes(settings_cfg::kNvsBlobKey, &old, sizeof(old));
-            if (got != sizeof(old)) {
-                Serial.println("[SET] stored read failed, using defaults");
-            } else if (old.version != settings_cfg::kPrev3FormatVersion ||
-                       old.payloadSize != sizeof(SettingsV3)) {
-                Serial.printf("[SET] stored format v%u/%u unsupported, using defaults\n",
-                              static_cast<unsigned>(old.version),
-                              static_cast<unsigned>(old.payloadSize));
-            } else {
-                migrateFromV3(old.data, loaded);
-                haveStored = true;
-                migrated = true;
-                migratedFrom = settings_cfg::kPrev3FormatVersion;
-            }
-        } else if (len == sizeof(StoredBlobV2)) {
-            // [Prompt 30] Оновлення з прошивки до еквалайзера: читаємо v2 і мігруємо.
-            StoredBlobV2 old;
-            const size_t got = prefs.getBytes(settings_cfg::kNvsBlobKey, &old, sizeof(old));
-            if (got != sizeof(old)) {
-                Serial.println("[SET] stored read failed, using defaults");
-            } else if (old.version != settings_cfg::kPrevFormatVersion ||
-                       old.payloadSize != sizeof(SettingsV2)) {
-                Serial.printf("[SET] stored format v%u/%u unsupported, using defaults\n",
-                              static_cast<unsigned>(old.version),
-                              static_cast<unsigned>(old.payloadSize));
-            } else {
-                migrateFromV2(old.data, loaded);
-                haveStored = true;
-                migrated = true;
-                migratedFrom = settings_cfg::kPrevFormatVersion;
-            }
-        } else if (len == sizeof(StoredBlobV1)) {
-            // [Prompt 21b] Оновлення зі старої прошивки: читаємо v1 і мігруємо.
-            StoredBlobV1 old;
-            const size_t got = prefs.getBytes(settings_cfg::kNvsBlobKey, &old, sizeof(old));
-            if (got != sizeof(old)) {
-                Serial.println("[SET] stored read failed, using defaults");
-            } else if (old.version != settings_cfg::kLegacyFormatVersion ||
-                       old.payloadSize != sizeof(SettingsV1)) {
-                Serial.printf("[SET] stored format v%u/%u unsupported, using defaults\n",
-                              static_cast<unsigned>(old.version),
-                              static_cast<unsigned>(old.payloadSize));
-            } else {
-                migrateFromV1(old.data, loaded);
-                haveStored = true;
-                migrated = true;
-                migratedFrom = settings_cfg::kLegacyFormatVersion;
-            }
+        } else if (len < offsetof(StoredBlob, data) || len > sizeof(StoredBlob)) {
+            Serial.printf("[SET] stored size %u unsupported, using defaults\n",
+                          static_cast<unsigned>(len));
         } else {
-            Serial.printf("[SET] stored size %u != %u, using defaults\n",
-                          static_cast<unsigned>(len), static_cast<unsigned>(sizeof(StoredBlob)));
+            // [Prompt 46b] Приймаємо ЛИШЕ поточний формат (версія + довжина + payload). Будь-який інший
+            // blob (старі версії v1..v5, чужа довжина) не мігрується: значення за замовчуванням.
+            alignas(4) uint8_t raw[sizeof(StoredBlob)];
+            memset(raw, 0, sizeof(raw));
+            const size_t got = prefs.getBytes(settings_cfg::kNvsBlobKey, raw, len);
+            uint16_t payload = 0;
+            memcpy(&payload, raw + offsetof(StoredBlob, payloadSize), sizeof(payload));
+            const uint8_t version = raw[offsetof(StoredBlob, version)];
+
+            if (got != len) {
+                Serial.println("[SET] stored read failed, using defaults");
+            } else if (version == settings_cfg::kFormatVersion && len == sizeof(StoredBlob) &&
+                       payload == sizeof(Settings)) {
+                memcpy(&loaded, raw + offsetof(StoredBlob, data), sizeof(Settings));
+                haveStored = true;
+            } else {
+                Serial.printf("[SET] stored format v%u/%u (len %u) unsupported (no migration), using defaults\n",
+                              static_cast<unsigned>(version), static_cast<unsigned>(payload),
+                              static_cast<unsigned>(len));
+            }
         }
         prefs.end();
     } else {
@@ -505,21 +314,7 @@ bool SettingsStore::load() {
         sanitize(loaded);
         s_settings = loaded;
         s_dirty = false;
-        applyEqLocked();  // [Prompt 30] пресет еквалайзера -> DSP (і при міграції)
-        if (migrated) {
-            if (migratedFrom == settings_cfg::kLegacyFormatVersion) {
-                Serial.println("[SET] migrated v1 -> v4: all input profiles inherit old global values, EQ flat, all inputs enabled");
-            } else if (migratedFrom == settings_cfg::kPrevFormatVersion) {
-                Serial.println("[SET] migrated v2 -> v4: EQ flat, all inputs enabled");
-            } else {
-                Serial.println("[SET] migrated v3 -> v4: all inputs enabled");
-            }
-            if (!writeLocked()) {  // старий blob лишається в NVS, доки запис не вдасться
-                markDirtyLocked();
-                return false;
-            }
-            return true;
-        }
+        applyEqLocked();  // [Prompt 30/46a] пресет входу 0 -> екземпляр радіо
         Serial.println("[SET] loaded from NVS");
         return true;
     }
@@ -602,7 +397,7 @@ bool SettingsStore::resetToDefaults() {
         return false;
     }
     fillDefaults(s_settings);
-    applyEqLocked();  // [Prompt 30] скидання налаштувань = плоский еквалайзер і в DSP
+    applyEqLocked();  // [Prompt 30/46a] скидання налаштувань = плоский еквалайзер (вхід 0) і в DSP радіо
     s_dirty = false;
     if (!writeLocked()) {
         markDirtyLocked();

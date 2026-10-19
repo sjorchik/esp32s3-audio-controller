@@ -3,6 +3,10 @@
 // [Prompt 30] + GET/POST /api/eq (5-смуговий еквалайзер радіо). На відміну від решти, /api/eq НЕ
 // йде через AppController::runWebCommand(): це чисто програмний фільтр у хуку PCM (audio/eq.*),
 // без заліза й без стану контролера; обробник кладе значення в eq::* і в Settings (NVS, дебаунс).
+// [Prompt 46a] Пресет EQ тепер ПО ВХОДАХ (Settings::profiles[i].eqGainsDb): /api/eq читає й пише профіль
+// ПОТОЧНОГО входу (AppState.inputIndex); на екземпляр радіо (eq::setAllDb) значення потрапляє лише коли
+// поточний вхід 0. Форма запиту/відповіді не змінилась (поле `input` — у P46b). Застарілі /api/gain та
+// bass/treble/balance/loudness у /api/settings лишились, але нічого не регулюють (див. AppController).
 //
 // Усе, що міняє стан пристрою, виконує AppController::runWebCommand() під його мʼютексом
 // (те саме, що кнопки/пульт: ramp, мʼют на переходах, збереження в Settings). Тут лише:
@@ -26,6 +30,7 @@
 #include "audio/eq.h"
 #include "config/defaults.h"         // [Prompt 39]
 #include "config/eq_config.h"
+#include "config/audio_config.h"     // [Prompt 46b] logicalInputCount()
 #include "config/settings_config.h"  // [Prompt 39] normalizeInputMask
 #include "core/app_controller.h"
 #include "core/app_state.h"
@@ -230,7 +235,7 @@ void handleGain(AsyncWebServerRequest* req) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /api/input {"index":N}   0..inputCount-1 (PT2313L: вхід 3 -> 400)
+// POST /api/input {"index":N}   [Prompt 46b] логічний вхід 0..N-1: TDA7318 0..4, PT2313L 0..3 (вхід 4 -> 400)
 // ---------------------------------------------------------------------------
 void handleInput(AsyncWebServerRequest* req) {
     if (!exactUrl(req, "/api/input")) return;
@@ -247,10 +252,10 @@ void handleInput(AsyncWebServerRequest* req) {
         sendFieldError(req, 400, "invalid_value", "index");
         return;
     }
-    const AudioProcessorCapabilities caps = s_proc->capabilities();
+    const int logicalCount = audio_cfg::logicalInputCount(s_proc->capabilities().inputCount);
     const int x = v.as<int>();
-    if (x < 0 || x >= caps.inputCount) {
-        sendRangeError(req, "index", 0, static_cast<int>(caps.inputCount) - 1);
+    if (x < 0 || x >= logicalCount) {
+        sendRangeError(req, "index", 0, logicalCount - 1);
         return;
     }
     runCommand(req, {WebCmdType::InputSet, x, false});
@@ -330,16 +335,30 @@ void handlePlayerStation(AsyncWebServerRequest* req) {
 }
 
 // ---------------------------------------------------------------------------
-// [Prompt 30] GET /api/eq, POST /api/eq — 5-смуговий еквалайзер радіо
+// [Prompt 30] GET /api/eq, POST /api/eq — 5-смуговий еквалайзер
 //   GET : {"gainsDb":[0,0,0,0,0],"freqHz":[60,250,1000,4000,12000],"minDb":-12,"maxDb":12,"stepDb":1}
 //   POST: {"gainsDb":[a,b,c,d,e]}  (рівно 5 елементів; null = смугу не чіпати)
 //         або {"band":N,"gainDb":X}  (одна смуга, N = 0..4)
 //         -> 200 {"ok":true, ...те саме, що GET}
-// Пресет глобальний (не по входах і не по станціях) і діє лише на потік радіо.
+// [Prompt 46b] Необовʼязковий вхід: GET /api/eq?input=N, POST {"input":N,...}; N = 0..4 (профіль цього входу,
+// незалежно від апаратної доступності); без поля — ПОТОЧНИЙ вхід. Відповідь (GET і POST) містить "input".
+// [Prompt 46a] Пресет — ПОТОЧНОГО входу (профіль у Settings). Зберігається для будь-якого входу;
+// на екземпляр радіо діє лише пресет входу 0, тож правка EQ на зовнішньому вході стане чутною після P47.
 // ---------------------------------------------------------------------------
-void fillEqState(JsonDocument& doc) {
-    int8_t g[eq_cfg::kBandCount];
-    eq::getAllDb(g);
+
+// Поточний вхід — з AppState (публікує AppController); поза межами профілів -> 0.
+uint8_t eqInputIndex() {
+    const uint8_t i = AppState::snapshot().inputIndex;
+    return i < defaults::kInputCount ? i : 0;
+}
+
+void readEqPreset(uint8_t input, int8_t out[eq_cfg::kBandCount]) {
+    const Settings st = SettingsStore::snapshot();
+    memcpy(out, st.profiles[input].eqGainsDb, eq_cfg::kBandCount);
+}
+
+void fillEqState(JsonDocument& doc, uint8_t input, const int8_t g[eq_cfg::kBandCount]) {
+    doc["input"] = input;
     JsonArray gains = doc["gainsDb"].to<JsonArray>();
     JsonArray freqs = doc["freqHz"].to<JsonArray>();
     for (uint8_t i = 0; i < eq_cfg::kBandCount; ++i) {
@@ -351,16 +370,46 @@ void fillEqState(JsonDocument& doc) {
     doc["stepDb"] = eq_cfg::kGainStepDb;
 }
 
-// Зберігає пресет у Settings (запис у NVS — з дебаунсом, лише коли значення справді змінились).
+struct EqStoreCtx {
+    uint8_t input;
+    int8_t gains[eq_cfg::kBandCount];
+};
+
 void storeEqPreset(Settings& s, void* ctx) {
-    memcpy(s.eqGainsDb, ctx, sizeof(s.eqGainsDb));
+    const EqStoreCtx* c = static_cast<const EqStoreCtx*>(ctx);
+    memcpy(s.profiles[c->input].eqGainsDb, c->gains, sizeof(c->gains));
+}
+
+// Розбір цілого з рядка запиту: уся рядкова частина має бути числом.
+bool parseQueryInt(const String& s, int& out) {
+    if (s.length() == 0) return false;
+    char* end = nullptr;
+    const long v = strtol(s.c_str(), &end, 10);
+    if (end == nullptr || *end != '\0') return false;
+    out = static_cast<int>(v);
+    return true;
 }
 
 void handleEqGet(AsyncWebServerRequest* req) {
     if (!exactUrl(req, "/api/eq")) return;
     WEB_API_LOG("%s %s", req->methodToString(), req->url().c_str());
+    uint8_t input = eqInputIndex();
+    if (req->hasParam("input")) {  // [Prompt 46b]
+        int x = 0;
+        if (!parseQueryInt(req->getParam("input")->value(), x)) {
+            sendFieldError(req, 400, "invalid_value", "input");
+            return;
+        }
+        if (x < 0 || x >= defaults::kInputCount) {
+            sendRangeError(req, "input", 0, defaults::kInputCount - 1);
+            return;
+        }
+        input = static_cast<uint8_t>(x);
+    }
+    int8_t cur[eq_cfg::kBandCount];
+    readEqPreset(input, cur);
     JsonDocument doc;
-    fillEqState(doc);
+    fillEqState(doc, input, cur);
     sendJson(req, 200, doc);
 }
 
@@ -377,15 +426,31 @@ void handleEqPost(AsyncWebServerRequest* req) {
     JsonObjectConst root = in.as<JsonObjectConst>();
     for (JsonPairConst kv : root) {
         const char* k = kv.key().c_str();
-        if (strcmp(k, "gainsDb") != 0 && strcmp(k, "band") != 0 && strcmp(k, "gainDb") != 0) {
+        if (strcmp(k, "gainsDb") != 0 && strcmp(k, "band") != 0 && strcmp(k, "gainDb") != 0 &&
+            strcmp(k, "input") != 0) {
             sendFieldError(req, 400, "unknown_field", "unknown");
             return;
         }
     }
 
+    // [Prompt 46b] Вхід — з тіла (0..kInputCount-1), інакше поточний; один раз: читання й запис того самого входу.
+    uint8_t input = eqInputIndex();
+    JsonVariantConst vInput = root["input"];
+    if (!vInput.isNull()) {
+        if (!vInput.is<int>()) {
+            sendFieldError(req, 400, "invalid_value", "input");
+            return;
+        }
+        const int x = vInput.as<int>();
+        if (x < 0 || x >= defaults::kInputCount) {
+            sendRangeError(req, "input", 0, defaults::kInputCount - 1);
+            return;
+        }
+        input = static_cast<uint8_t>(x);
+    }
     int8_t cur[eq_cfg::kBandCount];
     int8_t next[eq_cfg::kBandCount];
-    eq::getAllDb(cur);
+    readEqPreset(input, cur);
     memcpy(next, cur, sizeof(next));
 
     JsonVariantConst vArr = root["gainsDb"];
@@ -454,26 +519,31 @@ void handleEqPost(AsyncWebServerRequest* req) {
     }
 
     if (memcmp(cur, next, sizeof(next)) != 0) {
-        eq::setAllDb(next);                          // звук змінюється одразу
-        SettingsStore::modify(storeEqPreset, next);  // NVS — з дебаунсом
+        EqStoreCtx ctx;
+        ctx.input = input;
+        memcpy(ctx.gains, next, sizeof(ctx.gains));
+        SettingsStore::modify(storeEqPreset, &ctx);  // профіль входу в Settings; NVS — з дебаунсом
+        if (input == 0) {
+            eq::setAllDb(next);  // екземпляр радіо: лише пресет входу 0, звук змінюється одразу
+        }
     }
     JsonDocument doc;
     doc["ok"] = true;
-    fillEqState(doc);
+    fillEqState(doc, input, next);
     sendJson(req, 200, doc);
 }
 
 // ---------------------------------------------------------------------------
 // [Prompt 39] GET /api/inputs, POST /api/inputs — доступність і відключення входів
 //   GET : {"inputs":[{"index":0,"name":"WiFi Radio","available":true,"enabled":true,
-//                     "selectable":true,"canDisable":false}, ... 4 входи ...],
+//                     "selectable":true,"canDisable":false}, ... 5 входів (P46b) ...],
 //          "enabledMask":15,"input":0}
-//         available  = вхід апаратно є (processor.capabilities.inputCount; PT2313L не має входу 3);
+//         available  = вхід є: радіо + входи чіпа (P46b: TDA7318 0..4, PT2313L 0..3; логічний 4 недоступний);
 //         enabled    = дозволено користувачем (маска); selectable = available && enabled;
 //         canDisable = false лише для радіо (вхід 0).
-//   POST: {"enabled":[a,b,c,d]}      рівно 4 елементи: true | false | null (= не змінювати);
+//   POST: {"enabled":[a,b,c,d,e]}    рівно 5 елементів (P46b): true | false | null (= не змінювати);
 //                                    елемент 0 (радіо) ігнорується: радіо завжди дозволене
-//         або {"index":N,"enabled":true|false}   (одне поле, N = 0..3)
+//         або {"index":N,"enabled":true|false}   (одне поле, N = 0..4)
 //         -> 200 {"ok":true, ...те саме, що GET}; 409 ota_in_progress | ir_learn_active; 503 busy.
 // Дозволено і в Standby. Зберігається в NVS (з дебаунсом, лише при зміні) і діє після перезапуску.
 // ---------------------------------------------------------------------------
@@ -481,10 +551,10 @@ void handleEqPost(AsyncWebServerRequest* req) {
 // Settings `st` мусить жити в викликача, поки doc не серіалізовано (sendJson() — синхронний).
 void fillInputsState(JsonDocument& doc, const Settings& st) {
     const uint8_t mask = settings_cfg::normalizeInputMask(st.inputEnabledMask);
-    uint8_t hw = defaults::kInputCount;  // апаратно доступні входи (без процесора — усі 4, як у контролері)
+    uint8_t hw = defaults::kInputCount;  // доступні логічні входи (без процесора — усі, як у контролері)
     if (s_proc != nullptr) {
-        const uint8_t n = s_proc->capabilities().inputCount;
-        if (n < hw) hw = n;
+        const uint8_t chip = s_proc->capabilities().inputCount;  // [Prompt 46b] входи чіпа -> логічні
+        if (chip != 0) hw = audio_cfg::logicalInputCount(chip);
     }
     JsonArray arr = doc["inputs"].to<JsonArray>();
     for (uint8_t i = 0; i < defaults::kInputCount; ++i) {

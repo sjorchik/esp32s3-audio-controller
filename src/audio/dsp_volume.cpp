@@ -1,4 +1,4 @@
-// Цифрова гучність і мʼют (Prompt 45). Опис і правила потоків — у dsp_volume.h.
+// Цифрова гучність і мʼют (Prompt 45, доповнено Prompt 47a). Опис і правила потоків — у dsp_volume.h.
 //
 // ВАЖЛИВО: файл НЕ включає Audio.h. Чиста математика.
 
@@ -59,12 +59,22 @@ bool DspVolume::muted() const {
     return mute_.load(std::memory_order_relaxed);
 }
 
-void DspVolume::forceMute() {
-    mute_.store(true, std::memory_order_relaxed);
+void DspVolume::resetState() {
     gCur_ = 0.0f;
     gTgt_ = 0.0f;
     step_ = 0.0f;
     rem_ = 0;
+    silent_.store(true, std::memory_order_relaxed);
+}
+
+void DspVolume::forceMute() {
+    mute_.store(true, std::memory_order_relaxed);
+    resetState();
+}
+
+void DspVolume::requestForceMute() {
+    mute_.store(true, std::memory_order_relaxed);
+    forceReq_.store(true, std::memory_order_release);
 }
 
 bool DspVolume::isRamping() const {
@@ -72,12 +82,18 @@ bool DspVolume::isRamping() const {
 }
 
 bool DspVolume::isSilent() const {
-    return mute_.load(std::memory_order_relaxed) && rem_ == 0 && gCur_ == 0.0f;
+    return mute_.load(std::memory_order_relaxed) && silent_.load(std::memory_order_relaxed);
 }
 
 void DspVolume::process(int32_t* buf, int32_t frames) {
     if (buf == nullptr || frames <= 0) {
         return;
+    }
+
+    // [P47a] Запит миттєвого мʼюту з іншої задачі: скидаємо стан власника тут. Мʼют не чіпаємо:
+    // якщо запитач уже встиг викликати setMute(false), далі піде плавне наростання з нуля.
+    if (forceReq_.exchange(false, std::memory_order_acq_rel)) {
+        resetState();
     }
 
     // Нова ціль? Перехід починається з поточного підсилення.
@@ -93,6 +109,7 @@ void DspVolume::process(int32_t* buf, int32_t frames) {
 
     // Усталений 0 дБ без переходу: блок не чіпаємо (усі відліки лишаються точними).
     if (rem_ == 0 && gCur_ == 1.0f) {
+        silent_.store(false, std::memory_order_relaxed);
         return;
     }
 
@@ -116,4 +133,5 @@ void DspVolume::process(int32_t* buf, int32_t frames) {
 
     gCur_ = g;
     rem_ = rem;
+    silent_.store(rem == 0 && g == 0.0f, std::memory_order_relaxed);
 }

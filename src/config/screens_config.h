@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 
+#include "config/defaults.h"  // [Prompt 46b] kInputCount (static_assert кольорів входів)
 #include "config/display_config.h"
 #include "config/vu_config.h"
 
@@ -121,14 +122,17 @@ constexpr int16_t kExtAreaBottom = kVuY - kVuGapAbove;                  // ве�
 constexpr int16_t kExtNameDy     = -4;   // ручна підгонка: від'ємне = вище (P38, за побажанням власника)
 constexpr int16_t kExtNameY      = kExtAreaTop +
     (kExtAreaBottom - kExtAreaTop - display_cfg::kFontXLargePx) / 2 + kExtNameDy;   // верх рядка шрифту (y=33)
-// Світлі кольори назви за номером входу 1..3 (індекс масиву = inputIndex - 1). Підібрано, щоб
+// [Prompt 46b] Світлі кольори назви за номером входу 1..4 (індекс масиву = inputIndex - 1). Підібрано, щоб
 // відрізнятись від бірюзового VU (kColorVuLit = 0,235,215): зелений — без синьої складової, блакитний —
 // з явним синім відтінком.
 constexpr uint16_t kColorInputName[] = {
     display_cfg::rgb565(120, 255, 120),   // вхід 1 — світло-зелений
     display_cfg::rgb565(255, 120, 120),   // вхід 2 — світло-червоний
     display_cfg::rgb565(120, 190, 255),   // вхід 3 — світло-блакитний
+    display_cfg::rgb565(205, 160, 255),   // вхід 4 — світло-фіолетовий (P46b; відмінний від VU та червоної зони)
 };
+static_assert(sizeof(kColorInputName) / sizeof(kColorInputName[0]) + 1 == defaults::kInputCount,
+              "one name color per external input (logical 1..kInputCount-1)");
 constexpr uint8_t kColorInputNameCount = sizeof(kColorInputName) / sizeof(kColorInputName[0]);
 
 // --- Статус-рядок (Radio і ExternalInput) ---

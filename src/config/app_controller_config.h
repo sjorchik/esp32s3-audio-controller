@@ -3,12 +3,19 @@
 // Константи модуля core/app_controller.
 // Піни тут не дублюються (їх немає: AppController не чіпає залізо напряму).
 // Усі часові значення — у мілісекундах, якщо не вказано інше.
+//
+// [Prompt 47a] ДОДАНО: kNeutralVolume (фіксована гучність чіпа), kRadioMuteWaitMs (очікування
+// згасання цифрового мʼюту радіо). Програмна рампа гучності прибрана (її робить audio/dsp_volume):
+// kRampStepMs / kRampStep НЕ ВИКОРИСТОВУЮТЬСЯ (прибрати в P52).
 
 #include <esp_system.h>  // [Prompt 39] esp_reset_reason_t
 #include <stdint.h>
 
+#include "config/audio_config.h"         // [Prompt 46a] audio_cfg::kInputGainSteps (перевірка нейтрального gain)
 #include "config/audio_player_config.h"  // player_cfg::kTaskPriority, ir_cfg, input_cfg
+#include "config/defaults.h"            // [Prompt 46a] defaults::kDefaultBass/Treble/Balance/Loudness
 #include "config/display_config.h"      // display_cfg::kTaskPriority
+#include "config/dsp_volume_config.h"   // [Prompt 47a] dsp_volume_cfg::kMuteRampMs
 #include "config/input_config.h"        // input_cfg::kBtnTaskPriority
 
 // ---------------------------------------------------------------------------
@@ -44,25 +51,63 @@ constexpr uint32_t kSyncPeriodMs = 200;
 constexpr uint32_t kLockTimeoutMs = 200;
 
 // ---------------------------------------------------------------------------
-// Переходи: мʼют -> зміна входу/станції -> розмʼют -> ramp
+// Переходи: мʼют -> зміна входу/станції -> розмʼют
 // ---------------------------------------------------------------------------
-// Пауза між командами зміни (вхід/станція/пробудження) і розмʼютом атенюаторів.
+// Пауза між командами зміни (вхід/станція/пробудження) і розмʼютом.
 constexpr uint32_t kUnmuteDelayMs = 250;
 
-// Ramp гучності після розмʼюту: від volumeMin до цілі кроками.
+// [Prompt 47a] Скільки максимум чекати (блокуюче, vTaskDelay(1) у задачі контролера), поки цифровий
+// мʼют радіо дозгасне, ПЕРЕД зупинкою плеєра / зміною станції / вимкненням підсилювача. Чекання
+// відбувається лише коли радіо реально грає. Має перекривати dsp_volume_cfg::kMuteRampMs (20 мс) із
+// запасом на блок хука (≈ 5 мс); після таймауту йде примусовий мʼют (requestForceMute()).
+constexpr uint32_t kRadioMuteWaitMs = 60;
+
+// [Prompt 47a] НЕ ВИКОРИСТОВУЄТЬСЯ: ramp гучності тепер цифровий (audio/dsp_volume, kRampMs = 100 мс).
 constexpr uint32_t kRampStepMs = 20;
 constexpr int      kRampStep   = 2;   // у одиницях шкали гучності UI (0..100)
 
-// [Prompt 31] Автоповернення цілі регулювання енкодера на гучність: скільки мс без подій
-// енкодера (обертання, клік, утримання), після чого ціль (бас/дискант/баланс/gain) знову
-// стає гучністю.
+// [Prompt 31] Автоповернення цілі регулювання енкодера на гучність.
+// [Prompt 46a] НЕ ВИКОРИСТОВУЄТЬСЯ: цілей бас/дискант/баланс/gain більше немає, ціль завжди Volume.
+// Константа лишена, щоб не чіпати інші файли; прибрати в P52.
 constexpr uint32_t kAdjustTimeoutMs = 5000;
 
 // Скільки тримати мʼют атенюаторів після зміни gain (апаратний стрибок рівня).
+// [Prompt 46a] НЕ ВИКОРИСТОВУЄТЬСЯ (gain більше не регулюється); прибрати в P52.
 constexpr uint32_t kGainMuteHoldMs = 80;
 
 // Через скільки повторити setMute(), якщо I2C-транзакція не вдалась.
 constexpr uint32_t kMuteRetryMs = 500;
+
+// ---------------------------------------------------------------------------
+// [Prompt 46a] Нейтральні значення чіпа (селектор-only)
+// ---------------------------------------------------------------------------
+// Чип лишається ЛИШЕ селектором входів: при застосуванні профілю входу контролер надсилає в нього
+// ці фіксовані значення (тембр, баланс, підсилення входу, loudness), а не збережені користувачем.
+// Значення = те, з чого стартують драйвери (audio/tda7318.cpp, audio/pt2313l.cpp: begin() бере
+// defaults::kDefaultBass/Treble/Balance/Loudness і audio_cfg::kInputGainSteps), тож це «плоско»:
+//   тембр 0 кроків = 0 дБ (TDA7318: код 0111 за даташитом; PT2313L: кодування за аналогією з
+//   TDA7313 — НЕ звірено з даташитом, див. коментар у pt2313l.cpp), баланс 0 = обидва атенюатори 0,
+//   gain 0 кроків = 0 дБ (static_assert-и драйверів: 0x58 у перемикачі), loudness вимкнено.
+constexpr int8_t kNeutralBass     = 0;
+constexpr int8_t kNeutralTreble   = 0;
+constexpr int8_t kNeutralBalance  = 0;
+constexpr int8_t kNeutralGain     = 0;
+constexpr bool   kNeutralLoudness = false;
+static_assert(kNeutralBass == defaults::kDefaultBass && kNeutralTreble == defaults::kDefaultTreble &&
+                  kNeutralBalance == defaults::kDefaultBalance &&
+                  kNeutralLoudness == defaults::kDefaultLoudness,
+              "neutral values must equal the driver start values (defaults.h)");
+static_assert(kNeutralGain == audio_cfg::kInputGainSteps[0] && kNeutralGain == audio_cfg::kInputGainSteps[1] &&
+                  kNeutralGain == audio_cfg::kInputGainSteps[2] && kNeutralGain == audio_cfg::kInputGainSteps[3] &&
+                  kNeutralGain == audio_cfg::kInputGainSteps[4],
+              "neutral gain must equal the driver start gain (audio_cfg::kInputGainSteps)");
+
+// [Prompt 47a] Фіксована гучність чипа (шкала UI): 0 кроків атенюації = 0 дБ (байт регістра 0x00 в обох
+// драйверах: encodeVolume(0)). Гучність користувача тепер цифрова (audio/radio_volume), чип не регулює її.
+// Надсилається в applyActiveToChip() (кеш драйвера відсікає повтори). Драйвери стартують із kDefaultVolume
+// (-27.5 дБ), тож без цього відправлення чип лишився б приглушеним для зовнішніх входів.
+constexpr int8_t kNeutralVolume = audio_cfg::kVolumeUiMax;
+static_assert(audio_cfg::volumeAttSteps(kNeutralVolume) == 0, "neutral chip volume must be 0 dB (0 steps)");
 
 // ---------------------------------------------------------------------------
 // Розкладка керування
@@ -139,6 +184,8 @@ static_assert(kActivePollMs >= 1 && kIdlePollMs >= kActivePollMs,
               "poll periods: 1 <= active <= idle");
 static_assert(kRampStep >= 1, "kRampStep must be >= 1");
 static_assert(kRampStepMs >= 1, "kRampStepMs must be >= 1");
+static_assert(kRadioMuteWaitMs > dsp_volume_cfg::kMuteRampMs,
+              "radio mute wait must exceed the digital mute ramp");
 static_assert(kSyncPeriodMs >= kActivePollMs, "sync period too short");
 static_assert(kAdjustTimeoutMs >= 1, "kAdjustTimeoutMs must be >= 1");
 static_assert(kVolumeStep >= 1, "kVolumeStep must be >= 1");

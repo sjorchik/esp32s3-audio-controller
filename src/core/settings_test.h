@@ -6,9 +6,9 @@
 //
 //   set.show                  — друк поточних Settings і профілів входів, dirty, лічильник записів
 //   set.<поле> <значення>     — змінити поле (відкладений запис, requestSave)
-//        proc 0|1, bright 0..255, flip 0|1, bass/treble/balance -128..127,
-//        loud 0|1, input 0..3, station 0..65535, vol -128..127, gain -128..127, mute 0|1
-//        [Prompt 21b] bass/treble/balance/loud/vol/gain міняють ПРОФІЛЬ входу lastInput
+//        proc 0|1, bright 0..255, flip 0|1, input 0..3, station 0..65535, vol -128..127, mute 0|1
+//        [Prompt 21b] vol міняє ПРОФІЛЬ входу lastInput; [Prompt 46a] профіль = {volume, EQ×5},
+//        команди bass/treble/balance/loud/gain прибрано
 //        (set.show друкує профілі всіх входів; поточний позначено «*»)
 //   set.name <idx> <текст>    — назва входу idx (до 31 байта)
 //   set.save                  — негайний запис
