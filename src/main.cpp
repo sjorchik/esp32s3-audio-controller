@@ -447,14 +447,15 @@ void setup() {
     // синхронізований стан AppController уже бачив Connecting/AP.
     initWifi(wifiResetRequested);
 
+    // [Prompt 44] ДОДАНО. [Prompt 47c] ПЕРЕНЕСЕНО ПЕРЕД AppController: begin() проходу має відбутись до першого
+    // powerOnTransition() контролера (стартує на зовнішньому вході й одразу керує LinePath).
+    initLinePath();
+
     // [Prompt 8] ДОДАНО: AppController після процесора, плеєра й Settings.
     initAppController();
 
     // [Prompt 37] ДОДАНО
     initAdcVu();
-
-    // [Prompt 44] ДОДАНО
-    initLinePath();
 
     // [Prompt 13] ДОДАНО: веб-сервер після AppController (AppState::begin() уже виконано).
     initWebServer();

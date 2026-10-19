@@ -141,6 +141,25 @@
 // Пауза радіо тримає DSP у мʼюті (s_stopHold) до наступного startStream(), щоб старий потік, що
 // дограє після асинхронного stop(), не "виринув" з нового наростання. Екземпляр DSP стартує замʼюченим.
 
+// [Prompt 47c] ЗОВНІШНІ ВХОДИ 1..4 ЧЕРЕЗ audio/line_path. Вибір зовнішнього входу запускає прохід PCM1808 -> DSP -> PCM5102,
+// AppController сам його веде автоматом LineState (без блокувань, рух — lineService() у tickLocked()):
+//   Off        — проходу немає (радіо / standby / перезапуск / OTA);
+//   Starting   — WaitIdle (чекаємо AudioPlayer Idle; stop() асинхронний) -> requestStart() -> WaitRunning
+//                (state()==Running і вихід чіпа стабілізовано) | WaitRetry (пауза перед єдиним автоповтором);
+//   Active     — звучить; цифровий мʼют користувача = LinePath::setUserMute(desiredMute());
+//   Switching  — вхід<->вхід БЕЗ перезапуску проходу: мʼют -> kExtMuteSettleMs -> setInput чіпа + гучність + EQ входу
+//                -> kExtInputSettleMs -> Active (мʼют знімає syncLineMute());
+//   Releasing  — мʼют -> kExtMuteSettleMs -> returnToRadio() -> чекаємо resourcesUp()==false (kLineReleaseTimeoutMs),
+//                далі за ситуацією: радіо (startTransition + стрім, щоб RAM під TLS уже була вільна) | новий старт проходу |
+//                Off (standby / OTA / перезапуск);
+//   Failed     — старт не вдався двічі: тиша до наступного явного вибору входу (автоповернення на радіо НЕМАЄ).
+// Мʼют проходу = desiredMute() || state != Active (lineMuteWanted()). Phase::Settle не завершується, поки прохід
+// Starting / Switching / Releasing (lineBusy()). Вхід<->вхід не запускає Phase::Settle (250 мс потрібні лише для аналогового
+// чипа / підсилювача). Чип-селектор міняється лише тоді, коли прохід цифрово замʼючений (applyChipForInput()).
+// XSMT AppController у режимі проходу не чіпає. Усі виклики LinePath — неблокуючі (requestStart, returnToRadio,
+// setUserMute, setVolumeDb, setEqAllDb). При LINE_PATH_ENABLE == 0 жодного виклику LinePath немає: зовнішні входи мовчать,
+// поведінка радіо як у P47a.
+
 #include "core/app_controller.h"
 
 #include <Arduino.h>
@@ -151,12 +170,14 @@
 #include "audio/audio_player.h"
 #include "audio/audio_processor.h"
 #include "audio/eq.h"  // [Prompt 46a] applyRadioEq()
+#include "audio/line_path.h"     // [Prompt 47c]
 #include "audio/radio_volume.h"  // [Prompt 47a]
 #include "config/amp_config.h"  // [Prompt 23c]
 #include "config/app_controller_config.h"
 #include "config/defaults.h"
 #include "config/features.h"  // [Prompt 23c]
 #include "config/ir_learn_ui_config.h"  // [Prompt 15] ДОДАНО
+#include "config/line_path_config.h"  // [Prompt 47c] LINE_PATH_ENABLE
 #include "config/audio_config.h"     // [Prompt 46b] chipInputFor(), logicalInputCount(); [P47a] radioVolumeDb()
 #include "config/settings_config.h"  // [Prompt 39] normalizeInputMask, kInputMaskAll
 #include "config/wifi_status_config.h"  // [Prompt 36]
@@ -183,6 +204,10 @@ static_assert(app_controller_cfg::kRestartMaxWaitMs >
                   amp_cfg::kAmpOffMuteWaitMs + app_controller_cfg::kRestartMuteMs,
               "kRestartMaxWaitMs must exceed amp off wait + restart pause");
 
+// [Prompt 47c] Пауза мʼюту проходу вкладається в затримку вимкнення підсилювача при standby.
+static_assert(app_controller_cfg::kExtMuteSettleMs < amp_cfg::kAmpOffDelayMs,
+              "line mute settle must fit into the amp off delay");
+
 #if APP_CONTROLLER_DEBUG
 #define APP_LOG(...) Serial.printf("[APP] " __VA_ARGS__)
 #else
@@ -201,6 +226,14 @@ enum class Phase : uint8_t {
     None,    // переходу немає
     Settle,  // мʼют, чекаємо kUnmuteDelayMs (і прогрів підсилювача), потім розмʼют
 };
+
+#if LINE_PATH_ENABLE
+// [Prompt 47c] Автомат проходу зовнішніх входів (див. заголовок файлу).
+enum class LineState : uint8_t { Off, Starting, Active, Switching, Releasing, Failed };
+enum class LineStartStep : uint8_t { WaitIdle, WaitRetry, WaitRunning };
+// Що робити після звільнення ресурсів, якщо пристрій «увімкнений» і вхід зовнішній.
+enum class LineAfter : uint8_t { Auto, Retry, Fail };
+#endif
 
 SemaphoreHandle_t s_lock = nullptr;
 bool s_started = false;
@@ -231,6 +264,21 @@ uint32_t s_lastMuteTryMs = 0;
 
 // [Prompt 47a] Пауза радіо: DSP-мʼют тримається, поки не буде наступного startStream() (див. pauseRadio()).
 bool s_stopHold = false;
+
+#if LINE_PATH_ENABLE
+// --- [Prompt 47c] Прохід зовнішніх входів ---
+LineState s_lineState = LineState::Off;
+LineStartStep s_lineStep = LineStartStep::WaitIdle;
+LineAfter s_lineAfter = LineAfter::Auto;
+bool s_lineRetryUsed = false;     // автоповтор після невдачі вже витрачено
+bool s_lineApplied = false;       // вхід чіпа + гучність + EQ уже надіслано для поточної спроби старту
+bool s_lineMuteSent = true;       // останній setUserMute(), надісланий у LinePath (LinePath стартує в мʼюті)
+uint8_t s_lineSwitchStep = 0;     // Switching: 0 = чекаємо мʼют, 1 = чекаємо стабілізацію входу
+uint8_t s_lineRelStep = 0;        // Releasing: 0 = чекаємо мʼют, 1 = чекаємо звільнення
+bool s_lineRelCalled = false;     // returnToRadio() прийнято
+uint32_t s_lineT0 = 0;            // початок поточного кроку (WaitRetry: момент повтору)
+uint32_t s_lineChipSetMs = 0;     // коли востаннє міняли вхід чіпа
+#endif
 
 uint32_t s_lastSyncMs = 0;
 
@@ -470,6 +518,13 @@ void applyStationLevel(int8_t db, uint16_t idx, const char* why) {
 }
 
 void startStream() {
+    // [Prompt 47c] Радіо-потік лише на вході 0: на зовнішньому вході його запуск зіпсував би прохід
+    // (мультиплексор GPIO18, 48 кГц на I2S0). Усі радіо-команди й так гейтяться за s_input.
+    if (s_input != 0) {
+        s_playPending = false;
+        APP_LOG("stream start blocked (external input)\n");
+        return;
+    }
     // [Prompt 47a] Новий запуск знімає утримання мʼюту після паузи (DSP знову керується desiredMute()).
     if (s_stopHold) {
         s_stopHold = false;
@@ -561,6 +616,29 @@ void applyRadioVolume() {
     radio_volume::setAttenuationDb(audio_cfg::radioVolumeDb(s_volume));
 }
 
+// [Prompt 47c] Гучність зовнішніх входів: та сама крива, що в радіо, + kExtLevelTrimDb (LinePath обрізає до свого діапазону).
+float extVolumeDb(int vol) {
+    return audio_cfg::radioVolumeDb(vol) + cfg::kExtLevelTrimDb;
+}
+
+// [Prompt 47c] Цільова гучність -> LinePath (діє й до старту проходу; плавно через DspVolume).
+void lineApplyVolume() {
+#if LINE_PATH_ENABLE
+    if (LinePath::isReady()) {
+        LinePath::setVolumeDb(extVolumeDb(s_volume));
+    }
+#endif
+}
+
+// [Prompt 47c] Живе застосування гучності активного шляху: радіо (s_input == 0) або прохід.
+void applyActiveVolume() {
+    if (s_input == 0) {
+        applyRadioVolume();
+    } else {
+        lineApplyVolume();
+    }
+}
+
 // s_volumes[idx] -> робоча гучність, обрізана за capabilities() поточного чипа.
 // Чипа не торкається й AppState не публікує (це робить викликач). [P47a] Оновлює цифрову гучність радіо.
 void loadActiveFromProfile(uint8_t idx) {
@@ -568,7 +646,11 @@ void loadActiveFromProfile(uint8_t idx) {
         idx = 0;
     }
     s_volume = static_cast<int8_t>(clampInt(s_volumes[idx], s_caps.volumeMin, s_caps.volumeMax));
-    applyRadioVolume();
+    // [Prompt 47c] Радіо — цифрова гучність одразу; для зовнішнього входу значення піде в LinePath разом з вибором
+    // входу чіпа (lineApplyParams()), щоб не міняти звук старого входу, поки він ще згасає.
+    if (idx == 0) {
+        applyRadioVolume();
+    }
 }
 
 // [Prompt 46a] Екземпляр еквалайзера радіо = пресет входу 0 (Settings::profiles[0].eqGainsDb).
@@ -607,7 +689,7 @@ void applyActiveToChip(bool withGain) {
     }
     APP_LOG("profile in%u: vol=%d (digital %.2f dB; chip volume/tone/balance/gain/loudness neutral)\n",
             static_cast<unsigned>(s_input), static_cast<int>(s_volume),
-            static_cast<double>(audio_cfg::radioVolumeDb(s_volume)));
+            static_cast<double>(s_input == 0 ? audio_cfg::radioVolumeDb(s_volume) : extVolumeDb(s_volume)));
 }
 
 // --- Мʼют ----------------------------------------------------------------------
@@ -625,6 +707,30 @@ bool desiredMute() {
            restarting() ||               // [Prompt 28]: перезапуск — тиша до кінця
            s_mode == Mode::WifiSetup;    // [Prompt 28]: екран налаштування Wi-Fi — тиша
 }
+
+// [Prompt 47c] Мʼют проходу: стан користувача/переходів + будь-який стан проходу, крім Active (старт, перемикання,
+// звільнення, помилка). Внутрішніх мʼютів line_path (Stall тощо) не чіпаємо.
+#if LINE_PATH_ENABLE
+bool lineMuteWanted() {
+    return desiredMute() || s_lineState != LineState::Active;
+}
+
+// Надсилає в LinePath актуальний мʼют користувача (лише при зміні). Мʼют плавний (DspVolume).
+void syncLineMute() {
+    if (!LinePath::isReady()) {
+        return;
+    }
+    const bool want = lineMuteWanted();
+    if (want == s_lineMuteSent) {
+        return;
+    }
+    LinePath::setUserMute(want);
+    s_lineMuteSent = want;
+    APP_LOG("line user mute %s\n", want ? "on" : "off");
+}
+#else
+inline void syncLineMute() {}
+#endif
 
 // [Prompt 47a] Чекає, поки цифровий мʼют радіо дозгасне. Лише коли радіо реально грає (інакше блоки
 // хука не йдуть і згасати нічому): тоді просто просимо миттєвий мʼют для найближчого блоку.
@@ -664,6 +770,7 @@ void syncRadioMute(bool waitSilent) {
 // Мʼют: спершу цифровий (радіо), потім чип (зовнішні входи; також підтвердження для підсилювача).
 void applyHardwareMute(bool force = false, bool waitSilent = false) {
     syncRadioMute(waitSilent);  // [Prompt 47a]
+    syncLineMute();             // [Prompt 47c] у режимі радіо LinePath і так у мʼюті (стан != Active)
     const bool want = desiredMute();
     if (s_proc == nullptr) {
         s_hwMute = want;
@@ -972,7 +1079,7 @@ bool setVolumeTarget(int v) {
         return false;
     }
     s_volume = static_cast<int8_t>(v);
-    applyRadioVolume();
+    applyActiveVolume();  // [Prompt 47c] радіо або прохід
     return true;
 }
 
@@ -983,6 +1090,339 @@ void startTransition() {
     s_phaseStartMs = millis();
     applyHardwareMute(false, true);
 }
+
+// ---------------------------------------------------------------------------
+// [Prompt 47c] Маршрутизація входу: радіо або прохід зовнішніх входів
+// ---------------------------------------------------------------------------
+// Вхід чіпа-селектора для s_input + нейтральні значення (під мʼютом). Для радіо — ЛЕГАСІ вхід чіпа 0 (прибрати в P47d).
+void applyChipForInput() {
+    if (s_proc != nullptr) {
+        s_proc->setInput(audio_cfg::chipInputFor(s_input));  // [Prompt 46b] логічний -> вхід чіпа
+        applyActiveToChip(true);
+    }
+#if LINE_PATH_ENABLE
+    s_lineChipSetMs = millis();
+#endif
+}
+
+// Запуск радіо: чип, пресет EQ входу 0, потік (профіль входу 0 уже в s_volume / radio_volume).
+void radioBegin() {
+    applyChipForInput();
+    applyRadioEq();  // [Prompt 46a]
+    startStream();
+}
+
+#if LINE_PATH_ENABLE
+inline bool lineBusy() {
+    return s_lineState == LineState::Starting || s_lineState == LineState::Switching ||
+           s_lineState == LineState::Releasing;
+}
+
+const char* lineStateName(LineState s) {
+    switch (s) {
+        case LineState::Off:       return "Off";
+        case LineState::Starting:  return "Starting";
+        case LineState::Active:    return "Active";
+        case LineState::Switching: return "Switching";
+        case LineState::Releasing: return "Releasing";
+        case LineState::Failed:    return "Failed";
+    }
+    return "?";
+}
+
+void lineSetState(LineState st) {
+    if (st == s_lineState) {
+        return;
+    }
+    APP_LOG("line: %s -> %s\n", lineStateName(s_lineState), lineStateName(st));
+    s_lineState = st;
+    syncLineMute();  // мʼют проходу залежить від стану
+}
+
+// Є що звільняти: ресурси існують або модуль ще не в Off.
+bool lineResourcesPresent() {
+    return LinePath::resourcesUp() || LinePath::state() != LinePathState::Off;
+}
+
+// Пресет EQ входу idx (Settings::profiles) -> екземпляр EQ проходу.
+void lineApplyEq(uint8_t idx) {
+    if (idx == 0 || idx >= defaults::kInputCount || !LinePath::isReady()) {
+        return;
+    }
+    const Settings st = SettingsStore::snapshot();
+    LinePath::setEqAllDb(st.profiles[idx].eqGainsDb);
+}
+
+// Гучність + EQ поточного зовнішнього входу -> прохід.
+void lineApplyParams() {
+    lineApplyVolume();
+    lineApplyEq(s_input);
+}
+
+// Вибір входу чіпа + гучність + EQ. Викликати лише коли прохід цифрово замʼючений або не працює.
+void lineApplyChipAndParams() {
+    applyChipForInput();
+    lineApplyParams();
+    s_lineApplied = true;
+}
+
+void lineBeginRelease() {
+    s_lineRelStep = 0;
+    s_lineRelCalled = false;
+    s_lineT0 = millis();
+    lineSetState(LineState::Releasing);
+}
+
+// Свіжий старт проходу (стан Off / Failed). Чип і параметри надсилаються перед requestStart().
+void lineBegin() {
+    s_lineAfter = LineAfter::Auto;
+    s_lineRetryUsed = false;
+    s_lineApplied = false;
+    s_lineStep = LineStartStep::WaitIdle;
+    s_lineT0 = millis();
+    lineSetState(LineState::Starting);
+}
+
+// Вхід<->вхід без перезапуску проходу (повторний виклик під час Switching перезапускає цикл).
+void lineSwitch() {
+    s_lineSwitchStep = 0;
+    s_lineT0 = millis();
+    lineSetState(LineState::Switching);
+}
+
+// Невдача старту / втрата проходу: звільнити ресурси, один автоповтор, далі Failed.
+void lineFail(const char* why) {
+    APP_LOG("line: FAILED (%s) err=%s state=%s\n", why, LinePath::errorName(LinePath::lastError()),
+            LinePath::stateName(LinePath::state()));
+    s_lineAfter = s_lineRetryUsed ? LineAfter::Fail : LineAfter::Retry;
+    s_lineRetryUsed = true;
+    lineBeginRelease();
+}
+
+// Зовнішній запит звільнення (standby / перезапуск / OTA): без радіо й без автоповторів.
+void lineRelease() {
+    s_lineAfter = LineAfter::Auto;
+    s_lineRetryUsed = false;
+    switch (s_lineState) {
+        case LineState::Starting:
+        case LineState::Active:
+        case LineState::Switching:
+            lineBeginRelease();
+            break;
+        case LineState::Failed:
+            lineSetState(LineState::Off);
+            break;
+        default:
+            break;  // Off / Releasing
+    }
+}
+
+// Ресурси звільнено (або вийшов час): вирішуємо, що далі, за ПОТОЧНИМ станом пристрою.
+void lineReleaseDone(uint32_t now) {
+    const LineAfter after = s_lineAfter;
+    s_lineAfter = LineAfter::Auto;
+    lineSetState(LineState::Off);
+    if (logicallyStandby() || s_mode == Mode::OtaUpdate || restarting()) {
+        return;  // тиша; новий старт — при виході зі standby / невдачі OTA
+    }
+    if (s_input != 0) {
+        if (after == LineAfter::Fail) {
+            lineSetState(LineState::Failed);
+            APP_LOG("line: giving up, silent until the input is selected again\n");
+            return;
+        }
+        s_lineApplied = false;
+        if (after == LineAfter::Retry) {
+            s_lineStep = LineStartStep::WaitRetry;
+            s_lineT0 = now + cfg::kLineRetryDelayMs;
+            APP_LOG("line: retry in %u ms\n", static_cast<unsigned>(cfg::kLineRetryDelayMs));
+        } else {
+            s_lineStep = LineStartStep::WaitIdle;
+            s_lineT0 = now;
+        }
+        lineSetState(LineState::Starting);
+        return;
+    }
+    // Вхід — радіо: RAM проходу вже звільнена, стартуємо потік. Settle перезапускаємо: радіо до розмʼюту в мʼюті.
+    startTransition();
+    radioBegin();
+    publishStationName();
+}
+
+void lineServiceStarting(uint32_t now) {
+    if (s_lineStep == LineStartStep::WaitRetry) {
+        if (reached(now, s_lineT0)) {
+            s_lineStep = LineStartStep::WaitIdle;
+            s_lineT0 = now;
+            s_lineApplied = false;
+        }
+        return;
+    }
+    if (s_lineStep == LineStartStep::WaitIdle) {
+        const bool ready = LinePath::isReady();
+        if (ready && AudioPlayer::state() == PlayerState::Idle) {
+            if (!s_lineApplied) {
+                lineApplyChipAndParams();  // прохід ще не працює: міняти чип безпечно
+            }
+            if (LinePath::requestStart()) {
+                s_lineStep = LineStartStep::WaitRunning;
+                s_lineT0 = now;
+                APP_LOG("line: start requested (input %u)\n", static_cast<unsigned>(s_input));
+                return;
+            }
+            if (LinePath::lastError() == LinePathError::AllocFailed) {
+                lineFail("alloc failed");
+                return;
+            }
+        }
+        if (static_cast<uint32_t>(now - s_lineT0) >= cfg::kLineIdleWaitMs) {
+            lineFail(ready ? "player not idle or start refused" : "line path not ready");
+        }
+        return;
+    }
+    // WaitRunning
+    const uint32_t elapsed = now - s_lineT0;
+    const LinePathState st = LinePath::state();
+    if (st == LinePathState::Running && reached(now, s_lineChipSetMs + cfg::kExtInputSettleMs)) {
+        s_lineRetryUsed = false;  // успішний старт повертає право на автоповтор
+        lineSetState(LineState::Active);  // syncLineMute() розмʼютить, якщо Settle / мʼют користувача не заважають
+        return;
+    }
+    if (st == LinePathState::Off && LinePath::lastError() != LinePathError::None &&
+        elapsed >= cfg::kLineErrCheckDelayMs) {
+        lineFail("start aborted");
+        return;
+    }
+    if (elapsed >= cfg::kLineStartTimeoutMs) {
+        lineFail("start timeout");
+    }
+}
+
+void lineServiceSwitching(uint32_t now) {
+    if (!LinePath::resourcesUp() || LinePath::state() == LinePathState::Off) {
+        lineFail("lost while switching");
+        return;
+    }
+    if (s_lineSwitchStep == 0) {
+        if (reached(now, s_lineT0 + cfg::kExtMuteSettleMs)) {
+            lineApplyChipAndParams();  // прохід цифрово замʼючений (state != Active)
+            s_lineSwitchStep = 1;
+        }
+        return;
+    }
+    if (reached(now, s_lineChipSetMs + cfg::kExtInputSettleMs)) {
+        lineSetState(LineState::Active);
+    }
+}
+
+void lineServiceReleasing(uint32_t now) {
+    if (s_lineRelStep == 0) {
+        const bool present = lineResourcesPresent();
+        if (present && static_cast<uint32_t>(now - s_lineT0) < cfg::kExtMuteSettleMs) {
+            return;  // чекаємо, поки цифровий мʼют дозгасне
+        }
+        s_lineRelStep = 1;
+        s_lineT0 = now;
+        if (present) {
+            s_lineRelCalled = LinePath::returnToRadio();
+            APP_LOG("line: returnToRadio %s\n", s_lineRelCalled ? "requested" : "refused (will retry)");
+        }
+    }
+    if (!lineResourcesPresent()) {
+        lineReleaseDone(now);
+        return;
+    }
+    if (!s_lineRelCalled) {
+        s_lineRelCalled = LinePath::returnToRadio();
+    }
+    if (static_cast<uint32_t>(now - s_lineT0) >= cfg::kLineReleaseTimeoutMs) {
+        APP_LOG("line: release timeout (resources=%d state=%s), continuing\n",
+                LinePath::resourcesUp() ? 1 : 0, LinePath::stateName(LinePath::state()));
+        lineReleaseDone(now);
+    }
+}
+
+// Щотакту з tickLocked().
+void lineService(uint32_t now) {
+    switch (s_lineState) {
+        case LineState::Starting:
+            lineServiceStarting(now);
+            break;
+        case LineState::Active:
+            if (!LinePath::resourcesUp() || LinePath::state() == LinePathState::Off) {
+                lineFail("lost while active");  // напр. хтось викликав lp.radio повз контролер
+            }
+            break;
+        case LineState::Switching:
+            lineServiceSwitching(now);
+            break;
+        case LineState::Releasing:
+            lineServiceReleasing(now);
+            break;
+        default:
+            break;  // Off / Failed
+    }
+}
+
+// Спрямувати звук на s_input (s_input / профіль уже встановлено; пристрій «увімкнений»).
+void routeInput() {
+    if (s_input == 0) {
+        switch (s_lineState) {
+            case LineState::Off:
+            case LineState::Failed:
+                lineSetState(LineState::Off);
+                radioBegin();
+                break;
+            case LineState::Releasing:
+                s_lineAfter = LineAfter::Auto;  // радіо стартує, коли ресурси звільнено
+                break;
+            default:
+                s_lineAfter = LineAfter::Auto;
+                lineBeginRelease();  // мʼют -> returnToRadio() -> радіо
+                break;
+        }
+        return;
+    }
+    switch (s_lineState) {
+        case LineState::Off:
+        case LineState::Failed:
+            lineBegin();
+            break;
+        case LineState::Releasing:
+            s_lineAfter = LineAfter::Auto;  // після звільнення — свіжий старт на новому вході
+            s_lineRetryUsed = false;
+            break;
+        case LineState::Starting:
+            if (s_lineStep == LineStartStep::WaitRunning) {
+                lineApplyChipAndParams();  // ресурси створюються, прохід ще замʼючений
+            } else {
+                s_lineApplied = false;  // перенадіслати з новим входом перед requestStart()
+            }
+            break;
+        case LineState::Active:
+        case LineState::Switching:
+            lineSwitch();
+            break;
+    }
+}
+
+// Вхід<->вхід не потребує Phase::Settle (аналогового чипа/підсилювача на цьому шляху немає).
+inline bool lineSkipsSettle(uint8_t prev, uint8_t next) {
+    return prev != 0 && next != 0;
+}
+#else  // LINE_PATH_ENABLE == 0: зовнішні входи мовчать, радіо як у P47a
+inline bool lineBusy() { return false; }
+inline void lineRelease() {}
+inline void lineService(uint32_t) {}
+inline bool lineSkipsSettle(uint8_t, uint8_t) { return false; }
+inline void routeInput() {
+    if (s_input == 0) {
+        radioBegin();
+    } else {
+        applyChipForInput();  // чип-селектор як раніше (звуку немає: прохід вимкнено збіркою)
+    }
+}
+#endif
 
 // Увімкнення: режим за s_input, перехід, вхід у чіпі, запуск потоку для Radio.
 // Вхід/станцію викликач уже поклав у s_input/s_station.
@@ -996,14 +1436,7 @@ void powerOnTransition() {
     // [Prompt 21b/46a] Усе ще під мʼютом: профіль входу -> робоча гучність, вхід у чіп, потім нейтральні
     // гучність/тембр/баланс/gain/loudness. Цифрову гучність піднімає DSP після розмʼюту в tick().
     loadActiveFromProfile(s_input);
-    if (s_proc != nullptr) {
-        s_proc->setInput(audio_cfg::chipInputFor(s_input));  // [Prompt 46b] логічний -> вхід чіпа
-        applyActiveToChip(true);
-    }
-    if (s_input == 0) {
-        applyRadioEq();  // [Prompt 46a] пресет входу 0 -> екземпляр радіо (до запуску потоку)
-        startStream();
-    }
+    routeInput();  // [Prompt 47c] радіо: чип + EQ + потік; зовнішній вхід: старт проходу (чип — перед requestStart())
     publishStationName();  // [Prompt 20b]
 }
 
@@ -1018,6 +1451,7 @@ void enterStandby() {
     applyHardwareMute(false, true);  // Standby входить у desiredMute(): [P47a] радіо згасає ДО stopStream()
     ampRequestOff();      // [Prompt 23c]: пін LOW через kAmpOffDelayMs (у tick())
     stopStream();
+    lineRelease();        // [Prompt 47c]: прохід замʼючено (desiredMute()), returnToRadio() через kExtMuteSettleMs
     persist();
     SettingsStore::flush();
     s_persistNeeded = false;
@@ -1103,31 +1537,26 @@ void changeInput(uint8_t newIdx) {
                 inputUnavailableWhy(newIdx));  // [Prompt 39]: + disabled
         return;
     }
-    const bool leavingRadio = (s_input == 0 && newIdx != 0);
-    const bool enteringRadio = (s_input != 0 && newIdx == 0);
     APP_LOG("input %u -> %u (%s)\n", static_cast<unsigned>(s_input),
             static_cast<unsigned>(newIdx),
             newIdx < defaults::kInputCount ? defaults::kInputNames[newIdx] : "?");
 
     captureActiveProfile();  // [Prompt 21b] профіль старого входу фіксуємо ДО зміни s_input
+    const uint8_t prevIdx = s_input;
     s_input = newIdx;
     s_mode = (newIdx == 0) ? Mode::Radio : Mode::ExternalInput;
-    startTransition();  // мʼют (цифровий радіо + чип)
-    if (leavingRadio) {
-        stopStream();
+    // [Prompt 47c] Вхід<->вхід через прохід: без Phase::Settle (мʼют проходу веде автомат Switching).
+    if (!lineSkipsSettle(prevIdx, newIdx)) {
+        startTransition();  // мʼют (цифровий радіо + прохід + чип)
     }
-    // [Prompt 21b/46a] Під мʼютом: профіль нового входу -> робоча гучність (s_volume = ціль
-    // майбутнього розмʼюту), setInput(), потім нейтральні гучність/gain/тембр/баланс/loudness (gain нового
-    // входу = нейтральне значення, а не те, що підставив драйвер).
+    if (prevIdx == 0) {
+        stopStream();  // залишаємо радіо
+    }
+    // [Prompt 21b/46a] Профіль нового входу -> робоча гучність (s_volume = ціль майбутнього розмʼюту).
     loadActiveFromProfile(newIdx);
-    if (s_proc != nullptr) {
-        s_proc->setInput(audio_cfg::chipInputFor(newIdx));  // [Prompt 46b] логічний -> вхід чіпа
-        applyActiveToChip(true);
-    }
-    if (enteringRadio) {
-        applyRadioEq();  // [Prompt 46a] повернення на вхід 0: пресет входу 0 -> екземпляр радіо
-        startStream();
-    }
+    // [Prompt 47c] Далі: радіо — чип, EQ входу 0, потік (після звільнення проходу, якщо він був); зовнішній —
+    // старт проходу / Switching (чип, гучність і EQ входу надсилаються, коли прохід цифрово замʼючений).
+    routeInput();
     publishStationName();  // [Prompt 20b]: вхід Radio -> назва зі списку, інакше порожньо
     s_persistNeeded = true;
 }
@@ -1550,7 +1979,9 @@ void leaveOtaLocked() {
         applyHardwareMute();
     } else {
         startTransition();
-        if (s_input == 0 && (s_mode == Mode::Radio || s_mode == Mode::Menu)) {
+        if (s_input != 0) {
+            routeInput();  // [Prompt 47c] прохід звільнено при beginOta(): запускаємо знову
+        } else if (s_mode == Mode::Radio || s_mode == Mode::Menu) {
             startStream();  // сам відкладе, якщо немає Wi-Fi
         }
     }
@@ -1579,6 +2010,7 @@ void beginRestart() {
         s_playUrlValid = false;
     }
     ampRequestOff();  // ПІСЛЯ applyHardwareMute(), як у enterStandby()
+    lineRelease();    // [Prompt 47c] прохід замʼючено (restarting() у desiredMute()), звільняємо ресурси
     // Остання зміна гучності/входу могла не дійти до NVS (запис із дебаунсом) — скидаємо зараз.
     persist();
     SettingsStore::flush();
@@ -1768,6 +2200,7 @@ void tickLocked() {
 
     ampService(now);  // [Prompt 23c]
     restartService(now);  // [Prompt 28] (ESP.restart() не повертається)
+    lineService(now);     // [Prompt 47c] автомат проходу зовнішніх входів
 
     if (s_otaAbortPending) {  // [Prompt 16] otaFailed() не отримав мʼютекс
         s_otaAbortPending = false;
@@ -1777,12 +2210,13 @@ void tickLocked() {
     // [Prompt 23c] Розмʼют лише коли підсилювач прогрітий (або не потрібен).
     // [Prompt 47a] Програмної рампи немає: applyHardwareMute() знімає цифровий мʼют радіо, DSP сам плавно
     // (kRampMs) піднімає звук з першого блоку; мʼют користувача/Standby/WifiSetup лишаються (desiredMute()).
+    // [Prompt 47c] Settle не завершується, поки прохід стартує / перемикається / звільняється.
     if (s_phase == Phase::Settle && reached(now, s_phaseStartMs + cfg::kUnmuteDelayMs) &&
-        ampReady()) {
+        ampReady() && !lineBusy()) {
         s_phase = Phase::None;
         applyHardwareMute();
         APP_LOG("unmute, vol=%d (%.2f dB)\n", static_cast<int>(s_volume),
-                static_cast<double>(audio_cfg::radioVolumeDb(s_volume)));
+                static_cast<double>(s_input == 0 ? audio_cfg::radioVolumeDb(s_volume) : extVolumeDb(s_volume)));
     }
 
     if (s_proc != nullptr && desiredMute() != s_hwMute &&
@@ -1828,6 +2262,7 @@ void taskMain(void*) {
         // [Prompt 15]: під час навчання IR теж активний (короткий) період опитування.
         const bool active =
             (s_phase != Phase::None) || (s_mode == Mode::IrLearn) ||
+            lineBusy() ||  // [Prompt 47c]: автомат проходу рухається з активним періодом
             ampBusy() ||  // [Prompt 23c]
             restarting();  // [Prompt 28]: чекаємо пін/паузу з активним періодом
         Event ev;
@@ -2154,6 +2589,7 @@ bool AppController::beginOta() {
         s_phase = Phase::None;  // Settle скасовано
         applyHardwareMute(false, true);  // desiredMute() уже true; мʼют ПЕРЕД зупинкою потоку ([P47a]: з очікуванням згасання)
         stopStream();
+        lineRelease();  // [Prompt 47c] звільнити RAM проходу (≈ 21 КБ) для OTA; мʼют — desiredMute()
         publishState();
         APP_LOG("OTA begin, mode %s -> OtaUpdate\n", modeName(s_otaPrevMode));
         ok = true;
@@ -2221,6 +2657,25 @@ bool AppController::startOffline() {
     }
     xSemaphoreGiveRecursive(s_lock);
     return ok;
+}
+
+// [Prompt 47c] ДОДАНО: живий пресет EQ поточного зовнішнього входу (викликає веб-обробник /api/eq)
+bool AppController::applyLineEq(uint8_t input, const int8_t gains[eq_cfg::kBandCount]) {
+#if LINE_PATH_ENABLE
+    if (!s_started || s_lock == nullptr ||
+        xSemaphoreTakeRecursive(s_lock, pdMS_TO_TICKS(cfg::kLockTimeoutMs)) != pdTRUE) {
+        return false;
+    }
+    if (input != 0 && input == s_input && LinePath::isReady()) {
+        LinePath::setEqAllDb(gains);  // неблокуюче; діє й до старту проходу
+        APP_LOG("line EQ preset applied live (input %u)\n", static_cast<unsigned>(input));
+    }
+    xSemaphoreGiveRecursive(s_lock);
+#else
+    (void)input;
+    (void)gains;
+#endif
+    return true;
 }
 
 bool AppController::begin(AudioProcessor* processorOrNull) {

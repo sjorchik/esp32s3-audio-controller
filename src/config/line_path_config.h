@@ -1,6 +1,6 @@
 #pragma once
 
-// Константи модуля audio/line_path (Prompt 44, прототип; P44b — життєвий цикл ресурсів;
+// Константи модуля audio/line_path (Prompt 44, прототип; P47c — kVolMaxDb = 0 дБ; P44b — життєвий цикл ресурсів;
 // P47b — API гучності, мʼюту користувача і помилок). Прохід зовнішнього звуку PCM1808 (I2S1 RX, slave)
 // -> ESP32-S3 -> PCM5102 (I2S1 TX, slave) на тактах BCLK GPIO15 / WS GPIO17, які веде I2S0
 // (ESP32-audioI2S). DOUT GPIO18 мультиплексується між I2S0 (радіо) і I2S1 TX (прохід).
@@ -20,7 +20,7 @@
 #define LINE_PATH_ENABLE 1
 
 // 1 = Serial-команди lp.* (працює і при LINE_PATH_ENABLE == 0, тоді доступна лише lp.heap).
-#define LINE_PATH_TEST 1
+#define LINE_PATH_TEST 0  // [P47c] 0 у виробничій збірці: lp.* керують проходом повз AppController
 
 // Serial-лог "[LINE] ...".
 #define LINE_PATH_DEBUG 1
@@ -58,13 +58,15 @@ constexpr uint32_t kCreateWaitMs   = 500;
 // Верх −6 дБ — жорсткий максимум до перевірки підсилювача на повну шкалу PCM5102.
 // Нижня межа −120 дБ = dsp_volume_cfg::kMinDb (перевіряється в line_path.cpp).
 constexpr float    kVolMinDb       = -120.0f;
-constexpr float    kVolMaxDb       = -6.0f;
+// [P47c] Верх піднято з −6 до 0 дБ: зовнішні входи мають ту саму шкалу гучності, що й радіо (максимум UI = 0 дБ).
+constexpr float    kVolMaxDb       = 0.0f;
 // Гучність, яка діє, якщо її ще ніколи не задавали (безпечно тихо).
 constexpr float    kStartVolumeDb  = -60.0f;
 // Нижче цього значення lp.vol друкує попередження (поза звичним тестовим діапазоном).
 constexpr float    kWarnVolDb      = -60.0f;
 
 // Діапазон setAttenuationDb(int8_t) / lp.att (обгортка над setVolumeDb, зберігається для сумісності).
+// [P47c] Тестовий запобіжник lp.att лишається −6 дБ (kVolMaxDb більше йому не дорівнює).
 constexpr int8_t   kAttMinDb       = -60;
 constexpr int8_t   kAttMaxDb       = -6;
 
@@ -121,7 +123,7 @@ static_assert(kStartVolumeDb >= kVolMinDb && kStartVolumeDb <= kVolMaxDb,
               "start volume outside safe range");
 static_assert(kWarnVolDb >= kVolMinDb && kWarnVolDb <= kVolMaxDb, "warn threshold outside range");
 static_assert(kAttMinDb < kAttMaxDb && kAttMaxDb <= 0, "attenuation range inverted");
-static_assert(static_cast<float>(kAttMaxDb) == kVolMaxDb, "int8 ceiling must equal float ceiling");
+static_assert(static_cast<float>(kAttMaxDb) <= kVolMaxDb, "lp.att ceiling must not exceed the volume ceiling");
 static_assert(static_cast<float>(kAttMinDb) == kWarnVolDb, "lp.att floor must equal warn threshold");
 static_assert(kStallMs > kReadTimeoutMs, "stall must exceed one read timeout");
 static_assert(kXsmtMutedLevel != kXsmtUnmutedLevel, "XSMT levels must differ");

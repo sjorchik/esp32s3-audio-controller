@@ -4,6 +4,8 @@
 // Піни тут не дублюються (їх немає: AppController не чіпає залізо напряму).
 // Усі часові значення — у мілісекундах, якщо не вказано інше.
 //
+// [Prompt 47c] ДОДАНО: kExtMuteSettleMs, kExtInputSettleMs, kLineIdleWaitMs, kLineStartTimeoutMs,
+// kLineErrCheckDelayMs, kLineRetryDelayMs, kLineReleaseTimeoutMs, kExtLevelTrimDb (зовнішні входи через line_path).
 // [Prompt 47a] ДОДАНО: kNeutralVolume (фіксована гучність чіпа), kRadioMuteWaitMs (очікування
 // згасання цифрового мʼюту радіо). Програмна рампа гучності прибрана (її робить audio/dsp_volume):
 // kRampStepMs / kRampStep НЕ ВИКОРИСТОВУЮТЬСЯ (прибрати в P52).
@@ -61,6 +63,30 @@ constexpr uint32_t kUnmuteDelayMs = 250;
 // відбувається лише коли радіо реально грає. Має перекривати dsp_volume_cfg::kMuteRampMs (20 мс) із
 // запасом на блок хука (≈ 5 мс); після таймауту йде примусовий мʼют (requestForceMute()).
 constexpr uint32_t kRadioMuteWaitMs = 60;
+
+// ---------------------------------------------------------------------------
+// [Prompt 47c] Зовнішні входи 1..4 через audio/line_path
+// ---------------------------------------------------------------------------
+// Пауза після цифрового мʼюту проходу (LinePath::setUserMute(true)) перед зміною входу чіпа / returnToRadio().
+// Має перекривати dsp_volume_cfg::kMuteRampMs (20 мс) із запасом на блок (≈2,7 мс) і період tick.
+constexpr uint32_t kExtMuteSettleMs = 40;
+// Пауза після setInput() чіпа-селектора, поки аналоговий сигнал на PCM1808 стабілізується, перед розмʼютом.
+// ПРОПОЗИЦІЯ, не виміряно (далі ще 100 мс плавного наростання DspVolume).
+constexpr uint32_t kExtInputSettleMs = 30;
+// Скільки чекати AudioPlayer::state() == Idle (stop() асинхронний) перед LinePath::requestStart().
+// Більше за line_path_cfg::kRadioStopWaitMs (2000).
+constexpr uint32_t kLineIdleWaitMs = 3000;
+// Від успішного requestStart() до state() == Running (типово ≈ 650..800 мс).
+constexpr uint32_t kLineStartTimeoutMs = 5000;
+// Відразу після requestStart() lastError() може бути застарілим: ознаку «старт перервано» беремо лише після цієї паузи.
+constexpr uint32_t kLineErrCheckDelayMs = 100;
+// Пауза перед єдиним автоповтором старту після невдачі.
+constexpr uint32_t kLineRetryDelayMs = 1000;
+// Скільки чекати звільнення ресурсів після returnToRadio() (resourcesUp() == false, state == Off).
+constexpr uint32_t kLineReleaseTimeoutMs = 3000;
+// Зсув рівня зовнішніх входів відносно кривої радіо, дБ (≤ 0). 0 = та сама крива radioVolumeDb(). Підгонка
+// «на слух»: якщо зовнішні входи гучніші за радіо при однаковому UI — зробити від'ємним (напр. −8).
+constexpr float    kExtLevelTrimDb = 0.0f;
 
 // [Prompt 47a] НЕ ВИКОРИСТОВУЄТЬСЯ: ramp гучності тепер цифровий (audio/dsp_volume, kRampMs = 100 мс).
 constexpr uint32_t kRampStepMs = 20;
@@ -187,6 +213,10 @@ static_assert(kRampStepMs >= 1, "kRampStepMs must be >= 1");
 static_assert(kRadioMuteWaitMs > dsp_volume_cfg::kMuteRampMs,
               "radio mute wait must exceed the digital mute ramp");
 static_assert(kSyncPeriodMs >= kActivePollMs, "sync period too short");
+static_assert(kExtMuteSettleMs > dsp_volume_cfg::kMuteRampMs, "ext mute settle must exceed the digital mute ramp");
+static_assert(kExtLevelTrimDb <= 0.0f, "ext level trim must not boost");
+static_assert(kLineStartTimeoutMs > kLineErrCheckDelayMs && kLineIdleWaitMs >= 1 && kLineReleaseTimeoutMs >= 1,
+              "line timeouts");
 static_assert(kAdjustTimeoutMs >= 1, "kAdjustTimeoutMs must be >= 1");
 static_assert(kVolumeStep >= 1, "kVolumeStep must be >= 1");
 static_assert(kRestartMuteMs >= 1 && kRestartMaxWaitMs > kRestartMuteMs,
