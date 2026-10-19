@@ -15,6 +15,8 @@
 // forceMute()), тож безпечний з будь-якої задачі. isRamping() лишається ЛИШЕ для власника.
 //
 // Множення в float з насиченням на int32. При нульовому переході (0 дБ, без ramp) блок не чіпається.
+// [Prompt 47d] processFloat(): те саме множення з тим самим ramp на float-буфері (стерео), БЕЗ насичення
+// (його робить викликач один раз у кінці конвеєра). process(int32_t*) для радіо без змін.
 
 #include <stdint.h>
 
@@ -47,7 +49,12 @@ public:
     // Множення стерео-блоку int32 (L,R,L,R...) на місці. frames — кількість стереокадрів.
     void process(int32_t* buf, int32_t frames);
 
+    // [Prompt 47d] Те саме на float-буфері (L,R,L,R...), без насичення.
+    void processFloat(float* buf, int32_t frames);
+
 private:
+    bool prepare();                      // власник: запит force, нова ціль; false = блок не чіпати (0 дБ)
+    void finish(float g, uint32_t rem);  // власник: зберегти стан і опублікувати silent_
     void resetState();  // власник: підсилення 0, перехід скасовано (мʼют не чіпає)
 
     uint32_t hz_ = dsp_volume_cfg::kDefaultSampleRateHz;

@@ -4,8 +4,10 @@
 // P47b — виробничий API). Ланцюжок: PCM1808 (I2S1 RX slave) -> ESP32-S3 -> PCM5102 (I2S1 TX slave)
 // на тактах I2S0 бібліотеки ESP32-audioI2S.
 //
-// ЛАНЦЮЖОК БЛОКУ (P45): RX -> піки входу -> eq::Processor (власний екземпляр) -> DspVolume ->
-// піки виходу -> TX. Гучність радіо лишається в TDA7318 до P47; DspVolume для радіо не вмикається.
+// ЛАНЦЮЖОК БЛОКУ (P45, P47d): RX int32 -> float -> піки входу -> eq::Processor (власний екземпляр,
+// processFloat) -> піки VU (після EQ, ДО гучності) -> DspVolume (processFloat) -> ОДНЕ насичення й
+// перетворення в int32 -> піки виходу -> TX. VU зовнішніх входів публікується у VuSourceLinePath
+// (audio/vu_source.h; шкала int16, калібрування line_path_cfg::kVuOffsetDb). Гучність радіо лишається в TDA7318 до P47; DspVolume для радіо не вмикається.
 //
 // ЖИТТЄВИЙ ЦИКЛ РЕСУРСІВ (P44b): begin() нічого не виділяє. start() / requestStart() створюють
 // буфер блоку, задачу line_path і канали I2S1 (задача). returnToRadio() знищує їх; stop() ресурси лишає.
@@ -84,7 +86,7 @@ struct LinePathStats {
     float         peakOutLeftDbfs;   // пік ВИХОДУ (після гучності), дБFS; -99 = тиша
     float         peakOutRightDbfs;
     uint32_t      allocFailures;     // відхилені старти (нестача памʼяті, таймаут, створення задачі)
-    uint32_t      clipCount;         // насичені відліки на виході EQ
+    uint32_t      clipCount;         // [P47d] насичені відліки на виході проходу (ПІСЛЯ гучності; EQ не насичує)
     // [P47b] нові поля в кінці
     float         volumeDb;          // гучність проходу, дБ [−120..−6]
     bool          userMuted;         // мʼют користувача (setUserMute)

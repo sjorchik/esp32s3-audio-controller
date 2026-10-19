@@ -23,6 +23,7 @@
 //   піднімає mDNS після підключення.
 // - [Prompt 13] WebServerManager::begin(proc) викликається ПІСЛЯ AppController::begin()
 //   (потрібні AppState і Settings); сервер сам піднімається, коли WifiManager дасть STA.
+// - [Prompt 47d] adc_vu видалено: VU зовнішніх входів виробляє line_path (initAdcVu() більше немає).
 // - [Prompt 23c] Перший рядок setup() — AmpStandby::begin(): пін standby підсилювача в LOW
 //   до ініціалізації аудіо; HIGH ставить лише AppController (powerOnTransition()).
 
@@ -32,7 +33,6 @@
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 
-#include "audio/adc_vu.h"             // [Prompt 37] ДОДАНО
 #include "audio/line_path.h"          // [Prompt 44] ДОДАНО
 #include "audio/amp_standby.h"        // [Prompt 23c] ДОДАНО
 #include "audio/audio_player.h"       // [Prompt 5] ДОДАНО
@@ -301,18 +301,6 @@ static void initAppController() {
     }
 }
 
-// [Prompt 37] ДОДАНО: VU зовнішніх входів через PCM1808. Після AppController (задача читає AppState)
-// і після AudioPlayer::begin() (там I2S0 отримує піни й MCLK). Помилка не зупиняє старт.
-static void initAdcVu() {
-#if ADC_VU_ENABLE && !LINE_PATH_ENABLE  // [Prompt 44] ЗМІНЕНО: при LINE_PATH_ENABLE I2S1 належить line_path
-    if (AdcVu::begin()) {
-        Serial.println("[MAIN] ADC VU ready");
-    } else {
-        Serial.println("[MAIN] ADC VU init failed (external input VU disabled)");
-    }
-#endif
-}
-
 // [Prompt 44] ДОДАНО: прототип проходу PCM1808 -> PCM5102 (I2S1 duplex slave). Після AudioPlayer::begin()
 // (там I2S0 отримує піни й MCLK, а XSMT переходить у мʼют). Запуск лише з Serial-тесту (lp.*).
 // [Prompt 44b] ЗМІНЕНО: begin() більше не створює канали I2S1, задачу й буфери (їх створює start() і
@@ -454,8 +442,7 @@ void setup() {
     // [Prompt 8] ДОДАНО: AppController після процесора, плеєра й Settings.
     initAppController();
 
-    // [Prompt 37] ДОДАНО
-    initAdcVu();
+    // [Prompt 47d] initAdcVu() видалено: VU зовнішніх входів тепер виробляє line_path (ініціалізується вище).
 
     // [Prompt 13] ДОДАНО: веб-сервер після AppController (AppState::begin() уже виконано).
     initWebServer();

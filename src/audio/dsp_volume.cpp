@@ -1,4 +1,4 @@
-// Цифрова гучність і мʼют (Prompt 45, доповнено Prompt 47a). Опис і правила потоків — у dsp_volume.h.
+// Цифрова гучність і мʼют (Prompt 45, доповнено Prompt 47a, P47d — processFloat). Опис і правила потоків — у dsp_volume.h.
 //
 // ВАЖЛИВО: файл НЕ включає Audio.h. Чиста математика.
 
@@ -85,11 +85,8 @@ bool DspVolume::isSilent() const {
     return mute_.load(std::memory_order_relaxed) && silent_.load(std::memory_order_relaxed);
 }
 
-void DspVolume::process(int32_t* buf, int32_t frames) {
-    if (buf == nullptr || frames <= 0) {
-        return;
-    }
-
+// Спільна підготовка блоку. false = усталений 0 дБ без переходу: блок не чіпаємо (відліки точні).
+bool DspVolume::prepare() {
     // [P47a] Запит миттєвого мʼюту з іншої задачі: скидаємо стан власника тут. Мʼют не чіпаємо:
     // якщо запитач уже встиг викликати setMute(false), далі піде плавне наростання з нуля.
     if (forceReq_.exchange(false, std::memory_order_acq_rel)) {
@@ -107,9 +104,24 @@ void DspVolume::process(int32_t* buf, int32_t frames) {
         step_ = (tgt - gCur_) / static_cast<float>(rem_);
     }
 
-    // Усталений 0 дБ без переходу: блок не чіпаємо (усі відліки лишаються точними).
     if (rem_ == 0 && gCur_ == 1.0f) {
         silent_.store(false, std::memory_order_relaxed);
+        return false;
+    }
+    return true;
+}
+
+void DspVolume::finish(float g, uint32_t rem) {
+    gCur_ = g;
+    rem_ = rem;
+    silent_.store(rem == 0 && g == 0.0f, std::memory_order_relaxed);
+}
+
+void DspVolume::process(int32_t* buf, int32_t frames) {
+    if (buf == nullptr || frames <= 0) {
+        return;
+    }
+    if (!prepare()) {
         return;
     }
 
@@ -131,7 +143,35 @@ void DspVolume::process(int32_t* buf, int32_t frames) {
         p += 2;
     }
 
-    gCur_ = g;
-    rem_ = rem;
-    silent_.store(rem == 0 && g == 0.0f, std::memory_order_relaxed);
+    finish(g, rem);
+}
+
+// [P47d] Той самий посемпловий ramp, без насичення.
+void DspVolume::processFloat(float* buf, int32_t frames) {
+    if (buf == nullptr || frames <= 0) {
+        return;
+    }
+    if (!prepare()) {
+        return;
+    }
+
+    float g = gCur_;
+    uint32_t rem = rem_;
+    const float step = step_;
+    const float tgtG = gTgt_;
+
+    float* p = buf;
+    for (int32_t f = 0; f < frames; ++f) {
+        if (rem > 0) {
+            g += step;
+            if (--rem == 0) {
+                g = tgtG;
+            }
+        }
+        p[0] *= g;
+        p[1] *= g;
+        p += 2;
+    }
+
+    finish(g, rem);
 }

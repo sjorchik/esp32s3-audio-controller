@@ -1,6 +1,6 @@
 // Прохід зовнішнього звуку PCM1808 -> ESP32-S3 -> PCM5102 (Prompt 44; P44b — життєвий цикл ресурсів;
 // P45 — EQ і dsp_volume у ланцюжку блоку; P47b — виробничий API гучності, мʼюту користувача, EQ входу,
-// помилок і неблокуючого старту). Опис і правила потоків — audio/line_path.h.
+// помилок і неблокуючого старту; P47d — float-конвеєр і VU зовнішніх входів). Опис і правила потоків — audio/line_path.h.
 //
 // Топологія (V2 з P43):
 //   PCM1808 --DIN GPIO8--> I2S1 RX (slave) --[блок 128 кадрів]--> I2S1 TX (slave)
@@ -11,6 +11,11 @@
 //
 // ВАЖЛИВО про піни 15/17: вони водночас вихід I2S0 і вхід I2S1 (slave). Після init/enable повертаємо
 // output-enable низькорівнево (gpio_ll). gpio_set_direction() не використовуємо.
+//
+// КОНВЕЄР БЛОКУ (P47d): RX int32 (24 біти зліва) -> float (×2^-31, точно) -> піки входу (lp.stat) ->
+// EQ (processFloat) -> VU (піки після EQ, ДО гучності) -> гучність (processFloat) -> ОДНЕ насичення й
+// перетворення в int32 -> піки виходу -> TX. Проміжних округлень і насичень немає. clipCount = лише
+// фінальне насичення (після гучності). VU публікується в VuSourceLinePath (шкала int16 + kVuOffsetDb).
 //
 // МЬЮТИ (P47b): два джерела, одна функція applyMute(). Ефективний цифровий мʼют =
 //   s_userMute || (s_state != Running).
@@ -38,6 +43,7 @@
 #include <string.h>
 
 #include "audio/audio_player.h"
+#include "config/features.h"
 #include "config/line_path_config.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -99,6 +105,8 @@ struct DbgInfo {
     uint32_t heapFreeAfter;
     uint32_t heapLargestAfter;
     uint32_t recoveries;
+    float    vuPeakLeftDbfs;   // [P47d] пік VU (шкала екрана, з kVuOffsetDb) з останнього lp.reset, дБFS; -99 = тиша
+    float    vuPeakRightDbfs;
 };
 
 [[maybe_unused]] const char* errorNameImpl(LinePathError e) {
@@ -123,8 +131,10 @@ struct DbgInfo {
 
 #include "audio/dsp_volume.h"
 #include "audio/eq.h"
+#include "audio/vu_source.h"
 #include "config/audio_player_config.h"
 #include "config/dsp_volume_config.h"
+#include "config/vu_config.h"
 #include "driver/i2s_std.h"
 #include "esp_rom_gpio.h"
 #include "esp_timer.h"
@@ -143,6 +153,14 @@ namespace {
 enum Req : uint8_t { kReqNone = 0, kReqStart, kReqStop, kReqRadio };
 
 constexpr size_t kBufBytes = cfg::kBlockFrames * 2 * sizeof(int32_t);
+// [P47d] Одне виділення: перша половина — int32 (RX / TX), друга — float-буфер конвеєра (той самий розмір).
+static_assert(sizeof(float) == sizeof(int32_t), "float block buffer must match the int32 block size");
+constexpr size_t kAllocBytes = 2 * kBufBytes;
+
+constexpr float kToFloat = 1.0f / 2147483648.0f;    // 2^-31: int32 -> ±1.0 (степінь двійки: точно)
+constexpr float kFromFloat = 2147483648.0f;         // 2^31
+constexpr float kOutMax = 2147483520.0f;            // найбільше float <= INT32_MAX
+constexpr float kOutMin = -2147483648.0f;
 
 // --- DSP: екземпляри EQ і цифрової гучності; обробка — лише в задачі line_path ---
 eq::Processor s_eqLine{"line"};
@@ -177,6 +195,7 @@ i2s_chan_handle_t s_rx = nullptr;
 i2s_chan_handle_t s_tx = nullptr;
 TaskHandle_t      s_task = nullptr;
 int32_t*          s_buf = nullptr;
+float*            s_fbuf = nullptr;          // [P47d] друга половина того самого виділення
 
 uint32_t s_settle = 0;
 uint32_t s_lastGoodMs = 0;
@@ -193,8 +212,17 @@ uint32_t          s_faultTx0 = 0;
 uint32_t s_blocks = 0, s_readTimeouts = 0, s_readErrors = 0, s_writeTimeouts = 0;
 uint32_t s_stalls = 0, s_starts = 0, s_maxProcessUs = 0, s_maxReadWaitUs = 0;
 uint32_t s_initMs = 0, s_lastStartMs = 0, s_allocFailures = 0, s_recoveries = 0;
-uint32_t s_peakL = 0, s_peakR = 0;
-uint32_t s_peakOutL = 0, s_peakOutR = 0;
+float    s_peakL = 0.0f, s_peakR = 0.0f;          // [P47d] пік входу, ±1.0 = повна шкала
+float    s_peakOutL = 0.0f, s_peakOutR = 0.0f;    // пік виходу (після єдиного насичення)
+uint32_t s_clips = 0;                             // [P47d] насичені відліки на виході (після гучності)
+
+#if ENABLE_VU
+// VU зовнішніх входів (P47d). Стан виміру живе лише в задачі line_path.
+float    s_vuScale = 32768.0f;                    // int16-шкала × 10^(kVuOffsetDb/20); задається в begin()
+float    s_vuDcL = 0.0f, s_vuDcR = 0.0f;
+bool     s_vuDcInit = false;
+uint32_t s_vuMaxL = 0, s_vuMaxR = 0;              // макс. опублікований пік з lp.reset (для lp.stat)
+#endif
 
 // Діагностика пам'яті / стека.
 uint32_t s_heapFreeBefore = 0, s_heapLargestBefore = 0, s_heapFreeAfter = 0, s_heapLargestAfter = 0;
@@ -335,31 +363,134 @@ void freeBuffer() {
         heap_caps_free(s_buf);
         s_buf = nullptr;
     }
+    s_fbuf = nullptr;
+}
+
+// Скинути стан DSP і виміру VU (старт і відновлення після Stall). Лише задача line_path.
+void resetDsp() {
+    s_eqLine.reset();
+#if ENABLE_VU
+    s_vuDcInit = false;
+#endif
 }
 
 // ---------------------------------------------------------------------------
 // Обробка блоку: вхід -> EQ -> dsp_volume -> вихід
 // ---------------------------------------------------------------------------
 
-// Макс. |x| у шкалі 2^31 по стерео-блоку (без UB для INT32_MIN).
-void peakScan(const int32_t* p, int32_t frames, uint32_t& pl, uint32_t& pr) {
-    for (int32_t i = 0; i < frames; ++i) {
-        const int32_t l = p[0];
-        const int32_t r = p[1];
-        p += 2;
-        const uint32_t al = (l < 0) ? (0u - static_cast<uint32_t>(l)) : static_cast<uint32_t>(l);
-        const uint32_t ar = (r < 0) ? (0u - static_cast<uint32_t>(r)) : static_cast<uint32_t>(r);
-        if (al > pl) pl = al;
-        if (ar > pr) pr = ar;
+#if ENABLE_VU
+// VU: пік по блоку ПІСЛЯ EQ і ДО гучності, у шкалі int16 з калібруванням kVuOffsetDb; зняття DC лише для виміру.
+void publishVu(const float* f, int32_t n) {
+    float dcL = s_vuDcL;
+    float dcR = s_vuDcR;
+    if (!s_vuDcInit) {  // перший блок: без стрибка від нульового стану фільтра
+        dcL = f[0];
+        dcR = f[1];
+        s_vuDcInit = true;
     }
+    const float a = cfg::kVuDcAlpha;
+    float       pl = 0.0f;
+    float       pr = 0.0f;
+    for (int32_t i = 0; i < n; ++i) {
+        const float xl = f[0];
+        const float xr = f[1];
+        f += 2;
+        dcL += a * (xl - dcL);
+        dcR += a * (xr - dcR);
+        const float yl = fabsf(xl - dcL);
+        const float yr = fabsf(xr - dcR);
+        if (yl > pl) pl = yl;
+        if (yr > pr) pr = yr;
+    }
+    s_vuDcL = dcL;
+    s_vuDcR = dcR;
+    float vl = pl * s_vuScale;
+    float vr = pr * s_vuScale;
+    if (vl > cfg::kVuPeakCap) vl = cfg::kVuPeakCap;
+    if (vr > cfg::kVuPeakCap) vr = cfg::kVuPeakCap;
+    const uint32_t ul = static_cast<uint32_t>(vl);
+    const uint32_t ur = static_cast<uint32_t>(vr);
+    if (ul > s_vuMaxL) s_vuMaxL = ul;
+    if (ur > s_vuMaxR) s_vuMaxR = ur;
+    VuSourceLinePath::publishPeaks(ul, ur, static_cast<uint32_t>(n));
 }
+#endif  // ENABLE_VU
 
+// Обробка блоку (P47d): float-конвеєр з одним насиченням у кінці.
 void processBlock(size_t frames) {
     const int32_t n = static_cast<int32_t>(frames);
-    peakScan(s_buf, n, s_peakL, s_peakR);
-    s_eqLine.process(s_buf, n);
-    s_dsp.process(s_buf, n);
-    peakScan(s_buf, n, s_peakOutL, s_peakOutR);
+    float*        f = s_fbuf;
+
+    // 1. int32 -> float (точно: 24 значущі біти) і піки входу (до EQ).
+    float pl = 0.0f;
+    float pr = 0.0f;
+    {
+        const int32_t* in = s_buf;
+        float*         o = f;
+        for (int32_t i = 0; i < n; ++i) {
+            const float l = static_cast<float>(in[0]) * kToFloat;
+            const float r = static_cast<float>(in[1]) * kToFloat;
+            in += 2;
+            o[0] = l;
+            o[1] = r;
+            o += 2;
+            const float al = fabsf(l);
+            const float ar = fabsf(r);
+            if (al > pl) pl = al;
+            if (ar > pr) pr = ar;
+        }
+    }
+    if (pl > s_peakL) s_peakL = pl;
+    if (pr > s_peakR) s_peakR = pr;
+
+    // 2. EQ, 3. VU (після EQ, до гучності), 4. гучність — усе у float, без насичення.
+    s_eqLine.processFloat(f, n);
+#if ENABLE_VU
+    publishVu(f, n);
+#endif
+    s_dsp.processFloat(f, n);
+
+    // 5. Єдине насичення й перетворення в int32 (округлення до найближчого); піки виходу.
+    uint32_t clips = 0;
+    float    ol = 0.0f;
+    float    orr = 0.0f;
+    {
+        const float* in = f;
+        int32_t*     o = s_buf;
+        for (int32_t i = 0; i < n; ++i) {
+            float yl = in[0] * kFromFloat;
+            float yr = in[1] * kFromFloat;
+            in += 2;
+            if (yl > kOutMax) {
+                yl = kOutMax;
+                ++clips;
+            } else if (yl < kOutMin) {
+                yl = kOutMin;
+                ++clips;
+            }
+            if (yr > kOutMax) {
+                yr = kOutMax;
+                ++clips;
+            } else if (yr < kOutMin) {
+                yr = kOutMin;
+                ++clips;
+            }
+            const float al = fabsf(yl);
+            const float ar = fabsf(yr);
+            if (al > ol) ol = al;
+            if (ar > orr) orr = ar;
+            o[0] = static_cast<int32_t>(yl >= 0.0f ? yl + 0.5f : yl - 0.5f);
+            o[1] = static_cast<int32_t>(yr >= 0.0f ? yr + 0.5f : yr - 0.5f);
+            o += 2;
+        }
+    }
+    ol *= kToFloat;
+    orr *= kToFloat;
+    if (ol > s_peakOutL) s_peakOutL = ol;
+    if (orr > s_peakOutR) s_peakOutR = orr;
+    if (clips != 0) {
+        s_clips = s_clips + clips;
+    }
 }
 
 // Нема даних: перевіряємо аварійний мʼют.
@@ -429,7 +560,7 @@ bool pump() {
         s_state = LinePathState::Starting;
         s_settle = cfg::kSettleBlocks;
         s_recovering = true;
-        s_eqLine.reset();
+        resetDsp();
         applyMute();  // Starting: мʼют лишається
         logBack = true;
     }
@@ -612,7 +743,7 @@ void doStart() {
     s_txOn = true;
     s_pinsOk = restorePinOutputs();
 
-    s_eqLine.reset();
+    resetDsp();
     s_settle = cfg::kSettleBlocks;
     s_lastGoodMs = millis();
     s_state = LinePathState::Starting;
@@ -703,15 +834,16 @@ bool startLocked(bool wait) {
     s_heapFreeBefore = static_cast<uint32_t>(heapFree());
     s_heapLargestBefore = static_cast<uint32_t>(heapLargest());
 
-    s_buf = static_cast<int32_t*>(heap_caps_malloc(kBufBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    s_buf = static_cast<int32_t*>(heap_caps_malloc(kAllocBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (s_buf == nullptr) {
         s_allocFailures = s_allocFailures + 1;
         s_lastError = LinePathError::AllocFailed;
         LINE_LOG("[LINE] start rejected: no memory for block buffer (%u B); free=%u B, largest=%u B\n",
-                 static_cast<unsigned>(kBufBytes), static_cast<unsigned>(heapFree()),
+                 static_cast<unsigned>(kAllocBytes), static_cast<unsigned>(heapFree()),
                  static_cast<unsigned>(heapLargest()));
         return false;
     }
+    s_fbuf = reinterpret_cast<float*>(s_buf + cfg::kBlockFrames * 2);  // друга половина виділення
 
     s_initAbandoned = false;
     s_initErr = 0;
@@ -775,6 +907,13 @@ bool startLocked(bool wait) {
     d.heapFreeAfter = s_heapFreeAfter;
     d.heapLargestAfter = s_heapLargestAfter;
     d.recoveries = s_recoveries;
+#if ENABLE_VU
+    d.vuPeakLeftDbfs = (s_vuMaxL > 0) ? 20.0f * log10f(static_cast<float>(s_vuMaxL) / vu_cfg::kFullScale) : -99.0f;
+    d.vuPeakRightDbfs = (s_vuMaxR > 0) ? 20.0f * log10f(static_cast<float>(s_vuMaxR) / vu_cfg::kFullScale) : -99.0f;
+#else
+    d.vuPeakLeftDbfs = -99.0f;
+    d.vuPeakRightDbfs = -99.0f;
+#endif
     return d;
 }
 
@@ -840,7 +979,12 @@ void printStats() {
     lineOut("[LINE] peaks since lp.reset: in L %.1f R %.1f dBFS | out L %.1f R %.1f dBFS\n",
             static_cast<double>(s.peakLeftDbfs), static_cast<double>(s.peakRightDbfs),
             static_cast<double>(s.peakOutLeftDbfs), static_cast<double>(s.peakOutRightDbfs));
-    lineOut("[LINE] eq: clipCount=%lu bypass=%d gains=%d %d %d %d %d dB\n", LP_UL(s.clipCount),
+    lineOut("[LINE] vu peak since lp.reset (screen scale, offset %+.0f dB, after EQ, before volume): "
+            "L %.1f R %.1f dBFS\n",
+            static_cast<double>(cfg::kVuOffsetDb), static_cast<double>(d.vuPeakLeftDbfs),
+            static_cast<double>(d.vuPeakRightDbfs));
+    lineOut("[LINE] eq: clipCount=%lu (final saturation after volume) bypass=%d gains=%d %d %d %d %d dB\n",
+            LP_UL(s.clipCount),
             s_eqLine.bypass() ? 1 : 0, static_cast<int>(g[0]), static_cast<int>(g[1]), static_cast<int>(g[2]),
             static_cast<int>(g[3]), static_cast<int>(g[4]));
     lineOut("[LINE] initMs=%lu lastStartMs=%lu stackFreeMin=%u B%s lastError=%s\n", LP_UL(s.initMs),
@@ -987,6 +1131,41 @@ void cmdCycle(int n) {
             "overflows on transitions: rx +%lu, tx +%lu; allocFailures=%lu\n",
             done, baseFree, lastFree, lastFree - baseFree, baseLargest, lastLargest, lastLargest - baseLargest,
             minLargest, LP_UL(sumRx), LP_UL(sumTx), LP_UL(LinePath::stats().allocFailures));
+}
+
+// lp.vu: 3 с друкує рівні VU (0..1 за шкалою екрана) раз на kVuTestPrintMs. Читає ті самі атомарні піки, що й
+// екран (exchange), тож на цей час дає йому частину пікiв: лише для налагодження.
+void cmdVu() {
+    static VuSourceLinePath src;
+    lineOut("[LINE] vu: %lu ms, norm 0..1 (0 dBFS = 1.0, floor %.0f dB); the screen meter may flicker meanwhile\n",
+            LP_UL(cfg::kVuTestMs), static_cast<double>(vu_cfg::kDbFloor));
+    const uint32_t t0 = millis();
+    uint32_t       lastPrint = t0;
+    float          maxL = 0.0f;
+    float          maxR = 0.0f;
+    bool           anyData = false;
+    while (millis() - t0 < cfg::kVuTestMs) {
+        float      l = 0.0f;
+        float      r = 0.0f;
+        const bool ok = src.read(l, r);
+        if (ok) {
+            anyData = true;
+            if (l > maxL) maxL = l;
+            if (r > maxR) maxR = r;
+        }
+        if (millis() - lastPrint >= cfg::kVuTestPrintMs) {
+            lastPrint = millis();
+            lineOut("[LINE] vu: %s L %.2f (%.1f dB) R %.2f (%.1f dB)\n", ok ? "data" : "no data",
+                    static_cast<double>(maxL), static_cast<double>(vu_cfg::kDbFloor * (1.0f - maxL)),
+                    static_cast<double>(maxR), static_cast<double>(vu_cfg::kDbFloor * (1.0f - maxR)));
+            maxL = 0.0f;
+            maxR = 0.0f;
+        }
+        vTaskDelay(pdMS_TO_TICKS(cfg::kVuTestPollMs));
+    }
+    if (!anyData) {
+        lineOut("[LINE] vu: no data (line path not Running, ENABLE_VU = 0, or no RX blocks)\n");
+    }
 }
 
 // lp.api: самотест публічного API. Не запускає прохід. Значення гучності / EQ тимчасово змінюються
@@ -1162,10 +1341,12 @@ void handleLine(const char* line) {
         cmdCycle(atoi(c + 6));
     } else if (strcmp(c, "api") == 0) {
         cmdApi();
+    } else if (strcmp(c, "vu") == 0) {
+        cmdVu();
     } else {
         lineOut("[LINE] commands: lp.start lp.rstart lp.stop lp.radio lp.stat lp.reset\n");
         lineOut("[LINE] lp.att <dB> lp.vol <dB> lp.mute|lp.usermute 0|1 lp.eq <band> <dB> lp.eqall <5 values>\n");
-        lineOut("[LINE] lp.eqbypass 0|1 lp.eqshow lp.fault [ms] lp.cycle <N> lp.api lp.heap\n");
+        lineOut("[LINE] lp.eqbypass 0|1 lp.eqshow lp.vu lp.fault [ms] lp.cycle <N> lp.api lp.heap\n");
     }
 #else
     lineOut("[LINE] line path disabled (LINE_PATH_ENABLE = 0): only lp.heap is available\n");
@@ -1235,6 +1416,9 @@ bool LinePath::begin() {
     s_dsp.setSampleRate(cfg::kFsHz);
     s_dsp.setAttenuationDb(cfg::kStartVolumeDb);
     s_dsp.forceMute();
+#if ENABLE_VU
+    s_vuScale = vu_cfg::kFullScale * powf(10.0f, cfg::kVuOffsetDb / 20.0f);
+#endif
     applyMute();  // мʼют користувача типово увімкнений; стан Off
     startTestTask();
     s_initMs = millis() - t0;
@@ -1413,14 +1597,12 @@ LinePathStats LinePath::stats() {
     s.maxReadWaitUs = s_maxReadWaitUs;
     s.initMs = s_initMs;
     s.lastStartMs = s_lastStartMs;
-    s.peakLeftDbfs = (s_peakL > 0) ? 20.0f * log10f(static_cast<float>(s_peakL) / 2147483648.0f) : -99.0f;
-    s.peakRightDbfs = (s_peakR > 0) ? 20.0f * log10f(static_cast<float>(s_peakR) / 2147483648.0f) : -99.0f;
-    s.peakOutLeftDbfs =
-        (s_peakOutL > 0) ? 20.0f * log10f(static_cast<float>(s_peakOutL) / 2147483648.0f) : -99.0f;
-    s.peakOutRightDbfs =
-        (s_peakOutR > 0) ? 20.0f * log10f(static_cast<float>(s_peakOutR) / 2147483648.0f) : -99.0f;
+    s.peakLeftDbfs = (s_peakL > 0.0f) ? 20.0f * log10f(s_peakL) : -99.0f;
+    s.peakRightDbfs = (s_peakR > 0.0f) ? 20.0f * log10f(s_peakR) : -99.0f;
+    s.peakOutLeftDbfs = (s_peakOutL > 0.0f) ? 20.0f * log10f(s_peakOutL) : -99.0f;
+    s.peakOutRightDbfs = (s_peakOutR > 0.0f) ? 20.0f * log10f(s_peakOutR) : -99.0f;
     s.allocFailures = s_allocFailures;
-    s.clipCount = s_eqLine.clipCount();
+    s.clipCount = s_clips;  // [P47d] лише фінальне насичення (після гучності)
     s.volumeDb = s_dsp.attenuationDb();
     s.userMuted = s_userMute;
     s.lastError = s_lastError;
@@ -1433,11 +1615,15 @@ void LinePath::resetStats() {
     s_allocFailures = s_recoveries = 0;
     s_rxOvf = 0;
     s_txOvf = 0;
-    s_peakL = 0;
-    s_peakR = 0;
-    s_peakOutL = 0;
-    s_peakOutR = 0;
-    s_eqLine.resetClipCount();
+    s_peakL = 0.0f;
+    s_peakR = 0.0f;
+    s_peakOutL = 0.0f;
+    s_peakOutR = 0.0f;
+    s_clips = 0;
+#if ENABLE_VU
+    s_vuMaxL = 0;
+    s_vuMaxR = 0;
+#endif
 }
 
 #else  // LINE_PATH_ENABLE

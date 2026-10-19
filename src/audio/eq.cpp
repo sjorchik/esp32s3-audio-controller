@@ -1,4 +1,4 @@
-// 5-смуговий еквалайзер (Prompt 30; P45 — екземпляри). Опис і правила потоків — у eq.h.
+// 5-смуговий еквалайзер (Prompt 30; P45 — екземпляри; P47d — processFloat). Опис і правила потоків — у eq.h.
 //
 // ВАЖЛИВО: файл НЕ включає Audio.h (як і vu_pcm_hook.cpp / output_trim.cpp). Залежності: математика,
 // FreeRTOS-мʼютекс сеттерів і Serial-лог (лише при EQ_DEBUG).
@@ -274,14 +274,12 @@ void eq::Processor::reset() {
     zeroStates();
 }
 
-// Гаряча частина. Викликається лише з задачі-власника.
-void eq::Processor::process(int32_t* buf, int32_t frames) {
-    if (buf == nullptr || frames <= 0) {
-        return;
-    }
+// Підготовка блоку (спільна для process / processFloat): bypass, нова ціль, інтерполяція коефіцієнтів,
+// список активних смуг, локальні копії станів. false = блок не чіпати (бітова ідентичність).
+bool eq::Processor::beginBlock(int32_t frames, detail::Block& b) {
     if (bypass_.load(std::memory_order_relaxed)) {
         bypassSeen_ = true;
-        return;  // bypass: блок не чіпаємо
+        return false;  // bypass: блок не чіпаємо
     }
     if (bypassSeen_) {
         // Вихід з bypass: стан фільтрів застарів, починаємо з нуля.
@@ -294,20 +292,20 @@ void eq::Processor::process(int32_t* buf, int32_t frames) {
     readTarget(t);
     if (t.version != appliedVer_) {
         appliedVer_ = t.version;
-        for (uint8_t b = 0; b < kN; ++b) {
-            wantOn_[b] = t.on[b];
+        for (uint8_t k = 0; k < kN; ++k) {
+            wantOn_[k] = t.on[k];
         }
         if (t.snap) {
-            for (uint8_t b = 0; b < kN; ++b) {
-                cur_[b] = t.c[b];
+            for (uint8_t k = 0; k < kN; ++k) {
+                cur_[k] = t.c[k];
             }
             rampTotal_ = 0;
             rampDone_ = 0;
             zeroStates();
         } else {
-            for (uint8_t b = 0; b < kN; ++b) {
-                from_[b] = cur_[b];
-                to_[b] = t.c[b];
+            for (uint8_t k = 0; k < kN; ++k) {
+                from_[k] = cur_[k];
+                to_[k] = t.c[k];
             }
             rampTotal_ = rampFramesFor(t.rateHz);
             rampDone_ = 0;
@@ -320,44 +318,61 @@ void eq::Processor::process(int32_t* buf, int32_t frames) {
         if (rampDone_ >= rampTotal_) {
             rampTotal_ = 0;
             rampDone_ = 0;
-            for (uint8_t b = 0; b < kN; ++b) {
-                cur_[b] = to_[b];
-                if (!wantOn_[b]) {
-                    zeroBand(b);  // смуга згасла: стан обнуляємо, щоб не було «хвоста»
+            for (uint8_t k = 0; k < kN; ++k) {
+                cur_[k] = to_[k];
+                if (!wantOn_[k]) {
+                    zeroBand(k);  // смуга згасла: стан обнуляємо, щоб не було «хвоста»
                 }
             }
         } else {
             const float a = static_cast<float>(rampDone_) / static_cast<float>(rampTotal_);
-            for (uint8_t b = 0; b < kN; ++b) {
-                cur_[b] = lerpCoef(from_[b], to_[b], a);
+            for (uint8_t k = 0; k < kN; ++k) {
+                cur_[k] = lerpCoef(from_[k], to_[k], a);
             }
         }
     }
 
     // 3. Активні смуги: увімкнені або ще в переході (згасання).
-    uint8_t act[kN];
-    uint8_t n = 0;
-    for (uint8_t b = 0; b < kN; ++b) {
-        if (wantOn_[b] || rampTotal_ > 0) {
-            act[n++] = b;
+    b.n = 0;
+    for (uint8_t k = 0; k < kN; ++k) {
+        if (wantOn_[k] || rampTotal_ > 0) {
+            b.act[b.n++] = k;
         }
     }
-    if (n == 0) {
-        return;  // усі смуги вимкнені: блок не чіпаємо (бітова ідентичність)
+    if (b.n == 0) {
+        return false;  // усі смуги вимкнені: блок не чіпаємо (бітова ідентичність)
     }
+    for (uint8_t i = 0; i < b.n; ++i) {
+        const uint8_t k = b.act[i];
+        b.c[i] = cur_[k];
+        b.zl[i][0] = z_[0][k][0];
+        b.zl[i][1] = z_[0][k][1];
+        b.zr[i][0] = z_[1][k][0];
+        b.zr[i][1] = z_[1][k][1];
+    }
+    return true;
+}
 
-    // Локальні копії коефіцієнтів і станів активних смуг.
-    detail::Coef c[kN];
-    float zl[kN][2];
-    float zr[kN][2];
-    for (uint8_t i = 0; i < n; ++i) {
-        const uint8_t b = act[i];
-        c[i] = cur_[b];
-        zl[i][0] = z_[0][b][0];
-        zl[i][1] = z_[0][b][1];
-        zr[i][0] = z_[1][b][0];
-        zr[i][1] = z_[1][b][1];
+void eq::Processor::endBlock(const detail::Block& b) {
+    for (uint8_t i = 0; i < b.n; ++i) {
+        const uint8_t k = b.act[i];
+        z_[0][k][0] = b.zl[i][0];
+        z_[0][k][1] = b.zl[i][1];
+        z_[1][k][0] = b.zr[i][0];
+        z_[1][k][1] = b.zr[i][1];
     }
+}
+
+// Гаряча частина (int32, радіо-хук). Викликається лише з задачі-власника.
+void eq::Processor::process(int32_t* buf, int32_t frames) {
+    if (buf == nullptr || frames <= 0) {
+        return;
+    }
+    detail::Block bl;
+    if (!beginBlock(frames, bl)) {
+        return;
+    }
+    const uint8_t n = bl.n;
 
     uint32_t clips = 0;
     int32_t* p = buf;
@@ -365,14 +380,14 @@ void eq::Processor::process(int32_t* buf, int32_t frames) {
         float xl = static_cast<float>(p[0]);
         float xr = static_cast<float>(p[1]);
         for (uint8_t i = 0; i < n; ++i) {
-            const detail::Coef& k = c[i];
-            const float yl = k.b0 * xl + zl[i][0];
-            zl[i][0] = k.b1 * xl - k.a1 * yl + zl[i][1];
-            zl[i][1] = k.b2 * xl - k.a2 * yl;
+            const detail::Coef& k = bl.c[i];
+            const float yl = k.b0 * xl + bl.zl[i][0];
+            bl.zl[i][0] = k.b1 * xl - k.a1 * yl + bl.zl[i][1];
+            bl.zl[i][1] = k.b2 * xl - k.a2 * yl;
             xl = yl;
-            const float yr = k.b0 * xr + zr[i][0];
-            zr[i][0] = k.b1 * xr - k.a1 * yr + zr[i][1];
-            zr[i][1] = k.b2 * xr - k.a2 * yr;
+            const float yr = k.b0 * xr + bl.zr[i][0];
+            bl.zr[i][0] = k.b1 * xr - k.a1 * yr + bl.zr[i][1];
+            bl.zr[i][1] = k.b2 * xr - k.a2 * yr;
             xr = yr;
         }
         p[0] = toInt32(xl, clips);
@@ -380,16 +395,44 @@ void eq::Processor::process(int32_t* buf, int32_t frames) {
         p += 2;
     }
 
-    for (uint8_t i = 0; i < n; ++i) {
-        const uint8_t b = act[i];
-        z_[0][b][0] = zl[i][0];
-        z_[0][b][1] = zl[i][1];
-        z_[1][b][0] = zr[i][0];
-        z_[1][b][1] = zr[i][1];
-    }
+    endBlock(bl);
     if (clips != 0) {
         clips_.fetch_add(clips, std::memory_order_relaxed);
     }
+}
+
+// [P47d] Те саме ядро на float-буфері, без перетворення й насичення.
+void eq::Processor::processFloat(float* buf, int32_t frames) {
+    if (buf == nullptr || frames <= 0) {
+        return;
+    }
+    detail::Block bl;
+    if (!beginBlock(frames, bl)) {
+        return;
+    }
+    const uint8_t n = bl.n;
+
+    float* p = buf;
+    for (int32_t f = 0; f < frames; ++f) {
+        float xl = p[0];
+        float xr = p[1];
+        for (uint8_t i = 0; i < n; ++i) {
+            const detail::Coef& k = bl.c[i];
+            const float yl = k.b0 * xl + bl.zl[i][0];
+            bl.zl[i][0] = k.b1 * xl - k.a1 * yl + bl.zl[i][1];
+            bl.zl[i][1] = k.b2 * xl - k.a2 * yl;
+            xl = yl;
+            const float yr = k.b0 * xr + bl.zr[i][0];
+            bl.zr[i][0] = k.b1 * xr - k.a1 * yr + bl.zr[i][1];
+            bl.zr[i][1] = k.b2 * xr - k.a2 * yr;
+            xr = yr;
+        }
+        p[0] = xl;
+        p[1] = xr;
+        p += 2;
+    }
+
+    endBlock(bl);
 }
 
 // ---------------------------------------------------------------------------

@@ -10,8 +10,8 @@
 // VU-метр: загальний вимикач. 0 — VU немає ні на радіо, ні на зовнішніх входах
 // (блок VU на екрані порожній, джерело VuSourceDecodedPcm вимкнено).
 // Радіо: рівні з декодованих PCM-семплів (VuSourceDecodedPcm).
-// Входи 1..3: рівні з АЦП PCM1808 — окремо вмикаються ADC_VU_ENABLE
-// (config/adc_vu_config.h), який потребує ENABLE_VU.
+// Зовнішні входи: рівні з проходу line_path (PCM1808 -> DSP -> PCM5102, VuSourceLinePath);
+// потребують LINE_PATH_ENABLE (config/line_path_config.h) і ENABLE_VU. Модуль adc_vu видалено (P47d).
 #define ENABLE_VU 1
 
 // Обидва аудіопроцесори компілюються.

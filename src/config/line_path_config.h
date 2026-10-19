@@ -1,7 +1,7 @@
 #pragma once
 
 // Константи модуля audio/line_path (Prompt 44, прототип; P47c — kVolMaxDb = 0 дБ; P44b — життєвий цикл ресурсів;
-// P47b — API гучності, мʼюту користувача і помилок). Прохід зовнішнього звуку PCM1808 (I2S1 RX, slave)
+// P47b — API гучності, мʼюту користувача і помилок; P47d — float-конвеєр і VU зовнішніх входів). Прохід зовнішнього звуку PCM1808 (I2S1 RX, slave)
 // -> ESP32-S3 -> PCM5102 (I2S1 TX, slave) на тактах BCLK GPIO15 / WS GPIO17, які веде I2S0
 // (ESP32-audioI2S). DOUT GPIO18 мультиплексується між I2S0 (радіо) і I2S1 TX (прохід).
 // Піни — лише з config/pins.h. Усі часові значення — у мілісекундах, якщо не вказано інше.
@@ -14,9 +14,9 @@
 // Прапорці умовної компіляції
 // ---------------------------------------------------------------------------
 
-// 0 = модуль не збирається (VU входів через adc_vu, як раніше).
-//     При LINE_PATH_TEST == 1 лишається Serial-тест лише з командою lp.heap.
-// 1 = I2S1 належить line_path; AdcVu НЕ стартує.
+// 0 = модуль не збирається. Зовнішні входи не звучать, VU зовнішніх входів недоступний (діагностичний
+//     режим; adc_vu видалено в P47d). При LINE_PATH_TEST == 1 лишається Serial-тест лише з командою lp.heap.
+// 1 = I2S1 належить line_path; він же виробляє звук і VU зовнішніх входів.
 #define LINE_PATH_ENABLE 1
 
 // 1 = Serial-команди lp.* (працює і при LINE_PATH_ENABLE == 0, тоді доступна лише lp.heap).
@@ -75,6 +75,23 @@ constexpr uint8_t  kXsmtMutedLevel   = 0;
 constexpr uint8_t  kXsmtUnmutedLevel = 1;
 
 // ---------------------------------------------------------------------------
+// VU зовнішніх входів (P47d; константи перенесено з adc_vu_config.h без зміни значень)
+// ---------------------------------------------------------------------------
+// Пік міряється ПІСЛЯ еквалайзера й ДО гучності, у шкалі int16 (±32768), як у радіо (vu_cfg::kFullScale).
+// Калібрування шкали, дБ: додається до виміряного рівня (раніше adc_vu_cfg::kAdcVuOffsetDb = 20).
+constexpr float    kVuOffsetDb     = 20.0f;
+// Однополюсний ВЧ-фільтр лише для виміру VU: dc += kVuDcAlpha * (x - dc); сигнал = x - dc.
+// Зріз ≈ kVuDcAlpha * fs / 2π ≈ 15 Гц при 48 кГц (раніше 14 Гц при 44,1 кГц). Звук цей фільтр НЕ чіпає.
+constexpr float    kVuDcAlpha      = 0.002f;
+// Верхня межа піка при публікації (захист перетворення float -> uint32).
+constexpr float    kVuPeakCap      = 1.0e9f;
+
+// lp.vu: вікно виміру, період опитування й друку (Serial-тест).
+constexpr uint32_t kVuTestMs       = 3000;
+constexpr uint32_t kVuTestPollMs   = 40;
+constexpr uint32_t kVuTestPrintMs  = 500;
+
+// ---------------------------------------------------------------------------
 // Старт / зупинка / аварії
 // ---------------------------------------------------------------------------
 constexpr uint32_t kRadioStopWaitMs   = 2000; // скільки чекати PlayerState::Idle після AudioPlayer::stop()
@@ -125,6 +142,10 @@ static_assert(kWarnVolDb >= kVolMinDb && kWarnVolDb <= kVolMaxDb, "warn threshol
 static_assert(kAttMinDb < kAttMaxDb && kAttMaxDb <= 0, "attenuation range inverted");
 static_assert(static_cast<float>(kAttMaxDb) <= kVolMaxDb, "lp.att ceiling must not exceed the volume ceiling");
 static_assert(static_cast<float>(kAttMinDb) == kWarnVolDb, "lp.att floor must equal warn threshold");
+static_assert(kVuDcAlpha > 0.0f && kVuDcAlpha < 0.1f, "kVuDcAlpha out of range");
+static_assert(kVuPeakCap > 32768.0f && kVuPeakCap < 4.0e9f, "kVuPeakCap must fit uint32_t");
+static_assert(kVuTestPollMs >= 10 && kVuTestPrintMs >= kVuTestPollMs && kVuTestMs >= kVuTestPrintMs,
+              "lp.vu timing");
 static_assert(kStallMs > kReadTimeoutMs, "stall must exceed one read timeout");
 static_assert(kXsmtMutedLevel != kXsmtUnmutedLevel, "XSMT levels must differ");
 static_assert(kCreateWaitMs >= 100, "resource creation wait too short");

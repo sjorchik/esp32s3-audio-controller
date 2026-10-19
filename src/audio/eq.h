@@ -15,6 +15,12 @@
 //    читання опублікованої цілі та лінійна інтерполяція коефіцієнтів за eq_cfg::kCoefRampMs.
 //  - Інтерполяція між двома стійкими біквадами лишається стійкою: область стійкості (a1, a2) опукла.
 //
+// [P47d] processFloat(): те саме біквад-ядро й інтерполяція коефіцієнтів, але на float-буфері
+// (стерео, шкала довільна, типово ±1.0 = повна шкала) БЕЗ перетворення й БЕЗ насичення. Для проходу
+// line_path: насичення робиться один раз у кінці конвеєра. process() (int32, радіо-хук) лишається з тим
+// самим контрактом, лічильником clipCount і бітово тим самим результатом; обидва шляхи ділять підготовку
+// блоку (beginBlock / endBlock), тож інтерполяція й стан фільтрів однакові.
+//
 // Збереження в NVS — НЕ тут (SettingsStore). Піни й I2S цей модуль не чіпає.
 //
 // Фасад namespace eq: API без змін (AppController, веб, SettingsStore, vu_pcm_hook, audio_player)
@@ -43,6 +49,15 @@ struct Target {
     uint32_t rateHz;
 };
 
+// [P47d] Підготовлений блок: активні смуги, їхні поточні коефіцієнти й локальні копії станів.
+struct Block {
+    uint8_t n;
+    uint8_t act[eq_cfg::kBandCount];
+    Coef    c[eq_cfg::kBandCount];
+    float   zl[eq_cfg::kBandCount][2];
+    float   zr[eq_cfg::kBandCount][2];
+};
+
 }  // namespace detail
 
 class Processor {
@@ -62,12 +77,16 @@ public:
     void getAllDb(int8_t out[eq_cfg::kBandCount]) const;
     void setBypass(bool on);
     bool bypass() const;
-    uint32_t clipCount() const;   // відліки, насичені на виході, з останнього resetClipCount()
+    // Відліки, насичені на виході process() (int32) з останнього resetClipCount(). [P47d] processFloat()
+    // не насичує й сюди не рахує.
+    uint32_t clipCount() const;
     void resetClipCount();
 
     // --- ЛИШЕ задача-власник потоку ---
     void reset();                                 // обнулити стан фільтрів (після enable / відновлення)
     void process(int32_t* buf, int32_t frames);   // стерео int32 L,R,L,R... НА МІСЦІ; frames — кадри
+    // [P47d] стерео float L,R,L,R... НА МІСЦІ, без насичення. Блок не чіпається, якщо bypass або всі смуги 0 дБ.
+    void processFloat(float* buf, int32_t frames);
 
 private:
     void lock() const;
@@ -76,6 +95,8 @@ private:
     void readTarget(detail::Target& out) const;    // seqlock-читання
     void zeroBand(uint8_t b);
     void zeroStates();
+    bool beginBlock(int32_t frames, detail::Block& b);  // false = блок не чіпати
+    void endBlock(const detail::Block& b);
 
     const char* tag_;
     mutable void* mutex_;                  // SemaphoreHandle_t: мʼютекс сеттерів

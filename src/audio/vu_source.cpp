@@ -1,4 +1,4 @@
-// VU-метр з декодованих PCM-семплів радіо (Prompt 17).
+// VU-метр з декодованих PCM-семплів радіо (Prompt 17) і з проходу line_path (Prompt 47d).
 //
 // Обмін між ядрами БЕЗ мʼютекса (мʼютекс у гарячому шляху аудіо = зайва затримка):
 //  - продюсер (ядро 1, аудіо-callback) лише підтримує «пік з моменту останнього
@@ -23,6 +23,7 @@
 #include <atomic>
 
 #include "config/features.h"
+#include "config/line_path_config.h"  // [P47d] LINE_PATH_ENABLE
 #include "config/vu_config.h"
 
 #if VU_DEBUG
@@ -39,6 +40,11 @@ std::atomic<uint32_t> s_peakL{0};
 std::atomic<uint32_t> s_peakR{0};
 std::atomic<uint32_t> s_blocks{0};
 std::atomic<uint32_t> s_lastFrames{0};  // лише для діагностики в логу
+
+// [Prompt 47d] Піки проходу line_path (зовнішні входи): окремий набір, єдиний письменник — задача line_path.
+std::atomic<uint32_t> s_linePeakL{0};
+std::atomic<uint32_t> s_linePeakR{0};
+std::atomic<uint32_t> s_lineBlocks{0};
 
 constexpr std::memory_order kRelaxed = std::memory_order_relaxed;
 
@@ -122,6 +128,88 @@ bool VuSourceDecodedPcm::read(float& left, float& right) {
 
     const uint32_t pl = s_peakL.exchange(0, kRelaxed);
     const uint32_t pr = s_peakR.exchange(0, kRelaxed);
+    m_levelL = ballistics(m_levelL, peakToNorm(pl), dtMs);
+    m_levelR = ballistics(m_levelR, peakToNorm(pr), dtMs);
+    left = m_levelL;
+    right = m_levelR;
+    return true;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// [Prompt 47d] VuSourceLinePath: VU зовнішніх входів зі line_path (замість adc_vu).
+// Логіка read() — та сама, що була у VuSourceAdc: пік «з моменту останнього читання» (exchange(0)),
+// свіжість за лічильником блоків (kStaleMs), балістика з vu_math. Без логу у гарячому шляху.
+// ---------------------------------------------------------------------------
+
+void VuSourceLinePath::publishPeaks(uint32_t peakL, uint32_t peakR, uint32_t frames) {
+#if ENABLE_VU && LINE_PATH_ENABLE
+    (void)frames;
+    if (peakL > s_linePeakL.load(kRelaxed)) {
+        s_linePeakL.store(peakL, kRelaxed);
+    }
+    if (peakR > s_linePeakR.load(kRelaxed)) {
+        s_linePeakR.store(peakR, kRelaxed);
+    }
+    s_lineBlocks.store(s_lineBlocks.load(kRelaxed) + 1u, kRelaxed);  // єдиний письменник
+#else
+    (void)peakL;
+    (void)peakR;
+    (void)frames;
+#endif
+}
+
+bool VuSourceLinePath::read(float& left, float& right) {
+    left = 0.0f;
+    right = 0.0f;
+#if !ENABLE_VU || !LINE_PATH_ENABLE
+    return false;
+#else
+    const uint32_t now = millis();
+    const uint32_t blocks = s_lineBlocks.load(kRelaxed);
+
+    float dtMs = 0.0f;
+    if (!m_init || (now - m_lastReadMs) > vu_cfg::kResumeGapMs) {
+        m_levelL = 0.0f;
+        m_levelR = 0.0f;
+        m_lastBlocks = blocks;
+        m_lastChangeMs = now;
+        m_sinceMs = now;
+        m_flowing = false;
+        m_init = true;
+        s_linePeakL.exchange(0, kRelaxed);
+        s_linePeakR.exchange(0, kRelaxed);
+    } else {
+        dtMs = static_cast<float>(now - m_lastReadMs);
+    }
+    m_lastReadMs = now;
+
+    if (blocks != m_lastBlocks) {
+        m_lastBlocks = blocks;
+        m_lastChangeMs = now;
+        if (!m_flowing) {
+            m_flowing = true;
+            m_everFlowed = true;
+            VU_LOG("[VU] line path flowing\n");
+        }
+    } else if (now - m_lastChangeMs >= vu_cfg::kStaleMs) {
+        // Прохід не працює (інший режим, Stall, перемикання): ховаємо старе значення.
+        m_levelL = 0.0f;
+        m_levelR = 0.0f;
+        s_linePeakL.exchange(0, kRelaxed);
+        s_linePeakR.exchange(0, kRelaxed);
+        if (m_flowing) {
+            m_flowing = false;
+            VU_LOG("[VU] line path stalled\n");
+        } else if (!m_everFlowed && !m_warnedNoData && now - m_sinceMs >= vu_cfg::kNoDataWarnMs) {
+            m_warnedNoData = true;
+            VU_LOG("[VU] no line path blocks on external input - check line_path state / PCM1808\n");
+        }
+        return false;
+    }
+
+    const uint32_t pl = s_linePeakL.exchange(0, kRelaxed);
+    const uint32_t pr = s_linePeakR.exchange(0, kRelaxed);
     m_levelL = ballistics(m_levelL, peakToNorm(pl), dtMs);
     m_levelR = ballistics(m_levelR, peakToNorm(pr), dtMs);
     left = m_levelL;
