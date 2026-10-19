@@ -1,91 +1,146 @@
 #pragma once
 
-// Прохід зовнішнього звуку (Prompt 44, [P44b] — життєвий цикл ресурсів; P45 — DSP-ланцюжок):
-// PCM1808 (I2S1 RX slave) -> ESP32-S3 -> PCM5102 (I2S1 TX slave) на тактах, які веде I2S0 бібліотеки
-// ESP32-audioI2S. Старт — завжди в мʼюті.
+// Прохід зовнішнього звуку (Prompt 44; P44b — життєвий цикл ресурсів; P45 — DSP-ланцюжок;
+// P47b — виробничий API). Ланцюжок: PCM1808 (I2S1 RX slave) -> ESP32-S3 -> PCM5102 (I2S1 TX slave)
+// на тактах I2S0 бібліотеки ESP32-audioI2S.
 //
-// [P45] Ланцюжок блоку: RX -> піки входу -> EQ (eq::Processor, власний екземпляр) -> dsp_volume
-// (цифрова гучність і мʼют) -> піки виходу -> TX. Гучність радіо лишається в TDA7318 до P47: dsp_volume
-// для радіо не вмикається.
+// ЛАНЦЮЖОК БЛОКУ (P45): RX -> піки входу -> eq::Processor (власний екземпляр) -> DspVolume ->
+// піки виходу -> TX. Гучність радіо лишається в TDA7318 до P47; DspVolume для радіо не вмикається.
 //
-// Весь прохід працює в одній задачі (ядро line_path_cfg::kTaskCore); публічні виклики лише ставлять
-// запит і повертаються (крім геттерів і створення ресурсів у start(), див. нижче).
-// Компілюється при LINE_PATH_ENABLE == 1.
+// ЖИТТЄВИЙ ЦИКЛ РЕСУРСІВ (P44b): begin() нічого не виділяє. start() / requestStart() створюють
+// буфер блоку, задачу line_path і канали I2S1 (задача). returnToRadio() знищує їх; stop() ресурси лишає.
 //
-// [P44b] ЖИТТЄВИЙ ЦИКЛ РЕСУРСІВ (внутрішня RAM, ≈20 КБ): begin() НЕ створює каналів I2S1, задачі й
-// буферів. Їх створює start() (з порожнього стану) і знищує returnToRadio(); stop() їх лишає (GPIO18
-// залишається на I2S1, радіо німе). Під радіо line_path не тримає нічого кореневого, окрім стану.
+// ГУЧНІСТЬ, МʼЮТ, EQ (P47b):
+//  - Гучність проходу: setVolumeDb(float) у [line_path_cfg::kVolMinDb, kVolMaxDb] = [−120, −6] дБ.
+//    Верх −6 дБ — жорсткий максимум. Значення діє і до старту; до першого задання — kStartVolumeDb (−60).
+//  - Два незалежні мʼюти: внутрішній (state != Running: старт, стоп, Stall, перехід) і мʼют користувача
+//    setUserMute(). Цифровий мʼют = userMute || внутрішній. Внутрішні переходи мʼют користувача НЕ
+//    скасовують, і навпаки. ТИПОВО мʼют користувача УВІМКНЕНИЙ: прохід після старту НЕ розмʼючується сам,
+//    лише після setUserMute(false). XSMT (PCM5102) від мʼюту користувача НЕ залежить: слідує за станом
+//    (Running = відкритий), тож при мʼюті користувача на ЦАП ідуть нулі (тиша).
+//  - EQ входу: setEqAllDb / setEqBandDb / setEqBypass діють на власний екземпляр eq::Processor проходу.
+//    Пресет існує від завантаження (плаский за замовчуванням), тож діє і до старту. Значення мовчки
+//    обрізаються до eq_cfg (−12..+12 дБ), неіснуюча смуга ігнорується.
 //
-// Стани: Off -> Starting (чекаємо стабільні блоки) -> Running -> Stalled (нема блоків ≥ kStallMs:
-// XSMT low, підсилення 0; сам відновлюється) -> ... -> Stopping -> Off.
+// ПОТОКИ:
+//  - Публічні виклики — з будь-якої задачі: AppController (ядро 0), веб-обробники, Serial-тест.
+//  - Обробка блоку, I2S1, XSMT (крім команди мʼюту з викликача) і лічильники RX/TX — лише задача line_path
+//    (ядро 1). Поля, що пишуться ззовні, або атомарні, або змінюються в критичній секції (мʼюти).
+//  - Команди старту / стопу / повернення сериалізуються неблокуючим try-lock (s_opLock). Якщо зайнято —
+//    виклик повертає false, нічого не чекаючи.
 //
-// Ділянка GPIO18 (DOUT): start() переводить її на I2S1 TX; stop() її НЕ повертає (лінія тиха,
-// I2S1 TX вимкнено); returnToRadio() повертає GPIO18 на I2S0, знімає фіксацію 48 кГц і звільняє
-// ресурси.
+// БЛОКУВАННЯ (верхні межі):
+//  - start(): блокує викликача до line_path_cfg::kCreateWaitMs (500 мс) лише на створення каналів I2S1.
+//    Типово 10–20 мс (за коментарем коду, окремо не вимірювалось). Повний старт (глушіння радіо,
+//    дренаж, фіксація 48 кГц) іде в задачі; за P44b ≈ 650 мс.
+//  - requestStart(): не блокує. true = запит прийнято; результат — state(), lastError(), stats().allocFailures.
+//    Для AppController (P47c) рекомендовано саме його.
+//  - stop(), returnToRadio(): не блокують (лише ставлять запит задачі).
+//
+// XSMT (власник — line_path): muteDac(true) у старті, стопі, поверненні, Stall; muteDac(false) при
+// переході Starting -> Running. Викликач (start / requestStart) лише тримає XSMT низько до відповіді задачі.
+//
+// Компілюється при LINE_PATH_ENABLE == 1. При 0 усі методи — заглушки (нові символи збірку не ламають).
 
 #include <stdint.h>
 
+#include "config/eq_config.h"
+
 enum class LinePathState : uint8_t { Off, Starting, Running, Stalled, Stopping };
+
+// Причина останньої невдачі старту або аварії. Скидається на початку кожної спроби старту.
+enum class LinePathError : uint8_t {
+    None,                 // помилок немає
+    AllocFailed,          // нестача внутрішньої RAM (буфер блоку)
+    TaskCreateFailed,     // xTaskCreatePinnedToCore не вдалося
+    ChannelCreateFailed,  // створення / ініціалізація каналів I2S1 у задачі
+    CreateTimeout,        // start() не дочекався створення каналів (kCreateWaitMs)
+    RadioStopTimeout,     // радіо не дійшло до Idle
+    RadioRefused,         // плеєр відхилив фіксацію 48 кГц (не Idle)
+    ClockFixFailed,       // 48 кГц не застосовано на I2S0 за kClockApplyWaitMs
+    EnableFailed,         // i2s_channel_enable повернув помилку
+    Stalled,              // аварія: блоки RX не надходять (kStallMs); самовідновлюється
+};
 
 struct LinePathStats {
     LinePathState state;
-    bool          muted;             // XSMT низько (і цифровий мʼют dsp_volume)
+    bool          muted;             // XSMT низько (сам пін, не мʼют користувача)
     bool          routedToLine;      // GPIO18 зараз на I2S1 TX
-    int8_t        attenuationDb;     // задане послаблення (через dsp_volume)
-    uint32_t      blocks;            // оброблено блоків (усього)
-    uint32_t      readTimeouts;      // таймаути читання RX
-    uint32_t      readErrors;        // інші помилки читання RX
-    uint32_t      writeTimeouts;     // таймаути / помилки запису TX
-    uint32_t      rxOverflows;       // переповнення черги RX DMA (ISR-callback)
-    uint32_t      txOverflows;       // переповнення черги TX DMA (ISR-callback)
-    uint32_t      stalls;            // скільки разів входили в Stalled
-    uint32_t      starts;            // успішних стартів (відновлення після Stalled сюди НЕ входять)
-    uint32_t      maxProcessUs;      // макс. час обробки + запису блоку (без очікування читання)
-    uint32_t      maxReadWaitUs;     // макс. очікування читання блоку
-    uint32_t      initMs;            // тривалість begin()
-    uint32_t      lastStartMs;       // тривалість останнього start(): від запиту до XSMT high
-    float         peakLeftDbfs;      // [P45] пік ВХОДУ (до EQ і гучності), дБFS, з resetStats(); -99 = тиша
+    int8_t        attenuationDb;     // [P47b] volumeDb, округлено до цілого (для сумісності)
+    uint32_t      blocks;
+    uint32_t      readTimeouts;
+    uint32_t      readErrors;
+    uint32_t      writeTimeouts;
+    uint32_t      rxOverflows;
+    uint32_t      txOverflows;
+    uint32_t      stalls;
+    uint32_t      starts;
+    uint32_t      maxProcessUs;
+    uint32_t      maxReadWaitUs;
+    uint32_t      initMs;
+    uint32_t      lastStartMs;
+    float         peakLeftDbfs;      // пік ВХОДУ (до EQ і гучності), дБFS; -99 = тиша
     float         peakRightDbfs;
-    float         peakOutLeftDbfs;   // [P45] пік ВИХОДУ (після dsp_volume), дБFS, з resetStats(); -99 = тиша
+    float         peakOutLeftDbfs;   // пік ВИХОДУ (після гучності), дБFS; -99 = тиша
     float         peakOutRightDbfs;
-    uint32_t      allocFailures;     // [P44b] start() відхилено через нестачу памʼяті / невдале створення каналів
-    uint32_t      clipCount;         // [P45] насичені відліки на виході EQ, з resetStats()
+    uint32_t      allocFailures;     // відхилені старти (нестача памʼяті, таймаут, створення задачі)
+    uint32_t      clipCount;         // насичені відліки на виході EQ
+    // [P47b] нові поля в кінці
+    float         volumeDb;          // гучність проходу, дБ [−120..−6]
+    bool          userMuted;         // мʼют користувача (setUserMute)
+    LinePathError lastError;         // остання причина невдачі старту / аварії
 };
 
 class LinePath {
 public:
-    // [P44b] Лише готує стан (і Serial-тест під LINE_PATH_TEST); каналів, задачі й буферів НЕ створює,
+    // Готує стан, мʼютекс логу, гучність (kStartVolumeDb) і мʼют. Каналів / задачі / буферів НЕ створює,
     // GPIO18 НЕ чіпає. Викликати ПІСЛЯ AudioPlayer::begin(). Повторний виклик безпечний.
-    // При LINE_PATH_ENABLE == 0 стартує лише Serial-тест (lp.heap) і повертає false.
     static bool begin();
     static bool isReady();
 
-    // Запит на старт: XSMT low, створює ресурси (якщо їх нема), зупиняє радіо, фіксує 48 кГц на I2S0,
-    // переводить GPIO18 на I2S1, вмикає канали й під мʼютом чекає стабільні блоки.
-    // [P44b] Якщо ресурсів нема, створення (канали I2S1, буфер, задача) виконується ТУТ, і виклик
-    // блокується на ≈ 10–20 мс (до kCreateWaitMs). false — запит відхилено: зайнято, не готово або
-    // нестача памʼяті (тоді лічильник allocFailures росте, XSMT low, GPIO18 лишається на I2S0).
-    // Невдача ПІСЛЯ повернення true (радіо не зупинилось, не застосувався 48 кГц, помилка enable) —
-    // автоматичний відкат: GPIO18 -> I2S0, ресурси звільнено, state() лишається Off (див. лог).
+    // Блокуючий старт (див. «БЛОКУВАННЯ»). true = запит прийнято і ресурси створено; Running настає пізніше,
+    // перевіряти state(). false = зайнято, не готово або створення не вдалося (lastError()).
     static bool start();
 
-    // Запит на зупинку проходу: спад до 0 (dsp_volume, kMuteRampMs), XSMT low, I2S1 вимкнено.
-    // GPIO18 лишається на I2S1, ресурси лишаються. false, якщо ресурсів нема (нічого зупиняти).
+    // Неблокуючий старт. true = запит прийнято (створення і старт виконуються в задачі); false = зайнято /
+    // не готово / нестача памʼяті на буфер. Результат пізніше: state(), lastError().
+    static bool requestStart();
+
+    // Запит на зупинку проходу (спад гучності, XSMT low, I2S1 вимкнено). Ресурси лишаються.
+    // false, якщо ресурсів нема або запит уже є / зайнято.
     static bool stop();
 
-    // Запит на повернення до радіо: (зупиняє прохід, якщо йде), GPIO18 -> I2S0, 48 кГц знято,
-    // канали / буфер / задача line_path знищуються. XSMT лишається низько (радіо саме зніме мʼют,
-    // коли потік стабільний). Якщо ресурсів уже нема — лише гарантує, що фіксацію 48 кГц знято.
+    // Запит на повернення до радіо: зупинити (якщо йде), GPIO18 -> I2S0, 48 кГц знято, ресурси звільнено.
+    // Неблокуючий. XSMT лишається низько (радіо саме зніме мʼют, коли потік стабільний).
     static bool returnToRadio();
 
-    static bool isRunning();  // Starting / Running / Stalled
+    static bool isRunning();     // Starting / Running / Stalled
+    static bool isStable();      // state == Running (без внутрішнього мʼюту; мʼют користувача сюди не входить)
+    static bool resourcesUp();   // задача й канали існують (між start*/requestStart і returnToRadio)
     static LinePathState state();
     static const char* stateName(LinePathState s);
+    static LinePathError lastError();
+    static const char* errorName(LinePathError e);
 
-    // Послаблення, дБ; обрізається до [kAttMinDb, kAttMaxDb]. Лише послаблення, наживо, плавно
-    // (через dsp_volume; перехід починається в наступному блоці).
+    // Гучність проходу, дБ. Обрізається до [kVolMinDb, kVolMaxDb]. Плавно (через DspVolume, будь-який стан).
+    static void setVolumeDb(float db);
+    static float volumeDb();
+
+    // Обгортка для сумісності (lp.att): обрізає до [kAttMinDb, kAttMaxDb] і викликає setVolumeDb.
     static void setAttenuationDb(int8_t db);
-    static int8_t attenuationDb();
+    static int8_t attenuationDb();   // volumeDb, округлено
+
+    // Мʼют користувача (цифровий, плавний). Не розмʼючує прохід сам і не залежить від станів.
+    static void setUserMute(bool mute);
+    static bool userMuted();
+
+    // EQ входу (власний екземпляр eq::Processor проходу). Діапазон і обрізання — як у фасаді eq.
+    static void setEqBandDb(uint8_t band, int8_t db);
+    static int8_t getEqBandDb(uint8_t band);
+    static void setEqAllDb(const int8_t gains[eq_cfg::kBandCount]);
+    static void getEqAllDb(int8_t out[eq_cfg::kBandCount]);
+    static void setEqBypass(bool on);
+    static bool eqBypass();
 
     static LinePathStats stats();
     static void resetStats();

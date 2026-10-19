@@ -1,53 +1,38 @@
-// Прохід зовнішнього звуку PCM1808 -> ESP32-S3 -> PCM5102 (Prompt 44, [P44b] — життєвий цикл ресурсів;
-// P45 — EQ і dsp_volume у ланцюжку блоку). Опис — audio/line_path.h.
+// Прохід зовнішнього звуку PCM1808 -> ESP32-S3 -> PCM5102 (Prompt 44; P44b — життєвий цикл ресурсів;
+// P45 — EQ і dsp_volume у ланцюжку блоку; P47b — виробничий API гучності, мʼюту користувача, EQ входу,
+// помилок і неблокуючого старту). Опис і правила потоків — audio/line_path.h.
 //
 // Топологія (V2 з P43):
 //   PCM1808 --DIN GPIO8--> I2S1 RX (slave) --[блок 128 кадрів]--> I2S1 TX (slave)
-//   --DOUT--> GPIO18 --> PCM5102. BCLK GPIO15 / WS GPIO17 веде I2S0 бібліотеки ESP32-audioI2S
-//   (master, MCLK GPIO16 = 256·fs для PCM1808); I2S1 їх лише слухає, тож RX і TX синхронні
-//   й звідти ж береться швидкість (ніякого ресемплінгу чи дрейфу між АЦП і ЦАП).
-//
-// [P45] Блок: RX -> піки входу -> eq::Processor (власний екземпляр, fs = kFsHz) -> dsp_volume ->
-// піки виходу -> TX. Початковий пресет EQ плаский. Пресет на вхід — у P46.
+//   --DOUT--> GPIO18 --> PCM5102. BCLK GPIO15 / WS GPIO17 веде I2S0 бібліотеки (master, MCLK GPIO16).
 //
 // GPIO18 фізично одна: у радіо-режимі її веде I2S0 (ESP32-audioI2S, setPinout), у режимі проходу —
-// I2S1 TX. Перемикання — лише GPIO-матрицею (esp_rom_gpio_connect_out_signal), без зміни
-// бібліотеки. Канал TX ініціалізується з dout = UNUSED, щоб драйвер IDF не перехопив GPIO18.
+// I2S1 TX. Перемикання — лише GPIO-матрицею (esp_rom_gpio_connect_out_signal).
 //
-// ВАЖЛИВО про піни 15/17: вони водночас вихід I2S0 і вхід I2S1 (slave). Драйвер IDF при
-// ініціалізації slave-входів може лишити пін «лише входом» — після init/enable повертаємо
-// output-enable низькорівнево (gpio_ll), як це робить audio/adc_vu (P37). gpio_set_direction()
-// не використовуємо: він може відключити вихідний сигнал піна від I2S0.
+// ВАЖЛИВО про піни 15/17: вони водночас вихід I2S0 і вхід I2S1 (slave). Після init/enable повертаємо
+// output-enable низькорівнево (gpio_ll). gpio_set_direction() не використовуємо.
 //
-// [P44b] ЖИТТЄВИЙ ЦИКЛ. begin() нічого не виділяє (крім Serial-тесту). start() створює:
-//   (1) буфер блоку (внутрішня RAM, 1 КБ), (2) задачу line_path, яка першою дією створює канали I2S1
-//   (≈12 КБ DMA) і сигналить семафором результат. Якщо щось не вдалось — start() повертає false,
-//   allocFailures++, XSMT low, GPIO18 на I2S0. returnToRadio() знищує канали й буфер і завершує задачу
-//   (стек і TCB звільнить IDLE-задача трохи пізніше). stop() ресурси лишає.
-//   Чому канали створює ЗАДАЧА, а не виклик start(): стек викликача (AppController / веб / тест) невідомий,
-//   а стек задачі виміряно (≈3,2 КБ вільного мінімуму в P44). start() блокується на семафорі.
+// МЬЮТИ (P47b): два джерела, одна функція applyMute(). Ефективний цифровий мʼют =
+//   s_userMute || (s_state != Running).
+// applyMute() викликається після КОЖНОЇ зміни s_state або s_userMute. Читання обох прапорців і запис
+// в DspVolume — в одній критичній секції (s_muxMute), тож задача і зовнішній виклик не перевернуть
+// мʼют один одному. Єдиний прямий розмʼют (раніше setMute(false) у pump) замінено на applyMute().
 //
-// Безпека: старт завжди під XSMT low і цифровим мʼютом; мʼют знімається лише після kSettleBlocks
-// стабільних блоків; при відсутності блоків понад kStallMs — XSMT low і миттєвий цифровий мʼют
-// (TX має auto_clear, тож без даних у лінію йдуть нулі, а не «повна гучність»).
+// ЖИТТЄВИЙ ЦИКЛ (P44b): start/requestStart створюють буфер блоку (внутрішня RAM) і задачу; задача
+// першою дією створює канали I2S1 і сигналить результат (лише для блокуючого start). Невдача —
+// lastError() і allocFailures++, XSMT low, GPIO18 на I2S0. returnToRadio() знищує канали й буфер.
 //
-// [P44b] ЧИСТІ ПЕРЕХОДИ (гіпотеза за кодом, НЕ перевірено на залізі — перевіряти lp.cycle):
-//   - TX увімкнений, а писати нічого (settle-блоки) -> тепер у TX пишуться нулі;
-//   - 20 мс затримки після XSMT low при увімкнених каналах (> глибини черги DMA ≈16 мс) -> тепер це
-//     вікно, у якому RX вичитується, а в TX пишуться нулі, і канали вимикаються одразу після;
-//   - Serial.printf у критичному місці Starting -> Running (≈5 мс на рядок за 115200) -> лог перенесено
-//     ПІСЛЯ запису першого блоку й обʼєднано в один рядок.
+// ЧИСТІ ПЕРЕХОДИ (P44b, перевірено на залізі lp.cycle): у TX пишуться нулі в settle-блоках і у вікні
+// після XSMT low; канали вимикаються лише після цього вікна.
 //
-// [P45] Скидання стану EQ: після enable каналів (перед першим pump()) і після відновлення зі Stalled.
-// Під час settle-блоків (у TX нулі) EQ не обробляє блок.
-//
-// Задача line_path — єдиний «власник» I2S1, XSMT і екземплярів EQ / dsp_volume на час проходу.
-// Прототип: XSMT керується тут напряму (digitalWrite), у P47 це перейде до dac_output.
+// LOG (P47b): кожен рядок виводиться через lineOut() — один Serial.write на рядок під мʼютексом.
+// Задача line_path і Serial-тест більше не перемежовують байти.
 
 #include "audio/line_path.h"
 
 #include <Arduino.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,17 +44,43 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+namespace {
+
+namespace cfg = line_path_cfg;
+
+// Вивід у Serial: один рядок цілком, одним Serial.write, під мʼютексом. Рядки не перемежовуються
+// між задачею line_path і Serial-тестом (причина втрачених \n у lp.*, див. звіт).
+StaticSemaphore_t s_outBuf;
+SemaphoreHandle_t s_outMux = xSemaphoreCreateMutexStatic(&s_outBuf);
+
+void lineOut(const char* fmt, ...) {
+    char    buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n <= 0) {
+        return;
+    }
+    size_t len = static_cast<size_t>(n);
+    if (len >= sizeof(buf)) {  // обрізано: зберегти перенос рядка
+        len = sizeof(buf) - 1;
+        buf[len - 1] = '\n';
+    }
+    const bool locked = xSemaphoreTake(s_outMux, pdMS_TO_TICKS(100)) == pdTRUE;
+    Serial.write(reinterpret_cast<const uint8_t*>(buf), len);
+    if (locked) {
+        xSemaphoreGive(s_outMux);
+    }
+}
+
 #if LINE_PATH_DEBUG
-#define LINE_LOG(...) Serial.printf(__VA_ARGS__)
+#define LINE_LOG(...) lineOut(__VA_ARGS__)
 #else
 #define LINE_LOG(...) \
     do {              \
     } while (0)
 #endif
-
-namespace {
-
-namespace cfg = line_path_cfg;
 
 [[maybe_unused]] size_t heapFree() {
     return heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
@@ -79,16 +90,32 @@ namespace cfg = line_path_cfg;
     return heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
 }
 
-// Діагностика ресурсів для Serial-тесту (заповнює реалізація нижче; при LINE_PATH_ENABLE == 0 — нулі).
+// Діагностика ресурсів для Serial-тесту.
 struct DbgInfo {
-    bool     alive;               // задача line_path існує (ресурси створені)
-    uint32_t stackFreeMin;        // вільний мінімум стека задачі, Б (після видалення — останнє виміряне)
-    uint32_t heapFreeBefore;      // внутрішня RAM перед створенням ресурсів (останній start із порожнього стану)
+    bool     alive;
+    uint32_t stackFreeMin;
+    uint32_t heapFreeBefore;
     uint32_t heapLargestBefore;
-    uint32_t heapFreeAfter;       // те саме одразу після створення
+    uint32_t heapFreeAfter;
     uint32_t heapLargestAfter;
-    uint32_t recoveries;          // скільки разів вийшли зі Stalled (самовідновлення)
+    uint32_t recoveries;
 };
+
+[[maybe_unused]] const char* errorNameImpl(LinePathError e) {
+    switch (e) {
+        case LinePathError::None:                return "none";
+        case LinePathError::AllocFailed:         return "alloc failed";
+        case LinePathError::TaskCreateFailed:    return "task create failed";
+        case LinePathError::ChannelCreateFailed: return "I2S1 channel create failed";
+        case LinePathError::CreateTimeout:       return "resource create timeout";
+        case LinePathError::RadioStopTimeout:    return "radio did not stop";
+        case LinePathError::RadioRefused:        return "player refused fixed rate";
+        case LinePathError::ClockFixFailed:      return "48 kHz not applied";
+        case LinePathError::EnableFailed:        return "channel enable failed";
+        case LinePathError::Stalled:             return "stalled (no RX blocks)";
+    }
+    return "?";
+}
 
 }  // namespace
 
@@ -108,6 +135,8 @@ struct DbgInfo {
 static_assert(line_path_cfg::kXsmtMutedLevel == player_cfg::kXsmtMutedLevel &&
                   line_path_cfg::kXsmtUnmutedLevel == player_cfg::kXsmtUnmutedLevel,
               "XSMT levels must match player_cfg");
+static_assert(line_path_cfg::kVolMinDb == dsp_volume_cfg::kMinDb,
+              "line path volume floor must equal dsp_volume floor");
 
 namespace {
 
@@ -115,27 +144,31 @@ enum Req : uint8_t { kReqNone = 0, kReqStart, kReqStop, kReqRadio };
 
 constexpr size_t kBufBytes = cfg::kBlockFrames * 2 * sizeof(int32_t);
 
-// --- DSP (P45): екземпляри EQ і цифрової гучності; обробка — лише в задачі line_path ---
+// --- DSP: екземпляри EQ і цифрової гучності; обробка — лише в задачі line_path ---
 eq::Processor s_eqLine{"line"};
 DspVolume     s_dsp;
 
-// --- Стан (пише лише задача, крім s_req / s_attDb / лічильників ISR / s_taskAlive на старті) ---
+// Критична секція для мʼютів (applyMute / setUserMute). Короткі, без блокувань всередині.
+portMUX_TYPE s_muxMute = portMUX_INITIALIZER_UNLOCKED;
+
+// --- Стан ---
 volatile uint8_t       s_req = kReqNone;
 volatile LinePathState s_state = LinePathState::Off;
-volatile bool          s_muted = true;
+volatile bool          s_muted = true;        // XSMT (лише для статистики / логу)
 volatile bool          s_routed = false;
-volatile int8_t        s_attDb = cfg::kPrototypeAttenuationDb;
+volatile bool          s_userMute = true;     // [P47b] мʼют користувача; типово увімкнений
+volatile LinePathError s_lastError = LinePathError::None;
 volatile uint32_t      s_rxOvf = 0;
 volatile uint32_t      s_txOvf = 0;
 
 // Життєвий цикл ресурсів.
 bool              s_ready = false;
-bool              s_opLock = false;          // серіалізує start / stop / returnToRadio між задачами
-volatile bool     s_taskAlive = false;       // задача існує (разом із каналами й буфером)
-volatile bool     s_initAbandoned = false;   // start() не дочекався створення каналів — задача сама згортається
-volatile bool     s_exit = false;            // задача має завершитись (після returnToRadio / відкату)
-volatile int      s_initErr = 0;             // esp_err_t створення каналів (0 = ESP_OK)
-SemaphoreHandle_t s_initSem = nullptr;       // binary, статичний (без кучі)
+bool              s_opLock = false;          // серіалізує start / requestStart / stop / returnToRadio
+volatile bool     s_taskAlive = false;
+volatile bool     s_initAbandoned = false;
+volatile bool     s_exit = false;
+volatile int      s_initErr = 0;
+SemaphoreHandle_t s_initSem = nullptr;
 StaticSemaphore_t s_initSemBuf;
 
 bool              s_rxOn = false;
@@ -143,35 +176,44 @@ bool              s_txOn = false;
 i2s_chan_handle_t s_rx = nullptr;
 i2s_chan_handle_t s_tx = nullptr;
 TaskHandle_t      s_task = nullptr;
-int32_t*          s_buf = nullptr;   // інтерліврований L,R,L,R...; 24 біти вирівняні вліво в 32-бітному слові
+int32_t*          s_buf = nullptr;
 
 uint32_t s_settle = 0;
 uint32_t s_lastGoodMs = 0;
 uint32_t s_startReqMs = 0;
-bool     s_recovering = false;       // Starting після Stalled (не рахувати як start)
-bool     s_pinsOk = true;            // результат restorePinOutputs() при останньому enable
+bool     s_recovering = false;
+bool     s_pinsOk = true;
 
-// Ін'єкція збою (lp.fault): до цього моменту (millis) RX не споживається. 0 = нема.
+// Ін'єкція збою (lp.fault).
 volatile uint32_t s_faultUntilMs = 0;
 uint32_t          s_faultRx0 = 0;
 uint32_t          s_faultTx0 = 0;
 
-// Статистика (читається з інших задач без блокувань; значення 32-бітні, вирівняні).
+// Статистика.
 uint32_t s_blocks = 0, s_readTimeouts = 0, s_readErrors = 0, s_writeTimeouts = 0;
 uint32_t s_stalls = 0, s_starts = 0, s_maxProcessUs = 0, s_maxReadWaitUs = 0;
 uint32_t s_initMs = 0, s_lastStartMs = 0, s_allocFailures = 0, s_recoveries = 0;
-uint32_t s_peakL = 0, s_peakR = 0;        // |x| входу у шкалі 2^31, макс. з останнього resetStats()
-uint32_t s_peakOutL = 0, s_peakOutR = 0;  // |x| виходу (після dsp_volume), макс. з останнього resetStats()
+uint32_t s_peakL = 0, s_peakR = 0;
+uint32_t s_peakOutL = 0, s_peakOutR = 0;
 
 // Діагностика пам'яті / стека.
 uint32_t s_heapFreeBefore = 0, s_heapLargestBefore = 0, s_heapFreeAfter = 0, s_heapLargestAfter = 0;
 uint32_t s_stackFreeMin = 0;
 
 // ---------------------------------------------------------------------------
-// Допоміжне
+// Мʼюти
 // ---------------------------------------------------------------------------
 
-// quiet = true: лише рівень піна й прапорець, без логу (лог друкує викликач у безпечний момент).
+// Ефективний цифровий мʼют = мʼют користувача АБО стан, відмінний від Running.
+// Викликати ПІСЛЯ кожної зміни s_state або s_userMute. Читання і запис — в одній критичній секції.
+void applyMute() {
+    portENTER_CRITICAL(&s_muxMute);
+    const bool eff = s_userMute || (s_state != LinePathState::Running);
+    s_dsp.setMute(eff);
+    portEXIT_CRITICAL(&s_muxMute);
+}
+
+// quiet = true: лише рівень піна й прапорець, без логу.
 void muteDac(bool mute, bool quiet = false) {
     digitalWrite(pins::kXsmt, mute ? cfg::kXsmtMutedLevel : cfg::kXsmtUnmutedLevel);
     if (mute != s_muted && !quiet) {
@@ -180,7 +222,11 @@ void muteDac(bool mute, bool quiet = false) {
     s_muted = mute;
 }
 
-// Повернути output-enable BCLK/WS (див. шапку файла); true — обидва справді «на виході».
+// ---------------------------------------------------------------------------
+// Допоміжне: піни, маршрут GPIO18, канали
+// ---------------------------------------------------------------------------
+
+// Повернути output-enable BCLK/WS; true — обидва справді «на виході».
 bool restorePinOutputs() {
     gpio_ll_output_enable(&GPIO, static_cast<gpio_num_t>(pins::kI2sBclk));
     gpio_ll_output_enable(&GPIO, static_cast<gpio_num_t>(pins::kI2sWs));
@@ -221,14 +267,14 @@ void disableChannels() {
     }
 }
 
-// Створити дуплексну пару каналів I2S1 (slave). Виконує ЗАДАЧА line_path (див. шапку). GPIO18 не чіпає.
+// Створити дуплексну пару каналів I2S1 (slave). Виконує ЗАДАЧА line_path. GPIO18 не чіпає.
 esp_err_t createChannels() {
     i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(static_cast<i2s_port_t>(cfg::kI2sPort),
                                                       I2S_ROLE_SLAVE);
     cc.dma_desc_num = cfg::kDmaDescCount;
     cc.dma_frame_num = cfg::kDmaFrameCount;
-    cc.auto_clear = true;  // без даних TX шле нулі (захист від «повної гучності» / повтору буфера)
-    esp_err_t e = i2s_new_channel(&cc, &s_tx, &s_rx);  // duplex на одному порту
+    cc.auto_clear = true;  // без даних TX шле нулі
+    esp_err_t e = i2s_new_channel(&cc, &s_tx, &s_rx);
     if (e != ESP_OK) {
         s_tx = nullptr;
         s_rx = nullptr;
@@ -236,13 +282,13 @@ esp_err_t createChannels() {
     }
 
     i2s_std_config_t sc = {};
-    sc.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(cfg::kFsHz);  // у slave частоту задає зовнішній LRCLK
+    sc.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(cfg::kFsHz);
     sc.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
-    sc.gpio_cfg.mclk = I2S_GPIO_UNUSED;  // MCLK веде I2S0
+    sc.gpio_cfg.mclk = I2S_GPIO_UNUSED;
     sc.gpio_cfg.bclk = static_cast<gpio_num_t>(pins::kI2sBclk);
     sc.gpio_cfg.ws = static_cast<gpio_num_t>(pins::kI2sWs);
     sc.gpio_cfg.din = static_cast<gpio_num_t>(pins::kI2sDin);
-    sc.gpio_cfg.dout = I2S_GPIO_UNUSED;  // GPIO18 перемикаємо вручну (routeDout), не драйвером
+    sc.gpio_cfg.dout = I2S_GPIO_UNUSED;
 
     e = i2s_channel_init_std_mode(s_rx, &sc);
     if (e == ESP_OK) {
@@ -268,7 +314,7 @@ esp_err_t createChannels() {
     return ESP_OK;
 }
 
-// Знищити канали (вимкнувши, якщо ще ввімкнені) і гарантувати, що I2S0 далі веде BCLK/WS.
+// Знищити канали і гарантувати, що I2S0 далі веде BCLK/WS.
 void destroyChannels() {
     disableChannels();
     if (s_tx != nullptr) {
@@ -279,8 +325,6 @@ void destroyChannels() {
         i2s_del_channel(s_rx);
         s_rx = nullptr;
     }
-    // Оборонно (НЕ перевірено, чи i2s_del_channel зачіпає ці піни): повернути output-enable й вихідні
-    // сигнали I2S0 на BCLK/WS. Якщо вони вже такі — нічого не змінюється.
     restorePinOutputs();
     esp_rom_gpio_connect_out_signal(pins::kI2sBclk, I2S0O_BCK_OUT_IDX, false, false);
     esp_rom_gpio_connect_out_signal(pins::kI2sWs, I2S0O_WS_OUT_IDX, false, false);
@@ -294,10 +338,10 @@ void freeBuffer() {
 }
 
 // ---------------------------------------------------------------------------
-// Обробка блоку (P45: вхід -> EQ -> dsp_volume -> вихід)
+// Обробка блоку: вхід -> EQ -> dsp_volume -> вихід
 // ---------------------------------------------------------------------------
 
-// Макс. |x| у шкалі 2^31 по стерео-блоку (без UB для INT32_MIN: 0u - (uint32_t)x = 2^31).
+// Макс. |x| у шкалі 2^31 по стерео-блоку (без UB для INT32_MIN).
 void peakScan(const int32_t* p, int32_t frames, uint32_t& pl, uint32_t& pr) {
     for (int32_t i = 0; i < frames; ++i) {
         const int32_t l = p[0];
@@ -312,10 +356,10 @@ void peakScan(const int32_t* p, int32_t frames, uint32_t& pl, uint32_t& pr) {
 
 void processBlock(size_t frames) {
     const int32_t n = static_cast<int32_t>(frames);
-    peakScan(s_buf, n, s_peakL, s_peakR);  // пік входу (до EQ і гучності): чи приходить сигнал
-    s_eqLine.process(s_buf, n);            // EQ на місці (коефіцієнти інтерполюються, без мʼютекса)
-    s_dsp.process(s_buf, n);               // цифрова гучність / мʼют (перехід посемпловий)
-    peakScan(s_buf, n, s_peakOutL, s_peakOutR);  // пік виходу: після EQ і гучності
+    peakScan(s_buf, n, s_peakL, s_peakR);
+    s_eqLine.process(s_buf, n);
+    s_dsp.process(s_buf, n);
+    peakScan(s_buf, n, s_peakOutL, s_peakOutR);
 }
 
 // Нема даних: перевіряємо аварійний мʼют.
@@ -327,16 +371,16 @@ void onNoData(uint32_t now) {
     if (now - s_lastGoodMs < cfg::kStallMs) {
         return;
     }
-    // Аварійний мʼют: миттєвий цифровий мʼют (блоків немає, перехід би не просунувся) і XSMT low.
-    s_dsp.forceMute();
+    s_dsp.forceMute();   // миттєвий мʼют: блоків немає, перехід би не просунувся
     muteDac(true);
     s_state = LinePathState::Stalled;
+    applyMute();
     s_stalls = s_stalls + 1;
+    s_lastError = LinePathError::Stalled;
     LINE_LOG("[LINE] STALL: no I2S1 RX blocks for %lu ms - muted (check PCM1808 / clocks)\n",
              static_cast<unsigned long>(now - s_lastGoodMs));
 }
 
-// Записати bytes байт із s_buf у TX.
 void writeTx(size_t bytes) {
     size_t          wrote = 0;
     const esp_err_t we = i2s_channel_write(s_tx, s_buf, bytes, &wrote, cfg::kWriteTimeoutMs);
@@ -347,7 +391,7 @@ void writeTx(size_t bytes) {
 
 // Один цикл: читання -> (EQ, гучність) -> запис. true — блок отримано.
 bool pump() {
-    // --- Ін'єкція збою (lp.fault): RX не споживається, DMA переповнюється, як при зависанні задачі ---
+    // Ін'єкція збою (lp.fault): RX не споживається.
     if (s_faultUntilMs != 0) {
         if (static_cast<int32_t>(millis() - s_faultUntilMs) < 0) {
             vTaskDelay(pdMS_TO_TICKS(5));
@@ -372,7 +416,7 @@ bool pump() {
             s_readTimeouts = s_readTimeouts + 1;
         } else {
             s_readErrors = s_readErrors + 1;
-            vTaskDelay(pdMS_TO_TICKS(10));  // не крутитись, якщо драйвер повертає помилку миттєво
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
         onNoData(now);
         return false;
@@ -385,7 +429,8 @@ bool pump() {
         s_state = LinePathState::Starting;
         s_settle = cfg::kSettleBlocks;
         s_recovering = true;
-        s_eqLine.reset();  // [P45] стан EQ застарів за час збою
+        s_eqLine.reset();
+        applyMute();  // Starting: мʼют лишається
         logBack = true;
     }
 
@@ -393,7 +438,6 @@ bool pump() {
     const size_t bytes = frames * 2 * sizeof(int32_t);
 
     if (s_settle > 0) {
-        // [P44b] Блок відкидаємо, але в TX пишемо нулі: канал TX увімкнений і має обслуговуватись.
         --s_settle;
         memset(s_buf, 0, bytes);
         writeTx(bytes);
@@ -403,15 +447,15 @@ bool pump() {
         return true;
     }
 
-    // Лог переходу друкуємо ПІСЛЯ запису першого блоку (Serial.printf блокує на ≈5 мс на рядок).
     bool justStarted = false;
     bool justRecovered = false;
     if (s_state == LinePathState::Starting) {
-        // Перший стабільний блок: знімаємо XSMT і плавно піднімаємо гучність (dsp_volume, kRampMs).
+        // Перший стабільний блок. Гучність з нуля (ramp піде від нуля). Мʼют користувача НЕ знімаємо:
+        // applyMute() лишить мʼют, якщо користувач його увімкнув.
         s_dsp.forceMute();
-        s_dsp.setMute(false);
         muteDac(false, true);
         s_state = LinePathState::Running;
+        applyMute();
         if (s_recovering) {
             s_recovering = false;
             s_recoveries = s_recoveries + 1;
@@ -431,11 +475,12 @@ bool pump() {
     s_blocks = s_blocks + 1;
 
     if (justStarted) {
-        LINE_LOG("[LINE] running: XSMT unmute, att %d dB, start took %lu ms%s\n",
-                 static_cast<int>(s_attDb), static_cast<unsigned long>(s_lastStartMs),
-                 s_pinsOk ? "" : ", WARNING BCLK/WS output enable MISSING");
+        LINE_LOG("[LINE] running: XSMT unmute, volume %.1f dB, user mute %d, start took %lu ms%s\n",
+                 static_cast<double>(s_dsp.attenuationDb()), s_userMute ? 1 : 0,
+                 static_cast<unsigned long>(s_lastStartMs), s_pinsOk ? "" : ", WARNING BCLK/WS output enable MISSING");
     } else if (justRecovered) {
-        LINE_LOG("[LINE] recovered: XSMT unmute, att %d dB\n", static_cast<int>(s_attDb));
+        LINE_LOG("[LINE] recovered: XSMT unmute, volume %.1f dB, user mute %d\n",
+                 static_cast<double>(s_dsp.attenuationDb()), s_userMute ? 1 : 0);
     }
     return true;
 }
@@ -444,8 +489,7 @@ bool pump() {
 // Послідовності
 // ---------------------------------------------------------------------------
 
-// Зняти фіксацію 48 кГц (лише при Idle радіо; бібліотека не потокобезпечна). Без повернення помилки:
-// лише лог, як у P44.
+// Зняти фіксацію 48 кГц (лише при Idle радіо). Без повернення помилки: лише лог.
 void releaseFixedRate() {
     if (!AudioPlayer::setFixedOutputRate(false)) {
         LINE_LOG("[LINE] radio: player refused to release fixed rate (not Idle?)\n");
@@ -462,13 +506,14 @@ void releaseFixedRate() {
 }
 
 void doStop() {
-    s_faultUntilMs = 0;  // зупинка скасовує ін'єкцію збою
+    s_faultUntilMs = 0;
     if (!s_rxOn && !s_txOn) {
         s_state = LinePathState::Off;
+        applyMute();
         return;
     }
     s_state = LinePathState::Stopping;
-    s_dsp.setMute(true);  // плавний спад (dsp_volume, kMuteRampMs)
+    applyMute();  // плавний спад (dsp_volume, kMuteRampMs)
     const uint32_t t0 = millis();
     while (!s_dsp.isSilent() &&
            millis() - t0 < dsp_volume_cfg::kMuteRampMs * 3 + cfg::kReadTimeoutMs) {
@@ -476,18 +521,16 @@ void doStop() {
     }
     s_dsp.forceMute();  // на випадок таймауту: гарантовано тиша
     muteDac(true);
-    // [P44b] Вікно після XSMT low: канали ще увімкнені, тож RX вичитуємо, а в TX пишемо нулі
-    // (підсилення 0) — ні RX, ні TX не стоять без обслуговування довше за глибину черги DMA.
     const uint32_t w0 = millis();
     do {
         pump();
     } while (millis() - w0 < cfg::kXsmtMuteSettleMs);
     disableChannels();
     s_state = LinePathState::Off;
+    applyMute();
     LINE_LOG("[LINE] stopped (DOUT %s)\n", s_routed ? "still on I2S1" : "on I2S0");
 }
 
-// Повернення до радіо + звільнення ресурсів. Після неї задача завершується (s_exit).
 void doRadio() {
     if (s_state != LinePathState::Off) {
         doStop();
@@ -499,12 +542,14 @@ void doRadio() {
     destroyChannels();
     freeBuffer();
     s_exit = true;
+    applyMute();
     LINE_LOG("[LINE] radio path restored, line path resources released "
              "(XSMT stays low until the player unmutes)\n");
 }
 
-// Невдача під час start() ПІСЛЯ того, як запит прийнято: відкат як returnToRadio().
-void abortStart(const char* why) {
+// Невдача під час старту ПІСЛЯ прийнятого запиту: записати причину й відкотитися на радіо.
+void abortStart(const char* why, LinePathError err) {
+    s_lastError = err;
     LINE_LOG("[LINE] start failed: %s - rolling back to radio path\n", why);
     doRadio();
 }
@@ -514,8 +559,7 @@ void doStart() {
     s_dsp.forceMute();
     s_recovering = false;
 
-    // 1. Радіо: зупинити й дати бібліотеці дограти хвіст буфера (його чути не буде, але зміну
-    //    тактів не можна робити під час запису в I2S0).
+    // 1. Радіо: зупинити й дати дограти хвіст буфера.
     AudioPlayer::stop();
     const uint32_t w0 = millis();
     while (AudioPlayer::state() != PlayerState::Idle) {
@@ -523,38 +567,37 @@ void doStart() {
             char why[64];
             snprintf(why, sizeof(why), "radio did not reach Idle (state %s)",
                      AudioPlayer::stateName(AudioPlayer::state()));
-            abortStart(why);
+            abortStart(why, LinePathError::RadioStopTimeout);
             return;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     vTaskDelay(pdMS_TO_TICKS(cfg::kRadioDrainMs));
 
-    // 2. Зафіксувати 48 кГц на I2S0 (виконує задача плеєра; лише при Idle).
+    // 2. Зафіксувати 48 кГц на I2S0.
     if (!AudioPlayer::setFixedOutputRate(true)) {
-        abortStart("player refused fixed output rate");
+        abortStart("player refused fixed output rate", LinePathError::RadioRefused);
         return;
     }
     const uint32_t c0 = millis();
     while (!AudioPlayer::fixedOutputRate()) {
         if (millis() - c0 > cfg::kClockApplyWaitMs) {
-            abortStart("48 kHz not applied on I2S0");
+            abortStart("48 kHz not applied on I2S0", LinePathError::ClockFixFailed);
             return;
         }
         vTaskDelay(pdMS_TO_TICKS(5));
     }
-    vTaskDelay(pdMS_TO_TICKS(20));  // такти після reconfig стабілізуються
+    vTaskDelay(pdMS_TO_TICKS(20));
 
     // 3. DOUT -> I2S1 TX (під мʼютом).
     routeDout(true);
 
-    // 4. Канали: RX першим, TX другим. Після enable повертаємо output-enable BCLK/WS.
-    //    Жодного логу між enable і першим pump() (див. шапку): друкуємо підсумок у рядку "running".
+    // 4. Канали: RX, потім TX.
     esp_err_t e = i2s_channel_enable(s_rx);
     if (e != ESP_OK) {
         char why[64];
         snprintf(why, sizeof(why), "RX enable: %s", esp_err_to_name(e));
-        abortStart(why);
+        abortStart(why, LinePathError::EnableFailed);
         return;
     }
     s_rxOn = true;
@@ -563,25 +606,28 @@ void doStart() {
         char why[64];
         snprintf(why, sizeof(why), "TX enable: %s", esp_err_to_name(e));
         disableChannels();
-        abortStart(why);
+        abortStart(why, LinePathError::EnableFailed);
         return;
     }
     s_txOn = true;
     s_pinsOk = restorePinOutputs();
 
-    s_eqLine.reset();  // [P45] стан EQ — з нуля перед першим блоком
+    s_eqLine.reset();
     s_settle = cfg::kSettleBlocks;
     s_lastGoodMs = millis();
     s_state = LinePathState::Starting;
+    applyMute();
 }
 
-// Тіло задачі. Перша дія — створення каналів і сигнал start(); завершується сама після doRadio().
+// Тіло задачі. Перша дія — створення каналів і сигнал результату; завершується після doRadio().
 void taskEntry(void*) {
     const esp_err_t e = createChannels();
     if (e != ESP_OK || s_initAbandoned) {
         const bool abandoned = s_initAbandoned;
         if (e == ESP_OK) {
             destroyChannels();
+        } else {
+            s_lastError = LinePathError::ChannelCreateFailed;
         }
         freeBuffer();
         s_req = kReqNone;
@@ -596,6 +642,12 @@ void taskEntry(void*) {
         return;
     }
     s_initErr = 0;
+    s_heapFreeAfter = static_cast<uint32_t>(heapFree());
+    s_heapLargestAfter = static_cast<uint32_t>(heapLargest());
+    LINE_LOG("[LINE] resources up: used %d B internal RAM (free %u -> %u B, largest %u -> %u B)\n",
+             static_cast<int>(s_heapFreeBefore) - static_cast<int>(s_heapFreeAfter),
+             static_cast<unsigned>(s_heapFreeBefore), static_cast<unsigned>(s_heapFreeAfter),
+             static_cast<unsigned>(s_heapLargestBefore), static_cast<unsigned>(s_heapLargestAfter));
     xSemaphoreGive(s_initSem);
 
     for (;;) {
@@ -613,7 +665,7 @@ void taskEntry(void*) {
             s_exit = false;
             s_stackFreeMin = uxTaskGetStackHighWaterMark(nullptr);
             s_task = nullptr;
-            s_taskAlive = false;  // останній запис: після нього новий start() може створити нову задачу
+            s_taskAlive = false;
             vTaskDelete(nullptr);
             return;
         }
@@ -626,13 +678,14 @@ void taskEntry(void*) {
     }
 }
 
-// start(), частина під s_opLock. Див. line_path.h.
-bool startLocked() {
+// Спільна частина start() і requestStart(). wait = true: чекає створення каналів (до kCreateWaitMs).
+bool startLocked(bool wait) {
     if (s_req != kReqNone) {
         return false;
     }
+    s_lastError = LinePathError::None;  // нова спроба скидає попередню причину
+
     if (s_taskAlive) {
-        // Ресурси є (після stop()): лише новий запит.
         if (s_state != LinePathState::Off) {
             return false;
         }
@@ -645,7 +698,6 @@ bool startLocked() {
         return false;
     }
 
-    // Ресурсів нема: створюємо. XSMT low першим — що б далі не сталось, звуку не буде.
     s_startReqMs = millis();
     muteDac(true);
     s_heapFreeBefore = static_cast<uint32_t>(heapFree());
@@ -654,6 +706,7 @@ bool startLocked() {
     s_buf = static_cast<int32_t*>(heap_caps_malloc(kBufBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (s_buf == nullptr) {
         s_allocFailures = s_allocFailures + 1;
+        s_lastError = LinePathError::AllocFailed;
         LINE_LOG("[LINE] start rejected: no memory for block buffer (%u B); free=%u B, largest=%u B\n",
                  static_cast<unsigned>(kBufBytes), static_cast<unsigned>(heapFree()),
                  static_cast<unsigned>(heapLargest()));
@@ -674,36 +727,36 @@ bool startLocked() {
         s_req = kReqNone;
         freeBuffer();
         s_allocFailures = s_allocFailures + 1;
+        s_lastError = LinePathError::TaskCreateFailed;
         LINE_LOG("[LINE] start rejected: task create failed (stack %u B); free=%u B, largest=%u B\n",
                  static_cast<unsigned>(cfg::kTaskStackBytes), static_cast<unsigned>(heapFree()),
                  static_cast<unsigned>(heapLargest()));
         return false;
     }
 
-    // Чекаємо, поки задача створить канали I2S1 (≈10–20 мс).
+    if (!wait) {
+        LINE_LOG("[LINE] start accepted (channels are created in the task)\n");
+        return true;
+    }
+
     if (xSemaphoreTake(s_initSem, pdMS_TO_TICKS(cfg::kCreateWaitMs)) != pdTRUE &&
         xSemaphoreTake(s_initSem, 0) != pdTRUE) {
         s_initAbandoned = true;  // задача сама згорнеться, коли дійде до цього місця
         s_allocFailures = s_allocFailures + 1;
+        s_lastError = LinePathError::CreateTimeout;
         LINE_LOG("[LINE] start rejected: resource creation timed out after %lu ms\n",
                  static_cast<unsigned long>(cfg::kCreateWaitMs));
         return false;
     }
     if (s_initErr != 0) {
         s_allocFailures = s_allocFailures + 1;
-        LINE_LOG("[LINE] start rejected: I2S1 channels not created (%s); XSMT low, DOUT stays on I2S0; "
-                 "free=%u B, largest=%u B\n",
-                 esp_err_to_name(static_cast<esp_err_t>(s_initErr)), static_cast<unsigned>(heapFree()),
-                 static_cast<unsigned>(heapLargest()));
+        if (s_lastError == LinePathError::None) {
+            s_lastError = LinePathError::ChannelCreateFailed;
+        }
+        LINE_LOG("[LINE] start rejected: I2S1 channels not created (%s); XSMT low, DOUT stays on I2S0\n",
+                 esp_err_to_name(static_cast<esp_err_t>(s_initErr)));
         return false;
     }
-
-    s_heapFreeAfter = static_cast<uint32_t>(heapFree());
-    s_heapLargestAfter = static_cast<uint32_t>(heapLargest());
-    LINE_LOG("[LINE] resources up: used %d B internal RAM (free %u -> %u B, largest %u -> %u B)\n",
-             static_cast<int>(s_heapFreeBefore) - static_cast<int>(s_heapFreeAfter),
-             static_cast<unsigned>(s_heapFreeBefore), static_cast<unsigned>(s_heapFreeAfter),
-             static_cast<unsigned>(s_heapLargestBefore), static_cast<unsigned>(s_heapLargestAfter));
     return true;
 }
 
@@ -725,7 +778,6 @@ bool startLocked() {
     return d;
 }
 
-// Запустити ін'єкцію збою на ms мілісекунд. Лише з Running.
 [[maybe_unused]] bool dbgFault(uint32_t ms) {
     if (s_state != LinePathState::Running || s_faultUntilMs != 0) {
         return false;
@@ -756,80 +808,63 @@ namespace {
 
 #if LINE_PATH_TEST
 
+#define LP_UL(x) static_cast<unsigned long>(x)
+
 void printHeap() {
-    Serial.printf("[LINE] heap internal: free=%u B, largest block=%u B, min free ever=%u B "
-                  "(LINE_PATH_ENABLE=%d)\n",
-                  static_cast<unsigned>(heapFree()), static_cast<unsigned>(heapLargest()),
-                  static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
-                  LINE_PATH_ENABLE);
+    lineOut("[LINE] heap internal: free=%u B, largest block=%u B, min free ever=%u B "
+            "(LINE_PATH_ENABLE=%d)\n",
+            static_cast<unsigned>(heapFree()), static_cast<unsigned>(heapLargest()),
+            static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)), LINE_PATH_ENABLE);
 }
 
 #if LINE_PATH_ENABLE
 
-// Розширення для printf без попереджень про тип.
-#define LP_UL(x) static_cast<unsigned long>(x)
-
-// lp.stat: увесь звіт збирається в один буфер і друкується ОДНИМ викликом Serial.print.
-// Кожен рядок закінчується явним '\n', рядки не злипаються з логом задачі line_path.
+// lp.stat: кожен рядок — окремий lineOut (повний, з \n).
 void printStats() {
     const LinePathStats s = LinePath::stats();
     const DbgInfo       d = dbgInfo();
     int8_t              g[eq_cfg::kBandCount];
     s_eqLine.getAllDb(g);
 
-    char   out[1024];
-    size_t n = 0;
-    out[0] = '\0';
-    auto add = [&](const char* fmt, auto... args) {
-        if (n + 1 >= sizeof(out)) {
-            return;
-        }
-        const int w = snprintf(out + n, sizeof(out) - n, fmt, args...);
-        if (w > 0) {
-            const size_t room = sizeof(out) - n - 1;
-            n += (static_cast<size_t>(w) < room) ? static_cast<size_t>(w) : room;
-        }
-    };
-
-    add("[LINE] state=%s muted=%d dout=%s att=%d dB resources=%s\n", LinePath::stateName(s.state),
-        s.muted ? 1 : 0, s.routedToLine ? "I2S1(line)" : "I2S0(radio)", static_cast<int>(s.attenuationDb),
-        d.alive ? "up" : "down");
-    add("[LINE] blocks=%lu starts=%lu stalls=%lu recoveries=%lu readTimeouts=%lu readErrors=%lu\n",
-        LP_UL(s.blocks), LP_UL(s.starts), LP_UL(s.stalls), LP_UL(d.recoveries), LP_UL(s.readTimeouts),
-        LP_UL(s.readErrors));
-    add("[LINE] writeTimeouts=%lu rxOvf=%lu txOvf=%lu allocFailures=%lu maxProcess=%lu us "
-        "maxReadWait=%lu us\n",
-        LP_UL(s.writeTimeouts), LP_UL(s.rxOverflows), LP_UL(s.txOverflows), LP_UL(s.allocFailures),
-        LP_UL(s.maxProcessUs), LP_UL(s.maxReadWaitUs));
-    add("[LINE] peaks since lp.reset: in L %.1f R %.1f dBFS | out L %.1f R %.1f dBFS\n",
-        static_cast<double>(s.peakLeftDbfs), static_cast<double>(s.peakRightDbfs),
-        static_cast<double>(s.peakOutLeftDbfs), static_cast<double>(s.peakOutRightDbfs));
-    add("[LINE] eq: clipCount=%lu bypass=%d gains=%d %d %d %d %d dB\n", LP_UL(s.clipCount),
-        s_eqLine.bypass() ? 1 : 0, static_cast<int>(g[0]), static_cast<int>(g[1]), static_cast<int>(g[2]),
-        static_cast<int>(g[3]), static_cast<int>(g[4]));
-    add("[LINE] initMs=%lu lastStartMs=%lu stackFreeMin=%u B%s\n", LP_UL(s.initMs), LP_UL(s.lastStartMs),
-        static_cast<unsigned>(d.stackFreeMin), d.alive ? "" : " (last run)");
-    add("[LINE] last create: free %u -> %u B, largest %u -> %u B\n", static_cast<unsigned>(d.heapFreeBefore),
-        static_cast<unsigned>(d.heapFreeAfter), static_cast<unsigned>(d.heapLargestBefore),
-        static_cast<unsigned>(d.heapLargestAfter));
-
-    Serial.print(out);
+    lineOut("[LINE] state=%s xsmt=%s userMute=%d dout=%s volume=%.2f dB resources=%s\n",
+            LinePath::stateName(s.state), s.muted ? "low" : "high", s.userMuted ? 1 : 0,
+            s.routedToLine ? "I2S1(line)" : "I2S0(radio)", static_cast<double>(s.volumeDb),
+            d.alive ? "up" : "down");
+    lineOut("[LINE] blocks=%lu starts=%lu stalls=%lu recoveries=%lu readTimeouts=%lu readErrors=%lu\n",
+            LP_UL(s.blocks), LP_UL(s.starts), LP_UL(s.stalls), LP_UL(d.recoveries), LP_UL(s.readTimeouts),
+            LP_UL(s.readErrors));
+    lineOut("[LINE] writeTimeouts=%lu rxOvf=%lu txOvf=%lu allocFailures=%lu maxProcess=%lu us "
+            "maxReadWait=%lu us\n",
+            LP_UL(s.writeTimeouts), LP_UL(s.rxOverflows), LP_UL(s.txOverflows), LP_UL(s.allocFailures),
+            LP_UL(s.maxProcessUs), LP_UL(s.maxReadWaitUs));
+    lineOut("[LINE] peaks since lp.reset: in L %.1f R %.1f dBFS | out L %.1f R %.1f dBFS\n",
+            static_cast<double>(s.peakLeftDbfs), static_cast<double>(s.peakRightDbfs),
+            static_cast<double>(s.peakOutLeftDbfs), static_cast<double>(s.peakOutRightDbfs));
+    lineOut("[LINE] eq: clipCount=%lu bypass=%d gains=%d %d %d %d %d dB\n", LP_UL(s.clipCount),
+            s_eqLine.bypass() ? 1 : 0, static_cast<int>(g[0]), static_cast<int>(g[1]), static_cast<int>(g[2]),
+            static_cast<int>(g[3]), static_cast<int>(g[4]));
+    lineOut("[LINE] initMs=%lu lastStartMs=%lu stackFreeMin=%u B%s lastError=%s\n", LP_UL(s.initMs),
+            LP_UL(s.lastStartMs), static_cast<unsigned>(d.stackFreeMin), d.alive ? "" : " (last run)",
+            LinePath::errorName(s.lastError));
+    lineOut("[LINE] last create: free %u -> %u B, largest %u -> %u B\n", static_cast<unsigned>(d.heapFreeBefore),
+            static_cast<unsigned>(d.heapFreeAfter), static_cast<unsigned>(d.heapLargestBefore),
+            static_cast<unsigned>(d.heapLargestAfter));
     printHeap();
 }
 
-// lp.fault [мс]: зупинити споживання RX на ms і простежити Running -> Stalled -> Starting -> Running.
+// lp.fault [мс]: зупинити споживання RX і простежити Running -> Stalled -> Starting -> Running.
 void cmdFault(uint32_t ms) {
     if (ms <= cfg::kStallMs || ms > cfg::kFaultMaxMs) {
-        Serial.printf("[LINE] fault: duration must be > kStallMs (%lu) and <= %lu ms\n",
-                      static_cast<unsigned long>(cfg::kStallMs), static_cast<unsigned long>(cfg::kFaultMaxMs));
+        lineOut("[LINE] fault: duration must be > kStallMs (%lu) and <= %lu ms\n",
+                LP_UL(cfg::kStallMs), LP_UL(cfg::kFaultMaxMs));
         return;
     }
     if (!dbgFault(ms)) {
-        Serial.println("[LINE] fault rejected: state must be Running with no fault active (lp.start first)");
+        lineOut("[LINE] fault rejected: state must be Running with no fault active (lp.start first)\n");
         return;
     }
-    Serial.printf("[LINE] fault: RX blocks not consumed for %lu ms (stall threshold %lu ms)\n",
-                  static_cast<unsigned long>(ms), static_cast<unsigned long>(cfg::kStallMs));
+    lineOut("[LINE] fault: RX blocks not consumed for %lu ms (stall threshold %lu ms)\n", LP_UL(ms),
+            LP_UL(cfg::kStallMs));
 
     const uint32_t t0 = millis();
     const uint32_t deadline = ms + cfg::kFaultRecoverWaitMs;
@@ -840,8 +875,8 @@ void cmdFault(uint32_t ms) {
     while (millis() - t0 < deadline) {
         const LinePathStats s = LinePath::stats();
         if (s.state != last) {
-            Serial.printf("[LINE] fault t=%lu ms: %s -> %s (muted=%d)\n", static_cast<unsigned long>(millis() - t0),
-                          LinePath::stateName(last), LinePath::stateName(s.state), s.muted ? 1 : 0);
+            lineOut("[LINE] fault t=%lu ms: %s -> %s (xsmt muted=%d)\n", LP_UL(millis() - t0),
+                    LinePath::stateName(last), LinePath::stateName(s.state), s.muted ? 1 : 0);
             last = s.state;
         }
         if (s.state == LinePathState::Stalled) {
@@ -855,15 +890,13 @@ void cmdFault(uint32_t ms) {
         vTaskDelay(pdMS_TO_TICKS(5));
     }
     const LinePathStats f = LinePath::stats();
-    Serial.printf("[LINE] fault result: stalled=%s mutedInStall=%s recovered=%s -> %s (stalls=%lu, "
-                  "rxOvf=%lu txOvf=%lu; overflows during the injected fault are expected)\n",
-                  sawStalled ? "yes" : "NO", mutedInStall ? "yes" : "NO", recovered ? "yes" : "NO",
-                  (sawStalled && mutedInStall && recovered) ? "PASS" : "FAIL",
-                  static_cast<unsigned long>(f.stalls), static_cast<unsigned long>(f.rxOverflows),
-                  static_cast<unsigned long>(f.txOverflows));
+    lineOut("[LINE] fault result: stalled=%s mutedInStall=%s recovered=%s -> %s (stalls=%lu, "
+            "rxOvf=%lu txOvf=%lu; overflows during the injected fault are expected)\n",
+            sawStalled ? "yes" : "NO", mutedInStall ? "yes" : "NO", recovered ? "yes" : "NO",
+            (sawStalled && mutedInStall && recovered) ? "PASS" : "FAIL", LP_UL(f.stalls), LP_UL(f.rxOverflows),
+            LP_UL(f.txOverflows));
 }
 
-// Дочекатися умови з таймаутом.
 bool waitState(LinePathState want, uint32_t timeoutMs) {
     const uint32_t t0 = millis();
     while (LinePath::state() != want) {
@@ -885,15 +918,15 @@ bool waitTaskGone(uint32_t timeoutMs) {
 // lp.cycle <N>: N разів start -> пауза -> returnToRadio, друк free / largest після кожного.
 void cmdCycle(int n) {
     if (n < 1 || n > static_cast<int>(cfg::kCycleMaxCount)) {
-        Serial.printf("[LINE] cycle: N must be 1..%lu\n", static_cast<unsigned long>(cfg::kCycleMaxCount));
+        lineOut("[LINE] cycle: N must be 1..%lu\n", LP_UL(cfg::kCycleMaxCount));
         return;
     }
     if (LinePath::state() != LinePathState::Off || dbgInfo().alive) {
-        Serial.println("[LINE] cycle rejected: line path must be Off with resources released (lp.radio first)");
+        lineOut("[LINE] cycle rejected: line path must be Off with resources released (lp.radio first)\n");
         return;
     }
     if (AudioPlayer::state() != PlayerState::Idle) {
-        Serial.println("[LINE] cycle rejected: radio is not Idle (switch to an external input / stop it first)");
+        lineOut("[LINE] cycle rejected: radio is not Idle (switch to an external input / stop it first)\n");
         return;
     }
 
@@ -908,19 +941,18 @@ void cmdCycle(int n) {
     uint32_t            sumRx = 0;
     uint32_t            sumTx = 0;
     int                 done = 0;
-    Serial.printf("[LINE] cycle x%d: baseline (Idle, resources down) free=%d B, largest=%d B, rxOvf=%lu, txOvf=%lu\n",
-                  n, baseFree, baseLargest, static_cast<unsigned long>(prevRx), static_cast<unsigned long>(prevTx));
+    lineOut("[LINE] cycle x%d: baseline (Idle, resources down) free=%d B, largest=%d B, rxOvf=%lu, txOvf=%lu\n",
+            n, baseFree, baseLargest, LP_UL(prevRx), LP_UL(prevTx));
 
     for (int i = 1; i <= n; ++i) {
         if (!LinePath::start()) {
-            Serial.printf("[LINE] cycle %d: start() rejected (allocFailures=%lu) - abort\n", i,
-                          static_cast<unsigned long>(LinePath::stats().allocFailures));
+            lineOut("[LINE] cycle %d: start() rejected (%s) - abort\n", i,
+                    LinePath::errorName(LinePath::lastError()));
             break;
         }
         if (!waitState(LinePathState::Running, cfg::kCycleStartWaitMs)) {
-            Serial.printf("[LINE] cycle %d: not Running within %lu ms (state %s) - abort\n", i,
-                          static_cast<unsigned long>(cfg::kCycleStartWaitMs),
-                          LinePath::stateName(LinePath::state()));
+            lineOut("[LINE] cycle %d: not Running within %lu ms (state %s) - abort\n", i,
+                    LP_UL(cfg::kCycleStartWaitMs), LinePath::stateName(LinePath::state()));
             LinePath::returnToRadio();
             waitTaskGone(cfg::kCycleRadioWaitMs);
             break;
@@ -931,7 +963,7 @@ void cmdCycle(int n) {
 
         LinePath::returnToRadio();
         const bool gone = waitTaskGone(cfg::kCycleRadioWaitMs);
-        vTaskDelay(pdMS_TO_TICKS(cfg::kCycleFreeSettleMs));  // IDLE-задача звільняє стек і TCB
+        vTaskDelay(pdMS_TO_TICKS(cfg::kCycleFreeSettleMs));
         const int           f = static_cast<int>(heapFree());
         const int           l = static_cast<int>(heapLargest());
         const LinePathStats s = LinePath::stats();
@@ -945,18 +977,82 @@ void cmdCycle(int n) {
         lastFree = f;
         lastLargest = l;
         ++done;
-        Serial.printf("[LINE] cycle %d/%d: up free=%d largest=%d | down free=%d largest=%d "
-                      "(vs baseline: free %+d, largest %+d) | rx+%lu tx+%lu stalls=%lu%s\n",
-                      i, n, upFree, upLargest, f, l, f - baseFree, l - baseLargest,
-                      static_cast<unsigned long>(dRx), static_cast<unsigned long>(dTx),
-                      static_cast<unsigned long>(s.stalls), gone ? "" : " WARNING: task still alive");
+        lineOut("[LINE] cycle %d/%d: up free=%d largest=%d | down free=%d largest=%d "
+                "(vs baseline: free %+d, largest %+d) | rx+%lu tx+%lu stalls=%lu%s\n",
+                i, n, upFree, upLargest, f, l, f - baseFree, l - baseLargest, LP_UL(dRx), LP_UL(dTx),
+                LP_UL(s.stalls), gone ? "" : " WARNING: task still alive");
         if (!gone) break;
     }
-    Serial.printf("[LINE] cycle summary: %d done; free %d -> %d B (%+d), largest %d -> %d B (%+d), min largest %d B; "
-                  "overflows on transitions: rx +%lu, tx +%lu; allocFailures=%lu\n",
-                  done, baseFree, lastFree, lastFree - baseFree, baseLargest, lastLargest, lastLargest - baseLargest,
-                  minLargest, static_cast<unsigned long>(sumRx), static_cast<unsigned long>(sumTx),
-                  static_cast<unsigned long>(LinePath::stats().allocFailures));
+    lineOut("[LINE] cycle summary: %d done; free %d -> %d B (%+d), largest %d -> %d B (%+d), min largest %d B; "
+            "overflows on transitions: rx +%lu, tx +%lu; allocFailures=%lu\n",
+            done, baseFree, lastFree, lastFree - baseFree, baseLargest, lastLargest, lastLargest - baseLargest,
+            minLargest, LP_UL(sumRx), LP_UL(sumTx), LP_UL(LinePath::stats().allocFailures));
+}
+
+// lp.api: самотест публічного API. Не запускає прохід. Значення гучності / EQ тимчасово змінюються
+// і відновлюються; якщо прохід працює, на цей час можлива коротка зміна звуку.
+void apiCheck(const char* name, bool ok, int& fails) {
+    lineOut("[LINE] api %-30s %s\n", name, ok ? "PASS" : "FAIL");
+    if (!ok) {
+        ++fails;
+    }
+}
+
+void cmdApi() {
+    const float oldVol = LinePath::volumeDb();
+    const bool  oldMute = LinePath::userMuted();
+    int8_t      oldEq[eq_cfg::kBandCount];
+    LinePath::getEqAllDb(oldEq);
+    const bool oldBypass = LinePath::eqBypass();
+    int        fails = 0;
+
+    lineOut("[LINE] api self-test start\n");
+
+    LinePath::setVolumeDb(-40.0f);
+    apiCheck("volume set -40", fabsf(LinePath::volumeDb() + 40.0f) < 0.01f, fails);
+    LinePath::setVolumeDb(-200.0f);
+    apiCheck("volume clamp low -120", fabsf(LinePath::volumeDb() - line_path_cfg::kVolMinDb) < 0.01f, fails);
+    LinePath::setVolumeDb(0.0f);
+    apiCheck("volume clamp high -6", fabsf(LinePath::volumeDb() - line_path_cfg::kVolMaxDb) < 0.01f, fails);
+    LinePath::setVolumeDb(-37.5f);
+    apiCheck("volume fractional -37.5", fabsf(LinePath::volumeDb() + 37.5f) < 0.01f, fails);
+    LinePath::setAttenuationDb(-100);
+    apiCheck("att wrapper clamp -60", LinePath::attenuationDb() == line_path_cfg::kAttMinDb, fails);
+    apiCheck("stats volume matches", fabsf(LinePath::stats().volumeDb - LinePath::volumeDb()) < 0.01f, fails);
+
+    LinePath::setUserMute(true);
+    apiCheck("user mute on", LinePath::userMuted(), fails);
+    LinePath::setUserMute(false);
+    apiCheck("user mute off", !LinePath::userMuted(), fails);
+
+    LinePath::setEqBandDb(2, 3);
+    apiCheck("eq band set 3 dB", LinePath::getEqBandDb(2) == 3, fails);
+    LinePath::setEqBandDb(2, 50);
+    apiCheck("eq band clamp +12", LinePath::getEqBandDb(2) == eq_cfg::kGainMaxDb, fails);
+    LinePath::setEqBandDb(9, 5);
+    apiCheck("eq bad band ignored", LinePath::getEqBandDb(9) == 0, fails);
+    const int8_t pat[eq_cfg::kBandCount] = {1, -2, 3, -4, 5};
+    LinePath::setEqAllDb(pat);
+    int8_t got[eq_cfg::kBandCount] = {};
+    LinePath::getEqAllDb(got);
+    bool allEq = true;
+    for (uint8_t b = 0; b < eq_cfg::kBandCount; ++b) {
+        allEq = allEq && (got[b] == pat[b]);
+    }
+    apiCheck("eq all set/get", allEq, fails);
+
+    LinePath::setEqBypass(true);
+    apiCheck("eq bypass on", LinePath::eqBypass(), fails);
+    LinePath::setEqBypass(false);
+    apiCheck("eq bypass off", !LinePath::eqBypass(), fails);
+
+    // Відновлення попереднього стану.
+    LinePath::setVolumeDb(oldVol);
+    LinePath::setUserMute(oldMute);
+    LinePath::setEqAllDb(oldEq);
+    LinePath::setEqBypass(oldBypass);
+
+    lineOut("[LINE] api self-test: %s (%d failed)\n", fails == 0 ? "PASS" : "FAIL", fails);
 }
 
 #undef LP_UL
@@ -965,7 +1061,7 @@ void cmdCycle(int n) {
 
 void handleLine(const char* line) {
     if (strncmp(line, "lp.", 3) != 0) {
-        return;  // не наша команда (Serial можуть читати й інші тести)
+        return;
     }
     const char* c = line + 3;
     if (strcmp(c, "heap") == 0) {
@@ -974,37 +1070,57 @@ void handleLine(const char* line) {
     }
 #if LINE_PATH_ENABLE
     if (strcmp(c, "start") == 0) {
-        Serial.println(LinePath::start() ? "[LINE] start requested" : "[LINE] start rejected");
+        // Тестовий режим: звук одразу. Мʼют користувача знімається ДО старту (документовано).
+        LinePath::setUserMute(false);
+        lineOut(LinePath::start() ? "[LINE] start requested (user mute off)\n"
+                                  : "[LINE] start rejected\n");
+    } else if (strcmp(c, "rstart") == 0) {
+        LinePath::setUserMute(false);
+        lineOut(LinePath::requestStart() ? "[LINE] requestStart accepted (user mute off)\n"
+                                         : "[LINE] requestStart rejected\n");
     } else if (strcmp(c, "stop") == 0) {
-        Serial.println(LinePath::stop() ? "[LINE] stop requested" : "[LINE] stop rejected");
+        lineOut(LinePath::stop() ? "[LINE] stop requested\n" : "[LINE] stop rejected\n");
     } else if (strcmp(c, "radio") == 0) {
-        Serial.println(LinePath::returnToRadio() ? "[LINE] radio requested" : "[LINE] radio rejected");
+        lineOut(LinePath::returnToRadio() ? "[LINE] radio requested\n" : "[LINE] radio rejected\n");
     } else if (strcmp(c, "stat") == 0) {
         printStats();
     } else if (strncmp(c, "att ", 4) == 0) {
         const int v = atoi(c + 4);
-        if (v < cfg::kAttMinDb || v > cfg::kAttMaxDb) {
-            Serial.printf("[LINE] att out of range (%d..%d dB)\n", static_cast<int>(cfg::kAttMinDb),
-                          static_cast<int>(cfg::kAttMaxDb));
+        if (v < line_path_cfg::kAttMinDb || v > line_path_cfg::kAttMaxDb) {
+            lineOut("[LINE] att out of range (%d..%d dB); use lp.vol for -120..-6\n",
+                    static_cast<int>(line_path_cfg::kAttMinDb), static_cast<int>(line_path_cfg::kAttMaxDb));
         } else {
             LinePath::setAttenuationDb(static_cast<int8_t>(v));
-            Serial.printf("[LINE] att = %d dB (dsp_volume)\n", v);
+            lineOut("[LINE] att = %d dB (volume)\n", v);
         }
-    } else if (strncmp(c, "mute ", 5) == 0) {
-        // [P45] Цифровий мʼют dsp_volume (без XSMT). Переходи: kMuteRampMs / kRampMs.
-        const int v = atoi(c + 5);
-        s_dsp.setMute(v != 0);
-        Serial.printf("[LINE] dsp mute = %d\n", v != 0 ? 1 : 0);
+    } else if (strncmp(c, "vol ", 4) == 0) {
+        const float v = static_cast<float>(atof(c + 4));
+        if (!(v >= line_path_cfg::kVolMinDb && v <= line_path_cfg::kVolMaxDb)) {
+            lineOut("[LINE] vol out of range (%.0f..%.0f dB)\n", static_cast<double>(line_path_cfg::kVolMinDb),
+                    static_cast<double>(line_path_cfg::kVolMaxDb));
+        } else {
+            if (v < line_path_cfg::kWarnVolDb) {
+                lineOut("[LINE] WARNING: %.2f dB is below the usual %.0f..%.0f dB test range\n",
+                        static_cast<double>(v), static_cast<double>(line_path_cfg::kWarnVolDb),
+                        static_cast<double>(line_path_cfg::kVolMaxDb));
+            }
+            LinePath::setVolumeDb(v);
+            lineOut("[LINE] volume = %.2f dB\n", static_cast<double>(v));
+        }
+    } else if (strncmp(c, "mute ", 5) == 0 || strncmp(c, "usermute ", 9) == 0) {
+        const int v = atoi(c + (c[0] == 'm' ? 5 : 9));
+        LinePath::setUserMute(v != 0);
+        lineOut("[LINE] user mute = %d\n", v != 0 ? 1 : 0);
     } else if (strncmp(c, "eq ", 3) == 0) {
         int band = -1;
         int db = 0;
         if (sscanf(c + 3, "%d %d", &band, &db) != 2 || band < 0 || band >= eq_cfg::kBandCount ||
             db < eq_cfg::kGainMinDb || db > eq_cfg::kGainMaxDb) {
-            Serial.printf("[LINE] eq: usage lp.eq <band 0..%d> <%d..%d dB>\n",
-                          static_cast<int>(eq_cfg::kBandCount) - 1, eq_cfg::kGainMinDb, eq_cfg::kGainMaxDb);
+            lineOut("[LINE] eq: usage lp.eq <band 0..%d> <%d..%d dB>\n",
+                    static_cast<int>(eq_cfg::kBandCount) - 1, eq_cfg::kGainMinDb, eq_cfg::kGainMaxDb);
         } else {
-            s_eqLine.setBandDb(static_cast<uint8_t>(band), static_cast<int8_t>(db));
-            Serial.printf("[LINE] eq band %d = %d dB\n", band, db);
+            LinePath::setEqBandDb(static_cast<uint8_t>(band), static_cast<int8_t>(db));
+            lineOut("[LINE] eq band %d = %d dB\n", band, db);
         }
     } else if (strncmp(c, "eqall ", 6) == 0) {
         int g[eq_cfg::kBandCount] = {};
@@ -1014,31 +1130,29 @@ void handleLine(const char* line) {
             ok = (g[b] >= eq_cfg::kGainMinDb && g[b] <= eq_cfg::kGainMaxDb);
         }
         if (!ok) {
-            Serial.printf("[LINE] eqall: usage lp.eqall <5 values, %d..%d dB each>\n", eq_cfg::kGainMinDb,
-                          eq_cfg::kGainMaxDb);
+            lineOut("[LINE] eqall: usage lp.eqall <5 values, %d..%d dB each>\n", eq_cfg::kGainMinDb,
+                    eq_cfg::kGainMaxDb);
         } else {
             int8_t v[eq_cfg::kBandCount];
             for (uint8_t b = 0; b < eq_cfg::kBandCount; ++b) {
                 v[b] = static_cast<int8_t>(g[b]);
             }
-            s_eqLine.setAllDb(v);
-            Serial.printf("[LINE] eqall = %d %d %d %d %d dB\n", g[0], g[1], g[2], g[3], g[4]);
+            LinePath::setEqAllDb(v);
+            lineOut("[LINE] eqall = %d %d %d %d %d dB\n", g[0], g[1], g[2], g[3], g[4]);
         }
     } else if (strncmp(c, "eqbypass ", 9) == 0) {
         const int v = atoi(c + 9);
-        s_eqLine.setBypass(v != 0);
-        Serial.printf("[LINE] eq bypass = %d\n", v != 0 ? 1 : 0);
+        LinePath::setEqBypass(v != 0);
+        lineOut("[LINE] eq bypass = %d\n", v != 0 ? 1 : 0);
     } else if (strcmp(c, "eqshow") == 0) {
         int8_t g[eq_cfg::kBandCount];
-        s_eqLine.getAllDb(g);
-        Serial.printf("[LINE] eq gains %d %d %d %d %d dB, bypass=%d, rate=%lu Hz, clipCount=%lu\n",
-                      static_cast<int>(g[0]), static_cast<int>(g[1]), static_cast<int>(g[2]),
-                      static_cast<int>(g[3]), static_cast<int>(g[4]), s_eqLine.bypass() ? 1 : 0,
-                      static_cast<unsigned long>(s_eqLine.sampleRate()),
-                      static_cast<unsigned long>(s_eqLine.clipCount()));
+        LinePath::getEqAllDb(g);
+        lineOut("[LINE] eq gains %d %d %d %d %d dB, bypass=%d, clipCount=%lu\n", static_cast<int>(g[0]),
+                static_cast<int>(g[1]), static_cast<int>(g[2]), static_cast<int>(g[3]), static_cast<int>(g[4]),
+                LinePath::eqBypass() ? 1 : 0, static_cast<unsigned long>(LinePath::stats().clipCount));
     } else if (strcmp(c, "reset") == 0) {
         LinePath::resetStats();
-        Serial.println("[LINE] stats reset");
+        lineOut("[LINE] stats reset\n");
     } else if (strcmp(c, "fault") == 0) {
         cmdFault(cfg::kFaultDefaultMs);
     } else if (strncmp(c, "fault ", 6) == 0) {
@@ -1046,13 +1160,15 @@ void handleLine(const char* line) {
         cmdFault(v > 0 ? static_cast<uint32_t>(v) : 0u);
     } else if (strncmp(c, "cycle ", 6) == 0) {
         cmdCycle(atoi(c + 6));
+    } else if (strcmp(c, "api") == 0) {
+        cmdApi();
     } else {
-        Serial.println("[LINE] commands: lp.start lp.stop lp.radio lp.stat lp.reset lp.att <dB> "
-                       "lp.mute 0|1 lp.eq <band> <dB> lp.eqall <5 values> lp.eqbypass 0|1 lp.eqshow "
-                       "lp.fault [ms] lp.cycle <N> lp.heap");
+        lineOut("[LINE] commands: lp.start lp.rstart lp.stop lp.radio lp.stat lp.reset\n");
+        lineOut("[LINE] lp.att <dB> lp.vol <dB> lp.mute|lp.usermute 0|1 lp.eq <band> <dB> lp.eqall <5 values>\n");
+        lineOut("[LINE] lp.eqbypass 0|1 lp.eqshow lp.fault [ms] lp.cycle <N> lp.api lp.heap\n");
     }
 #else
-    Serial.println("[LINE] line path disabled (LINE_PATH_ENABLE = 0): only lp.heap is available");
+    lineOut("[LINE] line path disabled (LINE_PATH_ENABLE = 0): only lp.heap is available\n");
 #endif
 }
 
@@ -1076,7 +1192,6 @@ void testTask(void*) {
     }
 }
 
-// Створити задачу Serial-тесту (один раз). Резидентна: ≈4 КБ стека — однакові при LINE_PATH_ENABLE 0 і 1.
 void startTestTask() {
     static bool started = false;
     if (started) {
@@ -1086,9 +1201,9 @@ void startTestTask() {
     if (xTaskCreatePinnedToCore(testTask, "line_test", cfg::kTestTaskStackBytes, nullptr,
                                 cfg::kTestTaskPriority, &testHandle, cfg::kTestTaskCore) == pdPASS) {
         started = true;
-        Serial.println("[LINE] test mode ready (send 'lp.help')");
+        lineOut("[LINE] test mode ready (send 'lp.help' or 'lp.api')\n");
     } else {
-        Serial.println("[LINE] test task create failed");
+        lineOut("[LINE] test task create failed\n");
     }
 }
 
@@ -1113,14 +1228,14 @@ bool LinePath::begin() {
     const uint32_t t0 = millis();
     s_initSem = xSemaphoreCreateBinaryStatic(&s_initSemBuf);
     if (s_initSem == nullptr) {
-        Serial.println("[LINE] begin failed: semaphore");
+        lineOut("[LINE] begin failed: semaphore\n");
         return false;
     }
-    // [P45] DSP до старту задачі (єдиний потік ще не працює): fs проходу, плаский EQ, мʼют, послаблення.
     s_eqLine.setSampleRate(cfg::kFsHz);
     s_dsp.setSampleRate(cfg::kFsHz);
-    s_dsp.setAttenuationDb(static_cast<float>(s_attDb));
+    s_dsp.setAttenuationDb(cfg::kStartVolumeDb);
     s_dsp.forceMute();
+    applyMute();  // мʼют користувача типово увімкнений; стан Off
     startTestTask();
     s_initMs = millis() - t0;
     s_ready = true;
@@ -1138,7 +1253,16 @@ bool LinePath::start() {
     if (!s_ready || __atomic_exchange_n(&s_opLock, true, __ATOMIC_ACQ_REL)) {
         return false;
     }
-    const bool ok = startLocked();
+    const bool ok = startLocked(true);
+    __atomic_store_n(&s_opLock, false, __ATOMIC_RELEASE);
+    return ok;
+}
+
+bool LinePath::requestStart() {
+    if (!s_ready || __atomic_exchange_n(&s_opLock, true, __ATOMIC_ACQ_REL)) {
+        return false;
+    }
+    const bool ok = startLocked(false);
     __atomic_store_n(&s_opLock, false, __ATOMIC_RELEASE);
     return ok;
 }
@@ -1166,8 +1290,6 @@ bool LinePath::returnToRadio() {
         if (s_taskAlive) {
             s_req = kReqRadio;
         } else {
-            // Ресурсів уже нема, GPIO18 на I2S0 (так лишає кожен шлях виходу). Лише страхуємося, що
-            // фіксацію 48 кГц знято (асинхронно, лише при Idle радіо).
             LINE_LOG("[LINE] radio: resources already released\n");
             if (AudioPlayer::fixedOutputRate()) {
                 AudioPlayer::setFixedOutputRate(false);
@@ -1180,8 +1302,15 @@ bool LinePath::returnToRadio() {
 
 bool LinePath::isRunning() {
     const LinePathState st = s_state;
-    return st == LinePathState::Starting || st == LinePathState::Running ||
-           st == LinePathState::Stalled;
+    return st == LinePathState::Starting || st == LinePathState::Running || st == LinePathState::Stalled;
+}
+
+bool LinePath::isStable() {
+    return s_state == LinePathState::Running;
+}
+
+bool LinePath::resourcesUp() {
+    return s_taskAlive;
 }
 
 LinePathState LinePath::state() {
@@ -1199,15 +1328,71 @@ const char* LinePath::stateName(LinePathState s) {
     return "?";
 }
 
+LinePathError LinePath::lastError() {
+    return s_lastError;
+}
+
+const char* LinePath::errorName(LinePathError e) {
+    return errorNameImpl(e);
+}
+
+void LinePath::setVolumeDb(float db) {
+    if (!(db >= line_path_cfg::kVolMinDb)) {  // також NaN
+        db = line_path_cfg::kVolMinDb;
+    }
+    if (db > line_path_cfg::kVolMaxDb) {
+        db = line_path_cfg::kVolMaxDb;
+    }
+    s_dsp.setAttenuationDb(db);
+}
+
+float LinePath::volumeDb() {
+    return s_dsp.attenuationDb();
+}
+
 void LinePath::setAttenuationDb(int8_t db) {
-    if (db < cfg::kAttMinDb) db = cfg::kAttMinDb;
-    if (db > cfg::kAttMaxDb) db = cfg::kAttMaxDb;
-    s_attDb = db;
-    s_dsp.setAttenuationDb(static_cast<float>(db));  // [P45] через dsp_volume (перехід у задачі)
+    if (db < line_path_cfg::kAttMinDb) db = line_path_cfg::kAttMinDb;
+    if (db > line_path_cfg::kAttMaxDb) db = line_path_cfg::kAttMaxDb;
+    setVolumeDb(static_cast<float>(db));
 }
 
 int8_t LinePath::attenuationDb() {
-    return s_attDb;
+    return static_cast<int8_t>(lroundf(s_dsp.attenuationDb()));
+}
+
+void LinePath::setUserMute(bool mute) {
+    portENTER_CRITICAL(&s_muxMute);
+    s_userMute = mute;
+    portEXIT_CRITICAL(&s_muxMute);
+    applyMute();
+}
+
+bool LinePath::userMuted() {
+    return s_userMute;
+}
+
+void LinePath::setEqBandDb(uint8_t band, int8_t db) {
+    s_eqLine.setBandDb(band, db);
+}
+
+int8_t LinePath::getEqBandDb(uint8_t band) {
+    return s_eqLine.getBandDb(band);
+}
+
+void LinePath::setEqAllDb(const int8_t gains[eq_cfg::kBandCount]) {
+    s_eqLine.setAllDb(gains);
+}
+
+void LinePath::getEqAllDb(int8_t out[eq_cfg::kBandCount]) {
+    s_eqLine.getAllDb(out);
+}
+
+void LinePath::setEqBypass(bool on) {
+    s_eqLine.setBypass(on);
+}
+
+bool LinePath::eqBypass() {
+    return s_eqLine.bypass();
 }
 
 LinePathStats LinePath::stats() {
@@ -1215,7 +1400,7 @@ LinePathStats LinePath::stats() {
     s.state = s_state;
     s.muted = s_muted;
     s.routedToLine = s_routed;
-    s.attenuationDb = s_attDb;
+    s.attenuationDb = attenuationDb();
     s.blocks = s_blocks;
     s.readTimeouts = s_readTimeouts;
     s.readErrors = s_readErrors;
@@ -1236,6 +1421,9 @@ LinePathStats LinePath::stats() {
         (s_peakOutR > 0) ? 20.0f * log10f(static_cast<float>(s_peakOutR) / 2147483648.0f) : -99.0f;
     s.allocFailures = s_allocFailures;
     s.clipCount = s_eqLine.clipCount();
+    s.volumeDb = s_dsp.attenuationDb();
+    s.userMuted = s_userMute;
+    s.lastError = s_lastError;
     return s;
 }
 
@@ -1254,21 +1442,43 @@ void LinePath::resetStats() {
 
 #else  // LINE_PATH_ENABLE
 
-// Модуль вимкнено: лише Serial-тест (lp.heap) для еталонного заміру RAM без line_path.
+// Модуль вимкнено: лише Serial-тест (lp.heap). Усі методи — безпечні заглушки.
 bool LinePath::begin() {
     startTestTask();
     return false;
 }
 bool LinePath::isReady() { return false; }
 bool LinePath::start() { return false; }
+bool LinePath::requestStart() { return false; }
 bool LinePath::stop() { return false; }
 bool LinePath::returnToRadio() { return false; }
 bool LinePath::isRunning() { return false; }
+bool LinePath::isStable() { return false; }
+bool LinePath::resourcesUp() { return false; }
 LinePathState LinePath::state() { return LinePathState::Off; }
 const char* LinePath::stateName(LinePathState) { return "Off"; }
+LinePathError LinePath::lastError() { return LinePathError::None; }
+const char* LinePath::errorName(LinePathError e) { return errorNameImpl(e); }
+void LinePath::setVolumeDb(float) {}
+float LinePath::volumeDb() { return line_path_cfg::kStartVolumeDb; }
 void LinePath::setAttenuationDb(int8_t) {}
-int8_t LinePath::attenuationDb() { return line_path_cfg::kPrototypeAttenuationDb; }
-LinePathStats LinePath::stats() { return LinePathStats{}; }
+int8_t LinePath::attenuationDb() { return static_cast<int8_t>(line_path_cfg::kStartVolumeDb); }
+void LinePath::setUserMute(bool) {}
+bool LinePath::userMuted() { return true; }
+void LinePath::setEqBandDb(uint8_t, int8_t) {}
+int8_t LinePath::getEqBandDb(uint8_t) { return 0; }
+void LinePath::setEqAllDb(const int8_t[eq_cfg::kBandCount]) {}
+void LinePath::getEqAllDb(int8_t out[eq_cfg::kBandCount]) {
+    for (uint8_t b = 0; b < eq_cfg::kBandCount; ++b) out[b] = 0;
+}
+void LinePath::setEqBypass(bool) {}
+bool LinePath::eqBypass() { return false; }
+LinePathStats LinePath::stats() {
+    LinePathStats s = {};
+    s.volumeDb = line_path_cfg::kStartVolumeDb;
+    s.userMuted = true;
+    return s;
+}
 void LinePath::resetStats() {}
 
 #endif  // LINE_PATH_ENABLE
