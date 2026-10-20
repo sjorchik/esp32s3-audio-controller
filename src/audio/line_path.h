@@ -12,6 +12,7 @@
 // ЖИТТЄВИЙ ЦИКЛ РЕСУРСІВ (P44b): begin() нічого не виділяє. start() / requestStart() створюють
 // буфер блоку, задачу line_path і канали I2S1 (задача). returnToRadio() знищує їх; stop() ресурси лишає.
 //
+// [Prompt 48b] ДОДАНО: setBalanceDb() / balanceDb() — цифровий баланс зовнішніх входів (DspVolume проходу).
 // ГУЧНІСТЬ, МʼЮТ, EQ (P47b):
 //  - Гучність проходу: setVolumeDb(float) у [line_path_cfg::kVolMinDb, kVolMaxDb] = [−120, −6] дБ.
 //    Верх −6 дБ — жорсткий максимум. Значення діє і до старту; до першого задання — kStartVolumeDb (−60).
@@ -135,6 +136,12 @@ public:
     // Мʼют користувача (цифровий, плавний). Не розмʼючує прохід сам і не залежить від станів.
     static void setUserMute(bool mute);
     static bool userMuted();
+
+    // [Prompt 48b] Цифровий баланс проходу, дБ (обрізається до balance_cfg::kMinDb..kMaxDb): додатне = вправо (лівий
+    // канал послаблюється), від'ємне = вліво, 0 = без змін. Той самий DspVolume проходу, ПІСЛЯ гучності;
+    // перехід 30 мс. Діє й до старту проходу (значення переживає stop / returnToRadio). Будь-яка задача.
+    static void setBalanceDb(int8_t db);
+    static int8_t balanceDb();
 
     // EQ входу (власний екземпляр eq::Processor проходу). Діапазон і обрізання — як у фасаді eq.
     static void setEqBandDb(uint8_t band, int8_t db);

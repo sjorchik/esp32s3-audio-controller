@@ -44,6 +44,10 @@
 // [Prompt 47c] ДОДАНО: applyLineEq(). Зовнішні входи 1..4 звучать через audio/line_path: AppController сам керує
 //             проходом (старт, гучність, мʼют користувача, EQ входу, перемикання, звільнення ресурсів).
 //             Решту публічного інтерфейсу не змінено.
+// [Prompt 48b] ДОДАНО: WebCmdType::BalanceSet (баланс активного входу, дБ), reason "balance_out_of_range". Баланс — ЦИФРОВИЙ,
+//             індивідуальний для кожного входу (Settings::profiles[i].balanceDb), застосовується в DSP радіо
+//             (radio_volume) або проходу (LinePath). Керування: клік енкодера перемикає ціль Volume <-> Balance, IR
+//             BALANCE_UP / BALANCE_DOWN, веб. Решту публічного інтерфейсу не змінено.
 // [Prompt 46a] Чип — лише селектор входів; профіль входу = {гучність, пресет EQ}. ПУБЛІЧНІ СИГНАТУРИ НЕ ЗМІНЕНО,
 //             змінилась лише семантика: setTone() приймає й ІГНОРУЄ тембр/баланс/loudness (*Ok = true для
 //             запитаних полів, які мав чип; у чіп, профіль і AppState нічого не йде); WebCmdType::GainSet
@@ -87,6 +91,8 @@ struct ToneUpdate {
 //   StationPlay   value = індекс станції; flag = true -> якщо активний інший вхід, перейти на Radio
 //   StationNext   - (напрямок як у кнопки RIGHT)
 //   StationPrev   - (напрямок як у кнопки LEFT)
+//   BalanceSet    value = баланс АКТИВНОГО входу, дБ (balance_cfg::kMinDb..kMaxDb; додатне = вправо) [Prompt 48b].
+//                 Поза діапазоном -> OutOfRange ("balance_out_of_range"); у Standby -> NotAllowed ("standby").
 //   InputsEnabledSet  value = нова МАСКА дозволених входів (біт i = вхід i; значення нормалізується:
 //                     біт 0 завжди 1, зайві біти скидаються) [Prompt 39]. Єдина команда, дозволена
 //                     в Standby (крім живлення). Якщо активний вхід став вимкненим — перехід на
@@ -107,6 +113,7 @@ enum class WebCmdType : uint8_t {
     StationNext,
     StationPrev,
     InputsEnabledSet,  // [Prompt 39] ДОДАНО (лише в кінець enum)
+    BalanceSet,        // [Prompt 48b] ДОДАНО (лише в кінець enum)
 };
 
 struct WebCommand {
@@ -191,7 +198,7 @@ public:
     // *reasonOut (якщо не nullptr) — статичний рядок snake_case для NotAllowed/OutOfRange/
     // Unsupported/Busy: "ota_in_progress", "ir_learn_active", "standby", "not_radio_input",
     // "wifi_setup", "no_stations", "input_unavailable", "station_out_of_range",
-    // "volume_out_of_range", "not_supported" (GainSet), "busy"; [Prompt 39] + "input_disabled"
+    // "volume_out_of_range", "balance_out_of_range" [Prompt 48b], "not_supported" (GainSet), "busy"; [Prompt 39] + "input_disabled"
     // (InputSet на вхід, вимкнений маскою входів -> NotAllowed); інакше nullptr.
     // Стан публікується в AppState і (за потреби) зберігається в Settings до повернення.
     static WebCmdResult runWebCommand(const WebCommand& cmd, const char** reasonOut = nullptr);

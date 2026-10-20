@@ -182,6 +182,7 @@
 #include "audio/line_path.h"     // [Prompt 47c]
 #include "audio/radio_volume.h"  // [Prompt 47a]
 #include "config/amp_config.h"  // [Prompt 23c]
+#include "config/balance_config.h"  // [Prompt 48b] діапазон / крок балансу, kSwapChannels
 #include "config/app_controller_config.h"
 #include "config/defaults.h"
 #include "config/features.h"  // [Prompt 23c]
@@ -220,8 +221,12 @@ static_assert(app_controller_cfg::kExtMuteSettleMs < amp_cfg::kAmpOffDelayMs,
 
 #if APP_CONTROLLER_DEBUG
 #define APP_LOG(...) Serial.printf("[APP] " __VA_ARGS__)
+#define BAL_LOG(...) Serial.printf("[BAL] " __VA_ARGS__)  // [Prompt 48b]
 #else
 #define APP_LOG(...) \
+    do {             \
+    } while (0)
+#define BAL_LOG(...) \
     do {             \
     } while (0)
 #endif
@@ -255,7 +260,9 @@ bool s_userMute = false;
 // [Prompt 21b/46a] Гучності профілів усіх логічних входів (включно з входом 3, якого PT2313L не має).
 // Пресет EQ у контролері НЕ дублюється (живе лише в Settings::profiles[i].eqGainsDb).
 int8_t s_volumes[defaults::kInputCount] = {};
-AdjustTarget s_target = AdjustTarget::Volume;  // [Prompt 46a] завжди Volume (поле AppState.adjustTarget)
+AdjustTarget s_target = AdjustTarget::Volume;  // [Prompt 48b] ціль обертання енкодера: Volume <-> Balance (клік), таймаут -> Volume
+uint32_t s_lastEncMs = 0;                      // [Prompt 48b] момент останньої події енкодера (для автоповернення цілі)
+int8_t s_balance = balance_cfg::kDefaultDb;    // [Prompt 48b] баланс АКТИВНОГО входу, дБ (профіль входу s_input)
 // [Prompt 32] Подія «показати спливне вікно параметра»: що показувати і лічильник подій.
 // Лічильник росте лише на ЛОКАЛЬНІ зміни (handleLocked); веб-команди (runWebCommand) його не чіпають.
 AdjustTarget s_popupTarget = AdjustTarget::Volume;
@@ -586,8 +593,9 @@ void stopStream() {
 }
 
 // [Prompt 46a] Єдина підтримувана ціль регулювання — гучність (бас/дискант/баланс/gain прибрано).
+// [Prompt 48b] Баланс повернувся (цифровий): підтримуються Volume і Balance.
 bool targetSupported(AdjustTarget t) {
-    return t == AdjustTarget::Volume;
+    return t == AdjustTarget::Volume || t == AdjustTarget::Balance;
 }
 
 // --- [Prompt 21b/46a] Профілі входів -------------------------------------------
@@ -628,6 +636,42 @@ void applyActiveVolume() {
     }
 }
 
+// --- [Prompt 48b] Баланс (цифровий, ±balance_cfg::kMaxDb дБ, індивідуальний для кожного входу) ---------------
+// s_balance — баланс АКТИВНОГО входу; джерело правди — Settings::profiles[i].balanceDb. Радіо: DSP радіо
+// (radio_volume, хук audio_process_i2s); зовнішні входи: DSP проходу (LinePath). Перехід 30 мс робить DSP, тож
+// застосування під мʼютом (зміна входу, standby) і «наживо» (енкодер / IR / веб) однакове.
+void logBalance(uint8_t input, int8_t db) {
+    const int l = db > 0 ? -static_cast<int>(db) : 0;  // послаблення лівого, дБ (≤ 0)
+    const int r = db < 0 ? static_cast<int>(db) : 0;   // послаблення правого, дБ (≤ 0)
+    (void)input;
+    (void)l;
+    (void)r;
+    BAL_LOG("input=%u balance=%+d (L=%ddB R=%ddB)%s\n", static_cast<unsigned>(input), static_cast<int>(db), l, r,
+            balance_cfg::kSwapChannels ? " [channels swapped]" : "");
+}
+
+void applyRadioBalance() {
+    radio_volume::setBalanceDb(s_balance);
+}
+
+// Баланс поточного зовнішнього входу -> прохід (діє й до старту проходу; значення переживає stop / returnToRadio).
+void lineApplyBalance() {
+#if LINE_PATH_ENABLE
+    if (LinePath::isReady()) {
+        LinePath::setBalanceDb(s_balance);
+    }
+#endif
+}
+
+// Живе застосування балансу активного шляху: радіо (s_input == 0) або прохід.
+void applyActiveBalance() {
+    if (s_input == 0) {
+        applyRadioBalance();
+    } else {
+        lineApplyBalance();
+    }
+}
+
 // s_volumes[idx] -> робоча гучність, обрізана за capabilities() поточного чипа.
 // Чипа не торкається й AppState не публікує (це робить викликач). [P47a] Оновлює цифрову гучність радіо.
 void loadActiveFromProfile(uint8_t idx) {
@@ -639,6 +683,15 @@ void loadActiveFromProfile(uint8_t idx) {
     // входу чіпа (lineApplyParams()), щоб не міняти звук старого входу, поки він ще згасає.
     if (idx == 0) {
         applyRadioVolume();
+    }
+    // [Prompt 48b] Баланс входу — з профілю в Settings (його пише контролер при зміні, веб — для неактивних входів).
+    // Радіо — у DSP радіо одразу (воно в мʼюті / не грає); зовнішній — разом із гучністю й EQ (lineApplyParams()).
+    {
+        const Settings st = SettingsStore::snapshot();
+        s_balance = balance_cfg::sanitizeDb(st.profiles[idx].balanceDb);
+    }
+    if (idx == 0) {
+        applyRadioBalance();
     }
 }
 
@@ -827,6 +880,7 @@ struct PubCtx {
     AdjustTarget popupTarget;  // [Prompt 32]
     uint8_t popupSeq;          // [Prompt 32]
     uint8_t inputEnabledMask;  // [Prompt 39]
+    int8_t balanceDb;          // [Prompt 48b]
     char inputName[kInputNameMax];  // [Prompt 23b]
 };
 
@@ -852,13 +906,14 @@ void applyPub(AppStateData& s, void* c) {
     s.popupTarget = p->popupTarget;  // [Prompt 32]
     s.popupSeq = p->popupSeq;        // [Prompt 32]
     s.inputEnabledMask = p->inputEnabledMask;  // [Prompt 39]
+    s.balanceDb = p->balanceDb;                // [Prompt 48b]
     memcpy(s.inputName, p->inputName, sizeof(s.inputName));  // [Prompt 23b]
 }
 
 void publishState() {
     PubCtx p = {s_mode,        s_input,   s_volume,  s_userMute, s_station,
                 s_target,      s_menuCtx, s_menuSel, s_offline,  restarting(),
-                s_popupTarget, s_popupSeq, s_inputMask};
+                s_popupTarget, s_popupSeq, s_inputMask, s_balance};
     resolveInputName(s_input, p.inputName, sizeof(p.inputName));  // [Prompt 23b]
     AppState::modify(applyPub, &p);
 }
@@ -1038,6 +1093,36 @@ bool setVolumeTarget(int v) {
     return true;
 }
 
+// --- [Prompt 48b] Баланс ----------------------------------------------------------------------------------
+// Запис балансу активного входу в Settings (окремо від persist(): persist() баланс НЕ чіпає, тож веб-запис
+// балансу НЕАКТИВНОГО входу не буде затерто, а factory-reset не отримає «старий» баланс зі стану контролера).
+struct BalancePersistCtx {
+    uint8_t input;
+    int8_t db;
+};
+
+void applyBalancePersist(Settings& st, void* c) {
+    const BalancePersistCtx* p = static_cast<const BalancePersistCtx*>(c);
+    if (p->input < defaults::kInputCount) {
+        st.profiles[p->input].balanceDb = balance_cfg::sanitizeDb(p->db);
+    }
+}
+
+// Змінює баланс активного входу (обрізається до балансових меж), застосовує в DSP й пише в профіль.
+// true — значення змінилось. SettingsStore::modify() — NVS з дебаунсом (не на кожен крок енкодера).
+bool setBalanceTarget(int v) {
+    v = clampInt(v, balance_cfg::kMinDb, balance_cfg::kMaxDb);
+    if (v == s_balance) {
+        return false;
+    }
+    s_balance = static_cast<int8_t>(v);
+    applyActiveBalance();
+    BalancePersistCtx ctx = {s_input, s_balance};
+    SettingsStore::modify(applyBalancePersist, &ctx);
+    logBalance(s_input, s_balance);
+    return true;
+}
+
 // Початок переходу: мʼют ПЕРШИМ (цифровий радіо з очікуванням згасання, потім чип). Розмʼют — у tick()
 // після kUnmuteDelayMs і прогріву підсилювача. Якщо перехід уже йде — просто перезапускає таймер.
 void startTransition() {
@@ -1111,6 +1196,7 @@ void lineApplyEq(uint8_t idx) {
 // Гучність + EQ поточного зовнішнього входу -> прохід.
 void lineApplyParams() {
     lineApplyVolume();
+    lineApplyBalance();  // [Prompt 48b]
     lineApplyEq(s_input);
 }
 
@@ -1616,9 +1702,21 @@ void togglePlayPause() {
     }
 }
 
+// [Prompt 48b] Клік енкодера: ціль обертання Volume <-> Balance (решта значень AdjustTarget в цикл не входить).
+// Повернення на Volume — таймаутом (tickLocked), у standby / при вмиканні — powerOnTransition() / enterStandby().
+void cycleAdjustTarget() {
+    s_target = (s_target == AdjustTarget::Balance) ? AdjustTarget::Volume : AdjustTarget::Balance;
+    APP_LOG("encoder target: %s\n", s_target == AdjustTarget::Balance ? "Balance" : "Volume");
+}
+
 // Один «крок» цілі t у напрямку знака d (|d| = кількість detent-ів).
 // [Prompt 46a] Регулюється лише гучність (бас/дискант/баланс/gain і цикл цілей прибрано).
+// [Prompt 48b] Підтримуються гучність і баланс (±balance_cfg::kStepDb на крок; d — кількість кроків зі знаком).
 void adjustParam(AdjustTarget t, int d) {
+    if (t == AdjustTarget::Balance) {
+        setBalanceTarget(static_cast<int>(s_balance) + d * balance_cfg::kStepDb);
+        return;
+    }
     if (t != AdjustTarget::Volume) {
         return;
     }
@@ -2022,6 +2120,8 @@ void popupForEvent(const Event& e) {
             break;
         case Action::VOL_UP:
         case Action::VOL_DOWN:     notifyPopup(AdjustTarget::Volume);  break;
+        case Action::BALANCE_UP:   // [Prompt 48b] екран (P49) малює Balance за AppState.popupTarget
+        case Action::BALANCE_DOWN: notifyPopup(AdjustTarget::Balance); break;
         default:
             break;
     }
@@ -2070,6 +2170,10 @@ void handleLocked(const Event& e) {
         // [Prompt 12] WifiSetup тут більше не ігнорується: перемикання входу й
         // гучність працюють (радіо без Wi-Fi недоступне, зовнішні входи — так).
     } else {
+        // [Prompt 48b] Будь-яка подія енкодера (обертання, клік, утримання) відкладає автоповернення цілі.
+        if (e.action == Action::ENC_CW || e.action == Action::ENC_CCW || e.action == Action::ENC_PRESS) {
+            s_lastEncMs = millis();
+        }
         bool handled = true;
         switch (e.action) {
             // Глобальні дії: однакові на головному екрані й у списку.
@@ -2084,16 +2188,20 @@ void handleLocked(const Event& e) {
             case Action::BASS_DOWN:
             case Action::TREBLE_UP:
             case Action::TREBLE_DOWN:
-            case Action::BALANCE_UP:
-            case Action::BALANCE_DOWN:
             case Action::GAIN_UP:
             case Action::GAIN_DOWN:
-                if (!e.repeat) APP_LOG("tone/balance/gain action ignored (controls removed)\n");
+                if (!e.repeat) APP_LOG("tone/gain action ignored (controls removed)\n");
                 break;
+            // [Prompt 48b] Баланс повернувся: IR BALANCE_UP / BALANCE_DOWN = ±kStepDb (повтор утримання — як у гучності).
+            case Action::BALANCE_UP:   adjustParam(AdjustTarget::Balance, +1); break;
+            case Action::BALANCE_DOWN: adjustParam(AdjustTarget::Balance, -1); break;
             case Action::ENC_PRESS:
-                // [Prompt 46a] Довге утримання = мʼют; короткий клік більше не міняє ціль (лише вікно гучності).
+                // Довге утримання = мʼют. [Prompt 48b] Короткий клік на головному екрані перемикає ціль обертання
+                // Volume <-> Balance (у списку станцій клік, як і раніше, нічого не робить).
                 if (e.longPress) {
                     toggleUserMute();
+                } else if (!e.repeat && (s_mode == Mode::Radio || s_mode == Mode::ExternalInput)) {
+                    cycleAdjustTarget();
                 }
                 break;
             default:
@@ -2158,6 +2266,14 @@ void tickLocked() {
     ampService(now);  // [Prompt 23c]
     restartService(now);  // [Prompt 28] (ESP.restart() не повертається)
     lineService(now);     // [Prompt 47c] автомат проходу зовнішніх входів
+
+    // [Prompt 48b] Автоповернення цілі енкодера на гучність після kAdjustTimeoutMs без подій енкодера.
+    if (s_target != AdjustTarget::Volume &&
+        static_cast<uint32_t>(now - s_lastEncMs) >= cfg::kAdjustTimeoutMs) {
+        s_target = AdjustTarget::Volume;
+        APP_LOG("encoder target timeout -> Volume\n");
+        publishState();
+    }
 
     if (s_otaAbortPending) {  // [Prompt 16] otaFailed() не отримав мʼютекс
         s_otaAbortPending = false;
@@ -2314,6 +2430,16 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
             // not_supported). Тип лишається в WebCmdType (ABI), стан не змінюється.
             why = "not_supported";
             return WebCmdResult::Unsupported;
+
+        case WebCmdType::BalanceSet:  // [Prompt 48b] баланс АКТИВНОГО входу, абсолютне значення, дБ
+            if (!balance_cfg::isValidDb(static_cast<int>(c.value))) {
+                why = "balance_out_of_range";
+                return WebCmdResult::OutOfRange;
+            }
+            if (setBalanceTarget(static_cast<int>(c.value))) {
+                APP_LOG("balance=%d (WEB)\n", static_cast<int>(s_balance));
+            }
+            break;
 
         case WebCmdType::StandbySet:
             if (c.flag) {

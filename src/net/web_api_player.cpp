@@ -6,6 +6,9 @@
 // [Prompt 48a] Аудіочіпи вирізано: 3 логічні входи (0 радіо, 1 TV Box, 2 Computer), `requireProc()` і
 // capabilities() прибрано; діапазон гучності — audio_cfg::kVolumeUiMin..kVolumeUiMax; POST /api/gain -> 400
 // not_supported; /api/inputs і /api/eq працюють по kInputCount (3). registerPlayerRoutes() без параметра AudioProcessor*: параметр прибрано разом із AudioProcessor.
+// [Prompt 48b] + POST /api/balance {"value":N[,"input":M]}: цифровий баланс ±20 дБ (balance_cfg), індивідуальний для кожного
+// входу. Активний вхід (без `input` або input == поточний) — через AppController::runWebCommand(BalanceSet): DSP
+// радіо / проходу + профіль; НЕАКТИВНИЙ вхід — лише запис у Settings (як /api/eq), застосується при перемиканні.
 // [Prompt 46a] Пресет EQ тепер ПО ВХОДАХ (Settings::profiles[i].eqGainsDb): /api/eq читає й пише профіль
 // ПОТОЧНОГО входу (AppState.inputIndex); на екземпляр радіо (eq::setAllDb) значення потрапляє лише коли
 // поточний вхід 0. Форма запиту/відповіді не змінилась (поле `input` — у P46b). Застарілі /api/gain та
@@ -33,6 +36,7 @@
 #include "config/defaults.h"         // [Prompt 39]
 #include "config/eq_config.h"
 #include "config/audio_config.h"     // [P48a] kVolumeUiMin / kVolumeUiMax
+#include "config/balance_config.h"   // [Prompt 48b] isValidDb / kMinDb / kMaxDb
 #include "config/settings_config.h"  // [Prompt 39] normalizeInputMask
 #include "core/app_controller.h"
 #include "core/app_state.h"
@@ -513,6 +517,96 @@ void handleEqPost(AsyncWebServerRequest* req) {
 }
 
 // ---------------------------------------------------------------------------
+// [Prompt 48b] POST /api/balance {"value":N[,"input":M]}
+//   value — баланс, дБ: balance_cfg::kMinDb..kMaxDb (−20..+20); додатне = вправо (лівий канал послаблюється),
+//           від'ємне = вліво, 0 = без змін. Ціле число.
+//   input — необовʼязково, 0..kInputCount−1; без поля — ПОТОЧНИЙ вхід (як у /api/eq).
+//   Поточний вхід (або input == поточний): AppController::runWebCommand(BalanceSet) — DSP + профіль; помилки
+//     як у /api/volume (409 standby | ota_in_progress | ir_learn_active, 400 balance_out_of_range, 503 busy).
+//   Неактивний вхід: лише профіль у Settings (NVS з дебаунсом), без DSP — застосується при перемиканні на вхід.
+//     409 ota_in_progress під час OTA (як /api/eq). Дозволено і в standby.
+//   -> 200 {"ok":true,"input":N,"balance":V}; 400 no_body | invalid_json | unknown_field | missing_field |
+//      invalid_value | out_of_range (value / input), 413, 409, 503.
+// ---------------------------------------------------------------------------
+struct BalanceStoreCtx {
+    uint8_t input;
+    int8_t db;
+};
+
+void storeBalance(Settings& s, void* ctx) {
+    const BalanceStoreCtx* c = static_cast<const BalanceStoreCtx*>(ctx);
+    if (c->input < defaults::kInputCount) {
+        s.profiles[c->input].balanceDb = balance_cfg::sanitizeDb(c->db);
+    }
+}
+
+void handleBalance(AsyncWebServerRequest* req) {
+    if (!exactUrl(req, "/api/balance")) return;
+    WEB_API_LOG("%s %s", req->methodToString(), req->url().c_str());
+
+    JsonDocument in;
+    if (!readJsonObjectBody(req, in)) return;
+    JsonObjectConst root = in.as<JsonObjectConst>();
+    if (!allowKeys(req, root, "value", "input")) return;
+
+    JsonVariantConst vv = root["value"];
+    if (vv.isNull()) {
+        sendFieldError(req, 400, "missing_field", "value");
+        return;
+    }
+    if (!vv.is<int>()) {
+        sendFieldError(req, 400, "invalid_value", "value");
+        return;
+    }
+    const int x = vv.as<int>();
+    if (!balance_cfg::isValidDb(x)) {
+        sendRangeError(req, "value", balance_cfg::kMinDb, balance_cfg::kMaxDb);
+        return;
+    }
+
+    const uint8_t active = eqInputIndex();  // поточний вхід (AppState), поза межами профілів -> 0
+    uint8_t input = active;
+    JsonVariantConst vi = root["input"];
+    if (!vi.isNull()) {
+        if (!vi.is<int>()) {
+            sendFieldError(req, 400, "invalid_value", "input");
+            return;
+        }
+        const int n = vi.as<int>();
+        if (n < 0 || n >= defaults::kInputCount) {
+            sendRangeError(req, "input", 0, defaults::kInputCount - 1);
+            return;
+        }
+        input = static_cast<uint8_t>(n);
+    }
+
+    if (input == active) {
+        const char* why = nullptr;
+        const WebCommand c = {WebCmdType::BalanceSet, static_cast<int32_t>(x), false};
+        const WebCmdResult r = AppController::runWebCommand(c, &why);
+        WEB_API_LOG("balance %d -> result %d (%s)", x, static_cast<int>(r), why != nullptr ? why : "-");
+        if (r != WebCmdResult::Ok) {
+            sendResult(req, r, why);
+            return;
+        }
+    } else {
+        if (AppState::snapshot().mode == Mode::OtaUpdate) {
+            sendError(req, 409, "ota_in_progress");
+            return;
+        }
+        BalanceStoreCtx ctx;
+        ctx.input = input;
+        ctx.db = static_cast<int8_t>(x);
+        SettingsStore::modify(storeBalance, &ctx);  // профіль входу в Settings; NVS — з дебаунсом
+    }
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["input"] = input;
+    doc["balance"] = x;
+    sendJson(req, 200, doc);
+}
+
+// ---------------------------------------------------------------------------
 // [Prompt 39] GET /api/inputs, POST /api/inputs — доступність і відключення входів
 //   GET : {"inputs":[{"index":0,"name":"WiFi Radio","available":true,"enabled":true,
 //                     "selectable":true,"canDisable":false}, ... 3 входи (P48a) ...],
@@ -654,6 +748,7 @@ void registerPlayerRoutes(AsyncWebServer& server) {  // [P48a] без AudioProce
     server.on("/api/mute", HTTP_POST, handleMute, nullptr, web_api::jsonBodyCallback);
     server.on("/api/volume", HTTP_POST, handleVolume, nullptr, web_api::jsonBodyCallback);
     server.on("/api/gain", HTTP_POST, handleGain, nullptr, web_api::jsonBodyCallback);
+    server.on("/api/balance", HTTP_POST, handleBalance, nullptr, web_api::jsonBodyCallback);  // [Prompt 48b]
     server.on("/api/input", HTTP_POST, handleInput, nullptr, web_api::jsonBodyCallback);
 
     // [Prompt 30] Еквалайзер радіо.

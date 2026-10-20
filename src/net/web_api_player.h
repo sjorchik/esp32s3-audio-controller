@@ -14,6 +14,7 @@
 //   POST /api/input            {"index":N}
 //   POST /api/player/{play|pause|stop|toggle|next|prev}
 //   POST /api/player/station   {"index":N[,"switchInput":true]}
+//   POST /api/balance          (P48b) {"value":N[,"input":M]} баланс ±20 дБ активного (або вказаного) входу
 //   GET  /api/eq               (P30) пресет еквалайзера радіо
 //   POST /api/eq               (P30) {"gainsDb":[a,b,c,d,e]} або {"band":N,"gainDb":X}
 //   GET  /api/inputs           (P39) входи: назва, апаратна доступність, дозвіл (маска)

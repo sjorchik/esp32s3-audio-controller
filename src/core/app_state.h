@@ -59,6 +59,7 @@ enum class Mode : uint8_t {
 
 // [Prompt 8] ДОДАНО: яким параметром зараз керує обертання енкодера.
 // Порядок = порядок циклу кліку енкодера (Volume -> Bass -> Treble -> Balance -> Gain).
+// [Prompt 48b] Фактично в циклі кліку лише Volume <-> Balance (Bass / Treble / Gain лишаються в enum заради ABI).
 enum class AdjustTarget : uint8_t {
     Volume,
     Bass,
@@ -190,6 +191,11 @@ struct AppStateData {
     // --- [Prompt 39] ДОДАНО ---
     // Маска дозволених користувачем входів (біт i = вхід i; біт 0 завжди 1). Лише AppController пише.
     uint8_t inputEnabledMask;
+
+    // --- [Prompt 48b] ДОДАНО ---
+    // Баланс АКТИВНОГО входу, дБ (balance_cfg::kMinDb..kMaxDb; додатне = вправо: лівий канал послаблено,
+    // 0 = без змін). Лише AppController пише. Старе поле `balance` (legacy, завжди 0) не чіпається — прибере P50.
+    int8_t balanceDb;
 };
 
 class AppState {

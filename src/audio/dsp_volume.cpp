@@ -1,4 +1,4 @@
-// Цифрова гучність і мʼют (Prompt 45, доповнено Prompt 47a, P47d — processFloat). Опис і правила потоків — у dsp_volume.h.
+// Цифрова гучність і мʼют (Prompt 45, доповнено Prompt 47a, P47d — processFloat, P48b — баланс). Опис і правила потоків — у dsp_volume.h.
 //
 // ВАЖЛИВО: файл НЕ включає Audio.h. Чиста математика.
 
@@ -29,6 +29,14 @@ float dbToGain(float db) {
 
 }  // namespace
 
+// [P48b] Таблиця множників балансу: k дБ послаблення -> 10^(-k/20). k = 0 -> рівно 1.0f.
+DspVolume::DspVolume() {
+    balTab_[0] = 1.0f;
+    for (int k = 1; k <= balance_cfg::kMaxDb; ++k) {
+        balTab_[k] = dbToGain(-static_cast<float>(k));
+    }
+}
+
 void DspVolume::setSampleRate(uint32_t hz) {
     if (hz < dsp_volume_cfg::kMinSampleRateHz || hz > dsp_volume_cfg::kMaxSampleRateHz) {
         return;
@@ -49,6 +57,16 @@ void DspVolume::setAttenuationDb(float db) {
 
 float DspVolume::attenuationDb() const {
     return attDb_.load(std::memory_order_relaxed);
+}
+
+void DspVolume::setBalanceDb(int8_t db) {
+    if (db < balance_cfg::kMinDb) db = balance_cfg::kMinDb;
+    if (db > balance_cfg::kMaxDb) db = balance_cfg::kMaxDb;
+    balDb_.store(db, std::memory_order_relaxed);
+}
+
+int8_t DspVolume::balanceDb() const {
+    return balDb_.load(std::memory_order_relaxed);
 }
 
 void DspVolume::setMute(bool mute) {
@@ -117,33 +135,123 @@ void DspVolume::finish(float g, uint32_t rem) {
     silent_.store(rem == 0 && g == 0.0f, std::memory_order_relaxed);
 }
 
-void DspVolume::process(int32_t* buf, int32_t frames) {
-    if (buf == nullptr || frames <= 0) {
-        return;
+// [P48b] Спільна підготовка балансу. Множники беруться з таблиці за |balanceDb|; послаблюється лівий канал при
+// balanceDb > 0 (праворуч), правий при < 0; kSwapChannels міняє канали місцями. Нова ціль -> лінійний перехід
+// від ПОТОЧНИХ множників. false = обидва множники рівно 1.0 і переходу немає: блок не чіпаємо.
+bool DspVolume::balancePrepare() {
+    const int8_t db = balDb_.load(std::memory_order_relaxed);
+    float tl = 1.0f;
+    float tr = 1.0f;
+    if (db != 0) {
+        const int a = db < 0 ? -static_cast<int>(db) : static_cast<int>(db);
+        const float g = balTab_[a <= balance_cfg::kMaxDb ? a : balance_cfg::kMaxDb];
+        const bool attenuateLeft = (db > 0) != balance_cfg::kSwapChannels;
+        if (attenuateLeft) {
+            tl = g;
+        } else {
+            tr = g;
+        }
     }
-    if (!prepare()) {
-        return;
+    if (tl != blTgt_ || tr != brTgt_) {
+        bRem_ = framesFor(balance_cfg::kRampMs, hz_);
+        blTgt_ = tl;
+        brTgt_ = tr;
+        blStep_ = (tl - blCur_) / static_cast<float>(bRem_);
+        brStep_ = (tr - brCur_) / static_cast<float>(bRem_);
     }
+    return !(bRem_ == 0 && blCur_ == 1.0f && brCur_ == 1.0f);
+}
 
-    float g = gCur_;
-    uint32_t rem = rem_;
-    const float step = step_;
-    const float tgtG = gTgt_;
+void DspVolume::balanceApply(int32_t* buf, int32_t frames) {
+    float l = blCur_;
+    float r = brCur_;
+    uint32_t rem = bRem_;
+    const float sl = blStep_;
+    const float sr = brStep_;
+    const float tl = blTgt_;
+    const float tr = brTgt_;
 
     int32_t* p = buf;
     for (int32_t f = 0; f < frames; ++f) {
         if (rem > 0) {
-            g += step;
+            l += sl;
+            r += sr;
             if (--rem == 0) {
-                g = tgtG;  // точне закінчення переходу
+                l = tl;  // точне закінчення переходу
+                r = tr;
             }
         }
-        p[0] = toInt32(static_cast<float>(p[0]) * g);
-        p[1] = toInt32(static_cast<float>(p[1]) * g);
+        p[0] = toInt32(static_cast<float>(p[0]) * l);
+        p[1] = toInt32(static_cast<float>(p[1]) * r);
         p += 2;
     }
+    blCur_ = l;
+    brCur_ = r;
+    bRem_ = rem;
+}
 
-    finish(g, rem);
+void DspVolume::balanceApplyFloat(float* buf, int32_t frames) {
+    float l = blCur_;
+    float r = brCur_;
+    uint32_t rem = bRem_;
+    const float sl = blStep_;
+    const float sr = brStep_;
+    const float tl = blTgt_;
+    const float tr = brTgt_;
+
+    float* p = buf;
+    for (int32_t f = 0; f < frames; ++f) {
+        if (rem > 0) {
+            l += sl;
+            r += sr;
+            if (--rem == 0) {
+                l = tl;
+                r = tr;
+            }
+        }
+        p[0] *= l;
+        p[1] *= r;
+        p += 2;
+    }
+    blCur_ = l;
+    brCur_ = r;
+    bRem_ = rem;
+}
+
+void DspVolume::process(int32_t* buf, int32_t frames) {
+    if (buf == nullptr || frames <= 0) {
+        return;
+    }
+    const bool vol = prepare();
+    const bool bal = balancePrepare();  // [P48b]
+    if (!vol && !bal) {
+        return;
+    }
+
+    if (vol) {
+        float g = gCur_;
+        uint32_t rem = rem_;
+        const float step = step_;
+        const float tgtG = gTgt_;
+
+        int32_t* p = buf;
+        for (int32_t f = 0; f < frames; ++f) {
+            if (rem > 0) {
+                g += step;
+                if (--rem == 0) {
+                    g = tgtG;  // точне закінчення переходу
+                }
+            }
+            p[0] = toInt32(static_cast<float>(p[0]) * g);
+            p[1] = toInt32(static_cast<float>(p[1]) * g);
+            p += 2;
+        }
+
+        finish(g, rem);
+    }
+    if (bal) {
+        balanceApply(buf, frames);  // [P48b] ПІСЛЯ гучності
+    }
 }
 
 // [P47d] Той самий посемпловий ramp, без насичення.
@@ -151,27 +259,34 @@ void DspVolume::processFloat(float* buf, int32_t frames) {
     if (buf == nullptr || frames <= 0) {
         return;
     }
-    if (!prepare()) {
+    const bool vol = prepare();
+    const bool bal = balancePrepare();  // [P48b]
+    if (!vol && !bal) {
         return;
     }
 
-    float g = gCur_;
-    uint32_t rem = rem_;
-    const float step = step_;
-    const float tgtG = gTgt_;
+    if (vol) {
+        float g = gCur_;
+        uint32_t rem = rem_;
+        const float step = step_;
+        const float tgtG = gTgt_;
 
-    float* p = buf;
-    for (int32_t f = 0; f < frames; ++f) {
-        if (rem > 0) {
-            g += step;
-            if (--rem == 0) {
-                g = tgtG;
+        float* p = buf;
+        for (int32_t f = 0; f < frames; ++f) {
+            if (rem > 0) {
+                g += step;
+                if (--rem == 0) {
+                    g = tgtG;
+                }
             }
+            p[0] *= g;
+            p[1] *= g;
+            p += 2;
         }
-        p[0] *= g;
-        p[1] *= g;
-        p += 2;
-    }
 
-    finish(g, rem);
+        finish(g, rem);
+    }
+    if (bal) {
+        balanceApplyFloat(buf, frames);  // [P48b] ПІСЛЯ гучності
+    }
 }

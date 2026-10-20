@@ -21,6 +21,15 @@ float radio_volume::attenuationDb() {
     return s_vol.attenuationDb();
 }
 
+// [Prompt 48b] Баланс радіо.
+void radio_volume::setBalanceDb(int8_t db) {
+    s_vol.setBalanceDb(db);
+}
+
+int8_t radio_volume::balanceDb() {
+    return s_vol.balanceDb();
+}
+
 void radio_volume::setMute(bool mute) {
     s_vol.setMute(mute);
 }

@@ -1,6 +1,6 @@
 // Прохід зовнішнього звуку PCM1808 -> ESP32-S3 -> PCM5102 (Prompt 44; P44b — життєвий цикл ресурсів;
 // P45 — EQ і dsp_volume у ланцюжку блоку; P47b — виробничий API гучності, мʼюту користувача, EQ входу,
-// помилок і неблокуючого старту; P47d — float-конвеєр і VU зовнішніх входів). Опис і правила потоків — audio/line_path.h.
+// помилок і неблокуючого старту; P47d — float-конвеєр і VU зовнішніх входів; P48b — цифровий баланс у DspVolume). Опис і правила потоків — audio/line_path.h.
 //
 // Топологія (V2 з P43):
 //   PCM1808 --DIN GPIO8--> I2S1 RX (slave) --[блок 128 кадрів]--> I2S1 TX (slave)
@@ -1555,6 +1555,15 @@ bool LinePath::userMuted() {
     return s_userMute;
 }
 
+// [P48b] Баланс — атомарне слово в DspVolume; перехід виконує задача line_path у наступному блоці.
+void LinePath::setBalanceDb(int8_t db) {
+    s_dsp.setBalanceDb(db);
+}
+
+int8_t LinePath::balanceDb() {
+    return s_dsp.balanceDb();
+}
+
 void LinePath::setEqBandDb(uint8_t band, int8_t db) {
     s_eqLine.setBandDb(band, db);
 }
@@ -1651,6 +1660,8 @@ void LinePath::setAttenuationDb(int8_t) {}
 int8_t LinePath::attenuationDb() { return static_cast<int8_t>(line_path_cfg::kStartVolumeDb); }
 void LinePath::setUserMute(bool) {}
 bool LinePath::userMuted() { return true; }
+void LinePath::setBalanceDb(int8_t) {}   // [P48b]
+int8_t LinePath::balanceDb() { return 0; }
 void LinePath::setEqBandDb(uint8_t, int8_t) {}
 int8_t LinePath::getEqBandDb(uint8_t) { return 0; }
 void LinePath::setEqAllDb(const int8_t[eq_cfg::kBandCount]) {}
