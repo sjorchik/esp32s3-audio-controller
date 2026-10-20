@@ -1,4 +1,5 @@
 // net/web_server.cpp (Prompt 13): інфраструктура, /api/status, /api/settings.
+// [P48b-фікс] GET /api/status: поле "balance" = AppStateData::balanceDb (дБ активного входу, −20..+20). Решту не змінено.
 // [Prompt 25] ДОДАНО: поле станції levelDb (рівень виходу декодера, дБ, -24..0) у GET/POST/PUT
 // /api/stations (parseStationObject, sendStationParseError). Нових ендпоїнтів немає; імпорт/
 // експорт передає поле через StationStore (reason "level_out_of_range" мапиться в 400 як
@@ -159,7 +160,7 @@ void handleStatus(AsyncWebServerRequest* req) {
     doc["volume"] = st.volume;
     doc["bass"] = st.bass;
     doc["treble"] = st.treble;
-    doc["balance"] = st.balance;
+    doc["balance"] = st.balanceDb;  // [P48b-фікс] дБ активного входу (−20..+20; додатне = вправо); legacy st.balance = 0
     doc["gain"] = st.gain;
     doc["mute"] = st.mute;
     doc["loudness"] = loudness;

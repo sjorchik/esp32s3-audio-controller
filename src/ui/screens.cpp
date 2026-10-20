@@ -377,6 +377,8 @@ void drawVu(int litL, int litR, int peakL, int peakR) {
 // [Prompt 32] Спливне вікно параметра звуку: підпис (Large) + значення великими цифрами.
 // Знак +/- лише для параметрів зі знаком (тембр, баланс), і лише коли значення не нуль
 // (як було в статус-рядку). Гучність і gain — без знака.
+// [P48b-фікс] Баланс береться з AppStateData::balanceDb (дБ, −20..+20, баланс активного входу),
+// а не з legacy-поля `balance` (завжди 0). Інші цілі (Bass / Treble / Gain) лишено заради ABI enum.
 void drawPopup(const AppStateData& s) {
     const char* label = "";
     int value = 0;
@@ -385,7 +387,7 @@ void drawPopup(const AppStateData& s) {
         case AdjustTarget::Volume:  label = "Volume";    value = s.volume;  break;
         case AdjustTarget::Bass:    label = "Bass";      value = s.bass;    signedValue = true; break;
         case AdjustTarget::Treble:  label = "Treble";    value = s.treble;  signedValue = true; break;
-        case AdjustTarget::Balance: label = "Balance";   value = s.balance; signedValue = true; break;
+        case AdjustTarget::Balance: label = "Balance";   value = s.balanceDb; signedValue = true; break;   // [P48b-фікс]
         case AdjustTarget::Gain:    label = "Gain";      value = s.gain;    break;
     }
     char buf[8];
