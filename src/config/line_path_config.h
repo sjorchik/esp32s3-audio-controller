@@ -1,5 +1,4 @@
 #pragma once
-
 // Константи модуля audio/line_path (Prompt 44, прототип; P47c — kVolMaxDb = 0 дБ; P44b — життєвий цикл ресурсів;
 // P47b — API гучності, мʼюту користувача і помилок; P47d — float-конвеєр і VU зовнішніх входів). Прохід зовнішнього звуку PCM1808 (I2S1 RX, slave)
 // -> ESP32-S3 -> PCM5102 (I2S1 TX, slave) на тактах BCLK GPIO15 / WS GPIO17, які веде I2S0
@@ -7,8 +6,8 @@
 // Піни — лише з config/pins.h. Усі часові значення — у мілісекундах, якщо не вказано інше.
 
 #include <stdint.h>
-
 #include "config/pins.h"
+#include "config/line_path_diag_config.h"  // [PD1] Діагностика
 
 // ---------------------------------------------------------------------------
 // Прапорці умовної компіляції
@@ -20,7 +19,7 @@
 #define LINE_PATH_ENABLE 1
 
 // 1 = Serial-команди lp.* (працює і при LINE_PATH_ENABLE == 0, тоді доступна лише lp.heap).
-#define LINE_PATH_TEST 0  // [P47c] 0 у виробничій збірці: lp.* керують проходом повз AppController
+#define LINE_PATH_TEST 1  // [P47c] 0 у виробничій збірці: lp.* керують проходом повз AppController
 
 // Serial-лог "[LINE] ...".
 #define LINE_PATH_DEBUG 1
@@ -30,10 +29,14 @@ namespace line_path_cfg {
 // ---------------------------------------------------------------------------
 // Формат і I2S1 (duplex slave)
 // ---------------------------------------------------------------------------
+
 // Фіксована частота, яку примусово тримає I2S0 під час проходу (Audio::setOutputSampleRate).
 constexpr uint32_t kFsHz           = 48000;
+
 constexpr int      kI2sPort        = 1;      // I2S_NUM_1 (I2S0 належить бібліотеці)
+
 constexpr uint32_t kBlockFrames    = 128;    // стереокадрів за ітерацію (≈2.7 мс на 48 кГц)
+
 // DMA 6 x 128: канали живуть лише під час проходу, а під радіо ці ≈12 КБ звільнені.
 constexpr uint32_t kDmaDescCount   = 6;
 constexpr uint32_t kDmaFrameCount  = 128;
@@ -41,12 +44,15 @@ constexpr uint32_t kDmaFrameCount  = 128;
 // ---------------------------------------------------------------------------
 // Задача FreeRTOS
 // ---------------------------------------------------------------------------
+
 // Ядро 1, пріоритет 6 (вище плеєра = 5 і введення = 4).
 // Задача, канали I2S1 і буфер блоку створюються в start() / requestStart() і знищуються в returnToRadio().
 constexpr int      kTaskCore       = 1;
 constexpr uint8_t  kTaskPriority   = 6;
 constexpr uint32_t kTaskStackBytes = 5120;   // без виміру НЕ зменшувати (вільний мінімум ≈3,2 КБ у P44)
+
 constexpr uint32_t kIdlePollMs     = 20;     // сон задачі, поки прохід вимкнено
+
 // Скільки start() (блокуючий) чекає створення каналів I2S1 задачею. Типово 10–20 мс за коментарем
 // коду (окремо не вимірювалось); це верхня межа, а не очікуваний час.
 constexpr uint32_t kCreateWaitMs   = 500;
@@ -54,14 +60,18 @@ constexpr uint32_t kCreateWaitMs   = 500;
 // ---------------------------------------------------------------------------
 // Гучність і мʼют (P47b)
 // ---------------------------------------------------------------------------
+
 // Діапазон цифрової гучності проходу, дБ (тільки послаблення; цифра не підсилює).
 // Верх −6 дБ — жорсткий максимум до перевірки підсилювача на повну шкалу PCM5102.
 // Нижня межа −120 дБ = dsp_volume_cfg::kMinDb (перевіряється в line_path.cpp).
 constexpr float    kVolMinDb       = -120.0f;
+
 // [P47c] Верх піднято з −6 до 0 дБ: зовнішні входи мають ту саму шкалу гучності, що й радіо (максимум UI = 0 дБ).
 constexpr float    kVolMaxDb       = 0.0f;
+
 // Гучність, яка діє, якщо її ще ніколи не задавали (безпечно тихо).
 constexpr float    kStartVolumeDb  = -60.0f;
+
 // Нижче цього значення lp.vol друкує попередження (поза звичним тестовим діапазоном).
 constexpr float    kWarnVolDb      = -60.0f;
 
@@ -77,12 +87,15 @@ constexpr uint8_t  kXsmtUnmutedLevel = 1;
 // ---------------------------------------------------------------------------
 // VU зовнішніх входів (P47d; константи перенесено з adc_vu_config.h без зміни значень)
 // ---------------------------------------------------------------------------
+
 // Пік міряється ПІСЛЯ еквалайзера й ДО гучності, у шкалі int16 (±32768), як у радіо (vu_cfg::kFullScale).
 // Калібрування шкали, дБ: додається до виміряного рівня (раніше adc_vu_cfg::kAdcVuOffsetDb = 20).
 constexpr float    kVuOffsetDb     = 20.0f;
+
 // Однополюсний ВЧ-фільтр лише для виміру VU: dc += kVuDcAlpha * (x - dc); сигнал = x - dc.
 // Зріз ≈ kVuDcAlpha * fs / 2π ≈ 15 Гц при 48 кГц (раніше 14 Гц при 44,1 кГц). Звук цей фільтр НЕ чіпає.
 constexpr float    kVuDcAlpha      = 0.002f;
+
 // Верхня межа піка при публікації (захист перетворення float -> uint32).
 constexpr float    kVuPeakCap      = 1.0e9f;
 
@@ -94,19 +107,25 @@ constexpr uint32_t kVuTestPrintMs  = 500;
 // ---------------------------------------------------------------------------
 // Старт / зупинка / аварії
 // ---------------------------------------------------------------------------
+
 constexpr uint32_t kRadioStopWaitMs   = 2000; // скільки чекати PlayerState::Idle після AudioPlayer::stop()
 constexpr uint32_t kRadioDrainMs      = 600;  // дограти хвіст буфера радіо (≈0.34 с) до зміни тактів
 constexpr uint32_t kClockApplyWaitMs  = 1000; // скільки чекати застосування 48 кГц на I2S0
+
 constexpr uint32_t kSettleBlocks      = 6;    // перші блоки після enable/відновлення відкидаються (у TX нулі)
+
 // Вікно після XSMT low, протягом якого RX вичитується, а в TX пишуться нулі.
 constexpr uint32_t kXsmtMuteSettleMs  = 20;
+
 constexpr uint32_t kReadTimeoutMs     = 40;   // нема тактів / даних -> таймаут, не зависання
 constexpr uint32_t kWriteTimeoutMs    = 40;
+
 constexpr uint32_t kStallMs           = 300;  // стільки без блоків = аварійний мʼют (XSMT low, мʼют DSP)
 
 // ---------------------------------------------------------------------------
 // Serial-тест
 // ---------------------------------------------------------------------------
+
 constexpr int      kTestTaskCore       = 0;
 constexpr uint8_t  kTestTaskPriority   = 1;
 constexpr uint32_t kTestTaskStackBytes = 4096;
@@ -128,6 +147,7 @@ constexpr uint32_t kCycleFreeSettleMs   = 300;
 // ---------------------------------------------------------------------------
 // Перевірки на етапі компіляції
 // ---------------------------------------------------------------------------
+
 static_assert(kI2sPort == 1, "I2S0 belongs to ESP32-audioI2S; line path must use I2S1");
 static_assert(kFsHz == 48000, "prototype is fixed at 48 kHz (Audio::SR_48000)");
 static_assert(kBlockFrames >= 32 && kBlockFrames <= 1024, "block size out of range");
