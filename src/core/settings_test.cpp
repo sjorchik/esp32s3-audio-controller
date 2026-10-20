@@ -1,6 +1,7 @@
 // Serial-тест Settings. Протокол — у settings_test.h.
 // [Prompt 21b] Поле vol змінює профіль входу Settings::lastInput; set.show друкує профілі всіх входів.
 // [Prompt 46a] Профіль = {volume, eqGainsDb[5]}: команди bass/treble/balance/loud/gain прибрано.
+// [Prompt 48a] Команду set.proc і поле processorType прибрано (аудіочіпи вирізано); show друкує balanceDb.
 
 #include "core/settings_test.h"
 
@@ -20,7 +21,7 @@ namespace {
 constexpr const char* kPrefix = "set.";
 
 enum class Field : uint8_t {
-    Proc, Bright, Flip, Input, Station, Vol, Mute, Name, RampVol,
+    Bright, Flip, Input, Station, Vol, Mute, Name, RampVol,
 };
 
 struct Edit {
@@ -36,7 +37,6 @@ void applyEdit(Settings& s, void* ctx) {
     // [Prompt 21b] Профіль входу, який зараз «активний» у Settings (lastInput).
     InputProfile& prof = s.profiles[s.lastInput < defaults::kInputCount ? s.lastInput : 0];
     switch (e.field) {
-        case Field::Proc:     s.processorType = static_cast<uint8_t>(e.value); break;
         case Field::Bright:   s.brightness = static_cast<uint8_t>(e.value); break;
         case Field::Flip:     s.displayFlipped = (e.value != 0); break;
         case Field::Input:    s.lastInput = static_cast<uint8_t>(e.value); break;
@@ -58,7 +58,6 @@ struct NumericCmd {
 };
 
 const NumericCmd kNumeric[] = {
-    {"proc",    Field::Proc,    0, 1},
     {"bright",  Field::Bright,  0, 255},
     {"flip",    Field::Flip,    0, 1},
     {"input",   Field::Input,   0, defaults::kInputCount - 1},
@@ -70,7 +69,7 @@ const NumericCmd kNumeric[] = {
 void printHelp() {
     Serial.println("[SET] commands (all start with 'set.'):");
     Serial.println("[SET]   set.show | set.save | set.ramp | set.reset | set.erase | set.help");
-    Serial.println("[SET]   set.proc 0|1   set.bright 0..255   set.flip 0|1");
+    Serial.println("[SET]   set.bright 0..255   set.flip 0|1");
     Serial.println("[SET]   set.vol -128..127   set.mute 0|1");
     Serial.println("[SET]   (vol edits the profile of input lastInput)");
     Serial.printf("[SET]   set.input 0..%u   set.station 0..65535   set.name <idx> <text>\n",
@@ -80,8 +79,6 @@ void printHelp() {
 void printShow() {
     const Settings s = SettingsStore::snapshot();
     Serial.println("[SET] ---- settings ----");
-    Serial.printf("[SET] processorType=%u (%s)\n", static_cast<unsigned>(s.processorType),
-                  s.processorType == 0 ? "TDA7318" : "PT2313L");
     for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
         Serial.printf("[SET] inputNames[%u]=\"%s\"\n", static_cast<unsigned>(i), s.inputNames[i]);
     }
@@ -92,11 +89,11 @@ void printShow() {
                   s.lastMute ? 1 : 0);
     for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
         const InputProfile& p = s.profiles[i];
-        Serial.printf("[SET] profile[%u]%s vol=%d eq=[%d %d %d %d %d]\n", static_cast<unsigned>(i),
+        Serial.printf("[SET] profile[%u]%s vol=%d eq=[%d %d %d %d %d] bal=%d\n", static_cast<unsigned>(i),
                       i == s.lastInput ? "*" : " ", static_cast<int>(p.volume),
                       static_cast<int>(p.eqGainsDb[0]), static_cast<int>(p.eqGainsDb[1]),
                       static_cast<int>(p.eqGainsDb[2]), static_cast<int>(p.eqGainsDb[3]),
-                      static_cast<int>(p.eqGainsDb[4]));
+                      static_cast<int>(p.eqGainsDb[4]), static_cast<int>(p.balanceDb));
     }
     Serial.printf("[SET] dirty=%d nvsWrites=%u\n", SettingsStore::isDirty() ? 1 : 0,
                   static_cast<unsigned>(SettingsStore::writeCount()));
@@ -197,7 +194,7 @@ void SettingsTest::handleLine(const char* line) {
     } else if (strcmp(cmd, "ramp") == 0) {
         runRamp();
     } else if (strcmp(cmd, "reset") == 0) {
-        Serial.printf("[SET] reset to defaults: %s (processorType applies after reboot)\n",
+        Serial.printf("[SET] reset to defaults: %s\n",
                       SettingsStore::resetToDefaults() ? "ok" : "FAILED");
     } else if (strcmp(cmd, "erase") == 0) {
         Serial.printf("[SET] erase stored key: %s (reboot to test first-run path)\n",

@@ -5,14 +5,14 @@
 // - ініціалізувати LittleFS (з форматуванням, якщо потрібно);
 // - підготувати подієву шину;
 // - запустити кнопки, енкодер і IR та (тимчасово) друкувати їхні події;
-// - [Prompt 3] створити аудіопроцесор (TDA7318 / PT2313L) і, під AUDIO_PROC_TEST,
-//   запустити Serial-тестовий режим;
+// - [Prompt 48a] аудіочіпи (TDA7318 / PT2313L), I2C і AudioProcTest ВИРІЗАНО: замість ініціалізації
+//   процесора — input_selector::begin() (реле входів TV Box / Computer, початковий стан = TV Box);
 // - [Prompt 4] ініціалізувати дисплей (ST7789, спрайт у PSRAM, задача малювання;
 //   під DISPLAY_DEMO — статичний тестовий кадр);
 // - [Prompt 5] створити аудіоплеєр інтернет-радіо (ESP32-audioI2S) і, під
 //   AUDIO_PLAYER_TEST, запустити його Serial-тестовий режим;
-// - [Prompt 6] ініціалізувати Settings (NVS) ДО аудіопроцесора й дисплея:
-//   тип процесора і орієнтація дисплея беруться з Settings; під SETTINGS_TEST —
+// - [Prompt 6] ініціалізувати Settings (NVS) ДО дисплея:
+//   орієнтація дисплея береться з Settings; під SETTINGS_TEST —
 //   Serial-тест Settings (команди з префіксом `set.`).
 // - [Prompt 8] запустити AppController (читає EventBus, керує звуком/плеєром/станом);
 //   тимчасовий друк подій (INPUT_DEMO_PRINT_EVENTS) прибрано, loop() порожній.
@@ -21,7 +21,7 @@
 // - [Prompt 12] WifiManager::begin(wifiResetRequested) викликається тут, окремо від
 //   AppController::begin() (сигнатуру AppController не змінено); WifiManager сам
 //   піднімає mDNS після підключення.
-// - [Prompt 13] WebServerManager::begin(proc) викликається ПІСЛЯ AppController::begin()
+// - [Prompt 13] WebServerManager::begin() викликається ПІСЛЯ AppController::begin()
 //   (потрібні AppState і Settings); сервер сам піднімається, коли WifiManager дасть STA.
 // - [Prompt 47d] adc_vu видалено: VU зовнішніх входів виробляє line_path (initAdcVu() більше немає).
 // - [Prompt 23c] Перший рядок setup() — AmpStandby::begin(): пін standby підсилювача в LOW
@@ -37,9 +37,7 @@
 #include "audio/amp_standby.h"        // [Prompt 23c] ДОДАНО
 #include "audio/audio_player.h"       // [Prompt 5] ДОДАНО
 #include "audio/audio_player_test.h"  // [Prompt 5] ДОДАНО
-#include "audio/audio_proc_test.h"    // [Prompt 3] ДОДАНО
-#include "audio/audio_processor.h"    // [Prompt 3] ДОДАНО
-#include "config/audio_config.h"      // [Prompt 3] ДОДАНО
+#include "audio/input_selector.h"     // [Prompt 48a] реле-селектор входів
 #include "config/audio_player_config.h"  // [Prompt 5] ДОДАНО
 #include "config/defaults.h"
 #include "config/display_config.h"  // [Prompt 6] ДОДАНО (display_cfg::kDefaultFlipped)
@@ -61,14 +59,6 @@
 #include "stations/station_store_test.h"  // [Prompt 11] ДОДАНО
 #include "ui/display.h"    // [Prompt 4] ДОДАНО
 #include "ui/screens.h"   // [Prompt 9] ДОДАНО
-
-// [Prompt 3] ДОДАНО: аудіопроцесор живе весь час роботи прошивки.
-// Згодом його створюватиме AppController за типом з Settings (NVS).
-static AudioProcessor* s_audioProc = nullptr;
-
-// [Prompt 5] ДОДАНО: true, якщо аудіопроцесор створено й begin() пройшов успішно.
-// Лише тоді його вказівник передається плеєру (інакше nullptr).
-static bool s_audioProcReady = false;
 
 // Друк інформації про чіп і памʼять.
 static void printChipInfo() {
@@ -153,59 +143,25 @@ static void initLittleFs() {
                   static_cast<unsigned>(LittleFS.usedBytes()));
 }
 
-// [Prompt 6] ЗМІНЕНО: тип чіпа береться з Settings (NVS). Settings::processorType
-// уже перевірено в SettingsStore::load() (0 або 1). Якщо Settings дадуть збій —
-// швидкий відкат: підставити audio_cfg::kTestProcType замість procType нижче
-// (константа з audio_config.h лишається).
-static void initAudioProcessor() {
-    const AudioProcType procType =
-        static_cast<AudioProcType>(SettingsStore::get().processorType);
-    const char* typeName = (procType == AudioProcType::Tda7318) ? "TDA7318" : "PT2313L";
-
-    s_audioProc = createAudioProcessor(procType);
-    if (s_audioProc == nullptr) {
-        Serial.printf("[MAIN] Audio processor %s create failed (disabled in features.h?)\n",
-                      typeName);
-        return;
+// [Prompt 48a] Реле-селектор входів: пін як вихід, реле вимкнено (TV Box). Рання ініціалізація (до плеєра й
+// AppController), щоб стан реле був визначений до першого звуку. Радіо реле не чіпає.
+static void initInputSelector() {
+    if (!input_selector::begin()) {
+        Serial.println("[MAIN] Input selector init failed");
     }
-
-    // Результат begin() і probe() логуємо окремо: begin() = усі команди пройшли,
-    // probe() = хтось відповів ACK на 0x44 (тип чіпа цим не підтверджується).
-    const bool beginOk = s_audioProc->begin();
-    s_audioProcReady = beginOk;  // [Prompt 5] ДОДАНО
-    Serial.printf("[MAIN] Audio processor %s begin: %s\n", typeName, beginOk ? "ok" : "FAILED");
-    Serial.printf("[MAIN] Audio processor probe 0x%02X: %s\n",
-                  static_cast<unsigned>(defaults::kAudioProcessorI2cAddr),
-                  s_audioProc->probe() ? "ACK" : "no ACK");
-
-    // [Prompt 5] ЗМІНЕНО: AudioProcTest і AudioPlayerTest читають той самий Serial і
-    // крали б байти один в одного, тому одночасно вони не запускаються.
-    // При AUDIO_PLAYER_TEST == 1 керування процесором — команди `vol` / `pmute`
-    // плеєрного тесту. Щоб знову користуватись AudioProcTest — AUDIO_PLAYER_TEST 0.
-#if AUDIO_PROC_TEST && !AUDIO_PLAYER_TEST
-    if (AudioProcTest::begin(s_audioProc)) {
-        Serial.println("[MAIN] Audio test mode ready (send 'h' for help)");
-    } else {
-        Serial.println("[MAIN] Audio test mode init failed");
-    }
-#elif AUDIO_PROC_TEST && AUDIO_PLAYER_TEST
-    Serial.println("[MAIN] Audio proc test skipped: Serial is used by player test");
-#endif
 }
 
-// [Prompt 5] ДОДАНО: аудіоплеєр. Приймає вказівник на процесор лише якщо той
-// успішно ініціалізувався (плеєр ним не володіє й setMute() не викликає).
+// [Prompt 5] ДОДАНО: аудіоплеєр. [Prompt 48a] Аудіопроцесора більше немає: у AudioPlayer::begin()
+// більше не передається (begin() без параметрів).
 static void initAudioPlayer() {
-    AudioProcessor* proc = s_audioProcReady ? s_audioProc : nullptr;
-
-    if (!AudioPlayer::begin(proc)) {
+    if (!AudioPlayer::begin()) {
         Serial.println("[MAIN] Audio player init failed");
         return;
     }
     Serial.println("[MAIN] Audio player ready");
 
 #if AUDIO_PLAYER_TEST
-    if (AudioPlayerTest::begin(proc)) {
+    if (AudioPlayerTest::begin()) {
         Serial.println("[MAIN] Player test mode ready (send 'help')");
     } else {
         Serial.println("[MAIN] Player test mode init failed");
@@ -244,8 +200,8 @@ static void initDisplay() {
     }
 }
 
-// [Prompt 6] ДОДАНО: Settings (NVS). Має відпрацювати ДО initAudioProcessor() та
-// initDisplay(): вони читають SettingsStore::get(). Збій NVS не зупиняє старт —
+// [Prompt 6] ДОДАНО: Settings (NVS). Має відпрацювати ДО initDisplay():
+// він читає SettingsStore::get(). Збій NVS не зупиняє старт —
 // у кеші лежать значення за замовчуванням.
 static void initSettings() {
     if (!SettingsStore::begin()) {
@@ -256,19 +212,18 @@ static void initSettings() {
     }
 
     const Settings& s = SettingsStore::get();
-    Serial.printf("[MAIN] Settings: proc=%s flipped=%d brightness=%u\n",
-                  (s.processorType == 0) ? "TDA7318" : "PT2313L", s.displayFlipped ? 1 : 0,
+    Serial.printf("[MAIN] Settings: flipped=%d brightness=%u\n", s.displayFlipped ? 1 : 0,
                   static_cast<unsigned>(s.brightness));
 }
 
 // [Prompt 6] ДОДАНО: Serial-тест Settings. Читає той самий Serial, що й
-// AudioProcTest / AudioPlayerTest, тому за замовчуванням не стартує, поки
-// активний хоч один із них (див. SETTINGS_TEST_SHARE_SERIAL у settings_config.h).
+// AudioPlayerTest, тому за замовчуванням не стартує, поки
+// він активний (див. SETTINGS_TEST_SHARE_SERIAL у settings_config.h).
 static void initSettingsTest() {
 #if SETTINGS_TEST
-#if (AUDIO_PROC_TEST || AUDIO_PLAYER_TEST) && !SETTINGS_TEST_SHARE_SERIAL
+#if AUDIO_PLAYER_TEST && !SETTINGS_TEST_SHARE_SERIAL
     Serial.println("[MAIN] Settings test skipped: Serial is used by another test "
-                   "(set AUDIO_PLAYER_TEST/AUDIO_PROC_TEST to 0 or SETTINGS_TEST_SHARE_SERIAL to 1)");
+                   "(set AUDIO_PLAYER_TEST to 0 or SETTINGS_TEST_SHARE_SERIAL to 1)");
 #else
     if (SettingsTest::begin()) {
         Serial.println("[MAIN] Settings test mode ready (send 'set.help')");
@@ -290,11 +245,9 @@ static void initWifi(bool forceReset) {
 }
 
 // [Prompt 8] ДОДАНО: AppController. Останній з модулів, від яких він залежить
-// (EventBus, Settings, аудіопроцесор, плеєр). Вказівник на процесор передається
-// лише якщо begin() процесора пройшов успішно (так само, як для плеєра).
+// (EventBus, Settings, input_selector, плеєр, line_path). [P48a] begin() без параметрів.
 static void initAppController() {
-    AudioProcessor* proc = s_audioProcReady ? s_audioProc : nullptr;
-    if (AppController::begin(proc)) {
+    if (AppController::begin()) {
         Serial.println("[MAIN] AppController ready");
     } else {
         Serial.println("[MAIN] AppController init failed");
@@ -308,7 +261,7 @@ static void initAppController() {
 // з командою lp.heap (еталонний замір RAM без line_path).
 static void initLinePath() {
 #if LINE_PATH_TEST
-#if (AUDIO_PROC_TEST || AUDIO_PLAYER_TEST)
+#if AUDIO_PLAYER_TEST
     Serial.println("[MAIN] WARNING: line path test shares Serial with another test (lp.* lines are ignored by others)");
 #endif
 #if STATION_STORE_TEST && !STATION_STORE_TEST_SHARE_SERIAL
@@ -329,11 +282,10 @@ static void initLinePath() {
 #endif
 }
 
-// [Prompt 13] ДОДАНО: веб-сервер. Вказівник на процесор — як для плеєра та AppController.
+// [Prompt 13] ДОДАНО: веб-сервер. [P48a] begin() без параметрів.
 // begin() лише створює задачу-стартер; HTTP піднімається, коли WifiManager дасть STA.
 static void initWebServer() {
-    AudioProcessor* proc = s_audioProcReady ? s_audioProc : nullptr;
-    if (WebServerManager::begin(proc)) {
+    if (WebServerManager::begin()) {
         Serial.println("[MAIN] WebServer starter task created");
     } else {
         Serial.println("[MAIN] WebServer init failed");
@@ -346,9 +298,9 @@ static void initWebServer() {
 // SETTINGS_TEST): знімається лише STATION_STORE_TEST_SHARE_SERIAL = 1.
 static void initStationStoreTest() {
 #if STATION_STORE_TEST
-#if (AUDIO_PROC_TEST || AUDIO_PLAYER_TEST || SETTINGS_TEST) && !STATION_STORE_TEST_SHARE_SERIAL
+#if (AUDIO_PLAYER_TEST || SETTINGS_TEST) && !STATION_STORE_TEST_SHARE_SERIAL
     Serial.println("[MAIN] Station store test skipped: Serial is used by another test "
-                   "(set AUDIO_PLAYER_TEST/AUDIO_PROC_TEST/SETTINGS_TEST to 0 or "
+                   "(set AUDIO_PLAYER_TEST/SETTINGS_TEST to 0 or "
                    "STATION_STORE_TEST_SHARE_SERIAL to 1)");
 #else
     if (StationStoreTest::begin()) {
@@ -422,13 +374,13 @@ void setup() {
         Serial.println("[MAIN] IR init failed");
     }
 
-    // [Prompt 3] ДОДАНО: аудіопроцесор (+ тестовий режим під AUDIO_PROC_TEST).
-    initAudioProcessor();
+    // [Prompt 48a] Реле-селектор входів (замість колишнього аудіопроцесора): TV Box до першого вибору входу.
+    initInputSelector();
 
-    // [Prompt 4] ДОДАНО: дисплей після ініціалізації аудіопроцесора.
+    // [Prompt 4] ДОДАНО: дисплей.
     initDisplay();
 
-    // [Prompt 5] ДОДАНО: аудіоплеєр (після процесора, щоб передати вказівник).
+    // [Prompt 5] ДОДАНО: аудіоплеєр.
     initAudioPlayer();
 
     // [Prompt 12] ДОДАНО: Wi-Fi після плеєра, але до AppController, щоб перший
@@ -439,7 +391,7 @@ void setup() {
     // powerOnTransition() контролера (стартує на зовнішньому вході й одразу керує LinePath).
     initLinePath();
 
-    // [Prompt 8] ДОДАНО: AppController після процесора, плеєра й Settings.
+    // [Prompt 8] ДОДАНО: AppController після input_selector, плеєра, line_path й Settings.
     initAppController();
 
     // [Prompt 47d] initAdcVu() видалено: VU зовнішніх входів тепер виробляє line_path (ініціалізується вище).

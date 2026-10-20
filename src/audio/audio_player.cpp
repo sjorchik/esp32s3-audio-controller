@@ -19,7 +19,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "audio/audio_processor.h"
 #include "audio/eq.h"
 #include "audio/output_trim.h"
 #include "config/adc_vu_config.h"  // [Prompt 37] ADC_VU_ENABLE
@@ -367,7 +366,6 @@ volatile uint8_t s_clkReq = 0;
 volatile bool s_clkFixed = false;
 
 Audio* s_audio = nullptr;
-AudioProcessor* s_proc = nullptr;  // не володіємо; setMute() не викликаємо
 SemaphoreHandle_t s_mutex = nullptr;
 TaskHandle_t s_task = nullptr;
 
@@ -799,12 +797,10 @@ void audio_id3data(const char* info) { handleId3(info); }
 // AudioPlayer
 // ===========================================================================
 
-bool AudioPlayer::begin(AudioProcessor* processorOrNull) {
+bool AudioPlayer::begin() {  // [P48a] без параметра AudioProcessor
     if (s_task != nullptr) {
         return true;
     }
-
-    s_proc = processorOrNull;
 
     // XSMT: ззовні pulldown, тож при живленні ЦАП замʼютований; явно тримаємо LOW.
     pinMode(pins::kXsmt, OUTPUT);
@@ -838,7 +834,7 @@ bool AudioPlayer::begin(AudioProcessor* processorOrNull) {
     s_audio->setBufsize(player_cfg::kStreamBufRamBytes, player_cfg::kStreamBufPsramBytes);
 #endif
     s_audio->setConnectionTimeout(player_cfg::kHttpTimeoutMs, player_cfg::kHttpsTimeoutMs);
-    // Гучність бібліотеки — максимум і надалі не змінюється (керує AudioProcessor).
+    // Гучність бібліотеки — максимум і надалі не змінюється (гучність — цифрова, поза плеєром).
     s_audio->setVolume(player_cfg::kLibVolume);
 
 #if AUDIO_PLAYER_CB_STYLE == 2
@@ -857,9 +853,8 @@ bool AudioPlayer::begin(AudioProcessor* processorOrNull) {
         return false;
     }
 
-    Serial.printf("[PLAYER] ready (core %d, prio %u, processor %s, buffer %s)\n",
+    Serial.printf("[PLAYER] ready (core %d, prio %u, buffer %s)\n",
                   player_cfg::kTaskCore, static_cast<unsigned>(player_cfg::kTaskPriority),
-                  (s_proc != nullptr) ? "attached" : "none",
                   AUDIO_PLAYER_HAS_SETBUFSIZE ? "configured" : "library default");
     return true;
 }

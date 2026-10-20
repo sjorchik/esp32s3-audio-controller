@@ -124,7 +124,7 @@
 // його пише веб-обробник /api/eq (SettingsStore::modify), а persist() записує в профілі ТІЛЬКИ гучність
 // (інакше застарілу копію EQ було б записано поверх свіжої). Бас / дискант / баланс / gain / loudness
 // прибрано з профілю, подій, команд і цілей енкодера; у чіп при застосуванні профілю надсилаються фіксовані
-// нейтральні значення (app_controller_cfg::kNeutral*), а поля AppStateData bass/treble/balance/gain/loudness
+// нейтральні значення (P48a: app_controller_cfg::kLegacy*), а поля AppStateData bass/treble/balance/gain/loudness
 // публікуються цими ж нейтральними константами (застарілі заглушки до P49/P50). Ціль регулювання енкодера
 // завжди Volume (цикл цілей і автоповернення P31 прибрано); короткий клік енкодера лише показує вікно
 // гучності. Дії BASS_* .. GAIN_* (enum незмінний) ігноруються з одним коротким логом. Пресет EQ екземпляра
@@ -134,8 +134,7 @@
 // [Prompt 47a] ЦИФРОВА ГУЧНІСТЬ РАДІО. Підсилювач сидить на виході PCM5102, тож гучність радіо — це
 // audio/radio_volume (DspVolume у хуку PCM, ядро 1): зміна гучності = setAttenuationDb(radioVolumeDb(vol)),
 // мʼют = setMute() (плавно: 20 мс вниз, 100 мс вгору — рампу робить DSP, програмної рампи в контролері
-// більше немає, Phase::Ramp прибрано). Чип гучність НЕ отримує: applyActiveToChip() надсилає фіксовану
-// нейтральну (kNeutralVolume, 0 дБ). Цифровий мʼют дзеркалить desiredMute() (syncRadioMute()), і ПЕРЕД
+// більше немає, Phase::Ramp прибрано). Чип гучність НЕ отримує (P48a: чипа немає). Цифровий мʼют дзеркалить desiredMute() (syncRadioMute()), і ПЕРЕД
 // зупинкою плеєра / зміною станції / вимкненням підсилювача контролер чекає згасання (до kRadioMuteWaitMs;
 // лише коли радіо грає): startTransition(), enterStandby(), beginRestart(), beginOta(), pauseRadio().
 // Пауза радіо тримає DSP у мʼюті (s_stopHold) до наступного startStream(), щоб старий потік, що
@@ -160,6 +159,16 @@
 // setUserMute, setVolumeDb, setEqAllDb). При LINE_PATH_ENABLE == 0 жодного виклику LinePath немає: зовнішні входи мовчать,
 // поведінка радіо як у P47a.
 
+// [Prompt 48a] АУДІОЧІПИ (TDA7318 / PT2313L) І I2C ВИРІЗАНО. AppController працює без AudioProcessor:
+// begin() без параметрів; логічних входів 3 (0 радіо, 1 TV Box, 2 Computer), «вхід чіпа k - 1» скасовано.
+// Входи 1 / 2 комутує реле (audio/input_selector::select()) у вже наявній послідовності P47c ПІД цифровим
+// мʼютом проходу: мʼют -> kExtMuteSettleMs -> select() -> input_selector_cfg::kRelaySettleMs -> розмʼют.
+// Радіо реле НЕ чіпає. Чип-мʼют (setMute) прибрано: s_hwMute = «цифровий мʼют виставлено» (потрібен
+// піну підсилювача P23c). Тембр / gain / loudness видалено: WebCmdType::GainSet -> Unsupported, setTone()
+// нічого не приймає. Профіль входу = {volume, eqGainsDb[5], balanceDb}: контролер пише лише гучність;
+// balanceDb поки не чіпає (P48b). inputAvailable() = маска входів (+ офлайн: без радіо).
+// IR прямого вибору: INPUT_RADIO / INPUT_TV / INPUT_PC -> 0 / 1 / 2; INPUT_AUX — без дії.
+
 #include "core/app_controller.h"
 
 #include <Arduino.h>
@@ -168,17 +177,18 @@
 
 #include "audio/amp_standby.h"  // [Prompt 23c]
 #include "audio/audio_player.h"
-#include "audio/audio_processor.h"
 #include "audio/eq.h"  // [Prompt 46a] applyRadioEq()
+#include "audio/input_selector.h"  // [Prompt 48a] реле-селектор входів 1 / 2
 #include "audio/line_path.h"     // [Prompt 47c]
 #include "audio/radio_volume.h"  // [Prompt 47a]
 #include "config/amp_config.h"  // [Prompt 23c]
 #include "config/app_controller_config.h"
 #include "config/defaults.h"
 #include "config/features.h"  // [Prompt 23c]
+#include "config/input_selector_config.h"  // [Prompt 48a] kRelaySettleMs
 #include "config/ir_learn_ui_config.h"  // [Prompt 15] ДОДАНО
 #include "config/line_path_config.h"  // [Prompt 47c] LINE_PATH_ENABLE
-#include "config/audio_config.h"     // [Prompt 46b] chipInputFor(), logicalInputCount(); [P47a] radioVolumeDb()
+#include "config/audio_config.h"     // [P47a] radioVolumeDb(); [P48a] kVolumeUiMin / kVolumeUiMax
 #include "config/settings_config.h"  // [Prompt 39] normalizeInputMask, kInputMaskAll
 #include "config/wifi_status_config.h"  // [Prompt 36]
 #include "core/app_state.h"
@@ -237,9 +247,6 @@ enum class LineAfter : uint8_t { Auto, Retry, Fail };
 
 SemaphoreHandle_t s_lock = nullptr;
 bool s_started = false;
-AudioProcessor* s_proc = nullptr;
-AudioProcessorCapabilities s_caps = {};
-
 Mode s_mode = Mode::Standby;
 uint8_t s_input = 0;
 uint16_t s_station = 0;
@@ -259,8 +266,7 @@ uint16_t s_menuSel = 0;
 Phase s_phase = Phase::None;
 uint32_t s_phaseStartMs = 0;
 
-bool s_hwMute = false;  // що востаннє УСПІШНО надіслано в чіп
-uint32_t s_lastMuteTryMs = 0;
+bool s_hwMute = false;  // [P48a] цифровий мʼют виставлено (= desiredMute() на момент останнього applyHardwareMute())
 
 // [Prompt 47a] Пауза радіо: DSP-мʼют тримається, поки не буде наступного startStream() (див. pauseRadio()).
 bool s_stopHold = false;
@@ -277,7 +283,7 @@ uint8_t s_lineSwitchStep = 0;     // Switching: 0 = чекаємо мʼют, 1 =
 uint8_t s_lineRelStep = 0;        // Releasing: 0 = чекаємо мʼют, 1 = чекаємо звільнення
 bool s_lineRelCalled = false;     // returnToRadio() прийнято
 uint32_t s_lineT0 = 0;            // початок поточного кроку (WaitRetry: момент повтору)
-uint32_t s_lineChipSetMs = 0;     // коли востаннє міняли вхід чіпа
+uint32_t s_lineRelayMs = 0;       // [P48a] коли востаннє виставляли реле-селектор
 #endif
 
 uint32_t s_lastSyncMs = 0;
@@ -579,23 +585,6 @@ void stopStream() {
     AudioPlayer::stop();
 }
 
-// --- Можливості ------------------------------------------------------------
-void loadCaps() {
-    if (s_proc != nullptr) {
-        s_caps = s_proc->capabilities();
-        // [Prompt 46b] У контролері s_caps.inputCount = кількість ЛОГІЧНИХ входів: радіо (0) + зовнішні,
-        // що чіп має (TDA7318: 4 -> 5; PT2313L: 3 -> 4). Сирий inputCount чіпа далі не потрібен.
-        s_caps.inputCount = (s_caps.inputCount == 0) ? defaults::kInputCount
-                                                     : audio_cfg::logicalInputCount(s_caps.inputCount);
-        return;
-    }
-    // Без процесора: умовні межі, щоб логіка стану не ламалась.
-    s_caps = {};
-    s_caps.inputCount = defaults::kInputCount;
-    s_caps.volumeMin = 0;
-    s_caps.volumeMax = 100;
-}
-
 // [Prompt 46a] Єдина підтримувана ціль регулювання — гучність (бас/дискант/баланс/gain прибрано).
 bool targetSupported(AdjustTarget t) {
     return t == AdjustTarget::Volume;
@@ -645,7 +634,7 @@ void loadActiveFromProfile(uint8_t idx) {
     if (idx >= defaults::kInputCount) {
         idx = 0;
     }
-    s_volume = static_cast<int8_t>(clampInt(s_volumes[idx], s_caps.volumeMin, s_caps.volumeMax));
+    s_volume = static_cast<int8_t>(clampInt(s_volumes[idx], audio_cfg::kVolumeUiMin, audio_cfg::kVolumeUiMax));
     // [Prompt 47c] Радіо — цифрова гучність одразу; для зовнішнього входу значення піде в LinePath разом з вибором
     // входу чіпа (lineApplyParams()), щоб не міняти звук старого входу, поки він ще згасає.
     if (idx == 0) {
@@ -664,32 +653,6 @@ void applyRadioEq() {
         eq::setAllDb(st.profiles[0].eqGainsDb);
         APP_LOG("radio EQ preset applied (input 0 profile)\n");
     }
-}
-
-// Надсилає в чип ФІКСОВАНІ нейтральні значення (гучність [P47a], тембр, баланс, loudness, gain входу).
-// Гучність користувача чип не отримує: вона цифрова (radio_volume). Викликати лише під мʼютом
-// атенюаторів. withGain=true — лише ПІСЛЯ setInput(), бо setGain() стосується поточного входу чипа; без
-// setInput() (завантаження в standby) gain не чіпаємо.
-// Драйвери не пишуть у шину байти, що вже лежать у чипі (кеш), тож повторні виклики дешеві.
-void applyActiveToChip(bool withGain) {
-    if (s_proc == nullptr) {
-        return;
-    }
-    bool ok = true;
-    ok = s_proc->setVolume(cfg::kNeutralVolume) && ok;  // [Prompt 47a] фіксована 0 дБ
-    if (s_caps.bass) ok = s_proc->setBass(cfg::kNeutralBass) && ok;
-    if (s_caps.treble) ok = s_proc->setTreble(cfg::kNeutralTreble) && ok;
-    if (s_caps.balance) ok = s_proc->setBalance(cfg::kNeutralBalance) && ok;
-    if (withGain && s_caps.inputGain && s_caps.gainMax > s_caps.gainMin) {
-        ok = s_proc->setGain(cfg::kNeutralGain) && ok;
-    }
-    if (s_caps.loudness) ok = s_proc->setLoudness(cfg::kNeutralLoudness) && ok;
-    if (!ok) {
-        APP_LOG("profile apply: some I2C writes FAILED\n");
-    }
-    APP_LOG("profile in%u: vol=%d (digital %.2f dB; chip volume/tone/balance/gain/loudness neutral)\n",
-            static_cast<unsigned>(s_input), static_cast<int>(s_volume),
-            static_cast<double>(s_input == 0 ? audio_cfg::radioVolumeDb(s_volume) : extVolumeDb(s_volume)));
 }
 
 // --- Мʼют ----------------------------------------------------------------------
@@ -767,24 +730,16 @@ void syncRadioMute(bool waitSilent) {
     }
 }
 
-// Мʼют: спершу цифровий (радіо), потім чип (зовнішні входи; також підтвердження для підсилювача).
-void applyHardwareMute(bool force = false, bool waitSilent = false) {
+// Мʼют: цифровий (радіо) + цифровий мʼют проходу зовнішніх входів. [P48a] Апаратного (чип) мʼюту немає:
+// s_hwMute = desiredMute() (піну підсилювача P23c достатньо цього «підтвердження»: DSP радіо / прохід уже
+// отримали запит на мʼют, а перед вимкненням підсилювача контролер чекає згасання через waitSilent).
+void applyHardwareMute(bool waitSilent = false) {
     syncRadioMute(waitSilent);  // [Prompt 47a]
     syncLineMute();             // [Prompt 47c] у режимі радіо LinePath і так у мʼюті (стан != Active)
     const bool want = desiredMute();
-    if (s_proc == nullptr) {
+    if (want != s_hwMute) {
         s_hwMute = want;
-        return;
-    }
-    if (!force && want == s_hwMute) {
-        return;
-    }
-    s_lastMuteTryMs = millis();
-    if (s_proc->setMute(want)) {
-        s_hwMute = want;
-        APP_LOG("hw mute %s\n", want ? "on" : "off");
-    } else {
-        APP_LOG("hw mute %s FAILED (I2C), will retry\n", want ? "on" : "off");
+        APP_LOG("mute %s\n", want ? "on" : "off");
     }
 }
 
@@ -882,11 +837,11 @@ void applyPub(AppStateData& s, void* c) {
     s.volume = p->volume;
     // [Prompt 46a] Застарілі поля: тембр/баланс/gain/loudness більше не регулюються — завжди нейтральні
     // константи (екрани й веб компілюються й не ламаються; поля видалить P49/P50).
-    s.bass = cfg::kNeutralBass;
-    s.treble = cfg::kNeutralTreble;
-    s.balance = cfg::kNeutralBalance;
-    s.gain = cfg::kNeutralGain;
-    s.loudness = cfg::kNeutralLoudness;
+    s.bass = cfg::kLegacyToneValue;
+    s.treble = cfg::kLegacyToneValue;
+    s.balance = cfg::kLegacyToneValue;  // [P48a] баланс (dB) у AppState з'явиться в P48b
+    s.gain = cfg::kLegacyToneValue;
+    s.loudness = cfg::kLegacyLoudness;
     s.mute = p->mute;
     s.stationIndex = p->station;
     s.adjustTarget = p->target;
@@ -1074,7 +1029,7 @@ void syncPlayer() {
 // [Prompt 47a] Змінює ЦІЛЬОВУ гучність і одразу застосовує цифрове послаблення радіо. Плавність
 // (100 мс) забезпечує DSP; у мʼюті/Settle нове значення просто чекає на розмʼют. Чип не чіпаємо.
 bool setVolumeTarget(int v) {
-    v = clampInt(v, s_caps.volumeMin, s_caps.volumeMax);
+    v = clampInt(v, audio_cfg::kVolumeUiMin, audio_cfg::kVolumeUiMax);
     if (v == s_volume) {
         return false;
     }
@@ -1088,26 +1043,26 @@ bool setVolumeTarget(int v) {
 void startTransition() {
     s_phase = Phase::Settle;
     s_phaseStartMs = millis();
-    applyHardwareMute(false, true);
+    applyHardwareMute(true);
 }
 
 // ---------------------------------------------------------------------------
 // [Prompt 47c] Маршрутизація входу: радіо або прохід зовнішніх входів
 // ---------------------------------------------------------------------------
-// Вхід чіпа-селектора для s_input + нейтральні значення (під мʼютом). Для радіо — ЛЕГАСІ вхід чіпа 0 (прибрати в P47d).
-void applyChipForInput() {
-    if (s_proc != nullptr) {
-        s_proc->setInput(audio_cfg::chipInputFor(s_input));  // [Prompt 46b] логічний -> вхід чіпа
-        applyActiveToChip(true);
+// [Prompt 48a] Реле-селектор для s_input: 1 -> TV Box, 2 -> Computer. Радіо (0) реле НЕ чіпає. Викликати лише
+// коли прохід цифрово замʼючений або не працює (клацання реле не має потрапити в динаміки). Момент перемикання
+// запамʼятовується: розмʼют не раніше input_selector_cfg::kRelaySettleMs.
+void applyRelayForInput() {
+    if (s_input != 0) {
+        input_selector::select(s_input);
     }
 #if LINE_PATH_ENABLE
-    s_lineChipSetMs = millis();
+    s_lineRelayMs = millis();
 #endif
 }
 
-// Запуск радіо: чип, пресет EQ входу 0, потік (профіль входу 0 уже в s_volume / radio_volume).
+// Запуск радіо: пресет EQ входу 0, потік (профіль входу 0 уже в s_volume / radio_volume). Реле не чіпаємо.
 void radioBegin() {
-    applyChipForInput();
     applyRadioEq();  // [Prompt 46a]
     startStream();
 }
@@ -1159,9 +1114,9 @@ void lineApplyParams() {
     lineApplyEq(s_input);
 }
 
-// Вибір входу чіпа + гучність + EQ. Викликати лише коли прохід цифрово замʼючений або не працює.
+// Реле входу + гучність + EQ. Викликати лише коли прохід цифрово замʼючений або не працює.
 void lineApplyChipAndParams() {
-    applyChipForInput();
+    applyRelayForInput();
     lineApplyParams();
     s_lineApplied = true;
 }
@@ -1283,7 +1238,7 @@ void lineServiceStarting(uint32_t now) {
     // WaitRunning
     const uint32_t elapsed = now - s_lineT0;
     const LinePathState st = LinePath::state();
-    if (st == LinePathState::Running && reached(now, s_lineChipSetMs + cfg::kExtInputSettleMs)) {
+    if (st == LinePathState::Running && reached(now, s_lineRelayMs + input_selector_cfg::kRelaySettleMs)) {
         s_lineRetryUsed = false;  // успішний старт повертає право на автоповтор
         lineSetState(LineState::Active);  // syncLineMute() розмʼютить, якщо Settle / мʼют користувача не заважають
         return;
@@ -1310,7 +1265,7 @@ void lineServiceSwitching(uint32_t now) {
         }
         return;
     }
-    if (reached(now, s_lineChipSetMs + cfg::kExtInputSettleMs)) {
+    if (reached(now, s_lineRelayMs + input_selector_cfg::kRelaySettleMs)) {
         lineSetState(LineState::Active);
     }
 }
@@ -1419,7 +1374,7 @@ inline void routeInput() {
     if (s_input == 0) {
         radioBegin();
     } else {
-        applyChipForInput();  // чип-селектор як раніше (звуку немає: прохід вимкнено збіркою)
+        applyRelayForInput();  // реле-селектор (звуку немає: прохід вимкнено збіркою)
     }
 }
 #endif
@@ -1448,7 +1403,7 @@ void enterStandby() {
     s_menuCtx = MenuContext::None;
     s_menuSel = 0;
     s_mode = Mode::Standby;
-    applyHardwareMute(false, true);  // Standby входить у desiredMute(): [P47a] радіо згасає ДО stopStream()
+    applyHardwareMute(true);  // Standby входить у desiredMute(): [P47a] радіо згасає ДО stopStream()
     ampRequestOff();      // [Prompt 23c]: пін LOW через kAmpOffDelayMs (у tick())
     stopStream();
     lineRelease();        // [Prompt 47c]: прохід замʼючено (desiredMute()), returnToRadio() через kExtMuteSettleMs
@@ -1466,13 +1421,13 @@ bool inputEnabled(uint8_t idx) {
     return idx < defaults::kInputCount && ((s_inputMask >> idx) & 1u) != 0;
 }
 
-bool inputAvailable(uint8_t idx) {
-    return idx < s_caps.inputCount && inputEnabled(idx) && !(s_offline && idx == 0);
+bool inputAvailable(uint8_t idx) {  // [P48a] = маска входів (+ офлайн: без радіо)
+    return inputEnabled(idx) && !(s_offline && idx == 0);
 }
 
 // Текстова причина недоступності входу для логів (лише коли inputAvailable(idx) == false).
 const char* inputUnavailableWhy(uint8_t idx) {
-    if (idx >= s_caps.inputCount) return "no such input";
+    if (idx >= defaults::kInputCount) return "no such input";
     if (!inputEnabled(idx)) return "disabled";
     return "offline";
 }
@@ -1480,7 +1435,7 @@ const char* inputUnavailableWhy(uint8_t idx) {
 // [Prompt 39] Чи є хоч один дозволений зовнішній вхід (1..inputCount-1) — потрібен офлайн-режиму,
 // де радіо недоступне. Офлайн-стан сюди не входить (зовнішні входи від нього не залежать).
 bool anyExternalInputEnabled() {
-    for (uint8_t i = 1; i < s_caps.inputCount; ++i) {
+    for (uint8_t i = 1; i < defaults::kInputCount; ++i) {
         if (inputEnabled(i)) {
             return true;
         }
@@ -1490,7 +1445,7 @@ bool anyExternalInputEnabled() {
 
 // Перший доступний вхід за порядком 0..inputCount-1 (в офлайні це перший не-радіо вхід).
 uint8_t firstAvailableInput() {
-    for (uint8_t i = 0; i < s_caps.inputCount; ++i) {
+    for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
         if (inputAvailable(i)) {
             return i;
         }
@@ -1503,7 +1458,7 @@ uint8_t firstAvailableInput() {
 void leaveStandby() {
     captureActiveProfile();  // [Prompt 21b] профіль «старого» входу, поки s_input ще його
     const Settings st = SettingsStore::snapshot();
-    s_input = (st.lastInput < s_caps.inputCount) ? st.lastInput : 0;
+    s_input = (st.lastInput < defaults::kInputCount) ? st.lastInput : 0;
     if (!inputAvailable(s_input)) {  // [Prompt 28] офлайн: lastInput = радіо -> перший не-радіо вхід
         s_input = firstAvailableInput();
     }
@@ -1562,7 +1517,7 @@ void changeInput(uint8_t newIdx) {
 }
 
 void stepInput(int dir) {
-    const int count = s_caps.inputCount;  // [Prompt 46b] логічні входи; PT2313L = 4: вхід 4 пропускається
+    const int count = defaults::kInputCount;  // [P48a] 3 логічні входи; вимкнені маскою пропускаються
     // [Prompt 28] Недоступні входи (в офлайні — радіо) пропускаються. Без офлайну перший же
     // крок доступний, тож поведінка не змінилась.
     int n = s_input;
@@ -1778,7 +1733,9 @@ void handleMainEvent(const Event& e) {
         case Action::INPUT_RADIO: if (plain) selectInput(0); break;
         case Action::INPUT_TV:    if (plain) selectInput(1); break;
         case Action::INPUT_PC:    if (plain) selectInput(2); break;
-        case Action::INPUT_AUX:   if (plain) selectInput(3); break;
+        case Action::INPUT_AUX:   // [P48a] входу AUX немає: дія лишається в enum (мапа IR), без дії
+            if (plain) APP_LOG("INPUT_AUX ignored (no such input)\n");
+            break;
         default:
             APP_LOG("event ignored (not in Prompt 8 scope)\n");
             break;
@@ -2003,7 +1960,7 @@ void beginRestart() {
     s_playPending = false;
     s_restartPhase = RestartPhase::WaitAmp;
     s_restartDeadlineMs = millis() + cfg::kRestartMaxWaitMs;
-    applyHardwareMute(false, true);  // мʼют ПЕРШИМ ([P47a]: радіо згасає до stopStream())
+    applyHardwareMute(true);  // мʼют ПЕРШИМ ([P47a]: радіо згасає до stopStream())
     if (AudioPlayer::state() != PlayerState::Idle) {
         stopStream();  // плеєр мʼютить XSMT ЦАП
     } else {
@@ -2219,8 +2176,7 @@ void tickLocked() {
                 static_cast<double>(s_input == 0 ? audio_cfg::radioVolumeDb(s_volume) : extVolumeDb(s_volume)));
     }
 
-    if (s_proc != nullptr && desiredMute() != s_hwMute &&
-        static_cast<uint32_t>(now - s_lastMuteTryMs) >= cfg::kMuteRetryMs) {
+    if (desiredMute() != s_hwMute) {  // [P48a] страховка: цифровий мʼют завжди відповідає desiredMute()
         applyHardwareMute();
     }
 
@@ -2324,7 +2280,7 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
 
     switch (c.type) {
         case WebCmdType::VolumeSet:
-            if (c.value < s_caps.volumeMin || c.value > s_caps.volumeMax) {
+            if (c.value < audio_cfg::kVolumeUiMin || c.value > audio_cfg::kVolumeUiMax) {
                 why = "volume_out_of_range";
                 return WebCmdResult::OutOfRange;
             }
@@ -2354,11 +2310,10 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
             break;
 
         case WebCmdType::GainSet:
-            // [Prompt 46a] Підсилення входу більше не регулюється (чип — лише селектор): веб-обробник
-            // /api/gain уже перевірив межі за capabilities(); команда приймається й ІГНОРУЄТЬСЯ (Ok),
-            // gain лишається нейтральним. Запис і мʼют не виконуються.
-            APP_LOG("gain=%d (WEB) ignored: input gain control removed\n", static_cast<int>(c.value));
-            break;
+            // [Prompt 48a] Підсилення входу видалено разом із чипом: команда не підтримується (400
+            // not_supported). Тип лишається в WebCmdType (ABI), стан не змінюється.
+            why = "not_supported";
+            return WebCmdResult::Unsupported;
 
         case WebCmdType::StandbySet:
             if (c.flag) {
@@ -2373,8 +2328,8 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
             break;
 
         case WebCmdType::InputSet:
-            if (c.value < 0 || c.value >= s_caps.inputCount) {
-                why = "input_unavailable";  // напр. логічний вхід 4 для PT2313L
+            if (c.value < 0 || c.value >= defaults::kInputCount) {
+                why = "input_unavailable";  // поза 0..2
                 return WebCmdResult::OutOfRange;
             }
             // [Prompt 39] Вхід вимкнено користувачем (маска) — не помилка значення, а стан
@@ -2526,19 +2481,10 @@ bool AppController::setTone(ToneUpdate& u) {
         xSemaphoreTakeRecursive(s_lock, pdMS_TO_TICKS(cfg::kLockTimeoutMs)) != pdTRUE) {
         return false;
     }
-    if (s_mode == Mode::OtaUpdate || restarting()) {  // [Prompt 16] під час прошивки чип не чіпаємо; [Prompt 28] і перезапуску
-        xSemaphoreGiveRecursive(s_lock);
-        return false;
-    }
-    // [Prompt 46a] Тембр/баланс/loudness більше не регулюються (чип — лише селектор входів): запит
-    // приймається й ІГНОРУЄТЬСЯ. *Ok = true для запитаних полів, які чип «мав» (capabilities), щоб веб
-    // не відповідав помилкою; значення в чип, профіль і AppState НЕ потрапляють (там нейтральні).
-    u.bassOk = u.hasBass && s_caps.bass;
-    u.trebleOk = u.hasTreble && s_caps.treble;
-    u.balanceOk = u.hasBalance && s_caps.balance;
-    u.loudnessOk = u.hasLoudness && s_caps.loudness;
+    // [Prompt 48a] Тембр / баланс / loudness не підтримуються (чипа немає; баланс повернеться цифровим у P48b
+    // іншим шляхом): усі *Ok = false («Unsupported»), стан не змінюється. Метод лишено заради ABI.
     if (u.hasBass || u.hasTreble || u.hasBalance || u.hasLoudness) {
-        APP_LOG("tone/balance/loudness (WEB) ignored: controls removed\n");
+        APP_LOG("tone/balance/loudness (WEB) unsupported: ignored\n");
     }
     xSemaphoreGiveRecursive(s_lock);
     return true;
@@ -2587,7 +2533,7 @@ bool AppController::beginOta() {
         publishOtaProgress(0);  // спершу 0, потім режим: екран не покаже старий відсоток
         s_mode = Mode::OtaUpdate;
         s_phase = Phase::None;  // Settle скасовано
-        applyHardwareMute(false, true);  // desiredMute() уже true; мʼют ПЕРЕД зупинкою потоку ([P47a]: з очікуванням згасання)
+        applyHardwareMute(true);  // desiredMute() уже true; мʼют ПЕРЕД зупинкою потоку ([P47a]: з очікуванням згасання)
         stopStream();
         lineRelease();  // [Prompt 47c] звільнити RAM проходу (≈ 21 КБ) для OTA; мʼют — desiredMute()
         publishState();
@@ -2678,7 +2624,7 @@ bool AppController::applyLineEq(uint8_t input, const int8_t gains[eq_cfg::kBandC
     return true;
 }
 
-bool AppController::begin(AudioProcessor* processorOrNull) {
+bool AppController::begin() {
     if (s_started) {
         return true;
     }
@@ -2704,14 +2650,8 @@ bool AppController::begin(AudioProcessor* processorOrNull) {
         return false;
     }
 
-    s_proc = processorOrNull;
-    loadCaps();
-    if (s_proc == nullptr) {
-        Serial.println("[APP] no audio processor: sound control unavailable");
-    }
-
-    // Налаштування — лише з Settings; значення обрізаємо за capabilities
-    // (Settings діапазони не валідує).
+    // Налаштування — лише з Settings; гучність обрізаємо за audio_cfg::kVolumeUiMin..kVolumeUiMax
+    // (Settings діапазон гучності не валідує).
     // [Prompt 21b/46a] Гучності профілів усіх входів — у таблицю контролера, робоча гучність — з профілю
     // останнього активного входу. Пресети EQ профілів лишаються в Settings (контролер їх не копіює).
     const Settings st = SettingsStore::snapshot();
@@ -2733,7 +2673,7 @@ bool AppController::begin(AudioProcessor* processorOrNull) {
 
     // Спершу тиша, потім решта. [P47a] Цифровий мʼют радіо (DSP стартує замʼюченим) + чип.
     s_hwMute = false;
-    applyHardwareMute(true);
+    applyHardwareMute();
 
     // [Prompt 39] Причина скидання: подача живлення / brownout (cfg::kColdStartResetReasons) —
     // стартуємо у Standby, як після POWER. Інші причини (ESP.restart(), паніка, watchdog, ...) —
@@ -2748,12 +2688,10 @@ bool AppController::begin(AudioProcessor* processorOrNull) {
 
     if (cfg::kBootInStandby || coldStart) {
         APP_LOG("boot in standby\n");
-        // Вхід у чіп не перемикаємо (як і раніше), тож gain (він стосується поточного входу
-        // ЧІПА) не чіпаємо: профіль входу застосується повністю при виході зі standby.
-        // [Prompt 46a/47a] Тут у чіп йдуть лише нейтральні гучність/тембр/баланс/loudness.
-        applyActiveToChip(false);
+        // [Prompt 48a] Реле не чіпаємо (лишається в TV Box після input_selector::begin()), тиша: профіль
+        // входу застосується повністю при виході зі standby.
     } else {
-        powerOnTransition();  // режим, setInput + профіль, playUrl для Radio, розмʼют у tick()
+        powerOnTransition();  // режим, реле / старт проходу + профіль, playUrl для Radio, розмʼют у tick()
     }
     publishState();
 

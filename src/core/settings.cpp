@@ -1,6 +1,8 @@
 // Реалізація SettingsStore: один blob у NVS з версією формату, кеш у RAM,
 // відкладений запис з дебаунсом у власній легкій задачі.
-// [Prompt 46b] Формат v6: 5 логічних входів (0 = радіо, 1..4 = зовнішні), профіль = {volume, eqGainsDb[5]}.
+// [Prompt 48a] Формат v7: 3 логічні входи (0 = радіо, 1 = TV Box, 2 = Computer), профіль = {volume,
+// eqGainsDb[5], balanceDb}, без типу аудіопроцесора (чипи вирізано).
+// [Prompt 46b] (v6: 5 логічних входів.)
 // МІГРАЦІЙ НЕМАЄ (рішення власника: прошивка на стертий flash): blob із будь-якою іншою версією, довжиною
 // чи payload-ом ігнорується з логом, і діють значення за замовчуванням (одразу записуються в NVS).
 
@@ -11,9 +13,8 @@
 #include <string.h>
 #include <type_traits>
 
-#include "audio/audio_processor.h"
 #include "audio/eq.h"
-#include "config/audio_config.h"
+#include "config/balance_config.h"
 #include "config/defaults.h"
 #include "config/display_config.h"
 #include "config/eq_config.h"
@@ -36,21 +37,17 @@ static_assert(std::is_trivially_copyable<Settings>::value,
 static_assert(sizeof(Settings::inputNames) / sizeof(Settings::inputNames[0]) ==
                   defaults::kInputCount,
               "Settings::inputNames must have defaults::kInputCount rows");
-static_assert(static_cast<uint8_t>(AudioProcType::Tda7318) == 0 &&
-                  static_cast<uint8_t>(AudioProcType::Pt2313l) == 1,
-              "Settings::processorType comment assumes Tda7318=0, Pt2313l=1");
 static_assert(sizeof(StoredBlob) <= 1024, "keep the blob small");
 
 // ---------------------------------------------------------------------------
-// Перевірки розкладки (формат v6)
+// Перевірки розкладки (формат v7)
 // ---------------------------------------------------------------------------
-static_assert(defaults::kInputCount == 5, "format v6 is laid out for 5 logical inputs (radio + 4 external)");
-static_assert(sizeof(InputProfile) == 1 + eq_cfg::kBandCount, "InputProfile = volume + EQ bands, no padding");
-static_assert(sizeof(Settings) == 198, "Settings v6 is 198 bytes");
-static_assert(sizeof(StoredBlob) == 202, "v6 blob is 202 bytes (differs from every earlier format: 144/164/168/170)");
+static_assert(defaults::kInputCount == 3, "format v7 is laid out for 3 logical inputs (radio + TV Box + Computer)");
+static_assert(sizeof(InputProfile) == 1 + eq_cfg::kBandCount + 1,
+              "InputProfile = volume + EQ bands + balanceDb, no padding");
+static_assert(sizeof(Settings) == 126, "Settings v7 is 126 bytes");
+static_assert(sizeof(StoredBlob) == 130, "v7 blob is 130 bytes (differs from every earlier format: 144/164/168/170/202)");
 static_assert(defaults::kInputCount >= 1, "profiles[0] (radio) must exist");
-
-constexpr uint8_t kProcTypeMax = static_cast<uint8_t>(AudioProcType::Pt2313l);
 
 
 // ---------------------------------------------------------------------------
@@ -97,9 +94,6 @@ private:
 // ---------------------------------------------------------------------------
 void fillDefaults(Settings& s) {
     memset(&s, 0, sizeof(s));
-    // Для першого запуску беремо поточний тип зі стенду (audio_cfg::kTestProcType),
-    // щоб замінити жорстку константу в main.cpp без зміни поведінки.
-    s.processorType = static_cast<uint8_t>(audio_cfg::kTestProcType);
     for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
         snprintf(s.inputNames[i], sizeof(s.inputNames[i]), "%s", defaults::kInputNames[i]);
     }
@@ -108,15 +102,16 @@ void fillDefaults(Settings& s) {
     s.lastInput = defaults::kDefaultInput;
     s.lastStation = 0;
     s.lastMute = defaults::kDefaultMute;
-    // [Prompt 46a] Профіль кожного входу: типова гучність, еквалайзер плоский (0 дБ; memset вище).
+    // [Prompt 46a] Профіль кожного входу: типова гучність, еквалайзер плоский (0 дБ), [P48a] баланс 0 дБ.
     for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
         InputProfile& p = s.profiles[i];
         p.volume = defaults::kDefaultVolume;
         for (uint8_t b = 0; b < eq_cfg::kBandCount; ++b) {
             p.eqGainsDb[b] = 0;
         }
+        p.balanceDb = balance_cfg::kDefaultDb;
     }
-    // [Prompt 46b] Дозволені входи 0..3; додатковий вхід 4 вимкнений (вмикається у вебі).
+    // [Prompt 48a] Усі три входи дозволені (0x07).
     s.inputEnabledMask = settings_cfg::kInputMaskDefault;
 }
 
@@ -129,11 +124,9 @@ void normalizeBool(bool& b) {
 
 // Перевірка даних, прочитаних з NVS (захист від пошкодженого, але формально
 // валідного blob-а). Діапазон гучності тут НЕ перевіряється: його обрізає AppController
-// за capabilities() конкретного чіпа. Пресети EQ обрізаються тут (eq_cfg::kGainMinDb..kGainMaxDb).
+// (audio_cfg::kVolumeUiMin..kVolumeUiMax). Пресети EQ обрізаються тут (eq_cfg::kGainMinDb..kGainMaxDb);
+// [P48a] balanceDb поза діапазоном (balance_cfg::kMinDb..kMaxDb) -> 0.
 void sanitize(Settings& s) {
-    if (s.processorType > kProcTypeMax) {
-        s.processorType = static_cast<uint8_t>(audio_cfg::kTestProcType);
-    }
     for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
         s.inputNames[i][sizeof(s.inputNames[i]) - 1] = '\0';
     }
@@ -149,6 +142,7 @@ void sanitize(Settings& s) {
             if (g < eq_cfg::kGainMinDb) g = eq_cfg::kGainMinDb;
             if (g > eq_cfg::kGainMaxDb) g = eq_cfg::kGainMaxDb;
         }
+        s.profiles[i].balanceDb = balance_cfg::sanitizeDb(s.profiles[i].balanceDb);  // [Prompt 48a]
     }
     // [Prompt 39] Маска входів: зайві біти скидаємо, радіо (біт 0) завжди дозволене.
     s.inputEnabledMask = settings_cfg::normalizeInputMask(s.inputEnabledMask);
@@ -283,8 +277,8 @@ bool SettingsStore::load() {
             Serial.printf("[SET] stored size %u unsupported, using defaults\n",
                           static_cast<unsigned>(len));
         } else {
-            // [Prompt 46b] Приймаємо ЛИШЕ поточний формат (версія + довжина + payload). Будь-який інший
-            // blob (старі версії v1..v5, чужа довжина) не мігрується: значення за замовчуванням.
+            // [Prompt 48a] Приймаємо ЛИШЕ поточний формат v7 (версія + довжина + payload). Будь-який інший
+            // blob (старі версії v1..v6, чужа довжина) не мігрується: значення за замовчуванням.
             alignas(4) uint8_t raw[sizeof(StoredBlob)];
             memset(raw, 0, sizeof(raw));
             const size_t got = prefs.getBytes(settings_cfg::kNvsBlobKey, raw, len);

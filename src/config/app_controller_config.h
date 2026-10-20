@@ -4,6 +4,10 @@
 // Піни тут не дублюються (їх немає: AppController не чіпає залізо напряму).
 // Усі часові значення — у мілісекундах, якщо не вказано інше.
 //
+// [Prompt 48a] ЗМІНЕНО: чип-селектор вирізано. ВИДАЛЕНО kNeutralBass / Treble / Balance / Gain / Loudness / Volume
+// (і static_assert-и до драйверів), kMuteRetryMs (повтор I2C-мʼюту) та kExtInputSettleMs: пауза після
+// перемикання реле тепер input_selector_cfg::kRelaySettleMs (config/input_selector_config.h). ДОДАНО
+// kLegacyToneValue / kLegacyLoudness — значення застарілих полів AppStateData (до P50).
 // [Prompt 47c] ДОДАНО: kExtMuteSettleMs, kExtInputSettleMs, kLineIdleWaitMs, kLineStartTimeoutMs,
 // kLineErrCheckDelayMs, kLineRetryDelayMs, kLineReleaseTimeoutMs, kExtLevelTrimDb (зовнішні входи через line_path).
 // [Prompt 47a] ДОДАНО: kNeutralVolume (фіксована гучність чіпа), kRadioMuteWaitMs (очікування
@@ -13,9 +17,7 @@
 #include <esp_system.h>  // [Prompt 39] esp_reset_reason_t
 #include <stdint.h>
 
-#include "config/audio_config.h"         // [Prompt 46a] audio_cfg::kInputGainSteps (перевірка нейтрального gain)
 #include "config/audio_player_config.h"  // player_cfg::kTaskPriority, ir_cfg, input_cfg
-#include "config/defaults.h"            // [Prompt 46a] defaults::kDefaultBass/Treble/Balance/Loudness
 #include "config/display_config.h"      // display_cfg::kTaskPriority
 #include "config/dsp_volume_config.h"   // [Prompt 47a] dsp_volume_cfg::kMuteRampMs
 #include "config/input_config.h"        // input_cfg::kBtnTaskPriority
@@ -70,9 +72,8 @@ constexpr uint32_t kRadioMuteWaitMs = 60;
 // Пауза після цифрового мʼюту проходу (LinePath::setUserMute(true)) перед зміною входу чіпа / returnToRadio().
 // Має перекривати dsp_volume_cfg::kMuteRampMs (20 мс) із запасом на блок (≈2,7 мс) і період tick.
 constexpr uint32_t kExtMuteSettleMs = 40;
-// Пауза після setInput() чіпа-селектора, поки аналоговий сигнал на PCM1808 стабілізується, перед розмʼютом.
-// ПРОПОЗИЦІЯ, не виміряно (далі ще 100 мс плавного наростання DspVolume).
-constexpr uint32_t kExtInputSettleMs = 30;
+// [Prompt 48a] Пауза після перемикання реле-селектора (сигнал на PCM1808 стабілізується) перед розмʼютом —
+// input_selector_cfg::kRelaySettleMs (було kExtInputSettleMs = 30 мс). Далі ще 100 мс плавного наростання DspVolume.
 // Скільки чекати AudioPlayer::state() == Idle (stop() асинхронний) перед LinePath::requestStart().
 // Більше за line_path_cfg::kRadioStopWaitMs (2000).
 constexpr uint32_t kLineIdleWaitMs = 3000;
@@ -101,39 +102,14 @@ constexpr uint32_t kAdjustTimeoutMs = 5000;
 // [Prompt 46a] НЕ ВИКОРИСТОВУЄТЬСЯ (gain більше не регулюється); прибрати в P52.
 constexpr uint32_t kGainMuteHoldMs = 80;
 
-// Через скільки повторити setMute(), якщо I2C-транзакція не вдалась.
-constexpr uint32_t kMuteRetryMs = 500;
-
 // ---------------------------------------------------------------------------
-// [Prompt 46a] Нейтральні значення чіпа (селектор-only)
+// [Prompt 48a] Застарілі поля AppStateData
 // ---------------------------------------------------------------------------
-// Чип лишається ЛИШЕ селектором входів: при застосуванні профілю входу контролер надсилає в нього
-// ці фіксовані значення (тембр, баланс, підсилення входу, loudness), а не збережені користувачем.
-// Значення = те, з чого стартують драйвери (audio/tda7318.cpp, audio/pt2313l.cpp: begin() бере
-// defaults::kDefaultBass/Treble/Balance/Loudness і audio_cfg::kInputGainSteps), тож це «плоско»:
-//   тембр 0 кроків = 0 дБ (TDA7318: код 0111 за даташитом; PT2313L: кодування за аналогією з
-//   TDA7313 — НЕ звірено з даташитом, див. коментар у pt2313l.cpp), баланс 0 = обидва атенюатори 0,
-//   gain 0 кроків = 0 дБ (static_assert-и драйверів: 0x58 у перемикачі), loudness вимкнено.
-constexpr int8_t kNeutralBass     = 0;
-constexpr int8_t kNeutralTreble   = 0;
-constexpr int8_t kNeutralBalance  = 0;
-constexpr int8_t kNeutralGain     = 0;
-constexpr bool   kNeutralLoudness = false;
-static_assert(kNeutralBass == defaults::kDefaultBass && kNeutralTreble == defaults::kDefaultTreble &&
-                  kNeutralBalance == defaults::kDefaultBalance &&
-                  kNeutralLoudness == defaults::kDefaultLoudness,
-              "neutral values must equal the driver start values (defaults.h)");
-static_assert(kNeutralGain == audio_cfg::kInputGainSteps[0] && kNeutralGain == audio_cfg::kInputGainSteps[1] &&
-                  kNeutralGain == audio_cfg::kInputGainSteps[2] && kNeutralGain == audio_cfg::kInputGainSteps[3] &&
-                  kNeutralGain == audio_cfg::kInputGainSteps[4],
-              "neutral gain must equal the driver start gain (audio_cfg::kInputGainSteps)");
-
-// [Prompt 47a] Фіксована гучність чипа (шкала UI): 0 кроків атенюації = 0 дБ (байт регістра 0x00 в обох
-// драйверах: encodeVolume(0)). Гучність користувача тепер цифрова (audio/radio_volume), чип не регулює її.
-// Надсилається в applyActiveToChip() (кеш драйвера відсікає повтори). Драйвери стартують із kDefaultVolume
-// (-27.5 дБ), тож без цього відправлення чип лишився б приглушеним для зовнішніх входів.
-constexpr int8_t kNeutralVolume = audio_cfg::kVolumeUiMax;
-static_assert(audio_cfg::volumeAttSteps(kNeutralVolume) == 0, "neutral chip volume must be 0 dB (0 steps)");
+// Чип вирізано: тембр, gain і loudness більше не існують, баланс повернеться як цифровий (P48b, dB). Поля
+// AppStateData bass / treble / balance / gain / loudness (структуру не міняємо до P50) публікуються цими
+// НЕЙТРАЛЬНИМИ значеннями. Фіксовану нейтральну гучність чипа (kNeutralVolume) видалено: чипа немає.
+constexpr int8_t kLegacyToneValue = 0;
+constexpr bool   kLegacyLoudness  = false;
 
 // ---------------------------------------------------------------------------
 // Розкладка керування

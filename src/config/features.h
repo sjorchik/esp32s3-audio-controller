@@ -14,11 +14,8 @@
 // потребують LINE_PATH_ENABLE (config/line_path_config.h) і ENABLE_VU. Модуль adc_vu видалено (P47d).
 #define ENABLE_VU 1
 
-// Обидва аудіопроцесори компілюються.
-// Вибір конкретного зберігається в NVS і змінюється у веб-інтерфейсі.
-// Автовизначення неможливе, бо адреса фіксована 0x44 і зчитування немає.
-#define ENABLE_TDA7318 1
-#define ENABLE_PT2313L 1
+// [Prompt 48a] Прапорців ENABLE_TDA7318 / ENABLE_PT2313L більше немає: аудіочіпи й I2C вирізано,
+// входи 1 / 2 комутує реле (audio/input_selector, пін pins::kInputRelay).
 
 // Веб-інтерфейс і mDNS.
 #define ENABLE_WEB 1

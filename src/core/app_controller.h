@@ -1,10 +1,13 @@
 #pragma once
 
 // Контролер логіки режимів і розкладки керування.
-// Читає EventBus у власній задачі (ядро 0, пріоритет 3) і керує AudioProcessor,
-// AudioPlayer, Settings та AppState за розкладкою з розділу 5 MASTER SPEC.
+// Читає EventBus у власній задачі (ядро 0, пріоритет 3) і керує входами (реле-селектор), AudioPlayer,
+// цифровим трактом, Settings та AppState за розкладкою з розділу 5 MASTER SPEC.
 // Сам нічого не малює й не чіпає DisplayManager: екрани читають AppState.
 //
+// [Prompt 48a] ЗМІНЕНО: аудіочіпи (TDA7318 / PT2313L) вирізано. begin() БЕЗ параметрів (було begin(AudioProcessor*)).
+//             Входів 3 (0 радіо, 1 TV Box, 2 Computer), 1 / 2 комутує реле (audio/input_selector). setTone() і
+//             WebCmdType::GainSet більше нічого не приймають: Unsupported (тип і метод лишено заради ABI).
 // [Prompt 8] Заглушку замінено.
 //   ЗМІНЕНО — begin() тепер приймає вказівник на аудіопроцесор (AppController
 //             ним не володіє; main.cpp створив його раніше). nullptr дозволений:
@@ -50,8 +53,6 @@
 #include "config/eq_config.h"  // [Prompt 47c] eq_cfg::kBandCount для applyLineEq()
 #include "core/events.h"
 
-class AudioProcessor;
-
 // [Prompt 13] ДОДАНО: запит на зміну тембру/балансу ззовні (веб). [Prompt 21b] + тонкомпенсація.
 // Значення мають бути вже перевірені за capabilities. Поля *Ok — результат.
 struct ToneUpdate {
@@ -75,11 +76,11 @@ struct ToneUpdate {
 //   VolumeStep    value = зміна гучності (знак = напрямок), результат обрізається до меж
 //   MuteSet       flag  = true -> мʼют увімкнути
 //   MuteToggle    -
-//   GainSet       value = нове підсилення ПОТОЧНОГО входу (gainMin..gainMax, сирі кроки)
-//                 [Prompt 46a] ПРИЙМАЄТЬСЯ Й ІГНОРУЄТЬСЯ (результат Ok): gain більше не регулюється
+//   GainSet       [Prompt 48a] НЕ ПІДТРИМУЄТЬСЯ: gain видалено разом із чипом -> Unsupported
+//                 ("not_supported"), стан не змінюється (до P50 тип лишається в enum)
 //   StandbySet    flag  = true -> перейти в standby, false -> вийти зі standby
 //   StandbyToggle -
-//   InputSet      value = індекс входу (0..inputCount-1)
+//   InputSet      value = індекс входу (0..2: радіо, TV Box, Computer)
 //   PlayerPlay    -   (вхід Radio; уже грає -> нічого не робить)
 //   PlayerPause   -   (вхід Radio; зупиняє потік і скасовує перепідключення)
 //   PlayerToggle  -
@@ -121,25 +122,26 @@ enum class WebCmdResult : uint8_t {
     NotAllowed,   // зараз недопустимо (Standby, OTA, навчання IR,
                   // не вхід Radio, немає станцій); причина — reason   -> 409
     OutOfRange,   // значення поза межами (вхід, станція, гучність)   -> 400
-    Unsupported,  // чип не підтримує функцію (gain)                  -> 400
+    Unsupported,  // функція не підтримується (gain, тембр)           -> 400
 };
 
 class AppController {
 public:
     // Ініціалізація: AppState::begin() (першим ділом), стан із Settings,
     // створення задачі. Викликати ПІСЛЯ EventBus::begin(), SettingsStore::begin()
-    // /load(), створення аудіопроцесора та AudioPlayer::begin().
+    // /load(), input_selector::begin(), AudioPlayer::begin() і LinePath::begin().
     // Повторний виклик безпечний (повертає true).
-    static bool begin(AudioProcessor* processorOrNull);
+    static bool begin();
 
     // Обробка однієї події. Основний шлях — внутрішня задача, яка сама читає
     // чергу; публічний виклик лишено для тестування. Захищено внутрішнім
     // мʼютексом, тож безпечний і з інших задач. Не робити з обробника подій.
     static void handleEvent(const Event& event);
 
-    // [Prompt 46a] ЗАСТАРІЛО: тембр/баланс/loudness більше не регулюються. Метод лишено для веб-сервера:
-    // під мʼютексом контролера нічого не пише в чип, профіль і AppState; *Ok = true для запитаних полів,
-    // які підтримує чип (веб не повертає помилку), false — поле не запитано або чип його не має.
+    // [Prompt 48a] НЕ ПІДТРИМУЄТЬСЯ: тембр/баланс/loudness більше не регулюються. Метод лишено заради ABI:
+    // нічого не змінює, усі *Ok = false; повертає true, якщо контролер запущено.
+    // [Prompt 46a] (колишній опис) під мʼютексом контролера нічого не писав у чип, профіль і AppState;
+    // *Ok = true для запитаних полів, які підтримував чип.
     // [Prompt 13] (колишній опис) викликав setBass/setTreble/setBalance
     // [Prompt 21b] (і setLoudness) процесора; значення стосувалися ПОТОЧНОГО входу й
     // зберігалися в його профілі; оновлював власні копії, публікував AppState і відкладено зберігав Settings.
@@ -189,7 +191,7 @@ public:
     // *reasonOut (якщо не nullptr) — статичний рядок snake_case для NotAllowed/OutOfRange/
     // Unsupported/Busy: "ota_in_progress", "ir_learn_active", "standby", "not_radio_input",
     // "wifi_setup", "no_stations", "input_unavailable", "station_out_of_range",
-    // "volume_out_of_range", "gain_out_of_range", "not_supported", "busy"; [Prompt 39] + "input_disabled"
+    // "volume_out_of_range", "not_supported" (GainSet), "busy"; [Prompt 39] + "input_disabled"
     // (InputSet на вхід, вимкнений маскою входів -> NotAllowed); інакше nullptr.
     // Стан публікується в AppState і (за потреби) зберігається в Settings до повернення.
     static WebCmdResult runWebCommand(const WebCommand& cmd, const char** reasonOut = nullptr);

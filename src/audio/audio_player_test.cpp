@@ -16,8 +16,7 @@
 // Для відтворення потрібна мережа, налаштована через портал AudioCtrl-Setup.
 //   norm <hex>              — прогнати байти ICY-рядка (hex, напр. CEEAE5E0ED)
 //                             через визначення кодування й перекодування
-//   vol <0..100>            — гучність AudioProcessor (якщо він переданий)
-//   pmute <0|1>             — мʼют атенюаторів AudioProcessor (незалежний від XSMT)
+// [Prompt 48a] Команди `vol` і `pmute` (AudioProcessor) прибрано разом з аудіочіпами.
 
 #include "audio/audio_player_test.h"
 
@@ -30,14 +29,12 @@
 #include <string.h>
 
 #include "audio/audio_player.h"
-#include "audio/audio_processor.h"
 #include "config/audio_player_config.h"
 #include "config/pins.h"
 #include "net/wifi_manager.h"  // [Prompt 12] ДОДАНО: лише читання стану Wi-Fi
 
 namespace {
 
-AudioProcessor* s_proc = nullptr;
 TaskHandle_t s_task = nullptr;
 
 void printHelp() {
@@ -46,8 +43,6 @@ void printHelp() {
     Serial.println("  stop           stop playback");
     Serial.println("  info           state, metadata, counters, XSMT, Wi-Fi");
     Serial.println("  norm <hex>     test ICY encoding detection, e.g. norm CEEAE5E0ED");
-    Serial.println("  vol <0..100>   AudioProcessor volume");
-    Serial.println("  pmute <0|1>    AudioProcessor speaker mute (independent of XSMT)");
     Serial.println("  help           this text");
     Serial.println("[PTEST] test stations:");
     for (size_t i = 0; i < player_cfg::kTestStationCount; ++i) {
@@ -135,25 +130,6 @@ void cmdNorm(const char* arg) {
                   static_cast<unsigned>(n), enc, out);
 }
 
-void cmdVol(const char* arg) {
-    if (s_proc == nullptr) {
-        Serial.println("[PTEST] no audio processor");
-        return;
-    }
-    const long v = strtol(arg, nullptr, 10);
-    Serial.printf("[PTEST] vol %ld -> %s\n", v,
-                  s_proc->setVolume(static_cast<int8_t>(v)) ? "OK" : "FAIL");
-}
-
-void cmdPmute(const char* arg) {
-    if (s_proc == nullptr) {
-        Serial.println("[PTEST] no audio processor");
-        return;
-    }
-    const bool m = (arg[0] == '1');
-    Serial.printf("[PTEST] pmute %d -> %s\n", m ? 1 : 0, s_proc->setMute(m) ? "OK" : "FAIL");
-}
-
 void execute(char* line) {
     // Розділяємо на команду та аргумент (аргумент зберігає регістр).
     char* arg = line;
@@ -177,10 +153,6 @@ void execute(char* line) {
         printInfo();
     } else if (strcmp(cmd, "norm") == 0) {
         cmdNorm(arg);
-    } else if (strcmp(cmd, "vol") == 0) {
-        cmdVol(arg);
-    } else if (strcmp(cmd, "pmute") == 0) {
-        cmdPmute(arg);
     } else {
         Serial.printf("[PTEST] unknown command \"%s\" (try `help`)\n", cmd);
     }
@@ -216,11 +188,10 @@ void testTask(void*) {
 
 }  // namespace
 
-bool AudioPlayerTest::begin(AudioProcessor* processorOrNull) {
+bool AudioPlayerTest::begin() {
     if (s_task != nullptr) {
         return true;
     }
-    s_proc = processorOrNull;
 
     const BaseType_t ok = xTaskCreatePinnedToCore(
         testTask, "player_test", player_cfg::kTestTaskStackBytes, nullptr,

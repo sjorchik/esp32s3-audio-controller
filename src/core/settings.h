@@ -17,34 +17,37 @@
 // Міграція v1..v4 -> v5 у load() (глобальний EQ копіюється в профілі всіх входів).
 // [Prompt 46b] NVS blob v6: 5 логічних входів (inputNames[5], profiles[5]); БЕЗ МІГРАЦІЇ (старі формати ->
 // значення за замовчуванням); ланцюг міграцій v1..v5 з load() видалено.
+// [Prompt 48a] NVS blob v7 (БЕЗ міграції): ВИДАЛЕНО processorType (аудіочіпи TDA7318 / PT2313L вирізано);
+// 3 логічні входи (inputNames[3], profiles[3]: 0 радіо, 1 TV Box, 2 Computer); профіль входу +balanceDb
+// (баланс ±20 дБ, крок 1 дБ, діапазон — config/balance_config.h; у P48a лише зберігається, DSP — P48b).
 // [Prompt 39] У КІНЕЦЬ структури додано inputEnabledMask (маска дозволених входів, відключення
 // входів 1..3 з вебу). Формат blob-а v4; blobs v3, v2 і v1 мігруються в load() (усі входи дозволені).
 
 #include <Arduino.h>
 #include <stdint.h>
 
+#include "config/balance_config.h"
 #include "config/defaults.h"
 #include "config/eq_config.h"
 
 // [Prompt 46a] Профіль одного логічного входу: гучність (шкала UI 0..100, діапазон обрізає
-// AppController за capabilities()) і пресет 5-смугового еквалайзера, дБ (eq_cfg::kGainMinDb..
-// kGainMaxDb, 0 = плоска АЧХ; sanitize() у settings.cpp обрізає пошкоджені значення). Мʼют сюди
-// НЕ входить. Профіль входу, якого чип не має (вхід 3 для PT2313L), просто зберігається.
-// Бас / дискант / баланс / gain / loudness з профілю прибрано (P46a): чип лишається селектором.
+// AppController за audio_cfg::kVolumeUiMin..kVolumeUiMax), пресет 5-смугового еквалайзера, дБ
+// (eq_cfg::kGainMinDb..kGainMaxDb, 0 = плоска АЧХ; sanitize() у settings.cpp обрізає пошкоджені
+// значення) і [P48a] баланс balanceDb, дБ (balance_cfg::kMinDb..kMaxDb, 0 = обидва канали без змін;
+// додатне = вправо, лівий послаблюється; поза діапазоном при завантаженні -> 0). Мʼют сюди НЕ входить.
+// Бас / дискант / gain / loudness з профілю прибрано (P46a). Поле volume — int8_t, як і раніше.
 struct InputProfile {
     int8_t volume;
     int8_t eqGainsDb[eq_cfg::kBandCount];
+    int8_t balanceDb;  // [Prompt 48a] ДОДАНО: лише зберігається й валідується (DSP — P48b)
 };
 
 // Налаштування, які зберігаються між запусками.
 // УВАГА: зміна порядку/типів полів → збільшити settings_cfg::kFormatVersion.
 struct Settings {
-    // Тип аудіопроцесора. Значення відповідає enum class AudioProcType
-    // (audio/audio_processor.h): 0 = Tda7318, 1 = Pt2313l.
-    // Відповідність перевіряється static_assert у settings.cpp.
-    uint8_t processorType;
+    // [Prompt 48a] Поле processorType ВИДАЛЕНО (аудіочіпи вирізано).
 
-    // Назви входів (кількість = defaults::kInputCount = 5: 0 радіо, 1..4 зовнішні) [Prompt 46b].
+    // Назви входів (кількість = defaults::kInputCount = 3: 0 радіо, 1 TV Box, 2 Computer) [Prompt 48a].
     char inputNames[defaults::kInputCount][32];
 
     // Яскравість підсвітки дисплея (та сама шкала, що defaults::kDefaultBrightness).
@@ -59,17 +62,16 @@ struct Settings {
     bool lastMute;
 
     // [Prompt 21b] Профілі по входах (індекс = логічний вхід 0..kInputCount-1).
-    // [Prompt 46a] Профіль = {volume, eqGainsDb[5]}. Гучність пише AppController (разом з lastInput);
-    // пресет EQ входу пише веб-обробник /api/eq (SettingsStore::modify). На екземпляр радіо (eq::*)
-    // застосовується лише пресет входу 0 (profiles[0].eqGainsDb): load(), resetToDefaults(), /api/eq,
-    // повернення на вхід 0 (AppController).
+    // [Prompt 46a] Профіль = {volume, eqGainsDb[5]}; [P48a] + balanceDb. Гучність пише AppController
+    // (разом з lastInput); пресет EQ входу пише веб-обробник /api/eq (SettingsStore::modify); balanceDb
+    // у P48a не пише ніхто (P48b). На екземпляр радіо (eq::*) застосовується лише пресет входу 0
+    // (profiles[0].eqGainsDb): load(), resetToDefaults(), /api/eq, повернення на вхід 0 (AppController).
     InputProfile profiles[defaults::kInputCount];
 
-    // [Prompt 39] Маска дозволених логічних входів: біт i = вхід i (0 = радіо ... 3 = Aux), 1 = дозволено.
-    // За замовчуванням дозволені входи 0..3 (settings_cfg::kInputMaskDefault). Біт 0 ЗАВЖДИ 1: нормалізується в
-    // load()/sanitize() і в AppController (settings_cfg::normalizeInputMask). Пише лише AppController
-    // (команда вебу WebCmdType::InputsEnabledSet). Апаратну доступність входу (PT2313L не має входу 3)
-    // маска не змінює: ефективний вхід = апаратно є І біт у масці. Поле стоїть ПІСЛЯ profiles (P46a: глобального eqGainsDb більше немає).
+    // [Prompt 39] Маска дозволених логічних входів: біт i = вхід i (0 = радіо, 1 = TV Box, 2 = Computer),
+    // 1 = дозволено. [P48a] За замовчуванням 0x07 (settings_cfg::kInputMaskDefault). Біт 0 ЗАВЖДИ 1:
+    // нормалізується в load()/sanitize() і в AppController (settings_cfg::normalizeInputMask). Пише лише
+    // AppController (команда вебу WebCmdType::InputsEnabledSet). Поле стоїть ПІСЛЯ profiles.
     uint8_t inputEnabledMask;
 };
 
@@ -95,7 +97,7 @@ public:
     static bool begin();
 
     // Читає blob з NVS. Немає запису / інша версія / інший розмір → значення за замовчуванням +
-    // негайний save(). [Prompt 46b] МІГРАЦІЙ НЕМАЄ (формат v6; старі blob-и ігноруються). Після load()
+    // негайний save(). [Prompt 48a] МІГРАЦІЙ НЕМАЄ (формат v7; старі blob-и ігноруються). Після load()
     // пресет входу 0 одразу йде в eq::setAllDb() (екземпляр радіо).
     // true — кеш містить дані з NVS або збережені дефолти; false — запис у NVS не вдався (кеш = дефолти/попередній).
     static bool load();

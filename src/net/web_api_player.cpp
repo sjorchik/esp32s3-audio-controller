@@ -3,6 +3,9 @@
 // [Prompt 30] + GET/POST /api/eq (5-смуговий еквалайзер радіо). На відміну від решти, /api/eq НЕ
 // йде через AppController::runWebCommand(): це чисто програмний фільтр у хуку PCM (audio/eq.*),
 // без заліза й без стану контролера; обробник кладе значення в eq::* і в Settings (NVS, дебаунс).
+// [Prompt 48a] Аудіочіпи вирізано: 3 логічні входи (0 радіо, 1 TV Box, 2 Computer), `requireProc()` і
+// capabilities() прибрано; діапазон гучності — audio_cfg::kVolumeUiMin..kVolumeUiMax; POST /api/gain -> 400
+// not_supported; /api/inputs і /api/eq працюють по kInputCount (3). registerPlayerRoutes() без параметра AudioProcessor*: параметр прибрано разом із AudioProcessor.
 // [Prompt 46a] Пресет EQ тепер ПО ВХОДАХ (Settings::profiles[i].eqGainsDb): /api/eq читає й пише профіль
 // ПОТОЧНОГО входу (AppState.inputIndex); на екземпляр радіо (eq::setAllDb) значення потрапляє лише коли
 // поточний вхід 0. Форма запиту/відповіді не змінилась (поле `input` — у P46b). Застарілі /api/gain та
@@ -26,11 +29,10 @@
 #include <ArduinoJson.h>
 #include <string.h>
 
-#include "audio/audio_processor.h"
 #include "audio/eq.h"
 #include "config/defaults.h"         // [Prompt 39]
 #include "config/eq_config.h"
-#include "config/audio_config.h"     // [Prompt 46b] logicalInputCount()
+#include "config/audio_config.h"     // [P48a] kVolumeUiMin / kVolumeUiMax
 #include "config/settings_config.h"  // [Prompt 39] normalizeInputMask
 #include "core/app_controller.h"
 #include "core/app_state.h"
@@ -41,8 +43,6 @@
 namespace {
 
 using namespace web_api;
-
-AudioProcessor* s_proc = nullptr;
 
 // {"ok":true,"state":{...}} — компактний знімок ПІСЛЯ команди (контролер уже опублікував
 // стан у AppState). streamStatus свідомо не віддаємо: він оновлюється періодично
@@ -91,13 +91,6 @@ void runCommand(AsyncWebServerRequest* req, const WebCommand& c) {
     sendResult(req, r, why);
 }
 
-// Команди, що б'ють по залізу чипа: без процесора — 503 (як аудіополя POST /api/settings).
-bool requireProc(AsyncWebServerRequest* req) {
-    if (s_proc != nullptr) return true;
-    sendError(req, 503, "audio_unavailable");
-    return false;
-}
-
 // ---------------------------------------------------------------------------
 // POST /api/power {"state":"on"|"off"|"toggle"}   on = вийти зі standby
 // ---------------------------------------------------------------------------
@@ -132,7 +125,6 @@ void handlePower(AsyncWebServerRequest* req) {
 void handleMute(AsyncWebServerRequest* req) {
     if (!exactUrl(req, "/api/mute")) return;
     WEB_API_LOG("%s %s", req->methodToString(), req->url().c_str());
-    if (!requireProc(req)) return;
 
     JsonDocument in;
     if (!readJsonObjectBody(req, in)) return;
@@ -158,7 +150,6 @@ void handleMute(AsyncWebServerRequest* req) {
 void handleVolume(AsyncWebServerRequest* req) {
     if (!exactUrl(req, "/api/volume")) return;
     WEB_API_LOG("%s %s", req->methodToString(), req->url().c_str());
-    if (!requireProc(req)) return;
 
     JsonDocument in;
     if (!readJsonObjectBody(req, in)) return;
@@ -175,7 +166,6 @@ void handleVolume(AsyncWebServerRequest* req) {
         sendFieldError(req, 400, "missing_field", "value");
         return;
     }
-    const AudioProcessorCapabilities caps = s_proc->capabilities();
 
     if (!vv.isNull()) {
         if (!vv.is<int>()) {
@@ -183,8 +173,8 @@ void handleVolume(AsyncWebServerRequest* req) {
             return;
         }
         const int x = vv.as<int>();
-        if (x < caps.volumeMin || x > caps.volumeMax) {
-            sendRangeError(req, "value", caps.volumeMin, caps.volumeMax);
+        if (x < audio_cfg::kVolumeUiMin || x > audio_cfg::kVolumeUiMax) {
+            sendRangeError(req, "value", audio_cfg::kVolumeUiMin, audio_cfg::kVolumeUiMax);
             return;
         }
         runCommand(req, {WebCmdType::VolumeSet, x, false});
@@ -209,38 +199,22 @@ void handleVolume(AsyncWebServerRequest* req) {
 void handleGain(AsyncWebServerRequest* req) {
     if (!exactUrl(req, "/api/gain")) return;
     WEB_API_LOG("%s %s", req->methodToString(), req->url().c_str());
-    if (!requireProc(req)) return;
 
     JsonDocument in;
     if (!readJsonObjectBody(req, in)) return;
     JsonObjectConst root = in.as<JsonObjectConst>();
     if (!allowKeys(req, root, "value")) return;
 
-    const AudioProcessorCapabilities caps = s_proc->capabilities();
-    if (!caps.inputGain || caps.gainMax <= caps.gainMin) {
-        sendFieldError(req, 400, "not_supported", "value");
-        return;
-    }
-    JsonVariantConst v = root["value"];
-    if (!v.is<int>()) {
-        sendFieldError(req, 400, "invalid_value", "value");
-        return;
-    }
-    const int x = v.as<int>();
-    if (x < caps.gainMin || x > caps.gainMax) {
-        sendRangeError(req, "value", caps.gainMin, caps.gainMax);
-        return;
-    }
-    runCommand(req, {WebCmdType::GainSet, x, false});
+    // [Prompt 48a] Підсилення входу видалено разом із чипом: завжди 400 not_supported.
+    sendFieldError(req, 400, "not_supported", "value");
 }
 
 // ---------------------------------------------------------------------------
-// POST /api/input {"index":N}   [Prompt 46b] логічний вхід 0..N-1: TDA7318 0..4, PT2313L 0..3 (вхід 4 -> 400)
+// POST /api/input {"index":N}   [Prompt 48a] логічний вхід 0..2 (радіо, TV Box, Computer)
 // ---------------------------------------------------------------------------
 void handleInput(AsyncWebServerRequest* req) {
     if (!exactUrl(req, "/api/input")) return;
     WEB_API_LOG("%s %s", req->methodToString(), req->url().c_str());
-    if (!requireProc(req)) return;
 
     JsonDocument in;
     if (!readJsonObjectBody(req, in)) return;
@@ -252,7 +226,7 @@ void handleInput(AsyncWebServerRequest* req) {
         sendFieldError(req, 400, "invalid_value", "index");
         return;
     }
-    const int logicalCount = audio_cfg::logicalInputCount(s_proc->capabilities().inputCount);
+    const int logicalCount = defaults::kInputCount;
     const int x = v.as<int>();
     if (x < 0 || x >= logicalCount) {
         sendRangeError(req, "index", 0, logicalCount - 1);
@@ -340,7 +314,7 @@ void handlePlayerStation(AsyncWebServerRequest* req) {
 //   POST: {"gainsDb":[a,b,c,d,e]}  (рівно 5 елементів; null = смугу не чіпати)
 //         або {"band":N,"gainDb":X}  (одна смуга, N = 0..4)
 //         -> 200 {"ok":true, ...те саме, що GET}
-// [Prompt 46b] Необовʼязковий вхід: GET /api/eq?input=N, POST {"input":N,...}; N = 0..4 (профіль цього входу,
+// [Prompt 46b] Необовʼязковий вхід: GET /api/eq?input=N, POST {"input":N,...}; N = 0..2 (P48a; профіль цього входу,
 // незалежно від апаратної доступності); без поля — ПОТОЧНИЙ вхід. Відповідь (GET і POST) містить "input".
 // [Prompt 46a] Пресет — ПОТОЧНОГО входу (профіль у Settings). Зберігається для будь-якого входу;
 // на екземпляр радіо діє лише пресет входу 0. [Prompt 47c] Пресет ПОТОЧНОГО зовнішнього входу застосовується
@@ -541,14 +515,14 @@ void handleEqPost(AsyncWebServerRequest* req) {
 // ---------------------------------------------------------------------------
 // [Prompt 39] GET /api/inputs, POST /api/inputs — доступність і відключення входів
 //   GET : {"inputs":[{"index":0,"name":"WiFi Radio","available":true,"enabled":true,
-//                     "selectable":true,"canDisable":false}, ... 5 входів (P46b) ...],
-//          "enabledMask":15,"input":0}
-//         available  = вхід є: радіо + входи чіпа (P46b: TDA7318 0..4, PT2313L 0..3; логічний 4 недоступний);
+//                     "selectable":true,"canDisable":false}, ... 3 входи (P48a) ...],
+//          "enabledMask":7,"input":0}
+//         available  = завжди true (P48a: чипів немає, усі 3 входи апаратно є);
 //         enabled    = дозволено користувачем (маска); selectable = available && enabled;
 //         canDisable = false лише для радіо (вхід 0).
-//   POST: {"enabled":[a,b,c,d,e]}    рівно 5 елементів (P46b): true | false | null (= не змінювати);
+//   POST: {"enabled":[a,b,c]}        рівно 3 елементи (P48a): true | false | null (= не змінювати);
 //                                    елемент 0 (радіо) ігнорується: радіо завжди дозволене
-//         або {"index":N,"enabled":true|false}   (одне поле, N = 0..4)
+//         або {"index":N,"enabled":true|false}   (одне поле, N = 0..2)
 //         -> 200 {"ok":true, ...те саме, що GET}; 409 ota_in_progress | ir_learn_active; 503 busy.
 // Дозволено і в Standby. Зберігається в NVS (з дебаунсом, лише при зміні) і діє після перезапуску.
 // ---------------------------------------------------------------------------
@@ -556,11 +530,7 @@ void handleEqPost(AsyncWebServerRequest* req) {
 // Settings `st` мусить жити в викликача, поки doc не серіалізовано (sendJson() — синхронний).
 void fillInputsState(JsonDocument& doc, const Settings& st) {
     const uint8_t mask = settings_cfg::normalizeInputMask(st.inputEnabledMask);
-    uint8_t hw = defaults::kInputCount;  // доступні логічні входи (без процесора — усі, як у контролері)
-    if (s_proc != nullptr) {
-        const uint8_t chip = s_proc->capabilities().inputCount;  // [Prompt 46b] входи чіпа -> логічні
-        if (chip != 0) hw = audio_cfg::logicalInputCount(chip);
-    }
+    const uint8_t hw = defaults::kInputCount;  // [P48a] апаратно доступні всі 3 логічні входи
     JsonArray arr = doc["inputs"].to<JsonArray>();
     for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
         const bool available = (i < hw);
@@ -673,8 +643,7 @@ void handleInputsPost(AsyncWebServerRequest* req) {
 
 }  // namespace
 
-void registerPlayerRoutes(AsyncWebServer& server, AudioProcessor* proc) {
-    s_proc = proc;
+void registerPlayerRoutes(AsyncWebServer& server) {  // [P48a] без AudioProcessor*
 
     // ПОРЯДОК ВАЖЛИВИЙ (як у web_server.cpp): "/api/player/station" спершу, потім
     // "/api/player/*"; обробники точного шляху ще й перевіряють url самі.

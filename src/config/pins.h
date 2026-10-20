@@ -30,9 +30,12 @@ constexpr int kXsmt = 45;         // active-low, зовнішній pulldown 10 
 // --- Standby підсилювача (вихід) ---
 constexpr int kAmpStby = 46;      // 1 = працює, 0 = standby; strapping-пін (pulldown 10 кОм до GND)
 
-// --- I2C (TDA7318 / PT2313L) ---
-constexpr int kI2cSda = 1;
-constexpr int kI2cScl = 2;
+// --- Реле-селектор зовнішніх входів (P48a) ---
+// ОДНЕ DPDT-реле на одному GPIO: вимкнено = логічний вхід 1 (TV Box), увімкнено = вхід 2 (Computer);
+// активний рівень — input_selector_cfg::kRelayActiveHigh (HIGH = Computer). Колишній SDA I2C
+// (аудіочіпи й I2C вирізано). ПРИПУЩЕННЯ планування: GPIO1; власник виправить, якщо розпаяно інакше.
+// Рекомендація до плати: pulldown на затворі / базі драйвера реле.
+constexpr int kInputRelay = 1;
 
 // --- Енкодер ---
 constexpr int kEncA   = 4;        // PCNT

@@ -2,7 +2,7 @@
 
 // Веб-API керування (Prompt 18): живлення, мʼют, гучність, gain, вибір входу, плеєр,
 // вибір станції. Усі зміни йдуть ЛИШЕ через AppController::runWebCommand(); модуль не
-// чіпає AudioPlayer/AudioProcessor напряму (читає лише capabilities() для валідації).
+// чіпає AudioPlayer напряму. [P48a] AudioProcessor вирізано: registerPlayerRoutes() без proc.
 // [Prompt 30] ВИНЯТОК: /api/eq (еквалайзер радіо) — чисто програмний DSP без заліза й без
 // стану контролера: обробник напряму викликає eq::set*() і SettingsStore::modify().
 //
@@ -17,14 +17,10 @@
 //   GET  /api/eq               (P30) пресет еквалайзера радіо
 //   POST /api/eq               (P30) {"gainsDb":[a,b,c,d,e]} або {"band":N,"gainDb":X}
 //   GET  /api/inputs           (P39) входи: назва, апаратна доступність, дозвіл (маска)
-//   POST /api/inputs           (P39) {"enabled":[b|null x4]} або {"index":N,"enabled":bool}; йде через
+//   POST /api/inputs           (P39) {"enabled":[b|null x3]} або {"index":N,"enabled":bool}; йде через
 //                              AppController::runWebCommand(InputsEnabledSet)
 
 #include <ESPAsyncWebServer.h>
 
-class AudioProcessor;
-
 // Реєструє маршрути на сервері. Викликати з web_server.cpp (registerRoutes) один раз.
-// proc — той самий вказівник, що й у WebServerManager::begin() (nullptr дозволений:
-// команди, яким потрібен чип, тоді відповідають 503 audio_unavailable).
-void registerPlayerRoutes(AsyncWebServer& server, AudioProcessor* proc);
+void registerPlayerRoutes(AsyncWebServer& server);

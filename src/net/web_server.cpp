@@ -40,8 +40,7 @@
 
 #include <new>
 
-#include "audio/audio_processor.h"
-#include "config/audio_config.h"  // [Prompt 46b] logicalInputCount()
+#include "config/audio_config.h"  // [P48a] kVolumeUiMin / kVolumeUiMax (заглушка processor.capabilities)
 #include "config/defaults.h"
 #include "config/web_server_config.h"
 #include "core/action_names.h"   // [Prompt 15]
@@ -72,13 +71,11 @@ static_assert(sizeof(Settings::inputNames) / sizeof(Settings::inputNames[0]) ==
 static_assert(sizeof(Settings::inputNames[0]) == web_cfg::kInputNameMaxBytes + 1,
               "web_cfg::kInputNameMaxBytes must match Settings::inputNames[i] size - 1");
 
-constexpr uint8_t kProcTda7318 = 0;  // = AudioProcType::Tda7318 (settings.cpp static_assert)
-constexpr uint8_t kProcPt2313l = 1;  // = AudioProcType::Pt2313l
+// [Prompt 48a] Аудіочіпи вирізано. Застарілі поля JSON (processorType в /api/settings, processor.* у
+// /api/status) віддаються СТАЛИМИ значеннями, щоб не ламати фронтенд до P50 / P51; POST processorType
+// ігнорується без помилки.
+constexpr const char* kLegacyProcType = "None";
 
-AudioProcessor* s_proc = nullptr;
-// Тип чипа, з яким прошивка ЗАРАЗ працює (Settings на момент begin()). Settings
-// може змінитись через POST, але живий драйвер лишається старим до перезапуску.
-uint8_t s_runningProcType = kProcTda7318;
 AsyncWebServer* s_server = nullptr;
 bool s_beginCalled = false;
 
@@ -106,14 +103,6 @@ const char* streamStatusName(StreamStatus s) {
         case StreamStatus::Playing:      return "Playing";
         case StreamStatus::Error:        return "Error";
         case StreamStatus::Reconnecting: return "Reconnecting";
-    }
-    return "Unknown";
-}
-
-const char* procTypeName(uint8_t t) {
-    switch (t) {
-        case kProcTda7318: return "Tda7318";
-        case kProcPt2313l: return "Pt2313l";
     }
     return "Unknown";
 }
@@ -187,21 +176,15 @@ void handleStatus(AsyncWebServerRequest* req) {
     doc["track"] = st.trackTitle;
     doc["streamStatus"] = streamStatusName(st.streamStatus);
 
-    // [Prompt 18] ДОДАНО: перелік входів для вибору. [Prompt 46b] 5 логічних входів (0 радіо, 1..4 зовнішні):
-    // для PT2313L логічний вхід 4 має available=false (кількість — radio + входи чіпа; без процесора —
-    // усі доступні).
-    uint8_t inputsAvailable = defaults::kInputCount;
-    if (s_proc != nullptr) {
-        const uint8_t chip = s_proc->capabilities().inputCount;
-        if (chip != 0) inputsAvailable = audio_cfg::logicalInputCount(chip);
-    }
+    // [Prompt 18] ДОДАНО: перелік входів для вибору. [Prompt 48a] 3 логічні входи (0 радіо, 1 TV Box,
+    // 2 Computer): апаратно доступні всі (available = true), вимкнення — маскою (/api/inputs).
     JsonArray inputs = doc["inputs"].to<JsonArray>();
     for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
         JsonObject o = inputs.add<JsonObject>();
         o["index"] = i;
         const char* nm = cfg.inputNames[i];
         o["name"] = (nm[0] != '\0') ? nm : defaults::kInputNames[i];
-        o["available"] = (i < inputsAvailable);
+        o["available"] = true;
     }
 
     JsonObject wifi = doc["wifi"].to<JsonObject>();
@@ -211,31 +194,28 @@ void handleStatus(AsyncWebServerRequest* req) {
     wifi["ip"] = ip;
     wifi["rssi"] = WifiManager::rssi();
 
+    // [Prompt 48a] ЗАСТАРІЛЕ (прибере P50): чипа немає, обʼєкт віддається сталими значеннями тієї ж форми, щоб
+    // фронтенд (шкала гучності 0..100, кількість входів) не ламався. Тембр / баланс / gain / loudness: false.
     JsonObject proc = doc["processor"].to<JsonObject>();
-    proc["type"] = procTypeName(s_runningProcType);
-    proc["ready"] = (s_proc != nullptr);
-    if (s_proc != nullptr) {
-        const AudioProcessorCapabilities c = s_proc->capabilities();
-        proc["i2cErrors"] = s_proc->i2cErrorCount();
-        JsonObject caps = proc["capabilities"].to<JsonObject>();
-        caps["bass"] = c.bass;
-        caps["treble"] = c.treble;
-        caps["balance"] = c.balance;
-        caps["loudness"] = c.loudness;
-        caps["inputCount"] = audio_cfg::logicalInputCount(c.inputCount);  // [Prompt 46b] логічні входи (радіо + чіп)
-        caps["volumeMin"] = c.volumeMin;
-        caps["volumeMax"] = c.volumeMax;
-        caps["toneMin"] = c.toneMin;
-        caps["toneMax"] = c.toneMax;
-        caps["fader"] = c.fader;
-        caps["inputGain"] = c.inputGain;
-        caps["balanceMin"] = c.balanceMin;
-        caps["balanceMax"] = c.balanceMax;
-        caps["gainMin"] = c.gainMin;
-        caps["gainMax"] = c.gainMax;
-    } else {
-        proc["capabilities"] = nullptr;
-    }
+    proc["type"] = kLegacyProcType;
+    proc["ready"] = true;
+    proc["i2cErrors"] = 0;
+    JsonObject caps = proc["capabilities"].to<JsonObject>();
+    caps["bass"] = false;
+    caps["treble"] = false;
+    caps["balance"] = false;
+    caps["loudness"] = false;
+    caps["inputCount"] = defaults::kInputCount;
+    caps["volumeMin"] = audio_cfg::kVolumeUiMin;
+    caps["volumeMax"] = audio_cfg::kVolumeUiMax;
+    caps["toneMin"] = 0;
+    caps["toneMax"] = 0;
+    caps["fader"] = false;
+    caps["inputGain"] = false;
+    caps["balanceMin"] = 0;
+    caps["balanceMax"] = 0;
+    caps["gainMin"] = 0;
+    caps["gainMax"] = 0;
 
     doc["brightness"] = DisplayManager::brightness();
     doc["displayFlipped"] = DisplayManager::isFlipped();
@@ -255,7 +235,7 @@ void handleSettingsGet(AsyncWebServerRequest* req) {
     const Settings s = SettingsStore::snapshot();
 
     JsonDocument doc;
-    doc["processorType"] = procTypeName(s.processorType);
+    doc["processorType"] = kLegacyProcType;  // [P48a] застаріле поле, стале значення
     JsonArray names = doc["inputNames"].to<JsonArray>();
     for (uint8_t i = 0; i < defaults::kInputCount; ++i) names.add(s.inputNames[i]);
     doc["brightness"] = s.brightness;
@@ -305,16 +285,6 @@ struct Plan {
     uint8_t brightness = 0;
     bool hasFlipped = false;
     bool flipped = false;
-    bool hasBass = false;
-    int8_t bass = 0;
-    bool hasTreble = false;
-    int8_t treble = 0;
-    bool hasBalance = false;
-    int8_t balance = 0;
-    bool hasLoudness = false;
-    bool loudness = false;
-    bool hasProc = false;
-    uint8_t proc = 0;
     bool hasName[kNames] = {};
     char names[kNames][web_cfg::kInputNameMaxBytes + 1] = {};
 };
@@ -388,9 +358,6 @@ bool isCleanUtf8(const char* s) {
 }
 
 void parsePlan(JsonObjectConst root, Plan& plan, JsonArray errs, ParseFlags& f) {
-    AudioProcessorCapabilities caps = {};
-    if (s_proc != nullptr) caps = s_proc->capabilities();
-
     for (JsonPairConst kv : root) {
         const char* key = kv.key().c_str();
         JsonVariantConst v = kv.value();
@@ -408,64 +375,17 @@ void parsePlan(JsonObjectConst root, Plan& plan, JsonArray errs, ParseFlags& f) 
                 plan.hasFlipped = true;
                 ++f.fields;
             }
-        } else if (strcmp(key, "bass") == 0 || strcmp(key, "treble") == 0) {
-            const bool isBass = (key[0] == 'b');
-            const char* field = isBass ? "bass" : "treble";
-            if (s_proc == nullptr) {
-                addErr(errs, field, "audio_unavailable");
-                f.unavailable = true;
-            } else if (!(isBass ? caps.bass : caps.treble)) {
-                addErr(errs, field, "not_supported");
-                f.invalid = true;
-            } else if (readInt(v, field, caps.toneMin, caps.toneMax, x, errs, f)) {
-                if (isBass) {
-                    plan.hasBass = true;
-                    plan.bass = static_cast<int8_t>(x);
-                } else {
-                    plan.hasTreble = true;
-                    plan.treble = static_cast<int8_t>(x);
-                }
-                ++f.fields;
-            }
-        } else if (strcmp(key, "balance") == 0) {
-            if (s_proc == nullptr) {
-                addErr(errs, "balance", "audio_unavailable");
-                f.unavailable = true;
-            } else if (!caps.balance) {
-                addErr(errs, "balance", "not_supported");
-                f.invalid = true;
-            } else if (readInt(v, "balance", caps.balanceMin, caps.balanceMax, x, errs, f)) {
-                plan.hasBalance = true;
-                plan.balance = static_cast<int8_t>(x);
-                ++f.fields;
-            }
-        } else if (strcmp(key, "loudness") == 0) {
-            if (s_proc == nullptr) {
-                addErr(errs, "loudness", "audio_unavailable");
-                f.unavailable = true;
-            } else if (!caps.loudness) {
-                addErr(errs, "loudness", "not_supported");
-                f.invalid = true;
-            } else if (readBool(v, "loudness", plan.loudness, errs, f)) {
-                plan.hasLoudness = true;
-                ++f.fields;
-            }
+        } else if (strcmp(key, "bass") == 0 || strcmp(key, "treble") == 0 ||
+                   strcmp(key, "balance") == 0 || strcmp(key, "loudness") == 0) {
+            // [Prompt 48a] Тембр / баланс / loudness не підтримуються (чипа немає; баланс повернеться
+            // в P48b окремим API): 400 not_supported, як для функції, якої немає в апаратури.
+            addErr(errs, key, "not_supported");
+            f.invalid = true;
         } else if (strcmp(key, "processorType") == 0) {
-            const char* s = v.is<const char*>() ? v.as<const char*>() : nullptr;
-            if (s != nullptr && strcmp(s, "Tda7318") == 0) {
-                plan.proc = kProcTda7318;
-            } else if (s != nullptr && strcmp(s, "Pt2313l") == 0) {
-                plan.proc = kProcPt2313l;
-            } else {
-                addErr(errs, "processorType", "invalid_value");
-                f.invalid = true;
-                continue;
-            }
-            plan.hasProc = true;
-            ++f.fields;
-        } else if (strcmp(key, "inputNames") == 0) {
+            // [Prompt 48a] Застаріле поле: приймається й ІГНОРУЄТЬСЯ без помилки (чипів немає).
+                } else if (strcmp(key, "inputNames") == 0) {
             if (!v.is<JsonArrayConst>() || v.as<JsonArrayConst>().size() != kNames) {
-                addErr(errs, "inputNames", "expected_array_of_5");
+                addErr(errs, "inputNames", "expected_array_of_3");
                 f.invalid = true;
                 continue;
             }
@@ -551,7 +471,8 @@ void handleSettingsPost(AsyncWebServerRequest* req) {
     resp.remove("errors");
 
     JsonObject results = resp["results"].to<JsonObject>();
-    JsonArray restart = resp["requiresRestart"].to<JsonArray>();
+    JsonArray restart = resp["requiresRestart"].to<JsonArray>();  // [P48a] завжди порожній (processorType ігнорується)
+    (void)restart;
     bool hwFailed = false;
 
     // --- Дисплей (безпечно з будь-якої задачі) ---
@@ -564,49 +485,14 @@ void handleSettingsPost(AsyncWebServerRequest* req) {
         results["displayFlipped"]["applied"] = true;
     }
 
-    // --- Тембр/баланс/тонкомпенсація: через AppController::setTone() ---
-    // AppController тримає власні копії bass/treble/balance/loudness (профіль поточного входу) і
-    // публікує їх у AppState та Settings після кожної події, тому пряма зміна чипа була б
-    // затерта. setTone() під його мʼютексом: чип -> копія -> AppState -> профіль у Settings.
     SettingsCtx sc = {&plan};
-    if (plan.hasBass || plan.hasTreble || plan.hasBalance || plan.hasLoudness) {
-        ToneUpdate tu;
-        tu.hasBass = plan.hasBass;         tu.bass = plan.bass;
-        tu.hasTreble = plan.hasTreble;     tu.treble = plan.treble;
-        tu.hasBalance = plan.hasBalance;   tu.balance = plan.balance;
-        tu.hasLoudness = plan.hasLoudness; tu.loudness = plan.loudness;
-        const bool handled = AppController::setTone(tu);
-        auto toneResult = [&](const char* field, bool wanted, bool ok) {
-            if (!wanted) return;
-            if (ok) {
-                results[field]["applied"] = true;
-            } else {
-                results[field]["applied"] = false;
-                results[field]["error"] = handled ? "i2c_failed" : "busy";
-                hwFailed = true;
-            }
-        };
-        toneResult("bass", plan.hasBass, tu.bassOk);
-        toneResult("treble", plan.hasTreble, tu.trebleOk);
-        toneResult("balance", plan.hasBalance, tu.balanceOk);
-        toneResult("loudness", plan.hasLoudness, tu.loudnessOk);
-    }
 
     // --- Settings (один modify = один мʼютекс, один requestSave) ---
-    if (plan.hasProc) {
-        if (plan.proc == s_runningProcType) {
-            results["processorType"]["applied"] = true;
-        } else {
-            results["processorType"]["applied"] = false;
-            results["processorType"]["requiresRestart"] = true;
-            restart.add("processorType");
-        }
-    }
     bool anyName = false;
     for (uint8_t i = 0; i < kNames; ++i) anyName = anyName || plan.hasName[i];
     if (anyName) results["inputNames"]["applied"] = true;
 
-    const bool touchSettings = plan.hasBrightness || plan.hasFlipped || plan.hasProc || anyName;
+    const bool touchSettings = plan.hasBrightness || plan.hasFlipped || anyName;
     if (touchSettings) {
         SettingsStore::modify(
             [](Settings& s, void* c) {
@@ -614,7 +500,6 @@ void handleSettingsPost(AsyncWebServerRequest* req) {
                 const Plan& p = *x->plan;
                 if (p.hasBrightness) s.brightness = p.brightness;
                 if (p.hasFlipped) s.displayFlipped = p.flipped;
-                if (p.hasProc) s.processorType = p.proc;
                 for (uint8_t i = 0; i < kNames; ++i) {
                     if (p.hasName[i]) memcpy(s.inputNames[i], p.names[i], sizeof(s.inputNames[i]));
                 }
@@ -1666,7 +1551,7 @@ void registerRoutes(AsyncWebServer& server) {
 
     // [Prompt 18] Команди керування, система, dev-CORS (нові файли net/web_api_*).
     web_api::registerDevCors(server);
-    registerPlayerRoutes(server, s_proc);
+    registerPlayerRoutes(server);  // [P48a]
     registerSystemRoutes(server);
 
     // [Prompt 19] Вбудований веб-інтерфейс (GET /, /index.html, /css/*, /js/*...). Останнім
@@ -1701,11 +1586,8 @@ void starterTask(void*) {
 
 }  // namespace
 
-bool WebServerManager::begin(AudioProcessor* processorOrNull) {
+bool WebServerManager::begin() {
     if (s_beginCalled) return true;
-
-    s_proc = processorOrNull;
-    s_runningProcType = SettingsStore::snapshot().processorType;
 
     const BaseType_t ok = xTaskCreatePinnedToCore(
         starterTask, "web_start", web_cfg::kStarterStackBytes, nullptr,

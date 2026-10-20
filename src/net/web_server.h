@@ -5,8 +5,8 @@
 // [Prompt 15] ДОДАНО маршрути /api/ir* (навчання пульта, мапа кодів; лише .cpp,
 // інтерфейс не змінено). Навчання керується через AppController, не напряму.
 //
-// [Prompt 13] Заглушку замінено. ЗМІНЕНО: begin() тепер приймає вказівник на
-// аудіопроцесор (так само, як AudioPlayer::begin / AppController::begin);
+// [Prompt 48a] ЗМІНЕНО: аудіочіпи вирізано, begin() БЕЗ параметрів (було begin(AudioProcessor*)).
+// [Prompt 13] Заглушку замінено. (Колишній опис: begin() приймав вказівник на аудіопроцесор.)
 // poll() прибрано — AsyncWebServer обслуговується власною задачею async_tcp,
 // опитувати ззовні нічого не треба.
 //
@@ -15,20 +15,15 @@
 // portal з WifiManager, тому WebServerManager там мовчить.
 //
 // Виняток з «AppController — єдиний власник заліза» (узгоджений у Prompt 13):
-// обробники напряму викликають DisplayManager::setBrightness/setFlipped та
-// AudioProcessor::setLoudness. Тембр/баланс йдуть через AppController::setTone():
-// AppController тримає власні копії цих значень і публікує їх після кожної події,
-// тож пряма зміна чипа була б затерта (виявлено при читанні app_controller.cpp).
+// обробники напряму викликають DisplayManager::setBrightness/setFlipped.
+// [P48a] Тембр / баланс / loudness більше не підтримуються (400 not_supported).
 // setInput/мʼют/станції не чіпаються взагалі.
-
-class AudioProcessor;
 
 class WebServerManager {
 public:
-    // Запам'ятовує вказівник на процесор (nullptr дозволений: аудіополя POST
-    // /api/settings тоді відповідають 503) і створює задачу-стартер.
+    // Створює задачу-стартер.
     // Викликати ПІСЛЯ AppController::begin() (потрібні AppState і Settings) і
     // після WifiManager::begin(). Повторний виклик безпечний (повертає true).
     // false — не вдалося створити задачу.
-    static bool begin(AudioProcessor* processorOrNull);
+    static bool begin();
 };

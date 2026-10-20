@@ -39,9 +39,10 @@ static_assert(kPin != pins::kSt7789Sclk && kPin != pins::kSt7789Mosi &&
 static_assert(kPin != pins::kI2sBclk && kPin != pins::kI2sWs && kPin != pins::kI2sDout &&
                   kPin != pins::kI2sMclk && kPin != pins::kI2sDin && kPin != pins::kXsmt,
               "amp standby pin collides with I2S/XSMT");
-static_assert(kPin != pins::kI2cSda && kPin != pins::kI2cScl && kPin != pins::kEncA &&
+// [Prompt 48a] I2C вирізано: замість SDA/SCL перевіряємо пін реле-селектора входів.
+static_assert(kPin != pins::kInputRelay && kPin != pins::kEncA &&
                   kPin != pins::kEncB && kPin != pins::kEncBtn,
-              "amp standby pin collides with I2C/encoder");
+              "amp standby pin collides with input relay/encoder");
 static_assert(kPin != pins::kBtnPower && kPin != pins::kBtnUp && kPin != pins::kBtnDown &&
                   kPin != pins::kBtnLeft && kPin != pins::kBtnRight && kPin != pins::kBtnOk,
               "amp standby pin collides with buttons");
