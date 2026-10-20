@@ -38,12 +38,16 @@
 // користувачем (біт i = вхід i, біт 0 завжди 1). Публікує AppController (старт, зміна з вебу);
 // апаратну доступність входів (inputCount чипа) вона НЕ враховує. До першого publishState() у
 // AppController::begin() значення 0 (нульова ініціалізація) не має сенсу — не читати раніше.
+// [Prompt 49a] ДОДАНО: MenuContext::EqBalance (екран «EQ + баланс» = Mode::Menu + цей контекст, за зразком
+// StationList) та поля eqSelected, eqGainsDb[5] (лише в кінець структури). Публікує AppController, поки екран
+// відкритий; поза ним нулі.
 // [Prompt 17] НЕ ВИКОРИСТОВУЮТЬСЯ: ui/screens читає рівні VU напряму з
 // VuSourceDecodedPcm::read() (частота кадру), минаючи AppState. Поля лишено, щоб не міняти POD-структуру.
 
 #include <Arduino.h>
 #include <stdint.h>
 
+#include "config/eq_config.h"  // [Prompt 49a] eq_cfg::kBandCount для AppStateData::eqGainsDb
 #include "core/events.h"  // [Prompt 15] ДОДАНО: тип Action
 
 // Режими пристрою.
@@ -73,6 +77,7 @@ enum class AdjustTarget : uint8_t {
 enum class MenuContext : uint8_t {
     None,
     StationList,
+    EqBalance,  // [Prompt 49a] ДОДАНО: екран «EQ + баланс» (Mode::Menu); відтворення / вхід / мʼют не зупиняються
 };
 
 // [Prompt 10] ДОДАНО: детальний статус потоку для UI. Незалежно від
@@ -196,6 +201,13 @@ struct AppStateData {
     // Баланс АКТИВНОГО входу, дБ (balance_cfg::kMinDb..kMaxDb; додатне = вправо: лівий канал послаблено,
     // 0 = без змін). Лише AppController пише. Старе поле `balance` (legacy, завжди 0) не чіпається — прибере P50.
     int8_t balanceDb;
+
+    // --- [Prompt 49a] ДОДАНО ---
+    // Екран «EQ + баланс» (осмислені, лише коли mode == Mode::Menu && menuContext == MenuContext::EqBalance;
+    // інакше 0). eqSelected: 0..eq_cfg::kBandCount - 1 = смуга EQ, eq_cfg::kBandCount = баланс (його значення — balanceDb).
+    // eqGainsDb = пресет EQ АКТИВНОГО входу, дБ (eq_cfg::kGainMinDb..kGainMaxDb). Лише AppController пише.
+    uint8_t eqSelected;
+    int8_t eqGainsDb[eq_cfg::kBandCount];
 };
 
 class AppState {
@@ -225,3 +237,4 @@ public:
     //   AppState::modify([](AppStateData& s, void* c) { s.volume = *static_cast<int8_t*>(c); }, &v);
     static void modify(void (*fn)(AppStateData&, void* ctx), void* ctx);
 };
+

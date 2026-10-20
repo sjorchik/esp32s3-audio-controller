@@ -7,6 +7,8 @@
 
 #include "config/defaults.h"
 #include "config/display_config.h"
+#include "config/eq_config.h"          // [Prompt 49a] eq_cfg::kBandCount / kBandFreqHz (тимчасовий екран EQ)
+#include "config/eq_screen_config.h"   // [Prompt 49a] розкладка тимчасового екрана
 #include "config/screens_config.h"
 #include "audio/adc_vu.h"         // [Prompt 37] ДОДАНО: VuSourceAdc (зовнішні входи)
 #include "audio/vu_source.h"      // [Prompt 17] ДОДАНО: рівні VU (читаються напряму)
@@ -47,6 +49,9 @@
 // за AppState.wifiRssi (Wifi1..3) з гістерезисом у UI (wifiBarsUpdate()); WifiManager екран не чіпає.
 // [Prompt 38] Екран ExternalInput: напис "INPUT" прибрано; назва входу — FontSize::XLarge, по центру
 // вільної області між смугою іконок і VU (kExtNameY), колір за номером входу (kColorInputName).
+// [Prompt 49a] ТИМЧАСОВИЙ текстовий екран «EQ + Баланс» (Mode::Menu + MenuContext::EqBalance): заголовок, шість
+// рядків (5 смуг EQ за kBandFreqHz і «Bal») зі значенням «%+d», маркер ">" і підсвітка вибраного. Лише для
+// перевірки логіки P49a; справжні вертикальні стовпчики малює P49b. Читає лише AppState (eqSelected, eqGainsDb, balanceDb).
 // [Prompt 17] ВИНЯТОК З ІЗОЛЯЦІЇ: рівні VU беруться напряму з VuSourceDecodedPcm::read() (з
 // частотою кадру), МИНАЮЧИ AppState; AppStateData.vuLeft/vuRight не використовуються.
 
@@ -517,6 +522,56 @@ void drawStationList(const AppStateData& s) {
     }
 }
 
+// [Prompt 49a] ТИМЧАСОВИЙ екран «EQ + Баланс» (переписує P49b). Рядки: 0..kBandCount - 1 = смуги EQ, останній = баланс.
+constexpr uint8_t kEqRows = eq_cfg::kBandCount + 1;
+static_assert(eq_screen_cfg::kTmpFirstY + kEqRows * eq_screen_cfg::kTmpRowH <= c::kH,
+              "temporary EQ screen rows do not fit the display");
+
+void drawEqBalance(const AppStateData& s) {
+    // Заголовок (Small) ліворуч і назва активного входу праворуч (обрізається, щоб не налізти на заголовок).
+    const char* title = "EQ + Баланс";
+    D::drawText(title, c::kMargin, eq_screen_cfg::kTmpTitleY, FontSize::Small, c::kColorDim);
+    const int32_t titleW = UiFonts::textWidth(title, FontSize::Small);
+    char name[kInputFitCap];
+    const int32_t nameMaxW = c::kW - 2 * c::kMargin - titleW - eq_screen_cfg::kTmpNameGap;
+    if (nameMaxW > 0) {
+        fitText(inputName(s), name, sizeof(name), FontSize::Small, nameMaxW);
+        const int32_t nameW = UiFonts::textWidth(name, FontSize::Small);
+        D::drawText(name, static_cast<int16_t>(c::kW - c::kMargin - nameW), eq_screen_cfg::kTmpTitleY,
+                    FontSize::Small, c::kColorDim);
+    }
+    D::drawLine(0, eq_screen_cfg::kTmpLineY, c::kW - 1, eq_screen_cfg::kTmpLineY, c::kColorDim);
+
+    const int16_t textDy = static_cast<int16_t>(
+        (eq_screen_cfg::kTmpRowH - static_cast<int16_t>(UiFonts::lineHeight(FontSize::Small))) / 2);
+    for (uint8_t i = 0; i < kEqRows; ++i) {
+        const bool isBalance = (i == eq_cfg::kBandCount);
+        const bool selected = (i == s.eqSelected);
+        const int16_t y = static_cast<int16_t>(eq_screen_cfg::kTmpFirstY + i * eq_screen_cfg::kTmpRowH);
+        const int16_t ty = static_cast<int16_t>(y + textDy);
+        if (selected) D::fillRect(0, y, c::kW, eq_screen_cfg::kTmpRowH, c::kColorSelectionBg);
+        if (selected) D::drawText(">", eq_screen_cfg::kTmpMarkerX, ty, FontSize::Small, c::kColorAccent);
+
+        char label[12];
+        if (isBalance) {
+            snprintf(label, sizeof(label), "Bal");
+        } else {
+            const unsigned hz = eq_cfg::kBandFreqHz[i];
+            if (hz >= 1000u && hz % 1000u == 0u) snprintf(label, sizeof(label), "%u kHz", hz / 1000u);
+            else                                 snprintf(label, sizeof(label), "%u Hz", hz);
+        }
+        const uint16_t labelColor = selected ? dc::kColorFg : c::kColorDim;
+        D::drawText(label, eq_screen_cfg::kTmpLabelX, ty, FontSize::Small, labelColor);
+
+        const int value = isBalance ? s.balanceDb : s.eqGainsDb[i];
+        char val[8];
+        snprintf(val, sizeof(val), "%+d", value);   // формат зі знаком: "+0", "-3", "+12"
+        const int32_t vw = UiFonts::textWidth(val, FontSize::Small);
+        D::drawText(val, static_cast<int16_t>(c::kW - c::kMargin - vw), ty, FontSize::Small,
+                    isBalance ? c::kColorAccent : dc::kColorFg);   // баланс — інший колір
+    }
+}
+
 void drawPlaceholder(const char* text) {
     drawCentered(text, c::kPlaceholderY, FontSize::Large, dc::kColorFg);
 }
@@ -734,8 +789,9 @@ bool frame() {
         case Mode::Radio:         drawRadio(s, litL, litR, s_peakL.seg, s_peakR.seg); break;
         case Mode::ExternalInput: drawExternal(s, litL, litR, s_peakL.seg, s_peakR.seg); break;   // [Prompt 37]
         case Mode::Menu:
-            if (s.menuContext == MenuContext::StationList) drawStationList(s);
-            else                                           drawPlaceholder("Menu (TODO)");
+            if (s.menuContext == MenuContext::StationList)    drawStationList(s);
+            else if (s.menuContext == MenuContext::EqBalance) drawEqBalance(s);   // [Prompt 49a]
+            else                                              drawPlaceholder("Menu (TODO)");
             break;
         case Mode::IrLearn:       drawIrLearn(s);                break;   // [Prompt 15]
         case Mode::WifiSetup:     drawWifiSetup(s);              break;

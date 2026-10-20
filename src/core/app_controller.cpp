@@ -169,6 +169,21 @@
 // balanceDb поки не чіпає (P48b). inputAvailable() = маска входів (+ офлайн: без радіо).
 // IR прямого вибору: INPUT_RADIO / INPUT_TV / INPUT_PC -> 0 / 1 / 2; INPUT_AUX — без дії.
 
+// [Prompt 49a] КЕРУВАННЯ ЕНКОДЕРОМ І ЕКРАН «EQ + БАЛАНС» (рішення власника 2026-10-20).
+// Головний екран (Radio / ExternalInput): КОРОТКЕ натискання енкодера = мʼют (перемикання), ДОВГЕ утримання =
+// відкрити екран «EQ + баланс»; обертання = гучність (завжди). Цикл цілі Volume <-> Balance, s_lastEncMs і
+// автоповернення цілі (P31 / P48b) прибрано: s_target завжди Volume (поле лишено для AppState / ABI).
+// Екран = Mode::Menu + MenuContext::EqBalance (за зразком StationList: відтворення, вхід і мʼют не зупиняються,
+// режим лише перехоплює керування; новий Mode не вводився, щоб не чіпати web_api_common / web_server, які
+// перелічують Mode). Редагується пресет EQ і баланс АКТИВНОГО входу: 6 параметрів (0..4 смуги EQ, 5 баланс).
+// LEFT / RIGHT — вибір (по колу), UP / DOWN / обертання — ±eq_screen_cfg::kStepDb дБ, клік енкодера — скинути
+// вибраний у 0, довге утримання енкодера / BACK / таймаут eq_screen_cfg::kTimeoutMs — вихід. Зміни живі й
+// зберігаються тими самими шляхами, що веб: EQ — Settings::profiles[s_input].eqGainsDb (SettingsStore::modify,
+// NVS з дебаунсом) + екземпляр DSP (радіо eq::setAllDb / прохід LinePath::setEqAllDb); баланс — setBalanceTarget().
+// Примусове закриття: standby, OTA, початок навчання IR, зміна входу з будь-якого джерела, підняття AP (WifiSetup),
+// веб-команди станцій. VOL_UP / VOL_DOWN (IR) у екрані працюють; решта дій ігнорується (крім INPUT_RADIO / TV / PC:
+// вони міняють вхід і тим закривають екран). Лог — префікс [EQS].
+
 #include "core/app_controller.h"
 
 #include <Arduino.h>
@@ -185,6 +200,7 @@
 #include "config/balance_config.h"  // [Prompt 48b] діапазон / крок балансу, kSwapChannels
 #include "config/app_controller_config.h"
 #include "config/defaults.h"
+#include "config/eq_screen_config.h"  // [Prompt 49a] таймаут / крок / вибір екрана «EQ + баланс»
 #include "config/features.h"  // [Prompt 23c]
 #include "config/input_selector_config.h"  // [Prompt 48a] kRelaySettleMs
 #include "config/ir_learn_ui_config.h"  // [Prompt 15] ДОДАНО
@@ -222,11 +238,15 @@ static_assert(app_controller_cfg::kExtMuteSettleMs < amp_cfg::kAmpOffDelayMs,
 #if APP_CONTROLLER_DEBUG
 #define APP_LOG(...) Serial.printf("[APP] " __VA_ARGS__)
 #define BAL_LOG(...) Serial.printf("[BAL] " __VA_ARGS__)  // [Prompt 48b]
+#define EQS_LOG(...) Serial.printf("[EQS] " __VA_ARGS__)  // [Prompt 49a]
 #else
 #define APP_LOG(...) \
     do {             \
     } while (0)
 #define BAL_LOG(...) \
+    do {             \
+    } while (0)
+#define EQS_LOG(...) \
     do {             \
     } while (0)
 #endif
@@ -260,8 +280,11 @@ bool s_userMute = false;
 // [Prompt 21b/46a] Гучності профілів усіх логічних входів (включно з входом 3, якого PT2313L не має).
 // Пресет EQ у контролері НЕ дублюється (живе лише в Settings::profiles[i].eqGainsDb).
 int8_t s_volumes[defaults::kInputCount] = {};
-AdjustTarget s_target = AdjustTarget::Volume;  // [Prompt 48b] ціль обертання енкодера: Volume <-> Balance (клік), таймаут -> Volume
-uint32_t s_lastEncMs = 0;                      // [Prompt 48b] момент останньої події енкодера (для автоповернення цілі)
+AdjustTarget s_target = AdjustTarget::Volume;  // [Prompt 49a] ціль обертання енкодера: ЗАВЖДИ Volume (цикл Volume <-> Balance прибрано)
+// [Prompt 49a] Екран «EQ + баланс»: вибраний параметр (0..kBandCount - 1 = смуги EQ, kBandCount = баланс) і момент
+// останньої дії в екрані (таймаут eq_screen_cfg::kTimeoutMs). Осмислені, лише поки eqOpen().
+uint8_t s_eqSel = eq_screen_cfg::kDefaultSelected;
+uint32_t s_eqLastActionMs = 0;
 int8_t s_balance = balance_cfg::kDefaultDb;    // [Prompt 48b] баланс АКТИВНОГО входу, дБ (профіль входу s_input)
 // [Prompt 32] Подія «показати спливне вікно параметра»: що показувати і лічильник подій.
 // Лічильник росте лише на ЛОКАЛЬНІ зміни (handleLocked); веб-команди (runWebCommand) його не чіпають.
@@ -357,6 +380,11 @@ inline bool reached(uint32_t now, uint32_t t) {
 // [Prompt 28] Іде «тихий» перезапуск: звук заблоковано, події ігноруються.
 inline bool restarting() {
     return s_restartPhase != RestartPhase::None;
+}
+
+// [Prompt 49a] Відкрито екран «EQ + баланс» (Mode::Menu + MenuContext::EqBalance).
+inline bool eqOpen() {
+    return s_mode == Mode::Menu && s_menuCtx == MenuContext::EqBalance;
 }
 
 inline int clampInt(int v, int lo, int hi) {
@@ -881,6 +909,8 @@ struct PubCtx {
     uint8_t popupSeq;          // [Prompt 32]
     uint8_t inputEnabledMask;  // [Prompt 39]
     int8_t balanceDb;          // [Prompt 48b]
+    uint8_t eqSelected;                      // [Prompt 49a]
+    int8_t eqGainsDb[eq_cfg::kBandCount];    // [Prompt 49a]
     char inputName[kInputNameMax];  // [Prompt 23b]
 };
 
@@ -907,6 +937,8 @@ void applyPub(AppStateData& s, void* c) {
     s.popupSeq = p->popupSeq;        // [Prompt 32]
     s.inputEnabledMask = p->inputEnabledMask;  // [Prompt 39]
     s.balanceDb = p->balanceDb;                // [Prompt 48b]
+    s.eqSelected = p->eqSelected;              // [Prompt 49a]
+    memcpy(s.eqGainsDb, p->eqGainsDb, sizeof(s.eqGainsDb));  // [Prompt 49a]
     memcpy(s.inputName, p->inputName, sizeof(s.inputName));  // [Prompt 23b]
 }
 
@@ -915,6 +947,15 @@ void publishState() {
                 s_target,      s_menuCtx, s_menuSel, s_offline,  restarting(),
                 s_popupTarget, s_popupSeq, s_inputMask, s_balance};
     resolveInputName(s_input, p.inputName, sizeof(p.inputName));  // [Prompt 23b]
+    // [Prompt 49a] Поки відкритий екран «EQ + баланс» — вибраний параметр і пресет EQ активного входу (з Settings:
+    // джерело правди, тож зміна з вебу теж видна); інакше нулі.
+    if (eqOpen()) {
+        p.eqSelected = s_eqSel;
+        if (s_input < defaults::kInputCount) {
+            const Settings st = SettingsStore::snapshot();
+            memcpy(p.eqGainsDb, st.profiles[s_input].eqGainsDb, sizeof(p.eqGainsDb));
+        }
+    }
     AppState::modify(applyPub, &p);
 }
 
@@ -1121,6 +1162,133 @@ bool setBalanceTarget(int v) {
     SettingsStore::modify(applyBalancePersist, &ctx);
     logBalance(s_input, s_balance);
     return true;
+}
+
+// --- [Prompt 49a] Екран «EQ + баланс» -------------------------------------------------------------------------
+// Параметри екрана: 0..eq_cfg::kBandCount - 1 = смуги EQ, kEqBalanceIdx = баланс (шостий).
+constexpr uint8_t kEqBalanceIdx = eq_cfg::kBandCount;
+constexpr uint8_t kEqParamCount = eq_cfg::kBandCount + 1;
+
+// Дія в екрані: відлік таймауту починається знову.
+void eqTouch() {
+    s_eqLastActionMs = millis();
+}
+
+// Пресет EQ входу input -> Settings (SettingsStore::modify: NVS з дебаунсом; ТОЙ САМИЙ запис, що в веб /api/eq).
+struct EqStoreCtx {
+    uint8_t input;
+    int8_t gains[eq_cfg::kBandCount];
+};
+
+void applyEqStore(Settings& st, void* c) {
+    const EqStoreCtx* p = static_cast<const EqStoreCtx*>(c);
+    if (p->input < defaults::kInputCount) {
+        memcpy(st.profiles[p->input].eqGainsDb, p->gains, sizeof(p->gains));
+    }
+}
+
+// Пресет АКТИВНОГО входу -> екземпляр DSP (як веб /api/eq): радіо — екземпляр g_radio, зовнішні входи — власний
+// EQ проходу (діє й до старту проходу; решту входів застосує lineApplyEq() при перемиканні).
+void applyEqToDsp(uint8_t input, const int8_t gains[eq_cfg::kBandCount]) {
+    if (input == 0) {
+        eq::setAllDb(gains);
+        return;
+    }
+#if LINE_PATH_ENABLE
+    if (LinePath::isReady()) {
+        LinePath::setEqAllDb(gains);
+    }
+#endif
+}
+
+// Значення смуги band пресету активного входу -> value (обрізається до eq_cfg::kGainMinDb..kGainMaxDb). Читає свіжий
+// Settings (веб міг змінити інші смуги), міняє лише одну смугу. true — значення змінилось.
+bool eqSetBand(uint8_t band, int value) {
+    if (band >= eq_cfg::kBandCount || s_input >= defaults::kInputCount) {
+        return false;
+    }
+    value = clampInt(value, eq_cfg::kGainMinDb, eq_cfg::kGainMaxDb);
+    const Settings st = SettingsStore::snapshot();
+    EqStoreCtx ctx;
+    ctx.input = s_input;
+    memcpy(ctx.gains, st.profiles[s_input].eqGainsDb, sizeof(ctx.gains));
+    if (ctx.gains[band] == value) {
+        return false;
+    }
+    ctx.gains[band] = static_cast<int8_t>(value);
+    SettingsStore::modify(applyEqStore, &ctx);  // профіль входу; NVS — з дебаунсом
+    applyEqToDsp(s_input, ctx.gains);           // звук міняється одразу
+    return true;
+}
+
+// Поточне значення вибраного параметра (EQ — з Settings, баланс — s_balance).
+int eqSelectedValue() {
+    if (s_eqSel == kEqBalanceIdx) {
+        return s_balance;
+    }
+    if (s_eqSel >= eq_cfg::kBandCount || s_input >= defaults::kInputCount) {
+        return 0;
+    }
+    const Settings st = SettingsStore::snapshot();
+    return st.profiles[s_input].eqGainsDb[s_eqSel];
+}
+
+// Встановлює вибраний параметр (з обрізанням до меж). Повертає true, якщо значення змінилось; лог — лише при зміні.
+bool eqSetSelected(int value) {
+    bool changed;
+    if (s_eqSel == kEqBalanceIdx) {
+        changed = setBalanceTarget(value);  // обрізає до ±balance_cfg::kMaxDb, застосовує, пише профіль (лог [BAL])
+    } else {
+        changed = eqSetBand(s_eqSel, value);
+    }
+    if (changed) {
+        EQS_LOG("sel=%u value=%+d\n", static_cast<unsigned>(s_eqSel), eqSelectedValue());
+    }
+    return changed;
+}
+
+// ±delta кроків eq_screen_cfg::kStepDb вибраного параметра.
+void eqAdjustSelected(int delta) {
+    eqSetSelected(eqSelectedValue() + delta * eq_screen_cfg::kStepDb);
+}
+
+// Клік енкодера в екрані: вибраний параметр -> 0.
+void eqResetSelected() {
+    EQS_LOG("reset sel=%u\n", static_cast<unsigned>(s_eqSel));
+    eqSetSelected(0);
+}
+
+// LEFT / RIGHT: вибір параметра по колу (0..kEqParamCount - 1).
+void eqMoveSelection(int dir) {
+    s_eqSel = static_cast<uint8_t>((static_cast<int>(s_eqSel) + dir + kEqParamCount) % kEqParamCount);
+    EQS_LOG("select %u\n", static_cast<unsigned>(s_eqSel));
+}
+
+// Відкриття: лише з головного екрана (Radio / ExternalInput), не під час перезапуску. Відтворення не чіпаємо.
+void openEq() {
+    if ((s_mode != Mode::Radio && s_mode != Mode::ExternalInput) || restarting()) {
+        return;
+    }
+    s_menuCtx = MenuContext::EqBalance;
+    s_menuSel = 0;
+    s_eqSel = eq_screen_cfg::kDefaultSelected;
+    s_mode = Mode::Menu;
+    eqTouch();
+    EQS_LOG("open input=%u\n", static_cast<unsigned>(s_input));
+}
+
+// Закриття (безпечно викликати, коли екран не відкритий: нічого не робить). reason — для логу: long / back /
+// timeout / standby / ota / ir_learn / input_change / wifi_setup / station. Режим -> Radio / ExternalInput за s_input
+// (під WifiSetup / Standby викликач одразу перекриває s_mode). Збереження вже зроблено при кожній зміні
+// (SettingsStore::modify); окремого flush тут немає (standby / перезапуск скидають NVS самі).
+void closeEq(const char* reason) {
+    if (!eqOpen()) {
+        return;
+    }
+    s_menuCtx = MenuContext::None;
+    s_menuSel = 0;
+    s_mode = (s_input == 0) ? Mode::Radio : Mode::ExternalInput;
+    EQS_LOG("close reason=%s\n", reason != nullptr ? reason : "?");
 }
 
 // Початок переходу: мʼют ПЕРШИМ (цифровий радіо з очікуванням згасання, потім чип). Розмʼют — у tick()
@@ -1484,6 +1652,7 @@ void powerOnTransition() {
 // --- Дії -------------------------------------------------------------------
 void enterStandby() {
     APP_LOG("standby on\n");
+    closeEq("standby");  // [Prompt 49a]
     s_phase = Phase::None;
     s_target = AdjustTarget::Volume;  // [Prompt 31]
     s_menuCtx = MenuContext::None;
@@ -1582,6 +1751,7 @@ void changeInput(uint8_t newIdx) {
             static_cast<unsigned>(newIdx),
             newIdx < defaults::kInputCount ? defaults::kInputNames[newIdx] : "?");
 
+    closeEq("input_change");  // [Prompt 49a] зміна входу з будь-якого джерела закриває екран «EQ + баланс»
     captureActiveProfile();  // [Prompt 21b] профіль старого входу фіксуємо ДО зміни s_input
     const uint8_t prevIdx = s_input;
     s_input = newIdx;
@@ -1702,16 +1872,10 @@ void togglePlayPause() {
     }
 }
 
-// [Prompt 48b] Клік енкодера: ціль обертання Volume <-> Balance (решта значень AdjustTarget в цикл не входить).
-// Повернення на Volume — таймаутом (tickLocked), у standby / при вмиканні — powerOnTransition() / enterStandby().
-void cycleAdjustTarget() {
-    s_target = (s_target == AdjustTarget::Balance) ? AdjustTarget::Volume : AdjustTarget::Balance;
-    APP_LOG("encoder target: %s\n", s_target == AdjustTarget::Balance ? "Balance" : "Volume");
-}
-
 // Один «крок» цілі t у напрямку знака d (|d| = кількість detent-ів).
 // [Prompt 46a] Регулюється лише гучність (бас/дискант/баланс/gain і цикл цілей прибрано).
 // [Prompt 48b] Підтримуються гучність і баланс (±balance_cfg::kStepDb на крок; d — кількість кроків зі знаком).
+// [Prompt 49a] Енкодер керує лише гучністю; Balance сюди приходить лише з IR BALANCE_UP / BALANCE_DOWN.
 void adjustParam(AdjustTarget t, int d) {
     if (t == AdjustTarget::Balance) {
         setBalanceTarget(static_cast<int>(s_balance) + d * balance_cfg::kStepDb);
@@ -1797,6 +1961,72 @@ void handleMenuEvent(const Event& e) {
     }
 }
 
+// [Prompt 49a] Події в екрані «EQ + баланс». Знак обертання енкодера береться без акселерації (delta ігнорується).
+// UP / DOWN повторюються при утриманні (repeat), LEFT / RIGHT — лише одиночні. Усе, що тут не перелічено, ігнорується
+// (MUTE, BALANCE_*, MENU, OK ...). INPUT_RADIO / TV / PC міняють вхід (changeInput закриває екран); POWER обробляє
+// handleLocked() вище (standby закриває екран).
+void handleEqEvent(const Event& e) {
+    const bool plain = !e.repeat && !e.longPress;
+    switch (e.action) {
+        case Action::LEFT:
+            if (plain) {
+                eqMoveSelection(-1);
+                eqTouch();
+            }
+            break;
+        case Action::RIGHT:
+            if (plain) {
+                eqMoveSelection(+1);
+                eqTouch();
+            }
+            break;
+        case Action::UP:
+            if (!e.longPress) {  // plain або repeat (утримання)
+                eqAdjustSelected(+1);
+                eqTouch();
+            }
+            break;
+        case Action::DOWN:
+            if (!e.longPress) {
+                eqAdjustSelected(-1);
+                eqTouch();
+            }
+            break;
+        case Action::ENC_CW:
+            eqAdjustSelected(+1);
+            eqTouch();
+            break;
+        case Action::ENC_CCW:
+            eqAdjustSelected(-1);
+            eqTouch();
+            break;
+        case Action::ENC_PRESS:
+            if (e.longPress) {
+                closeEq("long");
+            } else if (!e.repeat) {
+                eqResetSelected();
+                eqTouch();
+            }
+            break;
+        case Action::BACK:
+            if (plain) closeEq("back");
+            break;
+        case Action::VOL_UP:  // гучність працює й тут (IR); скидає таймаут
+            adjustParam(AdjustTarget::Volume, +1);
+            eqTouch();
+            break;
+        case Action::VOL_DOWN:
+            adjustParam(AdjustTarget::Volume, -1);
+            eqTouch();
+            break;
+        case Action::INPUT_RADIO: if (plain) selectInput(0); break;
+        case Action::INPUT_TV:    if (plain) selectInput(1); break;
+        case Action::INPUT_PC:    if (plain) selectInput(2); break;
+        default:
+            break;  // решта дій у екрані ігнорується
+    }
+}
+
 void handleMainEvent(const Event& e) {
     const int step = (e.delta > 0) ? e.delta : 1;
     const bool plain = !e.repeat && !e.longPress;
@@ -1826,8 +2056,8 @@ void handleMainEvent(const Event& e) {
                 }
             }
             break;
-        case Action::ENC_CW:  adjustParam(s_target, +step); break;
-        case Action::ENC_CCW: adjustParam(s_target, -step); break;
+        case Action::ENC_CW:  adjustParam(AdjustTarget::Volume, +step); break;   // [Prompt 49a] завжди гучність
+        case Action::ENC_CCW: adjustParam(AdjustTarget::Volume, -step); break;
         case Action::INPUT_RADIO: if (plain) selectInput(0); break;
         case Action::INPUT_TV:    if (plain) selectInput(1); break;
         case Action::INPUT_PC:    if (plain) selectInput(2); break;
@@ -1979,6 +2209,7 @@ bool beginIrLearnLocked(Action target) {
     if (!IrRc5::beginLearn(target)) {
         return false;
     }
+    closeEq("ir_learn");  // [Prompt 49a] навчання IR закриває екран «EQ + баланс» (до запамʼятовування режиму)
     s_irPrevMode = s_mode;
     s_mode = Mode::IrLearn;
     s_irHolding = false;
@@ -2107,16 +2338,13 @@ void notifyPopup(AdjustTarget t) {
 }
 
 // Викликається ПІСЛЯ обробки події і лише на головних екранах (Radio / ExternalInput).
-// Енкодер: обертання й коротка клавіша показують ПОТОЧНУ ціль ([Prompt 46a]: завжди гучність).
-// Утримання енкодера (мʼют) вікно не викликає. Прямі дії кнопок/IR показують свій параметр.
+// Енкодер: обертання показує гучність ([Prompt 49a]: ціль завжди Volume). Натискання енкодера (коротке = мʼют,
+// довге = екран «EQ + баланс») вікно НЕ викликає: мʼют видно за іконкою. Прямі дії кнопок/IR показують свій параметр.
 void popupForEvent(const Event& e) {
     switch (e.action) {
         case Action::ENC_CW:
         case Action::ENC_CCW:
-            notifyPopup(s_target);
-            break;
-        case Action::ENC_PRESS:
-            if (!e.longPress && !e.repeat) notifyPopup(s_target);
+            notifyPopup(AdjustTarget::Volume);
             break;
         case Action::VOL_UP:
         case Action::VOL_DOWN:     notifyPopup(AdjustTarget::Volume);  break;
@@ -2170,54 +2398,59 @@ void handleLocked(const Event& e) {
         // [Prompt 12] WifiSetup тут більше не ігнорується: перемикання входу й
         // гучність працюють (радіо без Wi-Fi недоступне, зовнішні входи — так).
     } else {
-        // [Prompt 48b] Будь-яка подія енкодера (обертання, клік, утримання) відкладає автоповернення цілі.
-        if (e.action == Action::ENC_CW || e.action == Action::ENC_CCW || e.action == Action::ENC_PRESS) {
-            s_lastEncMs = millis();
-        }
-        bool handled = true;
-        switch (e.action) {
-            // Глобальні дії: однакові на головному екрані й у списку.
-            case Action::MUTE:
-                if (!e.repeat && !e.longPress) toggleUserMute();
-                break;
-            case Action::VOL_UP:       adjustParam(AdjustTarget::Volume, +1); break;
-            case Action::VOL_DOWN:     adjustParam(AdjustTarget::Volume, -1); break;
-            // [Prompt 46a] Дії тембру/балансу/gain (enum не змінено — значення зберігаються в мапі IR):
-            // ігноруються з одним коротким логом на натискання (повтори утримання не логуються).
-            case Action::BASS_UP:
-            case Action::BASS_DOWN:
-            case Action::TREBLE_UP:
-            case Action::TREBLE_DOWN:
-            case Action::GAIN_UP:
-            case Action::GAIN_DOWN:
-                if (!e.repeat) APP_LOG("tone/gain action ignored (controls removed)\n");
-                break;
-            // [Prompt 48b] Баланс повернувся: IR BALANCE_UP / BALANCE_DOWN = ±kStepDb (повтор утримання — як у гучності).
-            case Action::BALANCE_UP:   adjustParam(AdjustTarget::Balance, +1); break;
-            case Action::BALANCE_DOWN: adjustParam(AdjustTarget::Balance, -1); break;
-            case Action::ENC_PRESS:
-                // Довге утримання = мʼют. [Prompt 48b] Короткий клік на головному екрані перемикає ціль обертання
-                // Volume <-> Balance (у списку станцій клік, як і раніше, нічого не робить).
-                if (e.longPress) {
-                    toggleUserMute();
-                } else if (!e.repeat && (s_mode == Mode::Radio || s_mode == Mode::ExternalInput)) {
-                    cycleAdjustTarget();
-                }
-                break;
-            default:
-                handled = false;
-                break;
-        }
-        if (!handled) {
-            if (s_mode == Mode::Menu) {
-                handleMenuEvent(e);
-            } else {
-                handleMainEvent(e);
+        // [Prompt 49a] Екран «EQ + баланс» перехоплює ВСІ події (окрема розкладка), у т.ч. енкодера й VOL_*.
+        if (eqOpen()) {
+            handleEqEvent(e);
+        } else {
+            bool handled = true;
+            switch (e.action) {
+                // Глобальні дії: однакові на головному екрані й у списку.
+                case Action::MUTE:
+                    if (!e.repeat && !e.longPress) toggleUserMute();
+                    break;
+                case Action::VOL_UP:       adjustParam(AdjustTarget::Volume, +1); break;
+                case Action::VOL_DOWN:     adjustParam(AdjustTarget::Volume, -1); break;
+                // [Prompt 46a] Дії тембру/балансу/gain (enum не змінено — значення зберігаються в мапі IR):
+                // ігноруються з одним коротким логом на натискання (повтори утримання не логуються).
+                case Action::BASS_UP:
+                case Action::BASS_DOWN:
+                case Action::TREBLE_UP:
+                case Action::TREBLE_DOWN:
+                case Action::GAIN_UP:
+                case Action::GAIN_DOWN:
+                    if (!e.repeat) APP_LOG("tone/gain action ignored (controls removed)\n");
+                    break;
+                // [Prompt 48b] Баланс повернувся: IR BALANCE_UP / BALANCE_DOWN = ±kStepDb (повтор утримання — як у гучності).
+                case Action::BALANCE_UP:   adjustParam(AdjustTarget::Balance, +1); break;
+                case Action::BALANCE_DOWN: adjustParam(AdjustTarget::Balance, -1); break;
+                case Action::ENC_PRESS:
+                    // [Prompt 49a] Головний екран (Radio / ExternalInput): коротке натискання = мʼют, довге утримання =
+                    // екран «EQ + баланс». У списку станцій поведінка як була: довге = мʼют, коротке — без дії.
+                    if (s_mode == Mode::Radio || s_mode == Mode::ExternalInput) {
+                        if (e.longPress) {
+                            openEq();
+                        } else if (!e.repeat) {
+                            toggleUserMute();
+                        }
+                    } else if (e.longPress) {
+                        toggleUserMute();
+                    }
+                    break;
+                default:
+                    handled = false;
+                    break;
             }
-        }
-        // [Prompt 32] Спливне вікно: лише головні екрани (у Menu енкодер рухає список).
-        if (s_mode == Mode::Radio || s_mode == Mode::ExternalInput) {
-            popupForEvent(e);
+            if (!handled) {
+                if (s_mode == Mode::Menu) {
+                    handleMenuEvent(e);
+                } else {
+                    handleMainEvent(e);
+                }
+            }
+            // [Prompt 32] Спливне вікно: лише головні екрани (у Menu енкодер рухає список).
+            if (s_mode == Mode::Radio || s_mode == Mode::ExternalInput) {
+                popupForEvent(e);
+            }
         }
     }
 
@@ -2248,6 +2481,7 @@ void followWifiMode() {
     if (want == s_mode) {
         return;
     }
+    closeEq("wifi_setup");  // [Prompt 49a] AP піднято (Menu -> WifiSetup): екран «EQ + баланс» закривається
     s_mode = want;
     s_menuCtx = MenuContext::None;
     s_menuSel = 0;
@@ -2267,11 +2501,10 @@ void tickLocked() {
     restartService(now);  // [Prompt 28] (ESP.restart() не повертається)
     lineService(now);     // [Prompt 47c] автомат проходу зовнішніх входів
 
-    // [Prompt 48b] Автоповернення цілі енкодера на гучність після kAdjustTimeoutMs без подій енкодера.
-    if (s_target != AdjustTarget::Volume &&
-        static_cast<uint32_t>(now - s_lastEncMs) >= cfg::kAdjustTimeoutMs) {
-        s_target = AdjustTarget::Volume;
-        APP_LOG("encoder target timeout -> Volume\n");
+    // [Prompt 49a] Екран «EQ + баланс»: вихід за таймаутом від останньої дії в екрані. (Автоповернення цілі
+    // енкодера P31 / P48b прибрано: ціль завжди Volume; cfg::kAdjustTimeoutMs знову не використовується.)
+    if (eqOpen() && static_cast<uint32_t>(now - s_eqLastActionMs) >= eq_screen_cfg::kTimeoutMs) {
+        closeEq("timeout");
         publishState();
     }
 
@@ -2316,6 +2549,9 @@ void tickLocked() {
         }
         syncStationLevel();  // [Prompt 25]
         syncPlayer();
+        if (eqOpen()) {
+            publishState();  // [Prompt 49a] зміна пресету / балансу з вебу при відкритому екрані — видно без події
+        }
     }
 }
 
@@ -2351,6 +2587,16 @@ void taskMain(void*) {
 // Викликати лише під s_lock. Перевірка меж і гейти — ДО будь-якої зміни стану, тож
 // відмова (NotAllowed/OutOfRange/Unsupported) нічого не чіпає (список станцій на
 // пристрої теж лишається відкритим).
+
+// [Prompt 49a] Веб-команда станції/плеєра закриває те, що відкрито на пристрої: список станцій (як було) або екран
+// «EQ + баланс» (reason — для логу [EQS]). Поза Mode::Menu нічого не робить.
+void closeAnyMenu(const char* eqReason) {
+    if (eqOpen()) {
+        closeEq(eqReason);
+    } else if (s_mode == Mode::Menu) {
+        closeStationList();
+    }
+}
 
 // Станційні/плеєрні команди мають сенс лише на вході Radio, і не в WifiSetup (потоку немає).
 bool webRadioGate(const char*& why) {
@@ -2468,7 +2714,7 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
                 why = "input_unavailable";
                 return WebCmdResult::OutOfRange;
             }
-            if (s_mode == Mode::Menu) closeStationList();
+            if (s_mode == Mode::Menu && s_menuCtx == MenuContext::StationList) closeStationList();  // [P49a] EQ закриє changeInput()
             changeInput(static_cast<uint8_t>(c.value));
             break;
 
@@ -2498,8 +2744,8 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
                     loadActiveFromProfile(fb);
                     s_persistNeeded = true;
                 } else {
-                    if (s_mode == Mode::Menu) closeStationList();
-                    changeInput(fb);  // мʼют -> профіль -> розмʼют, зупинка/запуск потоку; persist
+                    if (s_mode == Mode::Menu && s_menuCtx == MenuContext::StationList) closeStationList();  // [P49a]
+                    changeInput(fb);  // мʼют -> профіль -> розмʼют, зупинка/запуск потоку; persist (+ закриває екран EQ)
                 }
             }
             break;
@@ -2555,7 +2801,7 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
                     why = "wifi_setup";
                     return WebCmdResult::NotAllowed;
                 }
-                if (s_mode == Mode::Menu) closeStationList();
+                closeAnyMenu("station");  // [P49a] список станцій або екран «EQ + баланс»
                 // Та сама станція вже грає — нічого не робимо; на паузі — запускаємо
                 // (так само, як selectFromList()).
                 if (idx != s_station || AudioPlayer::state() == PlayerState::Idle) {
@@ -2572,7 +2818,7 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
                 why = "no_stations";
                 return WebCmdResult::NotAllowed;
             }
-            if (s_mode == Mode::Menu) closeStationList();
+            closeAnyMenu("station");  // [P49a] список станцій або екран «EQ + баланс»
             stepStation(c.type == WebCmdType::StationNext ? cfg::kStationRightStep
                                                           : cfg::kStationLeftStep);
             break;
@@ -2654,6 +2900,7 @@ bool AppController::beginOta() {
     }
     bool ok = false;
     if (s_mode != Mode::IrLearn && s_mode != Mode::OtaUpdate && !restarting()) {  // [Prompt 28]
+        closeEq("ota");  // [Prompt 49a] OTA закриває екран «EQ + баланс» (до запамʼятовування режиму)
         s_otaPrevMode = s_mode;
         s_otaAbortPending = false;
         publishOtaProgress(0);  // спершу 0, потім режим: екран не покаже старий відсоток
@@ -2834,3 +3081,4 @@ bool AppController::begin() {
             static_cast<int>(s_volume), s_userMute ? 1 : 0, static_cast<unsigned>(s_inputMask));
     return true;
 }
+
