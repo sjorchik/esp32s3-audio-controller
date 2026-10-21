@@ -52,8 +52,8 @@ private:
     float    m_levelR = 0.0f;
 };
 
-// [Prompt 47d] Джерело з проходу line_path (зовнішні входи). Замінило VuSourceAdc із adc_vu (audio/adc_vu.h
-// лишає псевдонім VuSourceAdc на цей клас до правки screens.cpp). Ті самі одиниці, що й у радіо:
+// [Prompt 47d] Джерело з проходу line_path (зовнішні входи). Замінило VuSourceAdc із adc_vu (модуль і шим
+// видалено в P48d). Ті самі одиниці, що й у радіо:
 // продюсер line_path публікує піки в шкалі int16 (0..32768) ПІСЛЯ еквалайзера й ДО гучності, з
 // калібруванням line_path_cfg::kVuOffsetDb. Обмін — lock-free, як у VuSourceDecodedPcm.
 // При LINE_PATH_ENABLE == 0 або ENABLE_VU == 0 read() завжди false, publishPeaks() порожня.
@@ -79,3 +79,4 @@ private:
     float    m_levelL = 0.0f;
     float    m_levelR = 0.0f;
 };
+

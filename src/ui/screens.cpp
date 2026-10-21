@@ -10,9 +10,9 @@
 #include "config/eq_config.h"          // [Prompt 49a] eq_cfg::kBandCount / kBandFreqHz (тимчасовий екран EQ)
 #include "config/eq_screen_config.h"   // [Prompt 49a/49b] розкладка екрана EQ + Balance
 #include "config/screens_config.h"
-#include "audio/adc_vu.h"         // [Prompt 37] ДОДАНО: VuSourceAdc (зовнішні входи)
-#include "audio/vu_source.h"      // [Prompt 17] ДОДАНО: рівні VU (читаються напряму)
+#include "audio/vu_source.h"      // [Prompt 17] рівні VU (читаються напряму); [Prompt 48d] + VuSourceLinePath
 #include "config/features.h"
+#include "config/line_path_config.h"  // [Prompt 48d] LINE_PATH_ENABLE (раніше приходив через adc_vu.h)
 #include "core/action_names.h"  // [Prompt 15] ДОДАНО: імена дій (чисті дані)
 #include "core/app_state.h"
 #include "ui/display.h"
@@ -91,7 +91,7 @@ uint16_t s_trackStation      = 0;
 // минулого кадру (перемальовуємо, лише коли вона змінилась).
 // [Prompt 34] + утримання піку по каналах (лише UI) і попередньо обчислені мітки шкали.
 VuSourceDecodedPcm s_vu;
-VuSourceAdc s_vuAdc;   // [Prompt 37] VU входів 1..3 з PCM1808
+VuSourceLinePath s_vuLine;   // [Prompt 48d] VU зовнішніх входів (будь-який логічний вхід >= 1) зі line_path
 int s_vuLitL = 0;
 int s_vuLitR = 0;
 int s_vuPeakDrawnL = 0;   // [Prompt 34] пік, намальований минулого кадру
@@ -485,13 +485,13 @@ void drawExternal(const AppStateData& s, int vuLitL, int vuLitR, int peakL, int 
     drawTopIcons(s, true);
     drawNetInfo(s);
     // [Prompt 38] Напис "INPUT" прибрано; назва входу — XLarge, по центру вільної області, колір за
-    // номером входу (1..3). Довге імʼя обрізається fitText() з "..." (marquee не потрібен: рядок
+    // номером входу (kColorInputName[inputIndex - 1]). Довге імʼя обрізається fitText() з "..." (marquee не потрібен: рядок
     // статичний, а центрування й прокрутка разом виглядали б гірше).
     char name[kInputFitCap];  // [Prompt 23b]
     fitText(inputName(s), name, sizeof(name), FontSize::XLarge, c::kContentW);
     const uint16_t color = (s.inputIndex >= 1 && s.inputIndex <= c::kColorInputNameCount)
                                ? c::kColorInputName[s.inputIndex - 1]
-                               : dc::kColorFg;   // запасний колір, якщо індекс поза 1..3
+                               : dc::kColorFg;   // запасний колір, якщо індекс поза таблицею kColorInputName
     drawCentered(name, c::kExtNameY, FontSize::XLarge, color);
     // [Prompt 37] Той самий блок VU, що й у Radio (y = kVuY..): назва входу закінчується вище.
     drawVu(vuLitL, vuLitR, peakL, peakR);
@@ -758,13 +758,14 @@ bool frame() {
             vuValid = true;
         }
     }
-#if ADC_VU_ENABLE
-    // [Prompt 37] Зовнішні входи 1..3: рівні з АЦП (VuSourceAdc). Немає даних / АЦП не готовий —
+#if LINE_PATH_ENABLE
+    // [Prompt 48d] Зовнішні входи (будь-який inputIndex >= 1): рівні з line_path (VuSourceLinePath).
+    // Немає даних / прохід не працює —
     // як у радіо: два базові сегменти, пік скинуто.
-    else if (s.mode == Mode::ExternalInput && s.inputIndex != 0 && !s.restarting) {
+    else if (s.mode == Mode::ExternalInput && s.inputIndex >= 1 && !s.restarting) {
         float vuL = 0.0f;
         float vuR = 0.0f;
-        if (s_vuAdc.read(vuL, vuR)) {
+        if (s_vuLine.read(vuL, vuR)) {
             litL = vuToSegments(vuL);
             litR = vuToSegments(vuR);
             vuValid = true;
@@ -878,3 +879,4 @@ bool UiScreens::begin() {
     DisplayManager::setFrameCallback(&frame);
     return true;
 }
+

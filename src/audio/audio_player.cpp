@@ -21,9 +21,9 @@
 
 #include "audio/eq.h"
 #include "audio/output_trim.h"
-#include "config/adc_vu_config.h"  // [Prompt 37] ADC_VU_ENABLE
 #include "config/audio_player_config.h"
 #include "config/eq_config.h"
+#include "config/line_path_config.h"  // [Prompt 48d] LINE_PATH_ENABLE (раніше ADC_VU_ENABLE через adc_vu_config.h)
 #include "config/pins.h"
 
 #if AUDIO_PLAYER_DEBUG
@@ -818,14 +818,14 @@ bool AudioPlayer::begin() {  // [P48a] без параметра AudioProcessor
     s_url[0] = '\0';
 
     // I2S ініціалізує бібліотека (конструктор + setPinout). DIN не чіпаємо.
-    // [Prompt 37] MCLK (GPIO16, 256·fs) виводиться ЛИШЕ для АЦП PCM1808 (SCKI); PCM5102 його не
-    // використовує (SCK на GND), тож на звук він не впливає. Без АЦП (ADC_VU_ENABLE 0) — як раніше.
+    // [Prompt 37] MCLK (GPIO16, 256·fs) виводиться ЛИШЕ для АЦП PCM1808 (за LINE_PATH_ENABLE; P48d) (SCKI); PCM5102 його не
+    // використовує (SCK на GND), тож на звук він не впливає. Без проходу (LINE_PATH_ENABLE 0) — як раніше.
     s_audio = new (std::nothrow) Audio();
     if (s_audio == nullptr) {
         Serial.println("[PLAYER] Audio object alloc failed");
         return false;
     }
-#if ADC_VU_ENABLE
+#if LINE_PATH_ENABLE
     s_audio->setPinout(pins::kI2sBclk, pins::kI2sWs, pins::kI2sDout, pins::kI2sMclk);
 #else
     s_audio->setPinout(pins::kI2sBclk, pins::kI2sWs, pins::kI2sDout);
