@@ -208,6 +208,13 @@ struct AppStateData {
     // eqGainsDb = пресет EQ АКТИВНОГО входу, дБ (eq_cfg::kGainMinDb..kGainMaxDb). Лише AppController пише.
     uint8_t eqSelected;
     int8_t eqGainsDb[eq_cfg::kBandCount];
+
+    // --- [Prompt 49d] ДОДАНО (в кінець структури) ---
+    // true: спливне вікно (гучність / баланс) треба сховати негайно — користувач натиснув кнопку / клікнув
+    // енкодер / натиснув кнопку IR (крім дій, що самі показують вікно). Це РІВЕНЬ, а не подія: UI не плутає
+    // порядок «показати» / «сховати» в межах одного кадру. Скидається в false, коли AppController знову
+    // показує вікно (notifyPopup). Лише AppController пише.
+    bool popupDismissed;
 };
 
 class AppState {
@@ -237,4 +244,5 @@ public:
     //   AppState::modify([](AppStateData& s, void* c) { s.volume = *static_cast<int8_t*>(c); }, &v);
     static void modify(void (*fn)(AppStateData&, void* ctx), void* ctx);
 };
+
 

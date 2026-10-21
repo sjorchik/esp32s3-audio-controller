@@ -176,8 +176,8 @@
 // Екран = Mode::Menu + MenuContext::EqBalance (за зразком StationList: відтворення, вхід і мʼют не зупиняються,
 // режим лише перехоплює керування; новий Mode не вводився, щоб не чіпати web_api_common / web_server, які
 // перелічують Mode). Редагується пресет EQ і баланс АКТИВНОГО входу: 6 параметрів (0..4 смуги EQ, 5 баланс).
-// LEFT / RIGHT — вибір (по колу), UP / DOWN / обертання — ±eq_screen_cfg::kStepDb дБ, клік енкодера — скинути
-// вибраний у 0, довге утримання енкодера / BACK / таймаут eq_screen_cfg::kTimeoutMs — вихід. Зміни живі й
+// LEFT / RIGHT — вибір (по колу), UP / DOWN / обертання — ±eq_screen_cfg::kStepDb дБ, клік енкодера — наступний
+// параметр по колу (P49c; раніше — скинути вибраний у 0), довге утримання енкодера / BACK / таймаут eq_screen_cfg::kTimeoutMs — вихід. Зміни живі й
 // зберігаються тими самими шляхами, що веб: EQ — Settings::profiles[s_input].eqGainsDb (SettingsStore::modify,
 // NVS з дебаунсом) + екземпляр DSP (радіо eq::setAllDb / прохід LinePath::setEqAllDb); баланс — setBalanceTarget().
 // Примусове закриття: standby, OTA, початок навчання IR, зміна входу з будь-якого джерела, підняття AP (WifiSetup),
@@ -290,6 +290,7 @@ int8_t s_balance = balance_cfg::kDefaultDb;    // [Prompt 48b] баланс АК
 // Лічильник росте лише на ЛОКАЛЬНІ зміни (handleLocked); веб-команди (runWebCommand) його не чіпають.
 AdjustTarget s_popupTarget = AdjustTarget::Volume;
 uint8_t s_popupSeq = 0;
+bool s_popupDismissed = false;  // [Prompt 49d] true: UI має негайно сховати вікно (рівень, див. AppStateData::popupDismissed)
 MenuContext s_menuCtx = MenuContext::None;
 uint16_t s_menuSel = 0;
 
@@ -912,6 +913,7 @@ struct PubCtx {
     uint8_t eqSelected;                      // [Prompt 49a]
     int8_t eqGainsDb[eq_cfg::kBandCount];    // [Prompt 49a]
     char inputName[kInputNameMax];  // [Prompt 23b]
+    bool popupDismissed;            // [Prompt 49d]
 };
 
 void applyPub(AppStateData& s, void* c) {
@@ -935,6 +937,7 @@ void applyPub(AppStateData& s, void* c) {
     s.restarting = p->restarting;  // [Prompt 28]
     s.popupTarget = p->popupTarget;  // [Prompt 32]
     s.popupSeq = p->popupSeq;        // [Prompt 32]
+    s.popupDismissed = p->popupDismissed;  // [Prompt 49d]
     s.inputEnabledMask = p->inputEnabledMask;  // [Prompt 39]
     s.balanceDb = p->balanceDb;                // [Prompt 48b]
     s.eqSelected = p->eqSelected;              // [Prompt 49a]
@@ -947,6 +950,7 @@ void publishState() {
                 s_target,      s_menuCtx, s_menuSel, s_offline,  restarting(),
                 s_popupTarget, s_popupSeq, s_inputMask, s_balance};
     resolveInputName(s_input, p.inputName, sizeof(p.inputName));  // [Prompt 23b]
+    p.popupDismissed = s_popupDismissed;                          // [Prompt 49d]
     // [Prompt 49a] Поки відкритий екран «EQ + баланс» — вибраний параметр і пресет EQ активного входу (з Settings:
     // джерело правди, тож зміна з вебу теж видна); інакше нулі.
     if (eqOpen()) {
@@ -1250,12 +1254,6 @@ bool eqSetSelected(int value) {
 // ±delta кроків eq_screen_cfg::kStepDb вибраного параметра.
 void eqAdjustSelected(int delta) {
     eqSetSelected(eqSelectedValue() + delta * eq_screen_cfg::kStepDb);
-}
-
-// Клік енкодера в екрані: вибраний параметр -> 0.
-void eqResetSelected() {
-    EQS_LOG("reset sel=%u\n", static_cast<unsigned>(s_eqSel));
-    eqSetSelected(0);
 }
 
 // LEFT / RIGHT: вибір параметра по колу (0..kEqParamCount - 1).
@@ -2001,10 +1999,11 @@ void handleEqEvent(const Event& e) {
             eqTouch();
             break;
         case Action::ENC_PRESS:
+            // [Prompt 49c] Коротке натискання = наступний параметр по колу (як RIGHT); скидання в 0 з енкодера прибрано.
             if (e.longPress) {
                 closeEq("long");
             } else if (!e.repeat) {
-                eqResetSelected();
+                eqMoveSelection(+1);
                 eqTouch();
             }
             break;
@@ -2334,6 +2333,7 @@ void notifyPopup(AdjustTarget t) {
         return;
     }
     s_popupTarget = t;
+    s_popupDismissed = false;  // [Prompt 49d] нове показ скасовує попереднє «сховати»
     ++s_popupSeq;  // uint8_t: перехід 255 -> 0 штатний, UI порівнює лише «змінилось чи ні»
 }
 
@@ -2351,6 +2351,11 @@ void popupForEvent(const Event& e) {
         case Action::BALANCE_UP:   // [Prompt 48b] екран (P49) малює Balance за AppState.popupTarget
         case Action::BALANCE_DOWN: notifyPopup(AdjustTarget::Balance); break;
         default:
+            // [Prompt 49d] Будь-яка інша кнопка / клік енкодера / кнопка IR гасить вікно одразу; сама дія вже
+            // виконана вище (handleLocked) — закриття лише додатковий ефект. Веб сюди не потрапляє.
+            if (e.source != EventSource::WEB) {
+                s_popupDismissed = true;
+            }
             break;
     }
 }
@@ -2425,7 +2430,7 @@ void handleLocked(const Event& e) {
                 case Action::BALANCE_DOWN: adjustParam(AdjustTarget::Balance, -1); break;
                 case Action::ENC_PRESS:
                     // [Prompt 49a] Головний екран (Radio / ExternalInput): коротке натискання = мʼют, довге утримання =
-                    // екран «EQ + баланс». У списку станцій поведінка як була: довге = мʼют, коротке — без дії.
+                    // екран «EQ + баланс». У списку станцій: довге = мʼют, коротке = запустити вибрану станцію (P49c, як OK).
                     if (s_mode == Mode::Radio || s_mode == Mode::ExternalInput) {
                         if (e.longPress) {
                             openEq();
@@ -2434,6 +2439,9 @@ void handleLocked(const Event& e) {
                         }
                     } else if (e.longPress) {
                         toggleUserMute();
+                    } else if (!e.repeat && s_mode == Mode::Menu && s_menuCtx == MenuContext::StationList) {
+                        // [Prompt 49c] Список станцій: коротке натискання енкодера = запустити вибрану станцію (як OK).
+                        selectFromList();
                     }
                     break;
                 default:
@@ -3081,4 +3089,3 @@ bool AppController::begin() {
             static_cast<int>(s_volume), s_userMute ? 1 : 0, static_cast<unsigned>(s_inputMask));
     return true;
 }
-

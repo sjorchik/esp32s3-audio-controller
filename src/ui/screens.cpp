@@ -799,13 +799,16 @@ bool frame() {
         s_popupSeqSeen  = s.popupSeq;
     } else if (s.popupSeq != s_popupSeqSeen) {
         s_popupSeqSeen = s.popupSeq;
-        if (popupMode) {
+        if (popupMode && !s.popupDismissed) {   // [Prompt 49d] «сховати» (рівень) сильніше за подію «показати» в тому ж кадрі
             s_popupActive  = true;
             s_popupUntilMs = now + c::kPopupTimeoutMs;
         }
     }
     if (!popupMode) {
         s_popupActive = false;
+    } else if (s_popupActive && s.popupDismissed) {
+        s_popupActive = false;                  // [Prompt 49d] кнопка / клік енкодера / IR — сховати одразу
+        dirty = true;                           // перемалювати кадр без вікна
     } else if (s_popupActive && static_cast<int32_t>(now - s_popupUntilMs) >= 0) {
         s_popupActive = false;
         dirty = true;                           // перемалювати кадр без вікна

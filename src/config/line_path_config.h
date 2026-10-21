@@ -19,7 +19,7 @@
 #define LINE_PATH_ENABLE 1
 
 // 1 = Serial-команди lp.* (працює і при LINE_PATH_ENABLE == 0, тоді доступна лише lp.heap).
-#define LINE_PATH_TEST 1  // [P47c] 0 у виробничій збірці: lp.* керують проходом повз AppController
+#define LINE_PATH_TEST 0  // [P47c] 0 у виробничій збірці: lp.* керують проходом повз AppController
 
 // Serial-лог "[LINE] ...".
 #define LINE_PATH_DEBUG 1
