@@ -15,6 +15,7 @@ struct Info {
     const char* name;
     // true: дію має сенс навчати з пульта. ENC_* (суто енкодер) — false.
     // OK і BACK теж true (змінено за рішенням власника; раніше MASTER SPEC розд. 5 їх виключав).
+    // [Prompt 49e] false і для дій без ефекту: INPUT_AUX, BASS_*, TREBLE_*, GAIN_*.
     bool learnable;
 };
 

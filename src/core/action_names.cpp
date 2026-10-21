@@ -7,6 +7,10 @@ namespace action_names {
 namespace {
 
 // Порядок: як у IR_LEARNING.txt (список навчання), далі технічні дії.
+// [Prompt 49e] learnable = false також для дій без ефекту: INPUT_AUX (вхід AUX видалено) та
+// зарезервованих BASS_* / TREBLE_* / GAIN_* (тембру й gain більше немає; AppController їх ігнорує).
+// Самі записи й порядок лишаються (імена потрібні для exportJson / importJson та старих мап у NVS).
+// BALANCE_UP / BALANCE_DOWN працюють (±1 дБ балансу активного входу) і лишаються learnable = true.
 const Info kTable[] = {
     {Action::POWER, "POWER", true},
     {Action::UP, "UP", true},
@@ -20,7 +24,7 @@ const Info kTable[] = {
     {Action::INPUT_RADIO, "INPUT_RADIO", true},
     {Action::INPUT_TV, "INPUT_TV", true},
     {Action::INPUT_PC, "INPUT_PC", true},
-    {Action::INPUT_AUX, "INPUT_AUX", true},
+    {Action::INPUT_AUX, "INPUT_AUX", false},  // [P49e] вхід AUX видалено
     {Action::DIGIT_0, "DIGIT_0", true},
     {Action::DIGIT_1, "DIGIT_1", true},
     {Action::DIGIT_2, "DIGIT_2", true},
@@ -31,14 +35,14 @@ const Info kTable[] = {
     {Action::DIGIT_7, "DIGIT_7", true},
     {Action::DIGIT_8, "DIGIT_8", true},
     {Action::DIGIT_9, "DIGIT_9", true},
-    {Action::BASS_UP, "BASS_UP", true},
-    {Action::BASS_DOWN, "BASS_DOWN", true},
-    {Action::TREBLE_UP, "TREBLE_UP", true},
-    {Action::TREBLE_DOWN, "TREBLE_DOWN", true},
+    {Action::BASS_UP, "BASS_UP", false},
+    {Action::BASS_DOWN, "BASS_DOWN", false},
+    {Action::TREBLE_UP, "TREBLE_UP", false},
+    {Action::TREBLE_DOWN, "TREBLE_DOWN", false},
     {Action::BALANCE_UP, "BALANCE_UP", true},
     {Action::BALANCE_DOWN, "BALANCE_DOWN", true},
-    {Action::GAIN_UP, "GAIN_UP", true},
-    {Action::GAIN_DOWN, "GAIN_DOWN", true},
+    {Action::GAIN_UP, "GAIN_UP", false},
+    {Action::GAIN_DOWN, "GAIN_DOWN", false},
     // OK і BACK навчаються з пульта (за рішенням власника; раніше були false).
     {Action::OK, "OK", true},
     {Action::BACK, "BACK", true},
