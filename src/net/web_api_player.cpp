@@ -1,18 +1,17 @@
-// net/web_api_player.cpp (Prompt 18): POST /api/power, /api/mute, /api/volume, /api/gain,
+// net/web_api_player.cpp (Prompt 18): POST /api/power, /api/mute, /api/volume,
 // /api/input, /api/player/*, /api/player/station.
+// [P50a] /api/gain ВИДАЛЕНО (маршрут не реєструється -> 404); додано GET /api/balance[?input=N].
 // [Prompt 30] + GET/POST /api/eq (5-смуговий еквалайзер радіо). На відміну від решти, /api/eq НЕ
 // йде через AppController::runWebCommand(): це чисто програмний фільтр у хуку PCM (audio/eq.*),
 // без заліза й без стану контролера; обробник кладе значення в eq::* і в Settings (NVS, дебаунс).
 // [Prompt 48a] Аудіочіпи вирізано: 3 логічні входи (0 радіо, 1 TV Box, 2 Computer), `requireProc()` і
-// capabilities() прибрано; діапазон гучності — audio_cfg::kVolumeUiMin..kVolumeUiMax; POST /api/gain -> 400
-// not_supported; /api/inputs і /api/eq працюють по kInputCount (3). registerPlayerRoutes() без параметра AudioProcessor*: параметр прибрано разом із AudioProcessor.
+// capabilities() прибрано; діапазон гучності — audio_cfg::kVolumeUiMin..kVolumeUiMax; /api/inputs і /api/eq працюють по kInputCount (3). registerPlayerRoutes() без параметра AudioProcessor*: параметр прибрано разом із AudioProcessor.
 // [Prompt 48b] + POST /api/balance {"value":N[,"input":M]}: цифровий баланс ±20 дБ (balance_cfg), індивідуальний для кожного
 // входу. Активний вхід (без `input` або input == поточний) — через AppController::runWebCommand(BalanceSet): DSP
 // радіо / проходу + профіль; НЕАКТИВНИЙ вхід — лише запис у Settings (як /api/eq), застосується при перемиканні.
 // [Prompt 46a] Пресет EQ тепер ПО ВХОДАХ (Settings::profiles[i].eqGainsDb): /api/eq читає й пише профіль
 // ПОТОЧНОГО входу (AppState.inputIndex); на екземпляр радіо (eq::setAllDb) значення потрапляє лише коли
-// поточний вхід 0. Форма запиту/відповіді не змінилась (поле `input` — у P46b). Застарілі /api/gain та
-// bass/treble/balance/loudness у /api/settings лишились, але нічого не регулюють (див. AppController).
+// поточний вхід 0. Форма запиту/відповіді не змінилась (поле `input` — у P46b).
 //
 // Усе, що міняє стан пристрою, виконує AppController::runWebCommand() під його мʼютексом
 // (те саме, що кнопки/пульт: ramp, мʼют на переходах, збереження в Settings). Тут лише:
@@ -195,22 +194,6 @@ void handleVolume(AsyncWebServerRequest* req) {
         }
         runCommand(req, {WebCmdType::VolumeStep, x, false});
     }
-}
-
-// ---------------------------------------------------------------------------
-// POST /api/gain {"value":N}   підсилення ПОТОЧНОГО входу, сирі кроки gainMin..gainMax
-// ---------------------------------------------------------------------------
-void handleGain(AsyncWebServerRequest* req) {
-    if (!exactUrl(req, "/api/gain")) return;
-    WEB_API_LOG("%s %s", req->methodToString(), req->url().c_str());
-
-    JsonDocument in;
-    if (!readJsonObjectBody(req, in)) return;
-    JsonObjectConst root = in.as<JsonObjectConst>();
-    if (!allowKeys(req, root, "value")) return;
-
-    // [Prompt 48a] Підсилення входу видалено разом із чипом: завжди 400 not_supported.
-    sendFieldError(req, 400, "not_supported", "value");
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +523,41 @@ void storeBalance(Settings& s, void* ctx) {
     }
 }
 
+// [P50a] GET /api/balance[?input=N] -> 200 {"input":N,"balance":V}
+//   без input — активний вхід (AppState.balanceDb, те саме, що в /api/status.balance); input 0..kInputCount−1 —
+//   баланс з профілю входу (Settings::profiles[N].balanceDb). Помилки input — як у GET /api/eq:
+//   400 invalid_value (не число) | out_of_range (поза діапазоном, з min / max). Без запису й обчислень.
+void handleBalanceGet(AsyncWebServerRequest* req) {
+    if (!exactUrl(req, "/api/balance")) return;
+    WEB_API_LOG("%s %s", req->methodToString(), req->url().c_str());
+    const AppStateData st = AppState::snapshot();
+    const uint8_t active = (st.inputIndex < defaults::kInputCount) ? st.inputIndex : 0;
+    uint8_t input = active;
+    if (req->hasParam("input")) {
+        int x = 0;
+        if (!parseQueryInt(req->getParam("input")->value(), x)) {
+            sendFieldError(req, 400, "invalid_value", "input");
+            return;
+        }
+        if (x < 0 || x >= defaults::kInputCount) {
+            sendRangeError(req, "input", 0, defaults::kInputCount - 1);
+            return;
+        }
+        input = static_cast<uint8_t>(x);
+    }
+    int balance;
+    if (input == active) {
+        balance = st.balanceDb;
+    } else {
+        const Settings s = SettingsStore::snapshot();
+        balance = s.profiles[input].balanceDb;
+    }
+    JsonDocument doc;
+    doc["input"] = input;
+    doc["balance"] = balance;
+    sendJson(req, 200, doc);
+}
+
 void handleBalance(AsyncWebServerRequest* req) {
     if (!exactUrl(req, "/api/balance")) return;
     WEB_API_LOG("%s %s", req->methodToString(), req->url().c_str());
@@ -747,7 +765,7 @@ void registerPlayerRoutes(AsyncWebServer& server) {  // [P48a] без AudioProce
     server.on("/api/power", HTTP_POST, handlePower, nullptr, web_api::jsonBodyCallback);
     server.on("/api/mute", HTTP_POST, handleMute, nullptr, web_api::jsonBodyCallback);
     server.on("/api/volume", HTTP_POST, handleVolume, nullptr, web_api::jsonBodyCallback);
-    server.on("/api/gain", HTTP_POST, handleGain, nullptr, web_api::jsonBodyCallback);
+    server.on("/api/balance", HTTP_GET, handleBalanceGet);  // [P50a]
     server.on("/api/balance", HTTP_POST, handleBalance, nullptr, web_api::jsonBodyCallback);  // [Prompt 48b]
     server.on("/api/input", HTTP_POST, handleInput, nullptr, web_api::jsonBodyCallback);
 

@@ -1,4 +1,7 @@
 // net/web_server.cpp (Prompt 13): інфраструктура, /api/status, /api/settings.
+// [P50a] GET /api/status: прибрано bass / treble / gain / loudness і обʼєкт processor; додано menuContext.
+// GET /api/settings без processorType / bass / treble / balance / loudness; POST /api/settings цих ключів
+// більше не приймає (400 unknown_field). Тип процесора й заглушки чипів видалено.
 // [P48b-фікс] GET /api/status: поле "balance" = AppStateData::balanceDb (дБ активного входу, −20..+20). Решту не змінено.
 // [Prompt 25] ДОДАНО: поле станції levelDb (рівень виходу декодера, дБ, -24..0) у GET/POST/PUT
 // /api/stations (parseStationObject, sendStationParseError). Нових ендпоїнтів немає; імпорт/
@@ -17,9 +20,8 @@
 // inputs[]); маршрути керування й системні винесено в net/web_api_player.cpp та
 // net/web_api_system.cpp (тут лише їх реєстрація в registerRoutes()).
 // [Prompt 21b] ЗМІНЕНО: звукові налаштування — по входах (профіль ПОТОЧНОГО входу, веде
-// AppController). Тонкомпенсація тепер іде через AppController::setTone() (раніше — напряму в
-// чип + Settings); /api/status бере loudness з AppState; GET /api/settings віддає значення
-// профілю lastInput під тими самими ключами (формат відповідей не змінено).
+// AppController). [P50a] Тонкомпенсації (setTone / loudness) більше немає. GET /api/settings віддає
+// lastVolume з профілю lastInput.
 // [Prompt 19] ДОДАНО: один рядок registerStaticRoutes() наприкінці registerRoutes() —
 // вбудовані веб-сторінки (net/web_static.*); API-маршрути лишаються першими.
 
@@ -41,7 +43,6 @@
 
 #include <new>
 
-#include "config/audio_config.h"  // [P48a] kVolumeUiMin / kVolumeUiMax (заглушка processor.capabilities)
 #include "config/defaults.h"
 #include "config/web_server_config.h"
 #include "core/action_names.h"   // [Prompt 15]
@@ -72,11 +73,6 @@ static_assert(sizeof(Settings::inputNames) / sizeof(Settings::inputNames[0]) ==
 static_assert(sizeof(Settings::inputNames[0]) == web_cfg::kInputNameMaxBytes + 1,
               "web_cfg::kInputNameMaxBytes must match Settings::inputNames[i] size - 1");
 
-// [Prompt 48a] Аудіочіпи вирізано. Застарілі поля JSON (processorType в /api/settings, processor.* у
-// /api/status) віддаються СТАЛИМИ значеннями, щоб не ламати фронтенд до P50 / P51; POST processorType
-// ігнорується без помилки.
-constexpr const char* kLegacyProcType = "None";
-
 AsyncWebServer* s_server = nullptr;
 bool s_beginCalled = false;
 
@@ -94,6 +90,16 @@ const char* modeName(Mode m) {
         case Mode::OtaUpdate:     return "OtaUpdate";  // [Prompt 16]
     }
     return "Unknown";
+}
+
+// [P50a] Підрежим Mode::Menu. Невідоме значення -> "None".
+const char* menuContextName(MenuContext c) {
+    switch (c) {
+        case MenuContext::None:        return "None";
+        case MenuContext::StationList: return "StationList";
+        case MenuContext::EqBalance:   return "EqBalance";
+    }
+    return "None";
 }
 
 const char* streamStatusName(StreamStatus s) {
@@ -150,20 +156,16 @@ void handleStatus(AsyncWebServerRequest* req) {
         if (inputName[0] == '\0') inputName = defaults::kInputNames[st.inputIndex];
     }
 
-    // [Prompt 21b] Тонкомпенсація — з AppState (профіль поточного входу, веде AppController).
-    const bool loudness = st.loudness;
-
     JsonDocument doc;
     doc["mode"] = modeName(st.mode);
+    // [P50a] Підрежим меню: "None" | "StationList" | "EqBalance". mode лишається "Menu" для будь-якого контексту;
+    // поза Mode::Menu контекст завжди "None".
+    doc["menuContext"] = (st.mode == Mode::Menu) ? menuContextName(st.menuContext) : "None";
     doc["input"] = st.inputIndex;
     doc["inputName"] = inputName;
     doc["volume"] = st.volume;
-    doc["bass"] = st.bass;
-    doc["treble"] = st.treble;
-    doc["balance"] = st.balanceDb;  // [P48b-фікс] дБ активного входу (−20..+20; додатне = вправо); legacy st.balance = 0
-    doc["gain"] = st.gain;
+    doc["balance"] = st.balanceDb;  // дБ активного входу (−20..+20; додатне = вправо)
     doc["mute"] = st.mute;
-    doc["loudness"] = loudness;
     // [Prompt 18] ДОДАНО
     doc["standby"] = (st.mode == Mode::Standby);
     doc["playing"] = st.streamPlaying;
@@ -195,29 +197,6 @@ void handleStatus(AsyncWebServerRequest* req) {
     wifi["ip"] = ip;
     wifi["rssi"] = WifiManager::rssi();
 
-    // [Prompt 48a] ЗАСТАРІЛЕ (прибере P50): чипа немає, обʼєкт віддається сталими значеннями тієї ж форми, щоб
-    // фронтенд (шкала гучності 0..100, кількість входів) не ламався. Тембр / баланс / gain / loudness: false.
-    JsonObject proc = doc["processor"].to<JsonObject>();
-    proc["type"] = kLegacyProcType;
-    proc["ready"] = true;
-    proc["i2cErrors"] = 0;
-    JsonObject caps = proc["capabilities"].to<JsonObject>();
-    caps["bass"] = false;
-    caps["treble"] = false;
-    caps["balance"] = false;
-    caps["loudness"] = false;
-    caps["inputCount"] = defaults::kInputCount;
-    caps["volumeMin"] = audio_cfg::kVolumeUiMin;
-    caps["volumeMax"] = audio_cfg::kVolumeUiMax;
-    caps["toneMin"] = 0;
-    caps["toneMax"] = 0;
-    caps["fader"] = false;
-    caps["inputGain"] = false;
-    caps["balanceMin"] = 0;
-    caps["balanceMax"] = 0;
-    caps["gainMin"] = 0;
-    caps["gainMax"] = 0;
-
     doc["brightness"] = DisplayManager::brightness();
     doc["displayFlipped"] = DisplayManager::isFlipped();
     doc["heap"] = ESP.getFreeHeap();
@@ -236,7 +215,6 @@ void handleSettingsGet(AsyncWebServerRequest* req) {
     const Settings s = SettingsStore::snapshot();
 
     JsonDocument doc;
-    doc["processorType"] = kLegacyProcType;  // [P48a] застаріле поле, стале значення
     JsonArray names = doc["inputNames"].to<JsonArray>();
     for (uint8_t i = 0; i < defaults::kInputCount; ++i) names.add(s.inputNames[i]);
     doc["brightness"] = s.brightness;
@@ -244,11 +222,6 @@ void handleSettingsGet(AsyncWebServerRequest* req) {
     // [Prompt 21b] Звукові значення — з ЗБЕРЕЖЕНОГО профілю входу lastInput (той самий вхід, що
     // відновиться після перезапуску); ключі й типи без змін.
     const InputProfile& pf = s.profiles[s.lastInput < defaults::kInputCount ? s.lastInput : 0];
-    // [P46a] Тембр/баланс/loudness більше не регулюються: віддаємо нейтральні значення (поля лишено для сумісності з вебом).
-    doc["bass"] = 0;
-    doc["treble"] = 0;
-    doc["balance"] = 0;
-    doc["loudness"] = false;
     doc["lastInput"] = s.lastInput;
     doc["lastStation"] = s.lastStation;
     doc["lastVolume"] = pf.volume;
@@ -292,7 +265,7 @@ struct Plan {
 
 struct ParseFlags {
     bool invalid = false;      // помилка клієнта -> 400
-    bool unavailable = false;  // немає процесора -> 503 (якщо інших помилок нема)
+    bool unavailable = false;  // зарезервовано (503, якщо інших помилок нема); зараз не виставляється
     int fields = 0;            // скільки ключів прийнято
 };
 
@@ -376,15 +349,7 @@ void parsePlan(JsonObjectConst root, Plan& plan, JsonArray errs, ParseFlags& f) 
                 plan.hasFlipped = true;
                 ++f.fields;
             }
-        } else if (strcmp(key, "bass") == 0 || strcmp(key, "treble") == 0 ||
-                   strcmp(key, "balance") == 0 || strcmp(key, "loudness") == 0) {
-            // [Prompt 48a] Тембр / баланс / loudness не підтримуються (чипа немає; баланс повернеться
-            // в P48b окремим API): 400 not_supported, як для функції, якої немає в апаратури.
-            addErr(errs, key, "not_supported");
-            f.invalid = true;
-        } else if (strcmp(key, "processorType") == 0) {
-            // [Prompt 48a] Застаріле поле: приймається й ІГНОРУЄТЬСЯ без помилки (чипів немає).
-                } else if (strcmp(key, "inputNames") == 0) {
+        } else if (strcmp(key, "inputNames") == 0) {
             if (!v.is<JsonArrayConst>() || v.as<JsonArrayConst>().size() != kNames) {
                 addErr(errs, "inputNames", "expected_array_of_3");
                 f.invalid = true;
@@ -427,7 +392,7 @@ void parsePlan(JsonObjectConst root, Plan& plan, JsonArray errs, ParseFlags& f) 
 // POST /api/settings — застосування
 // ---------------------------------------------------------------------------
 struct SettingsCtx {
-    const Plan* plan;  // [Prompt 21b] тембр/баланс/loudness зберігає AppController::setTone()
+    const Plan* plan;
 };
 
 void handleSettingsPost(AsyncWebServerRequest* req) {
@@ -472,7 +437,7 @@ void handleSettingsPost(AsyncWebServerRequest* req) {
     resp.remove("errors");
 
     JsonObject results = resp["results"].to<JsonObject>();
-    JsonArray restart = resp["requiresRestart"].to<JsonArray>();  // [P48a] завжди порожній (processorType ігнорується)
+    JsonArray restart = resp["requiresRestart"].to<JsonArray>();  // [P50a] зарезервовано, завжди порожній (лишено для сумісності відповіді)
     (void)restart;
     bool hwFailed = false;
 

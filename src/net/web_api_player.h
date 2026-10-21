@@ -1,6 +1,6 @@
 #pragma once
 
-// Веб-API керування (Prompt 18): живлення, мʼют, гучність, gain, вибір входу, плеєр,
+// Веб-API керування (Prompt 18): живлення, мʼют, гучність, вибір входу, плеєр,
 // вибір станції. Усі зміни йдуть ЛИШЕ через AppController::runWebCommand(); модуль не
 // чіпає AudioPlayer напряму. [P48a] AudioProcessor вирізано: registerPlayerRoutes() без proc.
 // [Prompt 30] ВИНЯТОК: /api/eq (еквалайзер радіо) — чисто програмний DSP без заліза й без
@@ -10,10 +10,10 @@
 //   POST /api/power            {"state":"on"|"off"|"toggle"}
 //   POST /api/mute             {"mute":true|false|"toggle"}
 //   POST /api/volume           {"value":N}  або  {"step":N}
-//   POST /api/gain             {"value":N}
 //   POST /api/input            {"index":N}
 //   POST /api/player/{play|pause|stop|toggle|next|prev}
 //   POST /api/player/station   {"index":N[,"switchInput":true]}
+//   GET  /api/balance          (P50a) [?input=N] -> {"input":N,"balance":V}
 //   POST /api/balance          (P48b) {"value":N[,"input":M]} баланс ±20 дБ активного (або вказаного) входу
 //   GET  /api/eq               (P30) пресет еквалайзера радіо
 //   POST /api/eq               (P30) {"gainsDb":[a,b,c,d,e]} або {"band":N,"gainDb":X}

@@ -16,7 +16,8 @@
 //
 // Виняток з «AppController — єдиний власник заліза» (узгоджений у Prompt 13):
 // обробники напряму викликають DisplayManager::setBrightness/setFlipped.
-// [P48a] Тембр / баланс / loudness більше не підтримуються (400 not_supported).
+// [P50a] bass / treble / balance / loudness / processorType у /api/settings більше не існують
+// (як будь-який невідомий ключ -> 400 unknown_field); /api/status без processor, з menuContext.
 // setInput/мʼют/станції не чіпаються взагалі.
 
 class WebServerManager {

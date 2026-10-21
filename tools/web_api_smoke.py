@@ -8,8 +8,9 @@
 
 Режими:
     (без прапорців)   лише GET. Нічого не змінює на пристрої.
-    --write           POST/PUT/DELETE-перевірки: гучність, мʼют, gain, яскравість, тембр, вхід (без зміни),
-                      станція-тимчасова (додається й видаляється), негативні випадки (очікувані 400).
+    --write           POST/PUT/DELETE-перевірки: гучність, мʼют, баланс (активний і неактивний вхід), яскравість,
+                      вхід (без зміни), станція-тимчасова (додається й видаляється), негативні випадки
+                      (очікувані 400/404: застарілі ключі /api/settings, /api/gain тощо).
                       Кожна зміна повертається до початкового значення.
     --player          (разом з --write) перемикання play/pause та next/prev станції: чутні переходи.
     --confirm-checks  (разом з --write) негативні перевірки factory-reset / wifi-reset БЕЗ підтвердження
@@ -18,6 +19,8 @@
 
 НІКОЛИ не запускається: POST /api/system/reboot, /api/ota, /api/stations/import, /api/ir/map/import,
 /api/power (standby), реальні factory-reset / wifi-reset.
+
+Оновлено в P50a: без processor / gain / тембру; додано GET /api/balance, menuContext, 3 входи.
 
 Код виходу: 0 — немає FAIL; 1 — є хоча б один FAIL; 2 — пристрій недоступний.
 """
@@ -30,6 +33,12 @@ import urllib.error
 import urllib.request
 
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
+VOLUME_MIN, VOLUME_MAX = 0, 100          # audio_cfg::kVolumeUiMin / kVolumeUiMax (processor.capabilities прибрано в P50a)
+INPUT_COUNT = 3                          # defaults::kInputCount (0 радіо, 1 TV Box, 2 Computer)
+BALANCE_MIN, BALANCE_MAX = -20, 20       # balance_cfg::kMinDb / kMaxDb
+MENU_CONTEXTS = ("None", "StationList", "EqBalance")
+REMOVED_STATUS_KEYS = ("processor", "bass", "treble", "gain", "loudness")
+REMOVED_SETTINGS_KEYS = ("processorType", "bass", "treble", "balance", "loudness")
 RETRIES = 3          # спроб на запит при мережевій помилці (не при HTTP-кодах)
 RETRY_PAUSE_S = 0.7  # пауза між спробами
 results = []
@@ -106,19 +115,55 @@ def expect(name, got, want_status, want_keys=None, want_error=None):
 # --------------------------------------------------------------------------
 def read_checks(d):
     ok, st = expect("GET /api/status", d.get("/api/status"), 200,
-                    ["mode", "standby", "input", "inputName", "inputs", "volume", "mute", "playing",
-                     "streamStatus", "station", "track", "wifi", "processor", "otaProgress",
-                     "heap", "uptimeMs"])
+                    ["mode", "menuContext", "standby", "input", "inputName", "inputs", "volume", "balance", "mute",
+                     "playing", "streamStatus", "station", "track", "wifi", "otaProgress", "heap", "uptimeMs"])
     if ok:
         record("status.station.{index,count,max}", has_keys(st["station"], ["index", "count", "max", "name"]))
-        record("status.inputs[] має index/name/available",
-               isinstance(st["inputs"], list) and len(st["inputs"]) > 0 and
+        record("status.inputs[] має index/name/available, рівно %d" % INPUT_COUNT,
+               isinstance(st["inputs"], list) and len(st["inputs"]) == INPUT_COUNT and
                all(has_keys(i, ["index", "name", "available"]) for i in st["inputs"]))
-        proc = st["processor"]
-        record("status.processor.{type,ready,capabilities}", has_keys(proc, ["type", "ready", "capabilities"]))
-    expect("GET /api/settings", d.get("/api/settings"), 200,
-           ["processorType", "inputNames", "brightness", "displayFlipped", "bass", "treble",
-            "balance", "loudness", "lastInput", "lastStation", "lastVolume", "lastMute"])
+        gone = [k for k in REMOVED_STATUS_KEYS if k in st]
+        record("status без застарілих полів (processor/bass/treble/gain/loudness)", not gone,
+               "ще є: %s" % ", ".join(gone) if gone else "")
+        record("status.menuContext ∈ {None, StationList, EqBalance}", st["menuContext"] in MENU_CONTEXTS,
+               "got %r" % (st["menuContext"],))
+        record("status.menuContext == None поза mode Menu", st["mode"] == "Menu" or st["menuContext"] == "None",
+               "mode=%s menuContext=%s" % (st["mode"], st["menuContext"]))
+        record("status.balance ціле в %d..%d" % (BALANCE_MIN, BALANCE_MAX),
+               isinstance(st["balance"], int) and BALANCE_MIN <= st["balance"] <= BALANCE_MAX,
+               "got %r" % (st["balance"],))
+    ok_s, sett = expect("GET /api/settings", d.get("/api/settings"), 200,
+                        ["inputNames", "brightness", "displayFlipped", "lastInput", "lastStation", "lastVolume",
+                         "lastMute"])
+    if ok_s:
+        gone = [k for k in REMOVED_SETTINGS_KEYS if k in sett]
+        record("settings без застарілих полів (processorType/bass/treble/balance/loudness)", not gone,
+               "ще є: %s" % ", ".join(gone) if gone else "")
+        record("settings.inputNames рівно %d" % INPUT_COUNT,
+               isinstance(sett["inputNames"], list) and len(sett["inputNames"]) == INPUT_COUNT)
+
+    # --- GET /api/balance (P50a) ---
+    ok_b, bal = expect("GET /api/balance (активний вхід)", d.get("/api/balance"), 200, ["input", "balance"])
+    if ok_b and ok:
+        record("balance: input == status.input", bal["input"] == st["input"], "%s vs %s" % (bal["input"], st["input"]))
+        record("balance: balance == status.balance", bal["balance"] == st["balance"],
+               "%s vs %s" % (bal["balance"], st["balance"]))
+    for n in range(INPUT_COUNT):
+        okn, bn = expect("GET /api/balance?input=%d" % n, d.get("/api/balance?input=%d" % n), 200, ["input", "balance"])
+        if okn:
+            record("balance?input=%d: input == %d, значення в межах" % (n, n),
+                   bn["input"] == n and isinstance(bn["balance"], int) and BALANCE_MIN <= bn["balance"] <= BALANCE_MAX,
+                   str(bn))
+    status, body = d.get("/api/balance?input=%d" % INPUT_COUNT)
+    record("GET /api/balance?input=%d -> 400 out_of_range" % INPUT_COUNT,
+           status == 400 and isinstance(body, dict) and body.get("error") == "out_of_range" and
+           body.get("field") == "input" and body.get("min") == 0 and body.get("max") == INPUT_COUNT - 1,
+           "HTTP %s %s" % (status, str(body)[:80]))
+    expect("GET /api/balance?input=-1 -> 400", d.get("/api/balance?input=-1"), 400, ["error"], "out_of_range")
+    expect("GET /api/balance?input=x -> 400", d.get("/api/balance?input=x"), 400, ["error"], "invalid_value")
+
+    # --- видалені маршрути ---
+    expect("GET /api/gain -> 404", d.get("/api/gain"), 404, ["error"], "not_found")
 
     status, lst = d.get("/api/stations")
     good = status == 200 and isinstance(lst, list) and all(has_keys(s, ["index", "name", "url"]) for s in lst)
@@ -137,7 +182,10 @@ def read_checks(d):
            (status, len(acts) if isinstance(acts, list) else "?"))
     if status == 200 and isinstance(acts, list):
         names = [a["action"] for a in acts]
-        record("ir/actions не містить OK/BACK", "OK" not in names and "BACK" not in names)
+        # З P22 OK і BACK навчаються; дії енкодера ENC_* та зарезервовані BASS_/TREBLE_/GAIN_/INPUT_AUX - ні.
+        record("ir/actions містить OK і BACK", "OK" in names and "BACK" in names)
+        bad = [n for n in names if n.startswith(("ENC_", "BASS_", "TREBLE_", "GAIN_")) or n == "INPUT_AUX"]
+        record("ir/actions без ENC_* / BASS_* / TREBLE_* / GAIN_* / INPUT_AUX", not bad, ", ".join(bad))
 
     status, mp = d.get("/api/ir/map")
     record("GET /api/ir/map", status == 200 and isinstance(mp, list), "HTTP %s" % status)
@@ -153,7 +201,6 @@ def read_checks(d):
 # Перевірки зі зміною стану (--write), кожна повертає початкове значення
 # --------------------------------------------------------------------------
 def write_checks(d, st, args):
-    caps = (st.get("processor") or {}).get("capabilities") if st else None
     standby = bool(st and st.get("standby"))
     busy_mode = st and st.get("mode") in ("OtaUpdate", "IrLearn")
     if busy_mode:
@@ -168,75 +215,104 @@ def write_checks(d, st, args):
            "conflicting_fields")
     expect("POST /api/player/bogus -> 404", d.post("/api/player/bogus"), 404, ["error"], "not_found")
     expect("POST /api/ir/learn unknown action -> 400", d.post("/api/ir/learn", {"action": "NOPE"}), 400, ["error"])
-    expect("POST /api/ir/learn OK (not learnable) -> 400", d.post("/api/ir/learn", {"action": "OK"}), 400, ["error"])
+    expect("POST /api/ir/learn ENC_CW (not learnable) -> 400", d.post("/api/ir/learn", {"action": "ENC_CW"}), 400,
+           ["error"])
+    expect("POST /api/ir/learn BASS_UP (зарезервовано) -> 400", d.post("/api/ir/learn", {"action": "BASS_UP"}), 400,
+           ["error"])
     status, _ = d.post("/api/ota")
     record("POST /api/ota без тіла -> 4xx (не стартує)", 400 <= status < 500, "HTTP %s" % status)
+    # --- P50a: видалене / нове (без побічних ефектів: валідація йде до застосування) ---
+    expect("POST /api/gain -> 404 (маршрут видалено)", d.post("/api/gain", {"value": 1}), 404, ["error"], "not_found")
+    for key in REMOVED_SETTINGS_KEYS:
+        body = {key: "None" if key == "processorType" else 0}
+        status, resp = d.post("/api/settings", body)
+        codes = [e.get("code") for e in resp.get("errors", [])] if isinstance(resp, dict) else []
+        record("POST /api/settings {%s} -> 400 unknown_field" % key,
+               status == 400 and codes == ["unknown_field"], "HTTP %s %s" % (status, str(resp)[:80]))
+    status, resp = d.post("/api/settings", {"inputNames": ["a", "b"]})
+    codes = [e.get("code") for e in resp.get("errors", [])] if isinstance(resp, dict) else []
+    record("POST /api/settings inputNames (2 елементи) -> 400 expected_array_of_3",
+           status == 400 and codes == ["expected_array_of_3"], "HTTP %s %s" % (status, str(resp)[:80]))
+    expect("POST /api/balance {} -> 400 missing_field", d.post("/api/balance", {}), 400, ["error"], "missing_field")
+    expect("POST /api/balance unknown field -> 400", d.post("/api/balance", {"value": 0, "x": 1}), 400, ["error"],
+           "unknown_field")
+    expect("POST /api/balance value=%d -> 400 out_of_range" % (BALANCE_MAX + 1),
+           d.post("/api/balance", {"value": BALANCE_MAX + 1}), 400, ["error", "min", "max"], "out_of_range")
+    expect("POST /api/balance input=%d -> 400 out_of_range" % INPUT_COUNT,
+           d.post("/api/balance", {"value": 0, "input": INPUT_COUNT}), 400, ["error", "min", "max"], "out_of_range")
 
-    if caps is None:
-        record("аудіо-перевірки", False, "processor.ready=false (немає аудіопроцесора)", skip=True)
+    vmin, vmax = VOLUME_MIN, VOLUME_MAX
+    expect("POST /api/volume above max -> 400", d.post("/api/volume", {"value": vmax + 1}), 400, ["error", "min", "max"],
+           "out_of_range")
+    bad_input = INPUT_COUNT
+    expect("POST /api/input out of range -> 400", d.post("/api/input", {"index": bad_input}), 400,
+           ["error", "min", "max"], "out_of_range")
+    expect("POST /api/input {index:cur} (без зміни)", d.post("/api/input", {"index": st["input"]})
+           if not standby else (409, {"error": "standby"}), 409 if standby else 200)
+
+    # --- баланс неактивного входу: дозволено й у standby (лише профіль у Settings) ---
+    other = (st["input"] + 1) % INPUT_COUNT
+    status, o0 = d.get("/api/balance?input=%d" % other)
+    if status == 200 and isinstance(o0, dict):
+        b0 = o0["balance"]
+        b1 = b0 + 1 if b0 < BALANCE_MAX else b0 - 1
+        ok, _ = expect("POST /api/balance {value, input:%d} (неактивний)" % other,
+                       d.post("/api/balance", {"value": b1, "input": other}), 200, ["input", "balance"])
+        if ok:
+            status, now = d.get("/api/balance?input=%d" % other)
+            record("balance (неактивний): GET == %d" % b1, status == 200 and now.get("balance") == b1, str(now))
+        expect("POST /api/balance повернути %d (вхід %d)" % (b0, other),
+               d.post("/api/balance", {"value": b0, "input": other}), 200, ["input", "balance"])
     else:
-        vmin, vmax = caps["volumeMin"], caps["volumeMax"]
-        expect("POST /api/volume above max -> 400", d.post("/api/volume", {"value": vmax + 1}), 400, ["error", "min", "max"],
-               "out_of_range")
-        bad_input = caps["inputCount"]
-        expect("POST /api/input out of range -> 400", d.post("/api/input", {"index": bad_input}), 400,
-               ["error", "min", "max"], "out_of_range")
-        expect("POST /api/input {index:cur} (без зміни)", d.post("/api/input", {"index": st["input"]})
-               if not standby else (409, {"error": "standby"}), 409 if standby else 200)
+        record("balance неактивного входу", False, "не вдалося прочитати", skip=True)
 
-        if standby:
-            record("volume/mute/gain/tone зміни", False, "пристрій у standby (очікувано 409)", skip=True)
-            expect("POST /api/volume у standby -> 409", d.post("/api/volume", {"value": st["volume"]}), 409, ["error"], "standby")
-        else:
-            # --- гучність ---
-            v0 = st["volume"]
-            v1 = v0 + 1 if v0 < vmax else v0 - 1
-            ok, b = expect("POST /api/volume {value} змінює гучність", d.post("/api/volume", {"value": v1}), 200, ["state"])
-            if ok:
-                record("volume: state.volume == %d" % v1, b["state"]["volume"] == v1, "got %s" % b["state"]["volume"])
-            ok, b = expect("POST /api/volume {step:-1}", d.post("/api/volume", {"step": -1}), 200, ["state"])
-            expect("POST /api/volume повернути %d" % v0, d.post("/api/volume", {"value": v0}), 200, ["state"])
+    if standby:
+        record("volume/mute/balance(активний) зміни", False, "пристрій у standby (очікувано 409)", skip=True)
+        expect("POST /api/volume у standby -> 409", d.post("/api/volume", {"value": st["volume"]}), 409, ["error"], "standby")
+        expect("POST /api/balance (активний) у standby -> 409", d.post("/api/balance", {"value": st["balance"]}), 409,
+               ["error"], "standby")
+    else:
+        # --- гучність ---
+        v0 = st["volume"]
+        v1 = v0 + 1 if v0 < vmax else v0 - 1
+        ok, b = expect("POST /api/volume {value} змінює гучність", d.post("/api/volume", {"value": v1}), 200, ["state"])
+        if ok:
+            record("volume: state.volume == %d" % v1, b["state"]["volume"] == v1, "got %s" % b["state"]["volume"])
+        ok, b = expect("POST /api/volume {step:-1}", d.post("/api/volume", {"step": -1}), 200, ["state"])
+        expect("POST /api/volume повернути %d" % v0, d.post("/api/volume", {"value": v0}), 200, ["state"])
 
-            # --- мʼют ---
-            m0 = st["mute"]
-            ok, b = expect("POST /api/mute {mute:!cur}", d.post("/api/mute", {"mute": not m0}), 200, ["state"])
-            if ok:
-                record("mute: state.mute == %s" % (not m0), b["state"]["mute"] == (not m0))
-            expect("POST /api/mute {mute:toggle}", d.post("/api/mute", {"mute": "toggle"}), 200, ["state"])
-            expect("POST /api/mute повернути %s" % m0, d.post("/api/mute", {"mute": m0}), 200, ["state"])
-            expect("POST /api/mute invalid -> 400", d.post("/api/mute", {"mute": 5}), 400, ["error"], "invalid_value")
+        # --- мʼют ---
+        m0 = st["mute"]
+        ok, b = expect("POST /api/mute {mute:!cur}", d.post("/api/mute", {"mute": not m0}), 200, ["state"])
+        if ok:
+            record("mute: state.mute == %s" % (not m0), b["state"]["mute"] == (not m0))
+        expect("POST /api/mute {mute:toggle}", d.post("/api/mute", {"mute": "toggle"}), 200, ["state"])
+        expect("POST /api/mute повернути %s" % m0, d.post("/api/mute", {"mute": m0}), 200, ["state"])
+        expect("POST /api/mute invalid -> 400", d.post("/api/mute", {"mute": 5}), 400, ["error"], "invalid_value")
 
-            # --- gain ---
-            if caps.get("inputGain") and caps["gainMax"] > caps["gainMin"]:
-                g0 = st["gain"]
-                g1 = g0 + 1 if g0 < caps["gainMax"] else g0 - 1
-                expect("POST /api/gain {value}", d.post("/api/gain", {"value": g1}), 200, ["state"])
-                status, now = d.get("/api/status")
-                record("gain: /api/status.gain == %d" % g1, status == 200 and now.get("gain") == g1,
-                       "got %s" % (now.get("gain") if isinstance(now, dict) else now))
-                expect("POST /api/gain повернути %d" % g0, d.post("/api/gain", {"value": g0}), 200, ["state"])
-                expect("POST /api/gain out of range -> 400", d.post("/api/gain", {"value": caps["gainMax"] + 1}), 400,
-                       ["error"], "out_of_range")
-            else:
-                record("gain", False, "чип не підтримує gain", skip=True)
+        # --- баланс активного входу (через AppController) ---
+        c0 = st["balance"]
+        c1 = c0 + 1 if c0 < BALANCE_MAX else c0 - 1
+        ok, b = expect("POST /api/balance {value} (активний вхід)", d.post("/api/balance", {"value": c1}), 200,
+                       ["input", "balance"])
+        if ok:
+            record("balance: відповідь input == status.input, balance == %d" % c1,
+                   b["input"] == st["input"] and b["balance"] == c1, str(b))
+            status, now = d.get("/api/status")
+            record("balance: /api/status.balance == %d" % c1, status == 200 and now.get("balance") == c1,
+                   "got %s" % (now.get("balance") if isinstance(now, dict) else now))
+            status, now = d.get("/api/balance")
+            record("balance: GET /api/balance == %d" % c1, status == 200 and now.get("balance") == c1, str(now))
+        expect("POST /api/balance повернути %d" % c0, d.post("/api/balance", {"value": c0}), 200, ["input", "balance"])
 
-            # --- тембр через /api/settings ---
-            if caps.get("bass"):
-                b0 = st["bass"]
-                b1 = b0 + 1 if b0 < caps["toneMax"] else b0 - 1
-                expect("POST /api/settings {bass}", d.post("/api/settings", {"bass": b1}), 200, ["ok", "results"])
-                expect("POST /api/settings повернути bass", d.post("/api/settings", {"bass": b0}), 200, ["ok"])
-            else:
-                record("bass через /api/settings", False, "чип не підтримує bass", skip=True)
-
-        # --- яскравість (не залежить від standby) ---
-        br0 = st["brightness"]
-        br1 = br0 - 1 if br0 > 0 else br0 + 1
-        expect("POST /api/settings {brightness}", d.post("/api/settings", {"brightness": br1}), 200, ["ok", "results"])
-        expect("POST /api/settings повернути brightness", d.post("/api/settings", {"brightness": br0}), 200, ["ok"])
-        status, body = d.post("/api/settings", {"brightness": 101})
-        record("POST /api/settings brightness=101 -> 400", status == 400 and body.get("ok") is False
-               and body["errors"][0]["code"] == "out_of_range", "HTTP %s" % status)
+    # --- яскравість (не залежить від standby) ---
+    br0 = st["brightness"]
+    br1 = br0 - 1 if br0 > 0 else br0 + 1
+    expect("POST /api/settings {brightness}", d.post("/api/settings", {"brightness": br1}), 200, ["ok", "results"])
+    expect("POST /api/settings повернути brightness", d.post("/api/settings", {"brightness": br0}), 200, ["ok"])
+    status, body = d.post("/api/settings", {"brightness": 101})
+    record("POST /api/settings brightness=101 -> 400", status == 400 and body.get("ok") is False
+           and body["errors"][0]["code"] == "out_of_range", "HTTP %s" % status)
 
     # --- станції: тимчасова станція додається й видаляється ---
     status, before = d.get("/api/stations")
