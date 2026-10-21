@@ -1,7 +1,8 @@
 // Прохід зовнішнього звуку PCM1808 -> ESP32-S3 -> PCM5102 (Prompt 44; P44b — життєвий цикл ресурсів;
 // P45 — EQ і dsp_volume у ланцюжку блоку; P47b — виробничий API гучності, мʼюту користувача, EQ входу,
 // помилок і неблокуючого старту; P47d — float-конвеєр і VU зовнішніх входів; P48b — цифровий баланс у DspVolume;
-// PD1 — діагностика lp.cfg/raw/spec/bypass/tone). Опис і правила потоків — audio/line_path.h.
+// PD1 — діагностика lp.cfg/raw/spec/bypass/tone; P48e — УСЯ діагностика лише під LINE_PATH_DIAG (реліз = 0),
+// виправлено lp.spec / lp.tone / lp.raw). Опис і правила потоків — audio/line_path.h.
 //
 // Топологія (V2 з P43):
 //   PCM1808 --DIN GPIO8--> I2S1 RX (slave) --[блок 128 кадрів]--> I2S1 TX (slave)
@@ -227,23 +228,49 @@ uint32_t s_heapFreeBefore = 0, s_heapLargestBefore = 0, s_heapFreeAfter = 0, s_h
 uint32_t s_stackFreeMin = 0;
 
 // ===========================================================================
-// [PD1] ДІАГНОСТИКА
+// [PD1 / P48e] ДІАГНОСТИКА. Усе нижче існує лише при LINE_PATH_DIAG == 1; при 0 компілюється геть.
+// Дані між консольною задачею (ядро 0) і задачею line_path (ядро 1) передаються без мʼютексів:
+//  - тон: seqlock (єдиний письменник — консоль), параметри застосовує ЗАДАЧА на початку блоку;
+//  - lp.raw: запит s_rawReq -> задача копіює сирий блок RX у s_rawSnap і скидає запит;
+//  - lp.spec: вікно s_specRunning, яке задача «фіксує» (s_specLatched) на початку кожного блоку.
 // ===========================================================================
 #if LINE_PATH_DIAG
-volatile bool s_diagBypass = false;
-volatile bool s_diagToneActive = false;
-volatile float s_diagToneHz = 0.0f;
-volatile float s_diagToneAmp = 0.0f;
-float s_diagTonePhaseL = 0.0f;
-float s_diagTonePhaseR = 0.0f;
-float s_diagTonePhaseStep = 0.0f;
 
-// Лічильники для lp.cfg
+namespace dcfg = line_path_diag_cfg;
+
+constexpr float kTwoPi = 6.28318530717958647692f;
+static_assert(dcfg::kRawMaxFrames >= 1 && dcfg::kRawMaxFrames <= line_path_cfg::kBlockFrames,
+              "lp.raw snapshot must fit into one block");
+
+volatile bool s_diagBypass = false;
+volatile bool s_diagEqResetReq = false;   // запит скидання стану EQ (виконує лише задача line_path)
+
+// Тон: рекурсивний квадратурний осцилятор (поворот на кут w за відлік), без sinf / cosf у гарячому шляху.
+struct ToneParams {
+  float cw;      // cos(w), w = 2*pi*f/fs
+  float sw;      // sin(w)
+  float amp;     // лінійна амплітуда (1.0 = 0 dBFS)
+  bool  active;
+};
+ToneParams        s_toneNew = {1.0f, 0.0f, 0.0f, false};  // пише лише diagSetTone (під seqlock s_toneSeq)
+volatile uint32_t s_toneSeq = 0;                          // непарне = іде запис
+volatile bool     s_diagToneActive = false;               // запитаний стан (для diagToneActive)
+volatile float    s_diagToneHz = 0.0f;
+ToneParams        s_toneCur = {1.0f, 0.0f, 0.0f, false};  // лише задача line_path
+float             s_toneC = 1.0f;                         // cos фази
+float             s_toneS = 0.0f;                         // sin фази (вихідний відлік = s_toneS * amp)
+uint32_t          s_toneSeen = 0;
+
+// Лічильники кадрів для lp.cfg (пише лише задача line_path).
 volatile uint32_t s_diagRxFrames = 0;
 volatile uint32_t s_diagTxFrames = 0;
-#endif
 
-// [PD1] Алгоритм Герцеля для одного частотного біна.
+// Знімок сирого RX для lp.raw (перші кадри останнього блоку; береться ДО обробки).
+int32_t           s_rawSnap[dcfg::kRawMaxFrames * 2];
+volatile uint32_t s_rawReq = 0;    // запитано кадрів (0 = запиту немає / виконано)
+volatile uint32_t s_rawGot = 0;    // скільки кадрів скопійовано
+
+// [PD1] Алгоритм Герцеля для одного частотного біна (довільна довжина вікна N, нормалізація 2/N).
 struct GoertzelState {
   float s0, s1, s2;
   float coef;
@@ -251,8 +278,7 @@ struct GoertzelState {
 
 inline void goertzelInit(GoertzelState& g, float freq, float fs) {
   g.s0 = g.s1 = g.s2 = 0.0f;
-  float k = 0.5f + (freq * 1024.0f / fs); // N = 1024 (або довжина блоку)
-  float w = (2.0f * 3.14159265358979323846f * k) / 1024.0f;
+  const float w = kTwoPi * freq / fs;   // [P48e] точна частота (раніше N = 1024 і зсув +0,5 біна)
   g.coef = 2.0f * cosf(w);
 }
 
@@ -262,22 +288,72 @@ inline void goertzelProcess(GoertzelState& g, float sample) {
   g.s1 = g.s0;
 }
 
-inline float goertzelMagnitudeDb(GoertzelState& g) {
-  float mag2 = g.s1 * g.s1 + g.s2 * g.s2 - g.coef * g.s1 * g.s2;
+// Амплітуда синусоїди на частоті біна, дБFS: |X| = A*N/2  =>  A = 2*|X|/N. frames = N (скільки відліків оброблено).
+inline float goertzelMagnitudeDb(const GoertzelState& g, uint32_t frames) {
+  if (frames == 0) return -99.0f;
+  const float mag2 = g.s1 * g.s1 + g.s2 * g.s2 - g.coef * g.s1 * g.s2;
   if (mag2 <= 1e-10f) return -99.0f;
-  // Нормалізація: mag = sqrt(mag2) / (N/2). N=1024.
-  // dBFS = 20 * log10(mag).
-  float mag = sqrtf(mag2) / 512.0f;
+  float mag = sqrtf(mag2) * 2.0f / static_cast<float>(frames);
   if (mag > 1.0f) mag = 1.0f;
   return 20.0f * log10f(mag);
 }
 
-// Глобальний стан для lp.spec (працює лише під час виконання команди)
-volatile bool s_specRunning = false;
-volatile uint32_t s_specEndMs = 0;
-GoertzelState s_specL[line_path_diag_cfg::kGoertzelCount];
-GoertzelState s_specR[line_path_diag_cfg::kGoertzelCount];
-uint32_t s_specBlocks = 0;
+// Вікно lp.spec. s_specBlocks / s_specFrames / s_specMaxProcUs пише лише задача line_path (x = x + 1, без ++).
+volatile bool     s_specRunning = false;
+GoertzelState     s_specL[dcfg::kGoertzelCount];
+GoertzelState     s_specR[dcfg::kGoertzelCount];
+volatile uint32_t s_specBlocks = 0;
+volatile uint32_t s_specFrames = 0;
+volatile uint32_t s_specMaxProcUs = 0;   // максимум часу processBlock + writeTx у вікні (разом із навантаженням Герцеля)
+bool              s_specLatched = false; // лише задача line_path: вікно було активним на початку цього блоку
+
+// Скинути діагностичні режими (stop / повернення до радіо). Викликає лише задача line_path.
+void diagResetOnStop() {
+  s_diagBypass = false;
+  s_diagToneActive = false;
+  s_diagToneHz = 0.0f;
+  s_toneCur.active = false;
+  const uint32_t seq = s_toneSeq;
+  if ((seq & 1u) == 0u) {
+    s_toneSeen = seq;   // запит тону, що чекав, не відновлюється після зупинки
+  }
+  s_specRunning = false;
+  s_rawReq = 0;
+}
+
+// Забрати нові параметри тону (seqlock). Початок блоку, задача line_path. Перезапускає осцилятор.
+inline void toneSync() {
+  const uint32_t s1 = s_toneSeq;
+  if (s1 == s_toneSeen || (s1 & 1u) != 0u) {
+    return;
+  }
+  const ToneParams p = s_toneNew;
+  __sync_synchronize();
+  if (s_toneSeq != s1) {
+    return;   // консоль писала під час копіювання: наступний блок
+  }
+  s_toneCur = p;
+  s_toneC = 1.0f;
+  s_toneS = 0.0f;
+  s_toneSeen = s1;
+}
+
+// Знімок сирих RX-кадрів на запит lp.raw. Задача line_path, ДО обробки (processBlock потім перезаписує s_buf).
+inline void rawSnapshot(const int32_t* in, int32_t frames) {
+  const uint32_t req = s_rawReq;
+  if (req == 0) {
+    return;
+  }
+  uint32_t k = req;
+  if (k > static_cast<uint32_t>(frames)) k = static_cast<uint32_t>(frames);
+  if (k > dcfg::kRawMaxFrames) k = dcfg::kRawMaxFrames;
+  memcpy(s_rawSnap, in, k * 2 * sizeof(int32_t));
+  s_rawGot = k;
+  __sync_synchronize();
+  s_rawReq = 0;   // сигнал виконання
+}
+
+#endif  // LINE_PATH_DIAG
 
 // ---------------------------------------------------------------------------
 // Мʼюти
@@ -472,9 +548,16 @@ void publishVu(const float* f, int32_t n) {
 void processBlock(size_t frames) {
   const int32_t n = static_cast<int32_t>(frames);
   float*        f = s_fbuf;
-  
+
 #if LINE_PATH_DIAG
-  s_diagRxFrames += n;
+  s_diagRxFrames = s_diagRxFrames + static_cast<uint32_t>(n);
+  rawSnapshot(s_buf, n);   // сирий RX до будь-якої обробки (на запит lp.raw)
+  toneSync();
+  if (s_diagEqResetReq) {
+    s_diagEqResetReq = false;
+    s_eqLine.reset();      // скидання стану фільтрів — у задачі, що ними володіє
+  }
+  s_specLatched = s_specRunning;
 #endif
 
   // 1. int32 -> float (точно: 24 значущі біти) і піки входу (до EQ).
@@ -483,22 +566,29 @@ void processBlock(size_t frames) {
   {
     const int32_t* in = s_buf;
     float*         o = f;
-    
+
 #if LINE_PATH_DIAG
-    // [PD1] Генерація тону замість RX
-    if (s_diagToneActive) {
+    // [PD1] Генерація тону замість RX (L = R). [P48e] Рекурсивний осцилятор: (c, s) повертається на кут w.
+    if (s_toneCur.active) {
+      const float cw = s_toneCur.cw;
+      const float sw = s_toneCur.sw;
+      const float amp = s_toneCur.amp;
+      float       c = s_toneC;
+      float       s = s_toneS;
       for (int32_t i = 0; i < n; ++i) {
-        float l = sinf(s_diagTonePhaseL) * s_diagToneAmp;
-        float r = sinf(s_diagTonePhaseR) * s_diagToneAmp;
-        s_diagTonePhaseL += s_diagTonePhaseStep;
-        s_diagTonePhaseR += s_diagTonePhaseStep;
-        if (s_diagTonePhaseL > 6.2831853f) s_diagTonePhaseL -= 6.2831853f;
-        if (s_diagTonePhaseR > 6.2831853f) s_diagTonePhaseR -= 6.2831853f;
-        o[0] = l;
-        o[1] = r;
+        const float v = s * amp;
+        o[0] = v;
+        o[1] = v;
         o += 2;
+        const float nc = c * cw - s * sw;
+        s = s * cw + c * sw;
+        c = nc;
       }
-    } else 
+      // Підгонка модуля до 1 раз на блок: 1/sqrt(1+e) ~ 1.5 - 0.5*(1+e) (без sqrt і double).
+      const float r = 1.5f - 0.5f * (c * c + s * s);
+      s_toneC = c * r;
+      s_toneS = s * r;
+    } else
 #endif
     {
       for (int32_t i = 0; i < n; ++i) {
@@ -510,35 +600,38 @@ void processBlock(size_t frames) {
         o += 2;
       }
     }
-    
-    // Піки та Goertzel
+
+    // Піки входу.
     o = f;
     for (int32_t i = 0; i < n; ++i) {
-      float l = o[0];
-      float r = o[1];
+      const float al = fabsf(o[0]);
+      const float ar = fabsf(o[1]);
       o += 2;
-      const float al = fabsf(l);
-      const float ar = fabsf(r);
       if (al > pl) pl = al;
       if (ar > pr) pr = ar;
-      
-#if LINE_PATH_DIAG
-      if (s_specRunning) {
-        for (size_t k = 0; k < line_path_diag_cfg::kGoertzelCount; ++k) {
-          goertzelProcess(s_specL[k], l);
-          goertzelProcess(s_specR[k], r);
-        }
-      }
-#endif
     }
   }
   if (pl > s_peakL) s_peakL = pl;
   if (pr > s_peakR) s_peakR = pr;
 
 #if LINE_PATH_DIAG
-  // [PD1] Bypass: пропускаємо EQ, VU, Volume, Balance
+  // [PD1] lp.spec: Герцель по вхідному сигналу (RX або тон), ДО EQ / гучності.
+  if (s_specLatched) {
+    const float* g = f;
+    for (int32_t i = 0; i < n; ++i) {
+      for (size_t k = 0; k < dcfg::kGoertzelCount; ++k) {
+        goertzelProcess(s_specL[k], g[0]);
+        goertzelProcess(s_specR[k], g[1]);
+      }
+      g += 2;
+    }
+    s_specFrames = s_specFrames + static_cast<uint32_t>(n);   // [P48e] лічильники вікна (раніше не інкрементувались)
+    s_specBlocks = s_specBlocks + 1u;
+  }
+
+  // [PD1] Bypass: пропускаємо EQ, VU, Volume, Balance.
   if (s_diagBypass) {
-    // Перетворюємо float назад в int32 для TX
+    // Перетворюємо float назад в int32 для TX.
     const float* in = f;
     int32_t*     o = s_buf;
     for (int32_t i = 0; i < n; ++i) {
@@ -553,13 +646,12 @@ void processBlock(size_t frames) {
       o[1] = static_cast<int32_t>(yr >= 0.0f ? yr + 0.5f : yr - 0.5f);
       o += 2;
     }
-    // Піки виходу
-    float ol = pl, orr = pr;
-    if (ol > s_peakOutL) s_peakOutL = ol;
-    if (orr > s_peakOutR) s_peakOutR = orr;
-    
-    s_diagTxFrames += n;
-    return; // Пропускаємо DSP
+    // Піки виходу.
+    if (pl > s_peakOutL) s_peakOutL = pl;
+    if (pr > s_peakOutR) s_peakOutR = pr;
+
+    s_diagTxFrames = s_diagTxFrames + static_cast<uint32_t>(n);
+    return;   // пропускаємо DSP
   }
 #endif
 
@@ -613,7 +705,7 @@ void processBlock(size_t frames) {
   }
   
 #if LINE_PATH_DIAG
-  s_diagTxFrames += n;
+  s_diagTxFrames = s_diagTxFrames + static_cast<uint32_t>(n);
 #endif
 }
 
@@ -729,6 +821,9 @@ bool pump() {
   writeTx(bytes);
   const uint32_t procUs = static_cast<uint32_t>(esp_timer_get_time() - t1);
   if (procUs > s_maxProcessUs) s_maxProcessUs = procUs;
+#if LINE_PATH_DIAG
+  if (s_specLatched && procUs > s_specMaxProcUs) s_specMaxProcUs = procUs;
+#endif
   s_blocks = s_blocks + 1;
 
   if (justStarted) {
@@ -785,14 +880,11 @@ void doStop() {
   disableChannels();
   s_state = LinePathState::Off;
   applyMute();
-  
+
 #if LINE_PATH_DIAG
-  s_diagBypass = false;
-  s_diagToneActive = false;
-  s_diagToneHz = 0.0f;
-  s_specRunning = false;
+  diagResetOnStop();
 #endif
-  
+
   LINE_LOG("[LINE] stopped (DOUT %s)\n", s_routed ? "still on I2S1" : "on I2S0");
 }
 
@@ -808,14 +900,11 @@ void doRadio() {
   freeBuffer();
   s_exit = true;
   applyMute();
-  
+
 #if LINE_PATH_DIAG
-  s_diagBypass = false;
-  s_diagToneActive = false;
-  s_diagToneHz = 0.0f;
-  s_specRunning = false;
+  diagResetOnStop();
 #endif
-  
+
   LINE_LOG("[LINE] radio path restored, line path resources released "
            "(XSMT stays low until the player unmutes)\n");
 }
@@ -891,7 +980,7 @@ void doStart() {
   s_lastGoodMs = millis();
   s_state = LinePathState::Starting;
   applyMute();
-  
+
 #if LINE_PATH_DIAG
   LINE_LOG("[LP] cfg: I2S1 SLAVE 32-bit Philips, MCLK from I2S0 (48kHz fixed). Use 'lp.cfg' for stats.\n");
 #endif
@@ -1388,6 +1477,162 @@ void cmdApi() {
   lineOut("[LINE] api self-test: %s (%d failed)\n", fails == 0 ? "PASS" : "FAIL", fails);
 }
 
+// ---------------------------------------------------------------------------
+// [PD1 / P48e] Діагностичні команди (лише LINE_PATH_DIAG == 1)
+// ---------------------------------------------------------------------------
+#if LINE_PATH_DIAG
+
+// lp.cfg: формат I2S, виміряна частота кадрів RX / TX і лічильники.
+void cmdDiagCfg() {
+  lineOut("[LP] cfg: I2S0 (master) fs=%lu (fixed), MCLK=GPIO%d, BCLK=GPIO%d, WS=GPIO%d\n", LP_UL(cfg::kFsHz),
+          pins::kI2sMclk, pins::kI2sBclk, pins::kI2sWs);
+  lineOut("[LP] cfg: I2S1 (slave) role=SLAVE, fmt=PHILIPS, data=32bit, slot=32bit, DMA=%lux%lu\n",
+          LP_UL(cfg::kDmaDescCount), LP_UL(cfg::kDmaFrameCount));
+  lineOut("[LP] cfg: RX->float formula: int32 * 2^-31 (assumes 24-bit MSB left-aligned in 32-bit slot)\n");
+
+  if (LinePath::state() != LinePathState::Running) {
+    lineOut("[LP] cfg: line path is not Running (state %s): frame rate not measured\n",
+            LinePath::stateName(LinePath::state()));
+  } else {
+    const uint32_t rx0 = s_diagRxFrames;
+    const uint32_t tx0 = s_diagTxFrames;
+    const uint32_t t0 = millis();
+    vTaskDelay(pdMS_TO_TICKS(dcfg::kCfgMeasureMs));
+    const uint32_t rx1 = s_diagRxFrames;
+    const uint32_t tx1 = s_diagTxFrames;
+    const uint32_t t1 = millis();
+    const float    dt = static_cast<float>(t1 - t0) / 1000.0f;
+    lineOut("[LP] cfg: measured over %.1f s: RX=%.0f fps, TX=%.0f fps (expect %lu)\n", static_cast<double>(dt),
+            static_cast<double>(static_cast<float>(rx1 - rx0) / dt),
+            static_cast<double>(static_cast<float>(tx1 - tx0) / dt), LP_UL(cfg::kFsHz));
+  }
+  lineOut("[LP] cfg: stats: rxOvf=%lu, txOvf=%lu, stalls=%lu\n", LP_UL(s_rxOvf), LP_UL(s_txOvf), LP_UL(s_stalls));
+}
+
+// lp.raw [n]: перші n кадрів ОСТАННЬОГО блоку RX. Знімок робить задача line_path (I2S напряму не читаємо).
+void cmdDiagRaw(int n) {
+  if (n < 1) n = 1;
+  if (n > static_cast<int>(dcfg::kRawMaxFrames)) n = static_cast<int>(dcfg::kRawMaxFrames);
+  if (LinePath::state() != LinePathState::Running) {
+    lineOut("[LP] raw: line path is not Running (state %s) - no RX blocks to capture\n",
+            LinePath::stateName(LinePath::state()));
+    return;
+  }
+  if (s_rawReq != 0) {
+    lineOut("[LP] raw: previous request still pending\n");
+    return;
+  }
+  s_rawGot = 0;
+  __sync_synchronize();
+  s_rawReq = static_cast<uint32_t>(n);
+
+  const uint32_t t0 = millis();
+  while (s_rawReq != 0 && millis() - t0 < dcfg::kRawWaitMs) {
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+  if (s_rawReq != 0) {
+    s_rawReq = 0;   // скасувати: блоків не було
+    lineOut("[LP] raw: no RX block within %lu ms\n", LP_UL(dcfg::kRawWaitMs));
+    return;
+  }
+  __sync_synchronize();
+  const int frames = static_cast<int>(s_rawGot);
+  lineOut("[LP] raw: %d raw RX frames (int32) from the last processed block\n", frames);
+  int nonzeroLower8 = 0;
+  for (int i = 0; i < frames; ++i) {
+    const int32_t l = s_rawSnap[i * 2];
+    const int32_t r = s_rawSnap[i * 2 + 1];
+    lineOut("  [%02d] L: 0x%08lX (%ld) | R: 0x%08lX (%ld)\n", i, LP_UL(static_cast<uint32_t>(l)), static_cast<long>(l),
+            LP_UL(static_cast<uint32_t>(r)), static_cast<long>(r));
+    if ((l & 0xFF) != 0 || (r & 0xFF) != 0) nonzeroLower8++;
+  }
+  lineOut("[LP] raw: frames=%d, frames with non-zero lower 8 bits=%d (expect 0 if 24-bit left-aligned)\n", frames,
+          nonzeroLower8);
+}
+
+// lp.spec [сек]: спектр сирого входу (RX або тон) у фіксованих точках, Герцель по всьому вікну.
+void cmdDiagSpec(int sec) {
+  if (sec < static_cast<int>(dcfg::kSpecMinSec)) sec = static_cast<int>(dcfg::kSpecMinSec);
+  if (sec > static_cast<int>(dcfg::kSpecMaxSec)) sec = static_cast<int>(dcfg::kSpecMaxSec);
+  if (LinePath::state() != LinePathState::Running) {
+    lineOut("[LP] spec: line path is not Running (state %s) - nothing to measure\n",
+            LinePath::stateName(LinePath::state()));
+    return;
+  }
+  if (s_specRunning) {
+    lineOut("[LP] spec: measurement already running\n");
+    return;
+  }
+  lineOut("[LP] spec: measuring RAW RX spectrum for %d s (Goertzel)...\n", sec);
+  const float fs = static_cast<float>(cfg::kFsHz);
+  for (size_t k = 0; k < dcfg::kGoertzelCount; ++k) {
+    goertzelInit(s_specL[k], dcfg::kGoertzelFreqs[k], fs);
+    goertzelInit(s_specR[k], dcfg::kGoertzelFreqs[k], fs);
+  }
+  s_specBlocks = 0;
+  s_specFrames = 0;
+  s_specMaxProcUs = 0;
+  __sync_synchronize();
+  s_specRunning = true;
+
+  const uint32_t t0 = millis();
+  while (millis() - t0 < static_cast<uint32_t>(sec) * 1000u && s_specRunning) {
+    vTaskDelay(pdMS_TO_TICKS(dcfg::kSpecPollMs));
+  }
+  s_specRunning = false;
+  vTaskDelay(pdMS_TO_TICKS(dcfg::kSpecStopSettleMs));   // дати задачі завершити блок, що вже в обробці
+  __sync_synchronize();
+
+  const uint32_t blocks = s_specBlocks;
+  const uint32_t frames = s_specFrames;
+  const uint32_t maxUs = s_specMaxProcUs;
+  // maxProcess у вікні = найдовший processBlock + writeTx (разом із навантаженням Герцеля), не різниця до / після.
+  lineOut("[LP] spec: blocks processed=%lu, frames=%lu, maxProcess in window=%lu us (incl. Goertzel load)\n",
+          LP_UL(blocks), LP_UL(frames), LP_UL(maxUs));
+  if (frames == 0) {
+    lineOut("[LP] spec: no blocks processed - no data\n");
+    return;
+  }
+  const uint32_t expected = static_cast<uint32_t>(sec) * cfg::kFsHz;
+  if (frames < expected - expected / 10u) {
+    lineOut("[LP] spec: WARNING: only %lu of ~%lu frames (stop / stall during the window?)\n", LP_UL(frames),
+            LP_UL(expected));
+  }
+  lineOut("[LP] spec: Freq(Hz) | L(dBFS) | R(dBFS)\n");
+  lineOut("-------------------------------------\n");
+  for (size_t k = 0; k < dcfg::kGoertzelCount; ++k) {
+    const float dbL = goertzelMagnitudeDb(s_specL[k], frames);
+    const float dbR = goertzelMagnitudeDb(s_specR[k], frames);
+    lineOut("  %5.0f    | %+6.1f  | %+6.1f\n", static_cast<double>(dcfg::kGoertzelFreqs[k]),
+            static_cast<double>(dbL), static_cast<double>(dbR));
+  }
+}
+
+// lp.tone <Гц|off> (аргумент — хвіст команди після "tone": " 1000", " off", "" ).
+void cmdDiagTone(const char* arg) {
+  if (arg[0] != ' ') {
+    lineOut("[LP] tone: usage lp.tone <%.0f..%.0f Hz | off>\n", static_cast<double>(dcfg::kToneMinHz),
+            static_cast<double>(dcfg::kToneMaxHz));
+    return;
+  }
+  if (strcmp(arg, " off") == 0 || strcmp(arg, " 0") == 0) {
+    LinePath::diagSetTone(0.0f);
+    lineOut("[LP] tone OFF\n");
+    return;
+  }
+  const float hz = static_cast<float>(atof(arg + 1));
+  if (!(hz >= dcfg::kToneMinHz && hz <= dcfg::kToneMaxHz)) {
+    lineOut("[LP] tone: freq must be %.0f..%.0f Hz\n", static_cast<double>(dcfg::kToneMinHz),
+            static_cast<double>(dcfg::kToneMaxHz));
+    return;
+  }
+  LinePath::diagSetTone(hz, dcfg::kToneDefaultDbfs);
+  lineOut("[LP] tone = %.0f Hz @ %.0f dBFS (replaces RX data)\n", static_cast<double>(hz),
+          static_cast<double>(dcfg::kToneDefaultDbfs));
+}
+
+#endif  // LINE_PATH_DIAG
+
 #undef LP_UL
 
 #endif  // LINE_PATH_ENABLE
@@ -1419,98 +1664,17 @@ void handleLine(const char* line) {
     printStats();
 #if LINE_PATH_DIAG
   } else if (strcmp(c, "cfg") == 0) {
-    lineOut("[LP] cfg: I2S0 (master) fs=48000 (fixed), MCLK=GPIO16, BCLK=GPIO15, WS=GPIO17\n");
-    lineOut("[LP] cfg: I2S1 (slave) role=SLAVE, fmt=PHILIPS, data=32bit, slot=32bit, DMA=%lux%lu\n",
-            (unsigned long)cfg::kDmaDescCount, (unsigned long)cfg::kDmaFrameCount);
-    lineOut("[LP] cfg: RX->Float formula: int32 * 2^-31 (assumes 24-bit MSB left-aligned in 32-bit slot)\n");
-    
-    uint32_t rx0 = s_diagRxFrames;
-    uint32_t tx0 = s_diagTxFrames;
-    uint32_t t0 = millis();
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    uint32_t rx1 = s_diagRxFrames;
-    uint32_t tx1 = s_diagTxFrames;
-    uint32_t t1 = millis();
-    float dt = (t1 - t0) / 1000.0f;
-    lineOut("[LP] cfg: measured over %.1fs: RX=%.0f fps, TX=%.0f fps (expect 48000)\n", 
-            dt, (rx1 - rx0) / dt, (tx1 - tx0) / dt);
-    lineOut("[LP] cfg: stats: rxOvf=%lu, txOvf=%lu, stalls=%lu\n", 
-            (unsigned long)s_rxOvf, (unsigned long)s_txOvf, (unsigned long)s_stalls);
-            
-  } else if (strncmp(c, "raw", 3) == 0) {
-    int n = 16;
-    if (c[3] == ' ') n = atoi(c + 4);
-    if (n < 1) n = 1;
-    if (n > 128) n = 128;
-    
-    lineOut("[LP] raw: printing %d raw RX samples (int32)\n", n);
-    int32_t tmp[256]; // 128 stereo frames
-    size_t got = 0;
-    // Тимчасово зупиняємо pump, щоб прочитати сирий блок
-    // Увага: це може викликати underrun TX, але для діагностики допустимо
-    i2s_channel_read(s_rx, tmp, n * 2 * sizeof(int32_t), &got, 100);
-    int frames = got / (2 * sizeof(int32_t));
-    int nonzeroLower8 = 0;
-    for (int i = 0; i < frames; ++i) {
-      lineOut("  [%02d] L: 0x%08lX (%ld) | R: 0x%08lX (%ld)\n", 
-              i, (unsigned long)tmp[i*2], (long)tmp[i*2], 
-              (unsigned long)tmp[i*2+1], (long)tmp[i*2+1]);
-      if ((tmp[i*2] & 0xFF) != 0 || (tmp[i*2+1] & 0xFF) != 0) nonzeroLower8++;
-    }
-    lineOut("[LP] raw: frames read=%d, samples with non-zero lower 8 bits=%d (expect 0 if 24-bit left-aligned)\n", 
-            frames, nonzeroLower8 * 2);
-            
-  } else if (strncmp(c, "spec", 4) == 0) {
-    int sec = 2;
-    if (c[4] == ' ') sec = atoi(c + 5);
-    if (sec < 1) sec = 1;
-    if (sec > 10) sec = 10;
-    
-    lineOut("[LP] spec: measuring RAW RX spectrum for %d sec (Goertzel)...\n", sec);
-    for (size_t k = 0; k < line_path_diag_cfg::kGoertzelCount; ++k) {
-      goertzelInit(s_specL[k], line_path_diag_cfg::kGoertzelFreqs[k], cfg::kFsHz);
-      goertzelInit(s_specR[k], line_path_diag_cfg::kGoertzelFreqs[k], cfg::kFsHz);
-    }
-    s_specBlocks = 0;
-    s_specRunning = true;
-    s_specEndMs = millis() + sec * 1000;
-    
-    uint32_t maxProcStart = s_maxProcessUs;
-    while (millis() < s_specEndMs) {
-      vTaskDelay(pdMS_TO_TICKS(50));
-    }
-    s_specRunning = false;
-    uint32_t maxProcEnd = s_maxProcessUs;
-    
-    lineOut("[LP] spec: blocks processed=%lu, maxProcess delta=%lu us\n", 
-            (unsigned long)s_specBlocks, (unsigned long)(maxProcEnd - maxProcStart));
-    lineOut("[LP] spec: Freq(Hz) | L(dBFS) | R(dBFS)\n");
-    lineOut("-------------------------------------\n");
-    for (size_t k = 0; k < line_path_diag_cfg::kGoertzelCount; ++k) {
-      float dbL = goertzelMagnitudeDb(s_specL[k]);
-      float dbR = goertzelMagnitudeDb(s_specR[k]);
-      lineOut("  %5.0f    | %+6.1f  | %+6.1f\n", line_path_diag_cfg::kGoertzelFreqs[k], dbL, dbR);
-    }
-    
-  } else if (strncmp(c, "bypass", 6) == 0) {
-    int v = 0;
-    if (c[6] == ' ') v = atoi(c + 7);
+    cmdDiagCfg();
+  } else if (strncmp(c, "raw", 3) == 0 && (c[3] == '\0' || c[3] == ' ')) {
+    cmdDiagRaw(c[3] == ' ' ? atoi(c + 4) : static_cast<int>(dcfg::kRawDefaultFrames));
+  } else if (strncmp(c, "spec", 4) == 0 && (c[4] == '\0' || c[4] == ' ')) {
+    cmdDiagSpec(c[4] == ' ' ? atoi(c + 5) : static_cast<int>(dcfg::kSpecDefaultSec));
+  } else if (strncmp(c, "bypass", 6) == 0 && (c[6] == '\0' || c[6] == ' ')) {
+    const int v = (c[6] == ' ') ? atoi(c + 7) : 0;
     LinePath::diagSetBypass(v != 0);
     lineOut("[LP] bypass = %d (DSP %s)\n", v != 0 ? 1 : 0, v ? "BYPASSED" : "ACTIVE");
-    
-  } else if (strncmp(c, "tone", 4) == 0) {
-    if (strcmp(c + 4, " off") == 0 || strcmp(c + 4, " 0") == 0) {
-      LinePath::diagSetTone(0.0f);
-      lineOut("[LP] tone OFF\n");
-    } else {
-      float hz = atof(c + 5);
-      if (hz < 20.0f || hz > 20000.0f) {
-        lineOut("[LP] tone: freq must be 20..20000 Hz\n");
-      } else {
-        LinePath::diagSetTone(hz, -12.0f);
-        lineOut("[LP] tone = %.0f Hz @ -12 dBFS (replaces RX data)\n", hz);
-      }
-    }
+  } else if (strncmp(c, "tone", 4) == 0 && (c[4] == '\0' || c[4] == ' ')) {
+    cmdDiagTone(c + 4);
 #endif
   } else if (strncmp(c, "att ", 4) == 0) {
     const int v = atoi(c + 4);
@@ -1890,24 +2054,29 @@ void LinePath::resetStats() {
 #if LINE_PATH_DIAG
 void LinePath::diagSetBypass(bool on) {
   s_diagBypass = on;
-  if (on) {
-    s_eqLine.reset(); // Скидаємо стан фільтрів
-  }
+  s_diagEqResetReq = true;   // стан EQ скине задача line_path (не викликач) при зміні режиму
 }
 bool LinePath::diagBypass() { return s_diagBypass; }
 
+// Параметри тону публікуються під seqlock; застосовує і перезапускає осцилятор задача line_path на початку блоку.
 void LinePath::diagSetTone(float hz, float dbfs) {
-  if (hz <= 0.0f) {
-    s_diagToneActive = false;
-    s_diagToneHz = 0.0f;
-    return;
+  ToneParams p = {1.0f, 0.0f, 0.0f, false};
+  if (hz > 0.0f && hz < 0.5f * static_cast<float>(cfg::kFsHz)) {
+    const float w = kTwoPi * hz / static_cast<float>(cfg::kFsHz);
+    p.cw = cosf(w);
+    p.sw = sinf(w);
+    p.amp = powf(10.0f, dbfs / 20.0f);
+    p.active = true;
+  } else {
+    hz = 0.0f;
   }
+  s_toneSeq = s_toneSeq + 1u;   // непарне: іде запис
+  __sync_synchronize();
+  s_toneNew = p;
+  __sync_synchronize();
+  s_toneSeq = s_toneSeq + 1u;   // парне: готово
   s_diagToneHz = hz;
-  s_diagToneAmp = powf(10.0f, dbfs / 20.0f);
-  s_diagTonePhaseStep = 2.0f * 3.14159265358979323846f * hz / static_cast<float>(cfg::kFsHz);
-  s_diagTonePhaseL = 0.0f;
-  s_diagTonePhaseR = 0.0f;
-  s_diagToneActive = true;
+  s_diagToneActive = p.active;
 }
 bool LinePath::diagToneActive() { return s_diagToneActive; }
 float LinePath::diagToneHz() { return s_diagToneHz; }
@@ -1955,5 +2124,13 @@ LinePathStats LinePath::stats() {
   return s;
 }
 void LinePath::resetStats() {}
+
+#if LINE_PATH_DIAG
+void LinePath::diagSetBypass(bool) {}
+bool LinePath::diagBypass() { return false; }
+void LinePath::diagSetTone(float, float) {}
+bool LinePath::diagToneActive() { return false; }
+float LinePath::diagToneHz() { return 0.0f; }
+#endif
 
 #endif  // LINE_PATH_ENABLE

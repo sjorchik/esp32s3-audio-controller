@@ -48,8 +48,7 @@ std::atomic<uint32_t> s_lineBlocks{0};
 
 constexpr std::memory_order kRelaxed = std::memory_order_relaxed;
 
-// [Prompt 37] Шкала dBFS і балістика винесені в audio/vu_math.h (спільні з VuSourceAdc);
-// код перенесено без змін.
+// Шкала dBFS і балістика — в audio/vu_math.h (спільні для VuSourceDecodedPcm і VuSourceLinePath).
 using vu_math::ballistics;
 using vu_math::peakToNorm;
 
@@ -137,8 +136,8 @@ bool VuSourceDecodedPcm::read(float& left, float& right) {
 }
 
 // ---------------------------------------------------------------------------
-// [Prompt 47d] VuSourceLinePath: VU зовнішніх входів зі line_path (замість adc_vu).
-// Логіка read() — та сама, що була у VuSourceAdc: пік «з моменту останнього читання» (exchange(0)),
+// [Prompt 47d] VuSourceLinePath: VU зовнішніх входів зі line_path.
+// Логіка read(): пік «з моменту останнього читання» (exchange(0)),
 // свіжість за лічильником блоків (kStaleMs), балістика з vu_math. Без логу у гарячому шляху.
 // ---------------------------------------------------------------------------
 
@@ -217,3 +216,4 @@ bool VuSourceLinePath::read(float& left, float& right) {
     return true;
 #endif
 }
+

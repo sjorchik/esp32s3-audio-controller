@@ -1,8 +1,7 @@
 #pragma once
 
 // Спільна математика VU (шкала dBFS і балістика) для VuSourceDecodedPcm (радіо) та
-// VuSourceAdc (зовнішні входи). [Prompt 37] Код ПЕРЕНЕСЕНО з audio/vu_source.cpp без змін
-// поведінки: радіо-VU працює як раніше.
+// VuSourceLinePath (зовнішні входи). Винесена з audio/vu_source.cpp без зміни поведінки.
 
 #include <math.h>
 #include <stdint.h>
@@ -41,3 +40,4 @@ inline float ballistics(float level, float target, float dtMs) {
 }
 
 }  // namespace vu_math
+

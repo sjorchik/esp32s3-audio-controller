@@ -21,8 +21,8 @@ constexpr int kSt7789Blk  = 14;   // LEDC PWM підсвітки
 constexpr int kI2sBclk = 15;      // спільний з PCM1808 (slave)
 constexpr int kI2sWs   = 17;      // LRCLK; спільний з PCM1808 (slave)
 constexpr int kI2sDout = 18;      // ESP32 -> DIN PCM5102
-constexpr int kI2sMclk = 16;      // MCLK для PCM1808: виводить I2S0 (setPinout) при ADC_VU_ENABLE; PCM5102 не використовує
-constexpr int kI2sDin  = 8;       // DIN <- PCM1808: читає I2S1 RX slave (audio/adc_vu)
+constexpr int kI2sMclk = 16;      // MCLK для PCM1808: виводить I2S0 (setPinout) при LINE_PATH_ENABLE; PCM5102 не використовує
+constexpr int kI2sDin  = 8;       // DIN <- PCM1808: читає I2S1 RX slave (audio/line_path)
 
 // --- Софт-мʼют PCM5102 ---
 constexpr int kXsmt = 45;         // active-low, зовнішній pulldown 10 кОм

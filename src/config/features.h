@@ -11,7 +11,7 @@
 // (блок VU на екрані порожній, джерело VuSourceDecodedPcm вимкнено).
 // Радіо: рівні з декодованих PCM-семплів (VuSourceDecodedPcm).
 // Зовнішні входи: рівні з проходу line_path (PCM1808 -> DSP -> PCM5102, VuSourceLinePath);
-// потребують LINE_PATH_ENABLE (config/line_path_config.h) і ENABLE_VU. Модуль adc_vu видалено (P47d).
+// потребують LINE_PATH_ENABLE (config/line_path_config.h) і ENABLE_VU.
 #define ENABLE_VU 1
 
 // [Prompt 48a] Прапорців ENABLE_TDA7318 / ENABLE_PT2313L більше немає: аудіочіпи й I2C вирізано,
