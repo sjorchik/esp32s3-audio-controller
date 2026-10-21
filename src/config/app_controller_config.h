@@ -10,9 +10,11 @@
 // kLegacyToneValue / kLegacyLoudness — значення застарілих полів AppStateData (до P50).
 // [Prompt 47c] ДОДАНО: kExtMuteSettleMs, kExtInputSettleMs, kLineIdleWaitMs, kLineStartTimeoutMs,
 // kLineErrCheckDelayMs, kLineRetryDelayMs, kLineReleaseTimeoutMs, kExtLevelTrimDb (зовнішні входи через line_path).
-// [Prompt 47a] ДОДАНО: kNeutralVolume (фіксована гучність чіпа), kRadioMuteWaitMs (очікування
-// згасання цифрового мʼюту радіо). Програмна рампа гучності прибрана (її робить audio/dsp_volume):
-// kRampStepMs / kRampStep НЕ ВИКОРИСТОВУЮТЬСЯ (прибрати в P52).
+// [Prompt 47a] ДОДАНО: kRadioMuteWaitMs (очікування згасання цифрового мʼюту радіо). Програмна рампа
+// гучності прибрана (її робить audio/dsp_volume); фіксована нейтральна гучність чіпа (kNeutralVolume)
+// видалена разом із чіпом (P48a).
+// [Prompt 48c] ВИДАЛЕНО невикористані kRampStepMs, kRampStep, kAdjustTimeoutMs (ціль енкодера завжди гучність,
+// P49a) і kGainMuteHoldMs (gain більше немає). ДОДАНО kPrepareRestartWaitMs (AppController::prepareForRestart()).
 
 #include <esp_system.h>  // [Prompt 39] esp_reset_reason_t
 #include <stdint.h>
@@ -69,7 +71,7 @@ constexpr uint32_t kRadioMuteWaitMs = 60;
 // ---------------------------------------------------------------------------
 // [Prompt 47c] Зовнішні входи 1..4 через audio/line_path
 // ---------------------------------------------------------------------------
-// Пауза після цифрового мʼюту проходу (LinePath::setUserMute(true)) перед зміною входу чіпа / returnToRadio().
+// Пауза після цифрового мʼюту проходу (LinePath::setUserMute(true)) перед перемиканням реле входу / returnToRadio().
 // Має перекривати dsp_volume_cfg::kMuteRampMs (20 мс) із запасом на блок (≈2,7 мс) і період tick.
 constexpr uint32_t kExtMuteSettleMs = 40;
 // [Prompt 48a] Пауза після перемикання реле-селектора (сигнал на PCM1808 стабілізується) перед розмʼютом —
@@ -88,20 +90,6 @@ constexpr uint32_t kLineReleaseTimeoutMs = 3000;
 // Зсув рівня зовнішніх входів відносно кривої радіо, дБ (≤ 0). 0 = та сама крива radioVolumeDb(). Підгонка
 // «на слух»: якщо зовнішні входи гучніші за радіо при однаковому UI — зробити від'ємним (напр. −8).
 constexpr float    kExtLevelTrimDb = 0.0f;
-
-// [Prompt 47a] НЕ ВИКОРИСТОВУЄТЬСЯ: ramp гучності тепер цифровий (audio/dsp_volume, kRampMs = 100 мс).
-constexpr uint32_t kRampStepMs = 20;
-constexpr int      kRampStep   = 2;   // у одиницях шкали гучності UI (0..100)
-
-// [Prompt 31] Автоповернення цілі регулювання енкодера на гучність.
-// [Prompt 46a] Було НЕ ВИКОРИСТОВУЄТЬСЯ (ціль завжди Volume).
-// [Prompt 48b] ВИКОРИСТОВУЄТЬСЯ знову: ціль енкодера Balance (клік) повертається на Volume через kAdjustTimeoutMs
-// після останньої події енкодера (обертання, клік, утримання).
-constexpr uint32_t kAdjustTimeoutMs = 5000;
-
-// Скільки тримати мʼют атенюаторів після зміни gain (апаратний стрибок рівня).
-// [Prompt 46a] НЕ ВИКОРИСТОВУЄТЬСЯ (gain більше не регулюється); прибрати в P52.
-constexpr uint32_t kGainMuteHoldMs = 80;
 
 // ---------------------------------------------------------------------------
 // [Prompt 48a] Застарілі поля AppStateData
@@ -171,6 +159,12 @@ constexpr uint32_t kRestartMuteMs = 300;
 // amp_cfg::kAmpOffMuteWaitMs — це перевіряє static_assert в app_controller.cpp.
 constexpr uint32_t kRestartMaxWaitMs = 3000;
 
+// [Prompt 48c] Скільки AppController::prepareForRestart() (викликають веб reboot / factory-reset / wifi-reset,
+// успішний OTA, портал Wi-Fi) чекає, поки контролер замʼютить звук, опустить пін підсилювача й витримає паузу
+// kRestartMuteMs. Найгірший випадок: kRestartMaxWaitMs (чекання піна) + kRestartMuteMs (пауза) + запас на період
+// tick. Чекає ЛИШЕ викликаюча задача (api_restart / ota_restart / wifi), не HTTP-обробник і не AppController.
+constexpr uint32_t kPrepareRestartWaitMs = 4000;
+
 // ---------------------------------------------------------------------------
 // Перевірки на етапі компіляції
 // ---------------------------------------------------------------------------
@@ -185,8 +179,6 @@ static_assert(kTaskPriority < player_cfg::kTaskPriority,
               "AppController priority must be below audio");
 static_assert(kActivePollMs >= 1 && kIdlePollMs >= kActivePollMs,
               "poll periods: 1 <= active <= idle");
-static_assert(kRampStep >= 1, "kRampStep must be >= 1");
-static_assert(kRampStepMs >= 1, "kRampStepMs must be >= 1");
 static_assert(kRadioMuteWaitMs > dsp_volume_cfg::kMuteRampMs,
               "radio mute wait must exceed the digital mute ramp");
 static_assert(kSyncPeriodMs >= kActivePollMs, "sync period too short");
@@ -194,10 +186,11 @@ static_assert(kExtMuteSettleMs > dsp_volume_cfg::kMuteRampMs, "ext mute settle m
 static_assert(kExtLevelTrimDb <= 0.0f, "ext level trim must not boost");
 static_assert(kLineStartTimeoutMs > kLineErrCheckDelayMs && kLineIdleWaitMs >= 1 && kLineReleaseTimeoutMs >= 1,
               "line timeouts");
-static_assert(kAdjustTimeoutMs >= 1, "kAdjustTimeoutMs must be >= 1");
 static_assert(kVolumeStep >= 1, "kVolumeStep must be >= 1");
 static_assert(kRestartMuteMs >= 1 && kRestartMaxWaitMs > kRestartMuteMs,
               "restart timings: 1 <= mute pause < max wait");
+static_assert(kPrepareRestartWaitMs > kRestartMaxWaitMs + kRestartMuteMs,
+              "prepareForRestart wait must exceed the worst-case quiet restart sequence");
 static_assert((kInputUpStep == 1 || kInputUpStep == -1) &&
                   (kInputDownStep == 1 || kInputDownStep == -1) &&
                   (kStationLeftStep == 1 || kStationLeftStep == -1) &&
@@ -205,3 +198,4 @@ static_assert((kInputUpStep == 1 || kInputUpStep == -1) &&
               "direction steps must be +1 or -1");
 
 }  // namespace app_controller_cfg
+

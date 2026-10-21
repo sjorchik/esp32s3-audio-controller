@@ -48,17 +48,19 @@
 //             індивідуальний для кожного входу (Settings::profiles[i].balanceDb), застосовується в DSP радіо
 //             (radio_volume) або проходу (LinePath). Керування: клік енкодера перемикає ціль Volume <-> Balance, IR
 //             BALANCE_UP / BALANCE_DOWN, веб. Решту публічного інтерфейсу не змінено.
+// [Prompt 48c] ДОДАНО: prepareForRestart() — «тихий» перезапуск для веб reboot / factory-reset / wifi-reset, OTA й порталу Wi-Fi.
 // [Prompt 46a] Чип — лише селектор входів; профіль входу = {гучність, пресет EQ}. ПУБЛІЧНІ СИГНАТУРИ НЕ ЗМІНЕНО,
 //             змінилась лише семантика: setTone() приймає й ІГНОРУЄ тембр/баланс/loudness (*Ok = true для
 //             запитаних полів, які мав чип; у чіп, профіль і AppState нічого не йде); WebCmdType::GainSet
 //             приймається й ігнорується (Ok); дії BASS_* .. GAIN_* ігноруються; цикл цілей енкодера прибрано
-//             (ціль завжди гучність). Нейтральні значення чіпа — app_controller_cfg::kNeutral*.
+//             (ціль завжди гучність). [P48a] Нейтральні значення чіпа (kNeutral*) видалено разом із чіпом.
 
 #include "config/eq_config.h"  // [Prompt 47c] eq_cfg::kBandCount для applyLineEq()
 #include "core/events.h"
 
 // [Prompt 13] ДОДАНО: запит на зміну тембру/балансу ззовні (веб). [Prompt 21b] + тонкомпенсація.
-// Значення мають бути вже перевірені за capabilities. Поля *Ok — результат.
+// [P48a] capabilities чипа немає: значення перевіряє викликач за діапазонами config/. Поля *Ok — результат
+// (зараз завжди false: setTone() нічого не застосовує).
 struct ToneUpdate {
     bool hasBass = false;
     int8_t bass = 0;
@@ -212,6 +214,20 @@ public:
     // енкодера у WifiSetup всередині контролера; публічний метод — для тестів і майбутніх входів.
     static bool startOffline();
 
+    // [Prompt 48c] ДОДАНО: «тихий» перезапуск для викликачів поза контролером (веб reboot / factory-reset /
+    // wifi-reset, успішний OTA, портал Wi-Fi). Та сама послідовність, що в «тихому» перезапуску POWER (P28):
+    // цифровий мʼют радіо / проходу -> стоп потоку -> пін підсилювача LOW (через amp_cfg::kAmpOffDelayMs) ->
+    // пауза app_controller_cfg::kRestartMuteMs; застосовані налаштування скидаються в NVS (flush). На відміну від
+    // POWER, ESP.restart() НЕ викликає — це робить викликач після повернення (щоб встигнути, наприклад,
+    // SettingsStore::resetToDefaults()). БЛОКУЄ викликаючу задачу до kPrepareRestartWaitMs (≈ 0,5 с у нормі):
+    // викликати ЛИШЕ з окремої задачі (api_restart / ota_restart / wifi), НЕ з HTTP-обробника AsyncTCP і не
+    // з задачі контролера. Після виклику контролер ігнорує події й веб-команди (503 busy), екран показує
+    // «Restarting...», і лишається замʼючений до ESP.restart().
+    // true — звук замʼючено й пауза витримана (або перезапуск уже веде сам контролер з POWER-утримання).
+    // false — контролер не запущено, мʼютекс зайнятий довше kLockTimeoutMs або вичерпано kPrepareRestartWaitMs;
+    // тоді викликач усе одно перезапускається (як раніше), просто без гарантії тиші.
+    static bool prepareForRestart();
+
     // [Prompt 47c] ДОДАНО: живе застосування пресету EQ зовнішнього входу. Веб-обробник /api/eq спершу пише
     // пресет у Settings, потім для input != 0 викликає це: якщо input збігається з ПОТОЧНИМ зовнішнім
     // входом — LinePath::setEqAllDb(gains) одразу (без перезапуску проходу); інакше нічого (пресет
@@ -220,3 +236,4 @@ public:
     // звук оновиться при наступному перемиканні входу). При LINE_PATH_ENABLE == 0 — нічого не робить (true).
     static bool applyLineEq(uint8_t input, const int8_t gains[eq_cfg::kBandCount]);
 };
+

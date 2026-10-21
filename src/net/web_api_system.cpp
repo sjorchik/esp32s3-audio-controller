@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "core/app_controller.h"  // [Prompt 48c] prepareForRestart()
 #include "core/app_state.h"
 #include "core/settings.h"
 #include "net/web_api_common.h"
@@ -150,7 +151,18 @@ volatile bool s_restartPending = false;  // чіпається лише з за�
 
 void restartTask(void* arg) {
     const RestartKind kind = static_cast<RestartKind>(reinterpret_cast<uintptr_t>(arg));
-    vTaskDelay(pdMS_TO_TICKS(web_api_cfg::kRestartDelayMs));  // відповідь має піти клієнту
+    // [Prompt 48c] «Тихий» перезапуск: ПОЧАТОК паузи для відповіді клієнту використовуємо на мʼют звуку й
+    // пін підсилювача LOW (AppController::prepareForRestart() ≈ 0,5 с; заодно скидає налаштування в NVS).
+    // Загальна пауза до дій нижче лишається web_api_cfg::kRestartDelayMs (якщо мʼют тривав довше — без додаткової).
+    // Відповідь клієнту йде паралельно (AsyncTCP): мʼют її не блокує.
+    const uint32_t t0 = millis();
+    if (!AppController::prepareForRestart()) {
+        Serial.println("[WEB] quiet restart not confirmed, restarting anyway");
+    }
+    const uint32_t spentMs = static_cast<uint32_t>(millis() - t0);
+    if (spentMs < web_api_cfg::kRestartDelayMs) {
+        vTaskDelay(pdMS_TO_TICKS(web_api_cfg::kRestartDelayMs - spentMs));  // відповідь має піти клієнту
+    }
 
     switch (kind) {
         case RestartKind::Reboot:
@@ -267,3 +279,4 @@ void registerSystemRoutes(AsyncWebServer& server) {
     // "/api/wifi" (GET) зіставилось би й з "/api/wifi/...", обробники перевіряють url самі.
     registerWifiRoutes(server);
 }
+

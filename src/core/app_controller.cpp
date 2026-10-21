@@ -82,6 +82,12 @@
 // не раніше kAmpOffMuteWaitMs). Усе без блокувань: стан рухає ampService() із tickLocked().
 // Мʼют користувача, гучність, вхід, станція, OTA і IR пін не чіпають.
 
+// [Prompt 48c] «Тихий» перезапуск тепер доступний і ззовні: AppController::prepareForRestart() запускає ту саму
+// послідовність (beginRestart(external = true)), але ESP.restart() після паузи НЕ викликає: restartService() лише
+// піднімає s_restartReady, а викликач (api_restart / ota_restart / wifi) сам перезапускає пристрій після
+// resetToDefaults() / стирання мереж тощо. Фаза Pause у такому разі триває, поки не станеться перезапуск (звук
+// лишається замʼючений, події й веб-команди ігноруються).
+
 // [Prompt 28] Офлайн-режим і «тихий» перезапуск.
 // Офлайн: у Mode::WifiSetup OK (кнопка / IR) або клік енкодера викликає startOfflineLocked():
 // s_offline = true, WifiManager::stop() (AP, портал, WiFi.mode(WIFI_OFF)), далі changeInput() на
@@ -98,7 +104,7 @@
 // джерела: енкодер, кнопки, IR); AppState.popupTarget/popupSeq. Веб (runWebCommand) вікно не викликає.
 // [Prompt 31] Автоповернення цілі регулювання енкодера на гучність. Будь-яка подія енкодера
 // (ENC_CW / ENC_CCW / ENC_PRESS, зокрема довге утримання = мʼют) оновлює s_lastEncMs; коли
-// s_target != Volume і від останньої події енкодера минуло kAdjustTimeoutMs, tickLocked()
+// s_target != Volume і від останньої події енкодера минуло (константа kAdjustTimeoutMs ВИДАЛЕНА в P48c; ціль завжди Volume), tickLocked()
 // повертає ціль на гучність і публікує стан (екран малює ціль за AppState.adjustTarget).
 // Також ціль скидається на гучність при вході в Standby й при вмиканні (powerOnTransition).
 // Публічний інтерфейс не змінено; у NVS ціль не зберігається.
@@ -123,9 +129,8 @@
 // пресет EQ}; контролер тримає лише гучності (s_volumes[]), пресет EQ живе в Settings і не дублюється:
 // його пише веб-обробник /api/eq (SettingsStore::modify), а persist() записує в профілі ТІЛЬКИ гучність
 // (інакше застарілу копію EQ було б записано поверх свіжої). Бас / дискант / баланс / gain / loudness
-// прибрано з профілю, подій, команд і цілей енкодера; у чіп при застосуванні профілю надсилаються фіксовані
-// нейтральні значення (P48a: app_controller_cfg::kLegacy*), а поля AppStateData bass/treble/balance/gain/loudness
-// публікуються цими ж нейтральними константами (застарілі заглушки до P49/P50). Ціль регулювання енкодера
+// прибрано з профілю, подій, команд і цілей енкодера; чіпа й I2C немає (P48a); поля AppStateData bass/treble/balance/gain/loudness
+// публікуються нейтральними константами app_controller_cfg::kLegacy* (застарілі заглушки до P49/P50). Ціль регулювання енкодера
 // завжди Volume (цикл цілей і автоповернення P31 прибрано); короткий клік енкодера лише показує вікно
 // гучності. Дії BASS_* .. GAIN_* (enum незмінний) ігноруються з одним коротким логом. Пресет EQ екземпляра
 // радіо = profiles[0].eqGainsDb: застосовується в SettingsStore::load()/resetToDefaults(), у /api/eq при
@@ -277,7 +282,7 @@ uint8_t s_input = 0;
 uint16_t s_station = 0;
 int8_t s_volume = 0;  // ЦІЛЬОВА гучність
 bool s_userMute = false;
-// [Prompt 21b/46a] Гучності профілів усіх логічних входів (включно з входом 3, якого PT2313L не має).
+// [Prompt 21b/46a] Гучності профілів усіх логічних входів (kInputCount = 3: радіо, TV Box, Computer).
 // Пресет EQ у контролері НЕ дублюється (живе лише в Settings::profiles[i].eqGainsDb).
 int8_t s_volumes[defaults::kInputCount] = {};
 AdjustTarget s_target = AdjustTarget::Volume;  // [Prompt 49a] ціль обертання енкодера: ЗАВЖДИ Volume (цикл Volume <-> Balance прибрано)
@@ -348,11 +353,13 @@ uint8_t s_inputMask = settings_cfg::kInputMaskAll;
 enum class RestartPhase : uint8_t {
     None,      // перезапуску немає
     WaitAmp,   // мʼют зроблено, чекаємо LOW піна підсилювача (ampBusy() == false)
-    Pause,     // пін LOW, неблокуюча пауза kRestartMuteMs
+    Pause,     // пін LOW, неблокуюча пауза kRestartMuteMs (для external — далі чекаємо перезапуск від викликача)
 };
 RestartPhase s_restartPhase = RestartPhase::None;
 uint32_t s_restartDeadlineMs = 0;  // страховка: після цього моменту не чекаємо пін
 uint32_t s_restartAtMs = 0;        // момент ESP.restart() (фаза Pause)
+bool s_restartExternal = false;    // [Prompt 48c] перезапуск веде викликач (prepareForRestart): ESP.restart() не викликаємо
+volatile bool s_restartReady = false;  // [Prompt 48c] external: пін LOW і пауза витримані (читає prepareForRestart без мʼютекса)
 
 // --- [Prompt 16] OTA ---
 Mode s_otaPrevMode = Mode::Radio;         // режим ДО OTA; осмислений лише при s_mode == OtaUpdate
@@ -701,8 +708,8 @@ void applyActiveBalance() {
     }
 }
 
-// s_volumes[idx] -> робоча гучність, обрізана за capabilities() поточного чипа.
-// Чипа не торкається й AppState не публікує (це робить викликач). [P47a] Оновлює цифрову гучність радіо.
+// s_volumes[idx] -> робоча гучність, обрізана за audio_cfg::kVolumeUiMin..Max ([P48a] capabilities чипа немає).
+// Реле входу не торкається й AppState не публікує (це робить викликач). [P47a] Оновлює цифрову гучність радіо.
 void loadActiveFromProfile(uint8_t idx) {
     if (idx >= defaults::kInputCount) {
         idx = 0;
@@ -1665,8 +1672,8 @@ void enterStandby() {
     s_persistNeeded = false;
 }
 
-// [Prompt 28] ЄДИНЕ місце рішення «чи доступний вхід»: індекс у межах логічних входів чипа ([Prompt 46b]:
-// TDA7318 = 5, PT2313L = 4 = радіо + входи чіпа) і,
+// [Prompt 28] ЄДИНЕ місце рішення «чи доступний вхід»: індекс у межах логічних входів ([P48a]: kInputCount = 3,
+// радіо + TV Box + Computer) і,
 // в офлайні, не радіо (вхід 0). Усі вибори входу (кнопки, пульт, веб, вихід зі standby) йдуть
 // через цю функцію.
 // [Prompt 39] + дозволено маскою входів (вхід 0 завжди дозволений: біт 0 нормалізується).
@@ -2279,13 +2286,16 @@ void leaveOtaLocked() {
 // [P47a]): мʼют (desiredMute() уже true через restarting()) -> стоп потоку (плеєр сам мʼютить XSMT)
 // -> ampRequestOff() (пін LOW через kAmpOffDelayMs, P23c) -> restartService() чекає LOW, паузу
 // kRestartMuteMs і ESP.restart().
-void beginRestart() {
+// [Prompt 48c] external = true: після паузи ESP.restart() НЕ викликаємо (див. restartService()).
+void beginRestart(bool external = false) {
     if (restarting()) {
         return;
     }
-    APP_LOG("restart: POWER held, quiet restart\n");
+    APP_LOG("restart: quiet restart (%s)\n", external ? "requested by caller" : "POWER held");
     s_phase = Phase::None;  // Settle скасовано (як у beginOta)
     s_playPending = false;
+    s_restartExternal = external;
+    s_restartReady = false;
     s_restartPhase = RestartPhase::WaitAmp;
     s_restartDeadlineMs = millis() + cfg::kRestartMaxWaitMs;
     applyHardwareMute(true);  // мʼют ПЕРШИМ ([P47a]: радіо згасає до stopStream())
@@ -2303,7 +2313,7 @@ void beginRestart() {
     publishState();  // AppState.restarting -> екран «Restarting...»
 }
 
-// Викликається щотакту з tickLocked(). ESP.restart() не повертається.
+// Викликається щотакту з tickLocked(). ESP.restart() не повертається (крім external — [Prompt 48c]).
 void restartService(uint32_t now) {
     if (s_restartPhase == RestartPhase::None) {
         return;
@@ -2319,6 +2329,15 @@ void restartService(uint32_t now) {
         return;
     }
     if (reached(now, s_restartAtMs)) {
+        if (s_restartExternal) {
+            // [Prompt 48c] Звук замʼючено, пін LOW, пауза витримана: сигналізуємо викликачу й лишаємось тут
+            // (restarting() = true), доки він не викличе ESP.restart().
+            if (!s_restartReady) {
+                APP_LOG("restart: hardware muted, waiting for caller\n");
+                s_restartReady = true;
+            }
+            return;
+        }
         APP_LOG("restart: now\n");
         Serial.flush();
         ESP.restart();
@@ -2510,7 +2529,7 @@ void tickLocked() {
     lineService(now);     // [Prompt 47c] автомат проходу зовнішніх входів
 
     // [Prompt 49a] Екран «EQ + баланс»: вихід за таймаутом від останньої дії в екрані. (Автоповернення цілі
-    // енкодера P31 / P48b прибрано: ціль завжди Volume; cfg::kAdjustTimeoutMs знову не використовується.)
+    // енкодера P31 / P48b прибрано: ціль завжди Volume; константа kAdjustTimeoutMs видалена в P48c.)
     if (eqOpen() && static_cast<uint32_t>(now - s_eqLastActionMs) >= eq_screen_cfg::kTimeoutMs) {
         closeEq("timeout");
         publishState();
@@ -2947,6 +2966,34 @@ void AppController::otaFailed(const char* reason) {
     xSemaphoreGiveRecursive(s_lock);
 }
 
+// [Prompt 48c] ДОДАНО: «тихий» перезапуск для викликачів поза контролером. Блокує ЛИШЕ викликаючу задачу
+// (vTaskDelay-опитування прапорця s_restartReady, який піднімає restartService() у задачі контролера); мʼютекс
+// тримається тільки на час запуску послідовності (радіо згасає до kRadioMuteWaitMs, як у beginRestart()).
+bool AppController::prepareForRestart() {
+    if (!s_started || s_lock == nullptr ||
+        xSemaphoreTakeRecursive(s_lock, pdMS_TO_TICKS(cfg::kLockTimeoutMs)) != pdTRUE) {
+        return false;
+    }
+    // Якщо перезапуск уже веде сам контролер (довге POWER), він скине пристрій без нашої участі: чекаємо цього
+    // (до таймауту), а не повертаємо «готово», щоб викликач не перезапустився раніше за тиху послідовність.
+    const bool selfDriven = restarting() && !s_restartExternal;
+    if (!restarting()) {
+        beginRestart(true);
+    }
+    xSemaphoreGiveRecursive(s_lock);
+    (void)selfDriven;  // використовується лише в APP_LOG (при APP_CONTROLLER_DEBUG == 0 — без попередження)
+
+    const uint32_t t0 = millis();
+    while (!s_restartReady) {
+        if (static_cast<uint32_t>(millis() - t0) >= cfg::kPrepareRestartWaitMs) {
+            APP_LOG("prepareForRestart: timeout (%s)\n", selfDriven ? "controller-driven restart" : "not ready");
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return true;
+}
+
 // [Prompt 18] ДОДАНО: команди з вебу
 WebCmdResult AppController::runWebCommand(const WebCommand& cmd, const char** reasonOut) {
     if (reasonOut != nullptr) {
@@ -3089,3 +3136,4 @@ bool AppController::begin() {
             static_cast<int>(s_volume), s_userMute ? 1 : 0, static_cast<unsigned>(s_inputMask));
     return true;
 }
+

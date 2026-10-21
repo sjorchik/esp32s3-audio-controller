@@ -1454,7 +1454,16 @@ void handleOtaBody(AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t
 }
 
 void otaRestartTask(void*) {
-    vTaskDelay(pdMS_TO_TICKS(web_cfg::kOtaRestartDelayMs));
+    // [Prompt 48c] «Тихий» перезапуск: мʼют звуку й пін підсилювача LOW (AppController::prepareForRestart(), ≈ 0,5 с)
+    // у початку паузи для відповіді клієнту; загальна пауза лишається web_cfg::kOtaRestartDelayMs.
+    const uint32_t t0 = millis();
+    if (!AppController::prepareForRestart()) {
+        Serial.println("[WEB] OTA: quiet restart not confirmed, restarting anyway");
+    }
+    const uint32_t spentMs = static_cast<uint32_t>(millis() - t0);
+    if (spentMs < web_cfg::kOtaRestartDelayMs) {
+        vTaskDelay(pdMS_TO_TICKS(web_cfg::kOtaRestartDelayMs - spentMs));
+    }
     SettingsStore::flush();  // відкладені налаштування не повинні загубитись
     Serial.println("[WEB] OTA: restarting");
     Serial.flush();

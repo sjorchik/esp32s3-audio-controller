@@ -33,6 +33,7 @@
 
 #include "config/defaults.h"
 #include "config/wifi_config.h"
+#include "core/app_controller.h"  // [Prompt 48c] prepareForRestart()
 #include "net/mdns.h"
 #include "net/wifi_networks.h"
 
@@ -737,7 +738,16 @@ void portalConnect() {
         char chk[wifi_cfg::kSsidMax + 1];
         WIFI_LOG("portal: connected, list=%s, esp_wifi=%s; restarting\n", saved ? "saved" : "NOT saved",
                  savedSsid(chk, sizeof(chk)) ? "saved" : "NO");
-        vTaskDelay(pdMS_TO_TICKS(wifi_cfg::kRestartDelayMs));
+        // [Prompt 48c] «Тихий» перезапуск: мʼют + пін підсилювача LOW (≈ 0,5 с) у початку паузи для відповіді
+        // телефону; загальна пауза лишається wifi_cfg::kRestartDelayMs.
+        const uint32_t restartT0 = millis();
+        if (!AppController::prepareForRestart()) {
+            WIFI_LOG("portal: quiet restart not confirmed, restarting anyway\n");
+        }
+        const uint32_t spentMs = static_cast<uint32_t>(millis() - restartT0);
+        if (spentMs < wifi_cfg::kRestartDelayMs) {
+            vTaskDelay(pdMS_TO_TICKS(wifi_cfg::kRestartDelayMs - spentMs));
+        }
         ESP.restart();
         return;
     }
@@ -1182,3 +1192,4 @@ WifiRequest WifiManager::requestConnect(uint8_t index) {
     s_apiConnectPending = true;
     return WifiRequest::Accepted;
 }
+
