@@ -41,6 +41,8 @@
 // [Prompt 49a] ДОДАНО: MenuContext::EqBalance (екран «EQ + баланс» = Mode::Menu + цей контекст, за зразком
 // StationList) та поля eqSelected, eqGainsDb[5] (лише в кінець структури). Публікує AppController, поки екран
 // відкритий; поза ним нулі.
+// [Prompt 50b] ВИДАЛЕНО поля bass, treble, balance (legacy-нуль; баланс активного входу — balanceDb), gain, loudness;
+// AdjustTarget тепер {Volume, Balance}.
 // [Prompt 17] НЕ ВИКОРИСТОВУЮТЬСЯ: ui/screens читає рівні VU напряму з
 // VuSourceDecodedPcm::read() (частота кадру), минаючи AppState. Поля лишено, щоб не міняти POD-структуру.
 
@@ -62,14 +64,10 @@ enum class Mode : uint8_t {
 };
 
 // [Prompt 8] ДОДАНО: яким параметром зараз керує обертання енкодера.
-// Порядок = порядок циклу кліку енкодера (Volume -> Bass -> Treble -> Balance -> Gain).
-// [Prompt 48b] Фактично в циклі кліку лише Volume <-> Balance (Bass / Treble / Gain лишаються в enum заради ABI).
+// [Prompt 50b] Лишилися лише Volume і Balance (Bass / Treble / Gain видалено разом із тембром).
 enum class AdjustTarget : uint8_t {
     Volume,
-    Bass,
-    Treble,
     Balance,
-    Gain,
 };
 
 // [Prompt 8] ДОДАНО: який саме підрежим активний, коли mode == Mode::Menu.
@@ -118,9 +116,6 @@ struct AppStateData {
     uint8_t inputIndex;
 
     int8_t volume;   // ЦІЛЬОВА гучність (під час ramp в чіпі може бути менше)
-    int8_t bass;
-    int8_t treble;
-    int8_t balance;
     bool mute;       // мʼют, який зробив користувач (Standby/переходи сюди не входять)
 
     uint16_t stationIndex;
@@ -135,8 +130,6 @@ struct AppStateData {
     float vuRight;
 
     // --- [Prompt 8] ДОДАНО (лише в кінець) ---
-    // Підсилення ПОТОЧНОГО входу, сирі апаратні кроки (0..3 для обох чипів).
-    int8_t gain;
     // Ціль, яку регулює обертання енкодера.
     AdjustTarget adjustTarget;
     // Підрежим меню; осмислений лише при mode == Mode::Menu (інакше None).
@@ -166,10 +159,6 @@ struct AppStateData {
     // --- [Prompt 16] ДОДАНО ---
     // Прогрес OTA 0..100; осмислений лише при mode == Mode::OtaUpdate.
     uint8_t otaProgress;
-
-    // --- [Prompt 21b] ДОДАНО ---
-    // Тонкомпенсація профілю поточного входу (false, якщо чип її не підтримує).
-    bool loudness;
 
     // --- [Prompt 23b] ДОДАНО ---
     // Назва поточного входу (UTF-8, завжди з '\0'; хвіст буфера обнулено, щоб однакові

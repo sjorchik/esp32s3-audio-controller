@@ -129,8 +129,8 @@
 // пресет EQ}; контролер тримає лише гучності (s_volumes[]), пресет EQ живе в Settings і не дублюється:
 // його пише веб-обробник /api/eq (SettingsStore::modify), а persist() записує в профілі ТІЛЬКИ гучність
 // (інакше застарілу копію EQ було б записано поверх свіжої). Бас / дискант / баланс / gain / loudness
-// прибрано з профілю, подій, команд і цілей енкодера; чіпа й I2C немає (P48a); поля AppStateData bass/treble/balance/gain/loudness
-// публікуються нейтральними константами app_controller_cfg::kLegacy* (застарілі заглушки до P49/P50). Ціль регулювання енкодера
+// прибрано з профілю, подій, команд і цілей енкодера; чіпа й I2C немає (P48a); [P50b] поля AppStateData
+// bass/treble/balance/gain/loudness ВИДАЛЕНО (більше не публікуються). Ціль регулювання енкодера
 // завжди Volume (цикл цілей і автоповернення P31 прибрано); короткий клік енкодера лише показує вікно
 // гучності. Дії BASS_* .. GAIN_* (enum незмінний) ігноруються з одним коротким логом. Пресет EQ екземпляра
 // радіо = profiles[0].eqGainsDb: застосовується в SettingsStore::load()/resetToDefaults(), у /api/eq при
@@ -169,8 +169,8 @@
 // Входи 1 / 2 комутує реле (audio/input_selector::select()) у вже наявній послідовності P47c ПІД цифровим
 // мʼютом проходу: мʼют -> kExtMuteSettleMs -> select() -> input_selector_cfg::kRelaySettleMs -> розмʼют.
 // Радіо реле НЕ чіпає. Чип-мʼют (setMute) прибрано: s_hwMute = «цифровий мʼют виставлено» (потрібен
-// піну підсилювача P23c). Тембр / gain / loudness видалено: WebCmdType::GainSet -> Unsupported, setTone()
-// нічого не приймає. Профіль входу = {volume, eqGainsDb[5], balanceDb}: контролер пише лише гучність;
+// піну підсилювача P23c). Тембр / gain / loudness видалено ([P50b] разом з WebCmdType::GainSet, WebCmdResult::Unsupported і
+// setTone()). Профіль входу = {volume, eqGainsDb[5], balanceDb}: контролер пише лише гучність;
 // balanceDb поки не чіпає (P48b). inputAvailable() = маска входів (+ офлайн: без радіо).
 // IR прямого вибору: INPUT_RADIO / INPUT_TV / INPUT_PC -> 0 / 1 / 2; INPUT_AUX — без дії.
 
@@ -928,13 +928,6 @@ void applyPub(AppStateData& s, void* c) {
     s.mode = p->mode;
     s.inputIndex = p->input;
     s.volume = p->volume;
-    // [Prompt 46a] Застарілі поля: тембр/баланс/gain/loudness більше не регулюються — завжди нейтральні
-    // константи (екрани й веб компілюються й не ламаються; поля видалить P49/P50).
-    s.bass = cfg::kLegacyToneValue;
-    s.treble = cfg::kLegacyToneValue;
-    s.balance = cfg::kLegacyToneValue;  // [P48a] баланс (dB) у AppState з'явиться в P48b
-    s.gain = cfg::kLegacyToneValue;
-    s.loudness = cfg::kLegacyLoudness;
     s.mute = p->mute;
     s.stationIndex = p->station;
     s.adjustTarget = p->target;
@@ -2612,7 +2605,7 @@ void taskMain(void*) {
 
 // --- [Prompt 18] Команди з вебу -----------------------------------------------
 // Викликати лише під s_lock. Перевірка меж і гейти — ДО будь-якої зміни стану, тож
-// відмова (NotAllowed/OutOfRange/Unsupported) нічого не чіпає (список станцій на
+// відмова (NotAllowed/OutOfRange) нічого не чіпає (список станцій на
 // пристрої теж лишається відкритим).
 
 // [Prompt 49a] Веб-команда станції/плеєра закриває те, що відкрито на пристрої: список станцій (як було) або екран
@@ -2697,12 +2690,6 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
         case WebCmdType::MuteToggle:
             toggleUserMute();
             break;
-
-        case WebCmdType::GainSet:
-            // [Prompt 48a] Підсилення входу видалено разом із чипом: команда не підтримується (400
-            // not_supported). Тип лишається в WebCmdType (ABI), стан не змінюється.
-            why = "not_supported";
-            return WebCmdResult::Unsupported;
 
         case WebCmdType::BalanceSet:  // [Prompt 48b] баланс АКТИВНОГО входу, абсолютне значення, дБ
             if (!balance_cfg::isValidDb(static_cast<int>(c.value))) {
@@ -2871,22 +2858,6 @@ void AppController::handleEvent(const Event& event) {
     }
     handleLocked(event);
     xSemaphoreGiveRecursive(s_lock);
-}
-
-// [Prompt 13] ДОДАНО
-bool AppController::setTone(ToneUpdate& u) {
-    u.bassOk = u.trebleOk = u.balanceOk = u.loudnessOk = false;
-    if (!s_started || s_lock == nullptr ||
-        xSemaphoreTakeRecursive(s_lock, pdMS_TO_TICKS(cfg::kLockTimeoutMs)) != pdTRUE) {
-        return false;
-    }
-    // [Prompt 48a] Тембр / баланс / loudness не підтримуються (чипа немає; баланс повернеться цифровим у P48b
-    // іншим шляхом): усі *Ok = false («Unsupported»), стан не змінюється. Метод лишено заради ABI.
-    if (u.hasBass || u.hasTreble || u.hasBalance || u.hasLoudness) {
-        APP_LOG("tone/balance/loudness (WEB) unsupported: ignored\n");
-    }
-    xSemaphoreGiveRecursive(s_lock);
-    return true;
 }
 
 // [Prompt 15] ДОДАНО: навчання IR

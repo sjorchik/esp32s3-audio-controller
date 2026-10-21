@@ -13,6 +13,7 @@
 // [Prompt 47a] ДОДАНО: kRadioMuteWaitMs (очікування згасання цифрового мʼюту радіо). Програмна рампа
 // гучності прибрана (її робить audio/dsp_volume); фіксована нейтральна гучність чіпа (kNeutralVolume)
 // видалена разом із чіпом (P48a).
+// [Prompt 50b] ВИДАЛЕНО kLegacyToneValue / kLegacyLoudness (поля AppStateData bass/treble/balance/gain/loudness прибрано).
 // [Prompt 48c] ВИДАЛЕНО невикористані kRampStepMs, kRampStep, kAdjustTimeoutMs (ціль енкодера завжди гучність,
 // P49a) і kGainMuteHoldMs (gain більше немає). ДОДАНО kPrepareRestartWaitMs (AppController::prepareForRestart()).
 
@@ -90,15 +91,6 @@ constexpr uint32_t kLineReleaseTimeoutMs = 3000;
 // Зсув рівня зовнішніх входів відносно кривої радіо, дБ (≤ 0). 0 = та сама крива radioVolumeDb(). Підгонка
 // «на слух»: якщо зовнішні входи гучніші за радіо при однаковому UI — зробити від'ємним (напр. −8).
 constexpr float    kExtLevelTrimDb = 0.0f;
-
-// ---------------------------------------------------------------------------
-// [Prompt 48a] Застарілі поля AppStateData
-// ---------------------------------------------------------------------------
-// Чип вирізано: тембр, gain і loudness більше не існують, баланс повернеться як цифровий (P48b, dB). Поля
-// AppStateData bass / treble / balance / gain / loudness (структуру не міняємо до P50) публікуються цими
-// НЕЙТРАЛЬНИМИ значеннями. Фіксовану нейтральну гучність чипа (kNeutralVolume) видалено: чипа немає.
-constexpr int8_t kLegacyToneValue = 0;
-constexpr bool   kLegacyLoudness  = false;
 
 // ---------------------------------------------------------------------------
 // Розкладка керування

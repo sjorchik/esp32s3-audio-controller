@@ -79,9 +79,6 @@ void sendResult(AsyncWebServerRequest* req, WebCmdResult r, const char* why) {
         case WebCmdResult::OutOfRange:
             sendError(req, 400, why != nullptr ? why : "out_of_range");
             return;
-        case WebCmdResult::Unsupported:
-            sendError(req, 400, "not_supported");
-            return;
     }
     sendError(req, 500, "internal");
 }

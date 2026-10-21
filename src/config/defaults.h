@@ -10,15 +10,11 @@ namespace defaults {
 constexpr uint32_t kSerialBaud = 115200;
 
 // --- Звук ---
-// [Prompt 48a] I2C та аудіопроцесор (TDA7318 / PT2313L) вирізано. kDefaultBass / kDefaultTreble /
-// kDefaultBalance / kDefaultLoudness — ЗАСТАРІЛІ значення для заглушок AppStateData (поля прибере P50);
-// баланс тепер у dB: balance_cfg::kDefaultDb (config/balance_config.h).
+// [Prompt 48a] I2C та аудіопроцесор (TDA7318 / PT2313L) вирізано.
+// [Prompt 50b] kDefaultBass / kDefaultTreble / kDefaultBalance / kDefaultLoudness ВИДАЛЕНО разом із полями
+// AppStateData; баланс тепер у dB: balance_cfg::kDefaultDb (config/balance_config.h).
 constexpr int8_t kDefaultVolume  = 40;
-constexpr int8_t kDefaultBass    = 0;
-constexpr int8_t kDefaultTreble  = 0;
-constexpr int8_t kDefaultBalance = 0;
 constexpr bool   kDefaultMute    = false;
-constexpr bool   kDefaultLoudness = false;
 
 // [Prompt 48a] Логічні входи (3): 0 = WiFi Radio (цифровий шлях, реле НЕ задіяне), 1 = TV Box,
 // 2 = Computer. Входи 1 / 2 комутує одне реле (audio/input_selector: вимкнено = TV Box, увімкнено =

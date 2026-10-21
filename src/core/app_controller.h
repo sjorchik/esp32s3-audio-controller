@@ -8,6 +8,7 @@
 // [Prompt 48a] ЗМІНЕНО: аудіочіпи (TDA7318 / PT2313L) вирізано. begin() БЕЗ параметрів (було begin(AudioProcessor*)).
 //             Входів 3 (0 радіо, 1 TV Box, 2 Computer), 1 / 2 комутує реле (audio/input_selector). setTone() і
 //             WebCmdType::GainSet більше нічого не приймають: Unsupported (тип і метод лишено заради ABI).
+// [Prompt 50b] ВИДАЛЕНО: ToneUpdate, AppController::setTone(), WebCmdType::GainSet, WebCmdResult::Unsupported.
 // [Prompt 8] Заглушку замінено.
 //   ЗМІНЕНО — begin() тепер приймає вказівник на аудіопроцесор (AppController
 //             ним не володіє; main.cpp створив його раніше). nullptr дозволений:
@@ -58,32 +59,11 @@
 #include "config/eq_config.h"  // [Prompt 47c] eq_cfg::kBandCount для applyLineEq()
 #include "core/events.h"
 
-// [Prompt 13] ДОДАНО: запит на зміну тембру/балансу ззовні (веб). [Prompt 21b] + тонкомпенсація.
-// [P48a] capabilities чипа немає: значення перевіряє викликач за діапазонами config/. Поля *Ok — результат
-// (зараз завжди false: setTone() нічого не застосовує).
-struct ToneUpdate {
-    bool hasBass = false;
-    int8_t bass = 0;
-    bool hasTreble = false;
-    int8_t treble = 0;
-    bool hasBalance = false;
-    int8_t balance = 0;
-    bool bassOk = false;
-    bool trebleOk = false;
-    bool balanceOk = false;
-    // [Prompt 21b] ДОДАНО
-    bool hasLoudness = false;
-    bool loudness = false;
-    bool loudnessOk = false;
-};
-
 // [Prompt 18] ДОДАНО: команда з вебу. Семантика полів залежить від type:
 //   VolumeSet     value = нова гучність (шкала UI, volumeMin..volumeMax)
 //   VolumeStep    value = зміна гучності (знак = напрямок), результат обрізається до меж
 //   MuteSet       flag  = true -> мʼют увімкнути
 //   MuteToggle    -
-//   GainSet       [Prompt 48a] НЕ ПІДТРИМУЄТЬСЯ: gain видалено разом із чипом -> Unsupported
-//                 ("not_supported"), стан не змінюється (до P50 тип лишається в enum)
 //   StandbySet    flag  = true -> перейти в standby, false -> вийти зі standby
 //   StandbyToggle -
 //   InputSet      value = індекс входу (0..2: радіо, TV Box, Computer)
@@ -104,7 +84,6 @@ enum class WebCmdType : uint8_t {
     VolumeStep,
     MuteSet,
     MuteToggle,
-    GainSet,
     StandbySet,
     StandbyToggle,
     InputSet,
@@ -131,7 +110,6 @@ enum class WebCmdResult : uint8_t {
     NotAllowed,   // зараз недопустимо (Standby, OTA, навчання IR,
                   // не вхід Radio, немає станцій); причина — reason   -> 409
     OutOfRange,   // значення поза межами (вхід, станція, гучність)   -> 400
-    Unsupported,  // функція не підтримується (gain, тембр)           -> 400
 };
 
 class AppController {
@@ -146,18 +124,6 @@ public:
     // чергу; публічний виклик лишено для тестування. Захищено внутрішнім
     // мʼютексом, тож безпечний і з інших задач. Не робити з обробника подій.
     static void handleEvent(const Event& event);
-
-    // [Prompt 48a] НЕ ПІДТРИМУЄТЬСЯ: тембр/баланс/loudness більше не регулюються. Метод лишено заради ABI:
-    // нічого не змінює, усі *Ok = false; повертає true, якщо контролер запущено.
-    // [Prompt 46a] (колишній опис) під мʼютексом контролера нічого не писав у чип, профіль і AppState;
-    // *Ok = true для запитаних полів, які підтримував чип.
-    // [Prompt 13] (колишній опис) викликав setBass/setTreble/setBalance
-    // [Prompt 21b] (і setLoudness) процесора; значення стосувалися ПОТОЧНОГО входу й
-    // зберігалися в його профілі; оновлював власні копії, публікував AppState і відкладено зберігав Settings.
-    // false — контролер не запущено або мʼютекс зайнятий довше kLockTimeoutMs (нічого не
-    // змінено). true — запит оброблено; успіх кожного поля — у *Ok (false = I2C не
-    // відповів або чип не підтримує функцію; копія в такому разі не змінюється).
-    static bool setTone(ToneUpdate& update);
 
     // [Prompt 15] ДОДАНО: починає навчання дії target. Запамʼятовує поточний Mode,
     // ставить Mode::IrLearn і викликає IrRc5::beginLearn(). Звук/потік не чіпає.
@@ -193,14 +159,14 @@ public:
     // виконає найближчий tick(). Безпечно викликати, коли OTA не триває (нічого не робить).
     static void otaFailed(const char* reason);
 
-    // [Prompt 18] ДОДАНО: виконує команду з вебу під внутрішнім мʼютексом (як setTone()).
+    // [Prompt 18] ДОДАНО: виконує команду з вебу під внутрішнім мʼютексом.
     // Гейти узгоджені з handleEvent(): у Mode::OtaUpdate та Mode::IrLearn — завжди
     // NotAllowed; у Standby дозволені лише StandbySet/StandbyToggle. Команди входу й
     // станції при відкритому списку станцій на пристрої спершу закривають його.
     // *reasonOut (якщо не nullptr) — статичний рядок snake_case для NotAllowed/OutOfRange/
-    // Unsupported/Busy: "ota_in_progress", "ir_learn_active", "standby", "not_radio_input",
+    // Busy: "ota_in_progress", "ir_learn_active", "standby", "not_radio_input",
     // "wifi_setup", "no_stations", "input_unavailable", "station_out_of_range",
-    // "volume_out_of_range", "balance_out_of_range" [Prompt 48b], "not_supported" (GainSet), "busy"; [Prompt 39] + "input_disabled"
+    // "volume_out_of_range", "balance_out_of_range" [Prompt 48b], "busy"; [Prompt 39] + "input_disabled"
     // (InputSet на вхід, вимкнений маскою входів -> NotAllowed); інакше nullptr.
     // Стан публікується в AppState і (за потреби) зберігається в Settings до повернення.
     static WebCmdResult runWebCommand(const WebCommand& cmd, const char** reasonOut = nullptr);

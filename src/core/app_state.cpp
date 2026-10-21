@@ -48,9 +48,6 @@ bool AppState::begin() {
     s_state.mode = Mode::Standby;
     s_state.inputIndex = defaults::kDefaultInput;
     s_state.volume = defaults::kDefaultVolume;
-    s_state.bass = defaults::kDefaultBass;
-    s_state.treble = defaults::kDefaultTreble;
-    s_state.balance = defaults::kDefaultBalance;
     s_state.mute = defaults::kDefaultMute;
 
     s_mutex = m;  // публікуємо мʼютекс після заповнення стану
