@@ -29,6 +29,7 @@
 #include "config/balance_config.h"
 #include "config/defaults.h"
 #include "config/eq_config.h"
+#include "config/vu_sens_config.h"  // [V1] діапазон чутливості VU
 
 // [Prompt 46a] Профіль одного логічного входу: гучність (шкала UI 0..100, діапазон обрізає
 // AppController за audio_cfg::kVolumeUiMin..kVolumeUiMax), пресет 5-смугового еквалайзера, дБ
@@ -40,6 +41,9 @@ struct InputProfile {
     int8_t volume;
     int8_t eqGainsDb[eq_cfg::kBandCount];
     int8_t balanceDb;  // [Prompt 48a] ДОДАНО: лише зберігається й валідується (DSP — P48b)
+    // [V1] ДОДАНО (лише в кінець профілю; NVS v8): чутливість VU цього входу, дБ (vu_sens_cfg::kMinDb..kMaxDb,
+    // 0 = нейтрально). Зсув рівня показу VU, на звук не впливає. Діє на VU, коли вхід активний.
+    int8_t vuSensDb;
 };
 
 // Налаштування, які зберігаються між запусками.

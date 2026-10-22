@@ -50,6 +50,11 @@
 //             (radio_volume) або проходу (LinePath). Керування: клік енкодера перемикає ціль Volume <-> Balance, IR
 //             BALANCE_UP / BALANCE_DOWN, веб. Решту публічного інтерфейсу не змінено.
 // [Prompt 48c] ДОДАНО: prepareForRestart() — «тихий» перезапуск для веб reboot / factory-reset / wifi-reset, OTA й порталу Wi-Fi.
+// [V1] ДОДАНО: WebCmdType::VuSensSet (чутливість VU АКТИВНОГО входу, дБ), reason "vu_sens_out_of_range". Чутливість VU —
+//             зсув рівня показу в дБ (vu_sens_cfg: ±20, крок 1, 0 за замовчуванням), на звук не впливає; зберігається в
+//             профілі входу (Settings::profiles[i].vuSensDb, NVS v8) і застосовується до VU при кожному застосуванні
+//             профілю (старт, зміна входу, вихід зі standby). Керування — лише веб; кнопок / енкодера / IR немає.
+//             Решту публічного інтерфейсу не змінено.
 // [Prompt 46a] Чип — лише селектор входів; профіль входу = {гучність, пресет EQ}. ПУБЛІЧНІ СИГНАТУРИ НЕ ЗМІНЕНО,
 //             змінилась лише семантика: setTone() приймає й ІГНОРУЄ тембр/баланс/loudness (*Ok = true для
 //             запитаних полів, які мав чип; у чіп, профіль і AppState нічого не йде); WebCmdType::GainSet
@@ -75,6 +80,9 @@
 //   StationPrev   - (напрямок як у кнопки LEFT)
 //   BalanceSet    value = баланс АКТИВНОГО входу, дБ (balance_cfg::kMinDb..kMaxDb; додатне = вправо) [Prompt 48b].
 //                 Поза діапазоном -> OutOfRange ("balance_out_of_range"); у Standby -> NotAllowed ("standby").
+//   VuSensSet     value = чутливість VU АКТИВНОГО входу, дБ (vu_sens_cfg::kMinDb..kMaxDb) [V1]. Поза діапазоном ->
+//                 OutOfRange ("vu_sens_out_of_range"); у Standby -> NotAllowed ("standby"); OTA / навчання IR — як інші
+//                 команди. НЕактивний вхід обробник пише лише в Settings (як баланс), без runWebCommand.
 //   InputsEnabledSet  value = нова МАСКА дозволених входів (біт i = вхід i; значення нормалізується:
 //                     біт 0 завжди 1, зайві біти скидаються) [Prompt 39]. Єдина команда, дозволена
 //                     в Standby (крім живлення). Якщо активний вхід став вимкненим — перехід на
@@ -95,6 +103,7 @@ enum class WebCmdType : uint8_t {
     StationPrev,
     InputsEnabledSet,  // [Prompt 39] ДОДАНО (лише в кінець enum)
     BalanceSet,        // [Prompt 48b] ДОДАНО (лише в кінець enum)
+    VuSensSet,         // [V1] ДОДАНО (лише в кінець enum)
 };
 
 struct WebCommand {
@@ -166,7 +175,7 @@ public:
     // *reasonOut (якщо не nullptr) — статичний рядок snake_case для NotAllowed/OutOfRange/
     // Busy: "ota_in_progress", "ir_learn_active", "standby", "not_radio_input",
     // "wifi_setup", "no_stations", "input_unavailable", "station_out_of_range",
-    // "volume_out_of_range", "balance_out_of_range" [Prompt 48b], "busy"; [Prompt 39] + "input_disabled"
+    // "volume_out_of_range", "balance_out_of_range" [Prompt 48b], "vu_sens_out_of_range" [V1], "busy"; [Prompt 39] + "input_disabled"
     // (InputSet на вхід, вимкнений маскою входів -> NotAllowed); інакше nullptr.
     // Стан публікується в AppState і (за потреби) зберігається в Settings до повернення.
     static WebCmdResult runWebCommand(const WebCommand& cmd, const char** reasonOut = nullptr);
@@ -202,4 +211,3 @@ public:
     // звук оновиться при наступному перемиканні входу). При LINE_PATH_ENABLE == 0 — нічого не робить (true).
     static bool applyLineEq(uint8_t input, const int8_t gains[eq_cfg::kBandCount]);
 };
-

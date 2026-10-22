@@ -185,6 +185,11 @@
 // параметр по колу (P49c; раніше — скинути вибраний у 0), довге утримання енкодера / BACK / таймаут eq_screen_cfg::kTimeoutMs — вихід. Зміни живі й
 // зберігаються тими самими шляхами, що веб: EQ — Settings::profiles[s_input].eqGainsDb (SettingsStore::modify,
 // NVS з дебаунсом) + екземпляр DSP (радіо eq::setAllDb / прохід LinePath::setEqAllDb); баланс — setBalanceTarget().
+// [V1] Чутливість VU по входах: s_vuSens = Settings::profiles[s_input].vuSensDb (джерело правди — Settings). Застосовується
+// через VuSource::setSensitivityDb() в loadActiveFromProfile() (старт, зміна входу, вихід зі standby, запасний вхід при
+// вимкненні маскою) і в setVuSensTarget() (WebCmdType::VuSensSet для АКТИВНОГО входу). persist() vuSensDb НЕ чіпає (як
+// баланс): веб-запис неактивного входу не затирається, factory-reset не отримує старе значення зі стану контролера.
+// Лог — префікс [VUS].
 // Примусове закриття: standby, OTA, початок навчання IR, зміна входу з будь-якого джерела, підняття AP (WifiSetup),
 // веб-команди станцій. VOL_UP / VOL_DOWN (IR) у екрані працюють; решта дій ігнорується (крім INPUT_RADIO / TV / PC:
 // вони міняють вхід і тим закривають екран). Лог — префікс [EQS].
@@ -201,6 +206,7 @@
 #include "audio/input_selector.h"  // [Prompt 48a] реле-селектор входів 1 / 2
 #include "audio/line_path.h"     // [Prompt 47c]
 #include "audio/radio_volume.h"  // [Prompt 47a]
+#include "audio/vu_source.h"     // [V1] VuSource::setSensitivityDb()
 #include "config/amp_config.h"  // [Prompt 23c]
 #include "config/balance_config.h"  // [Prompt 48b] діапазон / крок балансу, kSwapChannels
 #include "config/app_controller_config.h"
@@ -212,6 +218,7 @@
 #include "config/line_path_config.h"  // [Prompt 47c] LINE_PATH_ENABLE
 #include "config/audio_config.h"     // [P47a] radioVolumeDb(); [P48a] kVolumeUiMin / kVolumeUiMax
 #include "config/settings_config.h"  // [Prompt 39] normalizeInputMask, kInputMaskAll
+#include "config/vu_sens_config.h"   // [V1] діапазон чутливості VU
 #include "config/wifi_status_config.h"  // [Prompt 36]
 #include "core/app_state.h"
 #include "core/settings.h"
@@ -244,6 +251,7 @@ static_assert(app_controller_cfg::kExtMuteSettleMs < amp_cfg::kAmpOffDelayMs,
 #define APP_LOG(...) Serial.printf("[APP] " __VA_ARGS__)
 #define BAL_LOG(...) Serial.printf("[BAL] " __VA_ARGS__)  // [Prompt 48b]
 #define EQS_LOG(...) Serial.printf("[EQS] " __VA_ARGS__)  // [Prompt 49a]
+#define VUS_LOG(...) Serial.printf("[VUS] " __VA_ARGS__)  // [V1]
 #else
 #define APP_LOG(...) \
     do {             \
@@ -252,6 +260,9 @@ static_assert(app_controller_cfg::kExtMuteSettleMs < amp_cfg::kAmpOffDelayMs,
     do {             \
     } while (0)
 #define EQS_LOG(...) \
+    do {             \
+    } while (0)
+#define VUS_LOG(...) \
     do {             \
     } while (0)
 #endif
@@ -291,6 +302,7 @@ AdjustTarget s_target = AdjustTarget::Volume;  // [Prompt 49a] ціль обер
 uint8_t s_eqSel = eq_screen_cfg::kDefaultSelected;
 uint32_t s_eqLastActionMs = 0;
 int8_t s_balance = balance_cfg::kDefaultDb;    // [Prompt 48b] баланс АКТИВНОГО входу, дБ (профіль входу s_input)
+int8_t s_vuSens = vu_sens_cfg::kDefaultDb;     // [V1] чутливість VU АКТИВНОГО входу, дБ (профіль входу s_input)
 // [Prompt 32] Подія «показати спливне вікно параметра»: що показувати і лічильник подій.
 // Лічильник росте лише на ЛОКАЛЬНІ зміни (handleLocked); веб-команди (runWebCommand) його не чіпають.
 AdjustTarget s_popupTarget = AdjustTarget::Volume;
@@ -708,6 +720,19 @@ void applyActiveBalance() {
     }
 }
 
+// --- [V1] Чутливість VU (зсув рівня показу в дБ, ±vu_sens_cfg::kMaxDb, індивідуальна для кожного входу) ----------
+// s_vuSens — чутливість АКТИВНОГО входу; джерело правди — Settings::profiles[i].vuSensDb. На звук не впливає: значення
+// читає лише споживач VU (audio/vu_source, display-задача), тож застосування під мʼютом й «наживо» однакове.
+void logVuSens(uint8_t input, int8_t db) {
+    (void)input;
+    (void)db;
+    VUS_LOG("input=%u sens=%+d\n", static_cast<unsigned>(input), static_cast<int>(db));
+}
+
+void applyVuSens() {
+    VuSource::setSensitivityDb(s_vuSens);
+}
+
 // s_volumes[idx] -> робоча гучність, обрізана за audio_cfg::kVolumeUiMin..Max ([P48a] capabilities чипа немає).
 // Реле входу не торкається й AppState не публікує (це робить викликач). [P47a] Оновлює цифрову гучність радіо.
 void loadActiveFromProfile(uint8_t idx) {
@@ -725,7 +750,11 @@ void loadActiveFromProfile(uint8_t idx) {
     {
         const Settings st = SettingsStore::snapshot();
         s_balance = balance_cfg::sanitizeDb(st.profiles[idx].balanceDb);
+        // [V1] Чутливість VU входу — з профілю; застосовується одразу (лише показ VU, звуку не чіпає).
+        s_vuSens = vu_sens_cfg::sanitizeDb(st.profiles[idx].vuSensDb);
     }
+    applyVuSens();
+    logVuSens(idx, s_vuSens);
     if (idx == 0) {
         applyRadioBalance();
     }
@@ -921,6 +950,7 @@ struct PubCtx {
     int8_t eqGainsDb[eq_cfg::kBandCount];    // [Prompt 49a]
     char inputName[kInputNameMax];  // [Prompt 23b]
     bool popupDismissed;            // [Prompt 49d]
+    int8_t vuSensDb;                // [V1]
 };
 
 void applyPub(AppStateData& s, void* c) {
@@ -943,6 +973,7 @@ void applyPub(AppStateData& s, void* c) {
     s.eqSelected = p->eqSelected;              // [Prompt 49a]
     memcpy(s.eqGainsDb, p->eqGainsDb, sizeof(s.eqGainsDb));  // [Prompt 49a]
     memcpy(s.inputName, p->inputName, sizeof(s.inputName));  // [Prompt 23b]
+    s.vuSensDb = p->vuSensDb;                                // [V1]
 }
 
 void publishState() {
@@ -951,6 +982,7 @@ void publishState() {
                 s_popupTarget, s_popupSeq, s_inputMask, s_balance};
     resolveInputName(s_input, p.inputName, sizeof(p.inputName));  // [Prompt 23b]
     p.popupDismissed = s_popupDismissed;                          // [Prompt 49d]
+    p.vuSensDb = s_vuSens;                                        // [V1]
     // [Prompt 49a] Поки відкритий екран «EQ + баланс» — вибраний параметр і пресет EQ активного входу (з Settings:
     // джерело правди, тож зміна з вебу теж видна); інакше нулі.
     if (eqOpen()) {
@@ -1165,6 +1197,36 @@ bool setBalanceTarget(int v) {
     BalancePersistCtx ctx = {s_input, s_balance};
     SettingsStore::modify(applyBalancePersist, &ctx);
     logBalance(s_input, s_balance);
+    return true;
+}
+
+// --- [V1] Чутливість VU -----------------------------------------------------------------------------------
+// Запис чутливості активного входу в Settings (окремо від persist(), за зразком балансу: persist() vuSensDb НЕ чіпає, тож
+// веб-запис НЕАКТИВНОГО входу не буде затерто, а factory-reset не отримає «старе» значення зі стану контролера).
+struct VuSensPersistCtx {
+    uint8_t input;
+    int8_t db;
+};
+
+void applyVuSensPersist(Settings& st, void* c) {
+    const VuSensPersistCtx* p = static_cast<const VuSensPersistCtx*>(c);
+    if (p->input < defaults::kInputCount) {
+        st.profiles[p->input].vuSensDb = vu_sens_cfg::sanitizeDb(p->db);
+    }
+}
+
+// Змінює чутливість VU активного входу (обрізається до vu_sens_cfg), застосовує до VU й пише в профіль.
+// true — значення змінилось. SettingsStore::modify() — NVS з дебаунсом.
+bool setVuSensTarget(int v) {
+    v = clampInt(v, vu_sens_cfg::kMinDb, vu_sens_cfg::kMaxDb);
+    if (v == s_vuSens) {
+        return false;
+    }
+    s_vuSens = static_cast<int8_t>(v);
+    applyVuSens();
+    VuSensPersistCtx ctx = {s_input, s_vuSens};
+    SettingsStore::modify(applyVuSensPersist, &ctx);
+    logVuSens(s_input, s_vuSens);
     return true;
 }
 
@@ -2701,6 +2763,16 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
             }
             break;
 
+        case WebCmdType::VuSensSet:  // [V1] чутливість VU АКТИВНОГО входу, абсолютне значення, дБ
+            if (!vu_sens_cfg::isValidDb(static_cast<int>(c.value))) {
+                why = "vu_sens_out_of_range";
+                return WebCmdResult::OutOfRange;
+            }
+            if (setVuSensTarget(static_cast<int>(c.value))) {
+                APP_LOG("vu sens=%d (WEB)\n", static_cast<int>(s_vuSens));
+            }
+            break;
+
         case WebCmdType::StandbySet:
             if (c.flag) {
                 if (s_mode != Mode::Standby) enterStandby();
@@ -3107,4 +3179,3 @@ bool AppController::begin() {
             static_cast<int>(s_volume), s_userMute ? 1 : 0, static_cast<unsigned>(s_inputMask));
     return true;
 }
-

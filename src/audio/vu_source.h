@@ -17,6 +17,8 @@
 
 #include <stdint.h>
 
+// [V1] Чутливість VU по входах: статичні VuSource::setSensitivityDb() / sensitivityDb() (див. нижче), застосовується в
+// read() обох джерел через vu_math::peakToNorm(peak, sensDb). Решту інтерфейсу не змінено.
 class VuSource {
 public:
     virtual ~VuSource() = default;
@@ -25,6 +27,15 @@ public:
     // Повертає нормалізовані значення 0..1.
     // false — даних немає (потік не грає / дані протухли): left = right = 0.
     virtual bool read(float& left, float& right) = 0;
+
+    // [V1] ДОДАНО (інтерфейс read() не змінено): чутливість VU АКТИВНОГО входу, дБ (vu_sens_cfg::kMinDb..kMaxDb;
+    // поза діапазоном обрізається). ОДНЕ значення на обидва джерела (радіо й прохід зовнішніх входів): рівень
+    // читає лише джерело активного входу. Ставить AppController (ядро 0) при кожному застосуванні профілю входу
+    // й при зміні значення; читають read() обох джерел (display-задача, ядро 0) — std::atomic<int8_t>, relaxed.
+    // Аудіо-ядро (publishPeaks / хук) цього значення не бачить і не чіпає: зсув додається до рівня в дБ у
+    // споживача, тож на звук і гарячий шлях не впливає. 0 = поведінка як до V1.
+    static void   setSensitivityDb(int8_t db);
+    static int8_t sensitivityDb();
 };
 
 // Джерело з декодованих PCM-семплів радіо.
@@ -79,4 +90,3 @@ private:
     float    m_levelL = 0.0f;
     float    m_levelR = 0.0f;
 };
-

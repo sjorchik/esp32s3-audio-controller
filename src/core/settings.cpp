@@ -1,6 +1,8 @@
 // Реалізація SettingsStore: один blob у NVS з версією формату, кеш у RAM,
 // відкладений запис з дебаунсом у власній легкій задачі.
-// [Prompt 48a] Формат v7: 3 логічні входи (0 = радіо, 1 = TV Box, 2 = Computer), профіль = {volume,
+// [V1] Формат v8: профіль входу = {volume, eqGainsDb[5], balanceDb, vuSensDb} = 8 Б; Settings 128 Б, blob 132 Б.
+// БЕЗ МІГРАЦІЇ з v7 (прошивка на СТЕРТИЙ flash): blob v7 (130 Б) відхиляється з логом, діють дефолти.
+// [Prompt 48a] (v7) Формат v7: 3 логічні входи (0 = радіо, 1 = TV Box, 2 = Computer), профіль = {volume,
 // eqGainsDb[5], balanceDb}, без типу аудіопроцесора (чипи вирізано).
 // [Prompt 46b] (v6: 5 логічних входів.)
 // МІГРАЦІЙ НЕМАЄ (рішення власника: прошивка на стертий flash): blob із будь-якою іншою версією, довжиною
@@ -19,6 +21,7 @@
 #include "config/display_config.h"
 #include "config/eq_config.h"
 #include "config/settings_config.h"
+#include "config/vu_sens_config.h"  // [V1]
 
 namespace {
 
@@ -40,13 +43,13 @@ static_assert(sizeof(Settings::inputNames) / sizeof(Settings::inputNames[0]) ==
 static_assert(sizeof(StoredBlob) <= 1024, "keep the blob small");
 
 // ---------------------------------------------------------------------------
-// Перевірки розкладки (формат v7)
+// Перевірки розкладки (формат v8)
 // ---------------------------------------------------------------------------
-static_assert(defaults::kInputCount == 3, "format v7 is laid out for 3 logical inputs (radio + TV Box + Computer)");
-static_assert(sizeof(InputProfile) == 1 + eq_cfg::kBandCount + 1,
-              "InputProfile = volume + EQ bands + balanceDb, no padding");
-static_assert(sizeof(Settings) == 126, "Settings v7 is 126 bytes");
-static_assert(sizeof(StoredBlob) == 130, "v7 blob is 130 bytes (differs from every earlier format: 144/164/168/170/202)");
+static_assert(defaults::kInputCount == 3, "format v8 is laid out for 3 logical inputs (radio + TV Box + Computer)");
+static_assert(sizeof(InputProfile) == 1 + eq_cfg::kBandCount + 1 + 1,
+              "InputProfile = volume + EQ bands + balanceDb + vuSensDb, no padding");
+static_assert(sizeof(Settings) == 128, "Settings v8 is 128 bytes (v7 was 126)");
+static_assert(sizeof(StoredBlob) == 132, "v8 blob is 132 bytes (differs from every earlier format: 130/144/164/168/170/202)");
 static_assert(defaults::kInputCount >= 1, "profiles[0] (radio) must exist");
 
 
@@ -110,6 +113,7 @@ void fillDefaults(Settings& s) {
             p.eqGainsDb[b] = 0;
         }
         p.balanceDb = balance_cfg::kDefaultDb;
+        p.vuSensDb = vu_sens_cfg::kDefaultDb;  // [V1]
     }
     // [Prompt 48a] Усі три входи дозволені (0x07).
     s.inputEnabledMask = settings_cfg::kInputMaskDefault;
@@ -125,7 +129,8 @@ void normalizeBool(bool& b) {
 // Перевірка даних, прочитаних з NVS (захист від пошкодженого, але формально
 // валідного blob-а). Діапазон гучності тут НЕ перевіряється: його обрізає AppController
 // (audio_cfg::kVolumeUiMin..kVolumeUiMax). Пресети EQ обрізаються тут (eq_cfg::kGainMinDb..kGainMaxDb);
-// [P48a] balanceDb поза діапазоном (balance_cfg::kMinDb..kMaxDb) -> 0.
+// [P48a] balanceDb поза діапазоном (balance_cfg::kMinDb..kMaxDb) -> 0; [V1] vuSensDb поза діапазоном
+// (vu_sens_cfg::kMinDb..kMaxDb) -> 0.
 void sanitize(Settings& s) {
     for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
         s.inputNames[i][sizeof(s.inputNames[i]) - 1] = '\0';
@@ -143,6 +148,7 @@ void sanitize(Settings& s) {
             if (g > eq_cfg::kGainMaxDb) g = eq_cfg::kGainMaxDb;
         }
         s.profiles[i].balanceDb = balance_cfg::sanitizeDb(s.profiles[i].balanceDb);  // [Prompt 48a]
+        s.profiles[i].vuSensDb = vu_sens_cfg::sanitizeDb(s.profiles[i].vuSensDb);    // [V1] поза діапазоном -> 0
     }
     // [Prompt 39] Маска входів: зайві біти скидаємо, радіо (біт 0) завжди дозволене.
     s.inputEnabledMask = settings_cfg::normalizeInputMask(s.inputEnabledMask);
@@ -277,8 +283,8 @@ bool SettingsStore::load() {
             Serial.printf("[SET] stored size %u unsupported, using defaults\n",
                           static_cast<unsigned>(len));
         } else {
-            // [Prompt 48a] Приймаємо ЛИШЕ поточний формат v7 (версія + довжина + payload). Будь-який інший
-            // blob (старі версії v1..v6, чужа довжина) не мігрується: значення за замовчуванням.
+            // [Prompt 48a / V1] Приймаємо ЛИШЕ поточний формат v8 (версія + довжина + payload). Будь-який інший
+            // blob (старі версії v1..v7, чужа довжина) не мігрується: значення за замовчуванням.
             alignas(4) uint8_t raw[sizeof(StoredBlob)];
             memset(raw, 0, sizeof(raw));
             const size_t got = prefs.getBytes(settings_cfg::kNvsBlobKey, raw, len);

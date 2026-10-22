@@ -25,6 +25,7 @@
 #include "config/features.h"
 #include "config/line_path_config.h"  // [P47d] LINE_PATH_ENABLE
 #include "config/vu_config.h"
+#include "config/vu_sens_config.h"  // [V1]
 
 #if VU_DEBUG
 #define VU_LOG(...) Serial.printf(__VA_ARGS__)
@@ -48,11 +49,23 @@ std::atomic<uint32_t> s_lineBlocks{0};
 
 constexpr std::memory_order kRelaxed = std::memory_order_relaxed;
 
+// [V1] Чутливість VU активного входу, дБ. Пише AppController, читають read() обох джерел (одна display-задача).
+std::atomic<int8_t> s_sensDb{vu_sens_cfg::kDefaultDb};
+
 // Шкала dBFS і балістика — в audio/vu_math.h (спільні для VuSourceDecodedPcm і VuSourceLinePath).
 using vu_math::ballistics;
 using vu_math::peakToNorm;
 
 }  // namespace
+
+// [V1] Не виходить за межі vu_sens_cfg (clampDb); без логів і блокувань.
+void VuSource::setSensitivityDb(int8_t db) {
+    s_sensDb.store(vu_sens_cfg::clampDb(db), kRelaxed);
+}
+
+int8_t VuSource::sensitivityDb() {
+    return s_sensDb.load(kRelaxed);
+}
 
 void VuSourceDecodedPcm::publishPeaks(uint32_t peakL, uint32_t peakR, uint32_t frames) {
 #if ENABLE_VU
@@ -127,8 +140,9 @@ bool VuSourceDecodedPcm::read(float& left, float& right) {
 
     const uint32_t pl = s_peakL.exchange(0, kRelaxed);
     const uint32_t pr = s_peakR.exchange(0, kRelaxed);
-    m_levelL = ballistics(m_levelL, peakToNorm(pl), dtMs);
-    m_levelR = ballistics(m_levelR, peakToNorm(pr), dtMs);
+    const float sens = static_cast<float>(s_sensDb.load(kRelaxed));  // [V1] чутливість VU активного входу, дБ
+    m_levelL = ballistics(m_levelL, peakToNorm(pl, sens), dtMs);
+    m_levelR = ballistics(m_levelR, peakToNorm(pr, sens), dtMs);
     left = m_levelL;
     right = m_levelR;
     return true;
@@ -209,11 +223,11 @@ bool VuSourceLinePath::read(float& left, float& right) {
 
     const uint32_t pl = s_linePeakL.exchange(0, kRelaxed);
     const uint32_t pr = s_linePeakR.exchange(0, kRelaxed);
-    m_levelL = ballistics(m_levelL, peakToNorm(pl), dtMs);
-    m_levelR = ballistics(m_levelR, peakToNorm(pr), dtMs);
+    const float sens = static_cast<float>(s_sensDb.load(kRelaxed));  // [V1] чутливість VU активного входу, дБ
+    m_levelL = ballistics(m_levelL, peakToNorm(pl, sens), dtMs);
+    m_levelR = ballistics(m_levelR, peakToNorm(pr, sens), dtMs);
     left = m_levelL;
     right = m_levelR;
     return true;
 #endif
 }
-

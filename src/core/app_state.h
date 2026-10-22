@@ -43,6 +43,8 @@
 // відкритий; поза ним нулі.
 // [Prompt 50b] ВИДАЛЕНО поля bass, treble, balance (legacy-нуль; баланс активного входу — balanceDb), gain, loudness;
 // AdjustTarget тепер {Volume, Balance}.
+// [V1] ДОДАНО: vuSensDb (лише в кінець структури) — чутливість VU АКТИВНОГО входу, дБ (vu_sens_cfg::kMinDb..kMaxDb,
+// 0 = нейтрально). Публікує AppController (publishState). Нуль = дефолт, тож app_state.cpp не змінюється.
 // [Prompt 17] НЕ ВИКОРИСТОВУЮТЬСЯ: ui/screens читає рівні VU напряму з
 // VuSourceDecodedPcm::read() (частота кадру), минаючи AppState. Поля лишено, щоб не міняти POD-структуру.
 
@@ -204,6 +206,11 @@ struct AppStateData {
     // порядок «показати» / «сховати» в межах одного кадру. Скидається в false, коли AppController знову
     // показує вікно (notifyPopup). Лише AppController пише.
     bool popupDismissed;
+
+    // --- [V1] ДОДАНО (в кінець структури) ---
+    // Чутливість VU активного входу, дБ (vu_sens_cfg::kMinDb..kMaxDb; 0 = без зсуву). Лише AppController пише.
+    // Сам VU зсув застосовує audio/vu_source (VuSource::setSensitivityDb); поле — для веб-статусу й діагностики.
+    int8_t vuSensDb;
 };
 
 class AppState {
@@ -233,5 +240,3 @@ public:
     //   AppState::modify([](AppStateData& s, void* c) { s.volume = *static_cast<int8_t*>(c); }, &v);
     static void modify(void (*fn)(AppStateData&, void* ctx), void* ctx);
 };
-
-
