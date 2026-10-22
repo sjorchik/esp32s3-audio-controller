@@ -1,22 +1,21 @@
 'use strict';
 /* Сторінка «Налаштування» (Prompt 23). Залежить від common.js і nav.js.
-   Лише конфігурація пристрою (звук — на «Аудіо»). Кожне поле зберігається окремим POST /api/settings.
+   Лише конфігурація пристрою (звук — на «Аудіо»). Назви входів — масив рівно з 3 елементів; яскравість і
+   displayFlipped — окремі POST /api/settings (P51a: тип процесора й тембр прибрано).
    Блок Wi-Fi — короткий підсумок поточної мережі; керування мережами — сторінка «Wi-Fi» (Prompt 29b). */
 (() => {
   const g = (id) => document.getElementById(id);
   const ui = {
-    wifi: g('wifi'), grp: g('grp'), proc: g('proc'), restart: g('restart-row'), restartText: g('restart-text'),
-    btnRestart: g('btn-restart'), names: g('names'), btnNames: g('btn-names'),
+    wifi: g('wifi'), grp: g('grp'), names: g('names'), btnNames: g('btn-names'),
     bright: g('bright'), brightOut: g('bright-out'), flip: g('flip'), wifiRows: g('wifi-rows'),
     inputsList: g('inputs-list'), inputsLoad: g('inputs-load'),
   };
   const CTRL = /[\u0000-\u001f\u007f]/;
-  const CHIP = { Tda7318: 'TDA7318', Pt2313l: 'PT2313L' };
   const MODES = { OtaUpdate: 'Іде оновлення прошивки', IrLearn: 'Іде навчання пульта', WifiSetup: 'Пристрій налаштовує Wi-Fi' };
 
   let st = null;              // /api/status
   let cfg = null;             // /api/settings (збережені значення)
-  let busy = false;           // триває збереження процесора / назв / перезапуск
+  let busy = false;           // триває збереження назв
   let flipBusy = false;       // триває запит перемикача: опитування його не чіпає
   let loadingCfg = false;
   let cfgFailed = false;
@@ -46,15 +45,16 @@
     try { await fn(); } catch (e) { toast(errorText(e), 'error'); }
     busy = false; render();
   }
-  const visibleInputs = () => CONFIG.processorInputs[ui.proc.value] || 4;
 
   /* ---------- Назви входів ---------- */
-  const fields = [0, 1, 2, 3].map((i) => {
-    const input = el('input', { class: 'input', type: 'text', id: 'in-' + i, autocomplete: 'off', spellcheck: 'false' });
+  const INPUT_LABELS = ['Вхід 0 · інтернет-радіо', 'Вхід 1', 'Вхід 2'];
+  const fields = Array.from({ length: CONFIG.inputCount }, (_, i) => {
+    const input = el('input', { class: 'input', type: 'text', id: 'in-' + i, autocomplete: 'off', spellcheck: 'false',
+      placeholder: CONFIG.inputDefaultNames[i] || '' });
     const cnt = el('small', { class: 'hint num' });
     const err = el('div', { class: 'field-error', role: 'alert', hidden: true });
     const wrap = el('div', { class: 'field' },
-      el('label', { for: 'in-' + i }, 'Вхід ' + (i + 1) + (i === 0 ? ' (інтернет-радіо)' : '')), input, cnt, err);
+      el('label', { for: 'in-' + i }, INPUT_LABELS[i] || 'Вхід ' + i), input, cnt, err);
     const f = { input, cnt, err, wrap, stored: '' };
     input.addEventListener('input', () => { updCount(f); setErr(f, ''); });
     ui.names.append(wrap);
@@ -85,11 +85,10 @@
 
   async function saveNames() {
     if (busy || !cfg) return;
-    const arr = [null, null, null, null];                 // null = не змінювати (web_api.md §3.2)
+    const arr = new Array(CONFIG.inputCount).fill(null);  // рівно 3 елементи; null = не змінювати (web_api.md §3.2)
     let any = false, bad = false;
     fields.forEach((f, i) => {
       setErr(f, '');
-      if (i >= visibleInputs()) return;
       const v = f.input.value.trim();
       const e = validateName(v);
       if (e) { setErr(f, e); if (!bad) f.input.focus(); bad = true; return; }
@@ -109,30 +108,9 @@
   }
   ui.btnNames.addEventListener('click', saveNames);
 
-  /* ---------- Тип процесора ---------- */
-  ui.proc.addEventListener('change', async () => {
-    const want = ui.proc.value;
-    render();                                            // одразу оновити кількість полів назв
-    await run(async () => {
-      try {
-        await api.post('/api/settings', { processorType: want }, CONFIG.stationsWriteTimeoutMs);
-        cfg.processorType = want;
-        saved('proc');
-      } catch (e) {
-        toast(errorText(e), 'error');
-        ui.proc.value = cfg.processorType;
-      }
-    });
-  });
-  ui.btnRestart.addEventListener('click', async () => {
-    if (busy) return;
-    if (!(await confirmDialog('Перезапустити пристрій зараз? Звук зупиниться приблизно на 10–15 секунд.', { okText: 'Перезапустити', danger: true }))) return;
-    run(() => rebootAndWait('/api/system/reboot', undefined, () => poller.stop()));
-  });
-
   /* ---------- Входи (P39b; web_api.md §12) ---------- */
   let inputsBusy = false;     // триває POST /api/inputs: перемикачі заблоковані, checked не перезаписується
-  const inRows = [0, 1, 2, 3].map((i) => {
+  const inRows = Array.from({ length: CONFIG.inputCount }, (_, i) => {
     const box = el('input', { type: 'checkbox', id: 'inen-' + i });
     const name = el('span');
     const note = el('p', { class: 'hint', hidden: true });
@@ -151,10 +129,10 @@
       if (!x) return;
       const radio = i === 0;
       const avail = x.available !== false;
-      setText(r.name, x.name || 'Вхід ' + (i + 1));
+      setText(r.name, x.name || CONFIG.inputDefaultNames[i] || 'Вхід ' + i);
       if (!inputsBusy) r.box.checked = radio ? true : x.enabled !== false;
-      r.box.disabled = radio || !avail || inputsBusy;
-      const t = radio ? 'Радіо завжди доступне.' : !avail ? 'Недоступний для цього аудіопроцесора.' : '';
+      r.box.disabled = radio || x.canDisable === false || !avail || inputsBusy;
+      const t = radio ? 'Радіо завжди доступне.' : !avail ? 'Вхід апаратно недоступний.' : '';
       setText(r.note, t);
       r.note.hidden = !t;
     });
@@ -221,7 +199,6 @@
       const first = !cfg;
       cfg = c;
       cfgFailed = false;
-      if (!busy || first) ui.proc.value = c.processorType;
       fields.forEach((f, i) => {
         const s = String((c.inputNames && c.inputNames[i]) || '');
         if (first || f.input.value === f.stored) f.input.value = s;     // не затираємо незбережену правку
@@ -250,19 +227,7 @@
     setBanner('busy', m ? m + '. Деякі зміни пристрій може відхилити.' : null, 'warn');
     if (st) renderWifi(ui.wifi, st.wifi);
     ui.grp.disabled = !st || !cfg || connection.offline;
-    ui.proc.disabled = busy;
     ui.btnNames.disabled = busy;
-    ui.btnRestart.disabled = busy;
-    const n = visibleInputs();
-    fields.forEach((f, i) => { f.wrap.hidden = i >= n; });
-
-    const now = st && st.processor && st.processor.type;
-    const need = !!now && !!cfg && now !== cfg.processorType;      // збережений тип ≠ тип, з яким працює прошивка
-    ui.restart.hidden = !need;
-    if (need) {
-      setText(ui.restartText, 'Тип змінено на ' + (CHIP[cfg.processorType] || cfg.processorType) +
-        ', але пристрій працює з ' + (CHIP[now] || now) + '. Зміна застосується після перезапуску.');
-    }
     if (st) {
       if (!brightCtl.held()) { ui.bright.value = st.brightness; setText(ui.brightOut, st.brightness + '%'); }
       if (!flipBusy) ui.flip.checked = !!st.displayFlipped;
@@ -278,3 +243,4 @@
   loadSettings();
   poller.start();
 })();
+

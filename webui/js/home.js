@@ -1,5 +1,5 @@
 'use strict';
-/* Сторінка «Головна» (Prompt 19). Залежить від common.js і nav.js. */
+/* Сторінка «Головна» (Prompt 19; P51a: 3 входи, без аудіочіпа / тембру). Залежить від common.js і nav.js. */
 (() => {
   const STREAM = {
     Idle: ['Зупинено', ''], Connecting: ['Підключення…', 'badge-warn'],
@@ -12,7 +12,7 @@
   const ui = {
     wifi: g('wifi'), power: g('btn-power'), wake: g('btn-wake'), standby: g('standby'), live: g('live'),
     grpPlayer: g('grp-player'), grpVolume: g('grp-volume'), grpInput: g('grp-input'), grpStations: g('grp-stations'),
-    badge: g('badge'), inputName: g('input-name'), name: g('station-name'), track: g('track'),
+    badge: g('badge'), inputName: g('input-name'), menuNote: g('menu-note'), name: g('station-name'), track: g('track'),
     dial: g('dial'), needle: g('dial-needle'), dialCaption: g('dial-caption'), hint: g('player-hint'),
     prev: g('btn-prev'), play: g('btn-play'), next: g('btn-next'),
     vol: g('vol'), volOut: g('vol-out'), volDn: g('vol-dn'), volUp: g('vol-up'), mute: g('btn-mute'),
@@ -35,7 +35,12 @@
   /* ---------- Стан ---------- */
   const isStandby = () => !!st && (st.standby === true || st.mode === 'Standby');
   const isRadio = () => !!st && st.input === 0;
-  const caps = () => (st && st.processor && st.processor.ready ? st.processor.capabilities : null);
+  /* Що відкрито на екрані пристрою (P50a: status.menuContext при mode === 'Menu'). Невідоме значення = «меню». */
+  const MENU_TEXT = {
+    StationList: 'На пристрої відкрито список станцій.',
+    EqBalance: 'На пристрої відкрито екран «EQ + баланс».',
+  };
+  const menuText = () => (st && st.mode === 'Menu' ? MENU_TEXT[st.menuContext] || 'На пристрої відкрито меню.' : '');
 
   function lockKind() {
     if (!st) return 'loading';
@@ -73,7 +78,12 @@
 
   /* ---------- Рендер ---------- */
   function renderInputs() {
-    const list = (st.inputs || []).filter((i) => i.available && isInputEnabled(i.index));   // вимкнені входи ховаємо (P39b)
+    /* Назви й доступність — з GET /api/inputs (кеш common.js); до першої відповіді — запасно з status.inputs.
+       Недоступні й вимкнені входи ховаємо (P39b) — так само, як вони зникають із перемикання на пристрої. */
+    const d = getInputs();
+    const src = d ? d.inputs.filter((i) => i.selectable !== false && i.available !== false && i.enabled !== false)
+                  : (st.inputs || []).filter((i) => i.available && isInputEnabled(i.index));
+    const list = src.slice(0, CONFIG.inputCount);
     const sig = JSON.stringify(list.map((i) => [i.index, i.name]));
     if (sig !== inputsSig) {
       inputsSig = sig;
@@ -105,7 +115,6 @@
     const lock = lockKind();
     const standby = isStandby();
     const radio = isRadio();
-    const c = caps();
     const locked = lock !== null;
 
     renderBanners(lock);
@@ -120,12 +129,15 @@
 
     ui.grpPlayer.disabled = locked || !radio;
     ui.grpStations.disabled = locked || !radio;
-    ui.grpVolume.disabled = locked || !c;
-    ui.grpInput.disabled = locked || !c;
+    ui.grpVolume.disabled = locked;
+    ui.grpInput.disabled = locked;
 
     // --- Плеєр ---
     renderStreamBadge();
     setText(ui.inputName, st.inputName || '');
+    const mt = menuText();                       // позначка про меню на пристрої; керування не блокує
+    ui.menuNote.hidden = !mt;
+    setText(ui.menuNote, mt);
     const sn = st.station || {};
     setMarquee(ui.name, radio ? (sn.name || '—') : (st.inputName || '—'));  // station.name = назва зі списку (P20b)
     setMarquee(ui.track, radio ? (st.track || '') : '');
@@ -144,11 +156,9 @@
     }
 
     // --- Гучність ---
-    if (c) {
-      setAttr(ui.vol, 'min', c.volumeMin);
-      setAttr(ui.vol, 'max', c.volumeMax);
-      if (!volHeld()) { ui.vol.value = st.volume; setText(ui.volOut, String(st.volume)); }
-    }
+    setAttr(ui.vol, 'min', CONFIG.volumeMin);      // min / max — ПЕРЕД value
+    setAttr(ui.vol, 'max', CONFIG.volumeMax);
+    if (!volHeld()) { ui.vol.value = st.volume; setText(ui.volOut, String(st.volume)); }
     setAttr(ui.mute, 'aria-pressed', !!st.mute);
     setAttr(ui.mute, 'aria-label', st.mute ? 'Увімкнути звук' : 'Вимкнути звук');
     setIcon(ui.mute, st.mute ? 'mute' : 'volume');
@@ -353,3 +363,4 @@
   render();
   poller.start();
 })();
+

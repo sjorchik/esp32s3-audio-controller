@@ -32,9 +32,11 @@ const CONFIG = {
   importMaxBytes: 131072,    // ліміт тіла POST /api/stations/import (≈ 128 КБ)
   importTimeoutMs: 60000,    // імпорт довгий: запис у flash
   searchDebounceMs: 150,
-  // --- Аудіо (Prompt 21); createSlider використовує volumeSendMinMs / volumeHoldMs ---
-  gainStepDb: { Tda7318: 6.25, Pt2313l: 3.75 },  // крок gain, дБ (web_api.md §2)
-  audioNeutral: { tone: 0, balance: 0, loudness: false }, // нейтраль / дефолт (контракт не наводить; settings.h)
+  // --- Звук і входи (P51a; web_api.md §1.3, §13). createSlider використовує volumeSendMinMs / volumeHoldMs ---
+  inputCount: 3,             // логічних входів: 0 = радіо, 1 = TV Box, 2 = Computer
+  inputDefaultNames: ['WiFi Radio', 'TV Box', 'Computer'], // типові назви (підказка в полях; справжні віддає API)
+  volumeMin: 0, volumeMax: 100,        // шкала гучності фіксована (web_api.md §2, §4.3)
+  balanceMinDb: -20, balanceMaxDb: 20, balanceStepDb: 1, balanceNeutralDb: 0, // баланс, дБ; «+» = вправо
   // --- Пульт (Prompt 22) ---
   irLearnPollMs: 400,        // GET /api/ir/learn/status під час навчання (web_api.md: 300-500 мс)
   irStatusPollMs: 2000,      // /api/status на сторінці «Пульт»
@@ -43,7 +45,6 @@ const CONFIG = {
   settingsPollMs: 2000,      // /api/status на сторінках «Налаштування» і «Система»
   savedMs: 1800,             // скільки висить бейдж «Збережено»
   inputNameMaxBytes: 31,     // inputNames[i]: 1..31 байт UTF-8 (web_api.md §3.2)
-  processorInputs: { Tda7318: 4, Pt2313l: 3 },   // скільки входів має чип (MASTER_SPEC §3)
   rebootPollMs: 1500,        // період опитування після reboot
   rebootPingMs: 2500,        // таймаут одного запиту під час очікування
   rebootTimeoutMs: 60000,    // скільки чекати, перш ніж здатися
@@ -72,7 +73,7 @@ const CONFIG = {
   // --- Еквалайзер радіо (Prompt 30b; web_api.md §11). Реальні межі й частоти повертає GET /api/eq ---
   eqMinDb: -12, eqMaxDb: 12, eqStepDb: 1,          // запасні значення до першої відповіді
   eqBandFreqHz: [60, 250, 1000, 4000, 12000],      // запасні підписи смуг (eq_cfg::kBandFreqHz)
-  eqRadioInput: 0,           // секція видима лише на цьому вході (0 = WiFi Radio)
+  eqRadioInput: 0,           // вхід 0 = радіо (P51b замінить показ EQ на «по входах»)
   eqRetryMs: 5000,           // пауза перед повтором невдалого GET /api/eq
   // --- Відключення входів (Prompt 39b; web_api.md §12) ---
   inputsRefreshMs: 10000,    // як часто перечитувати GET /api/inputs (зміна з іншого клієнта); зміна активного входу перечитує одразу
@@ -102,16 +103,12 @@ const REASONS = {
   not_radio_input: 'Це працює лише на вході «WiFi Radio».',
   wifi_setup: 'Пристрій налаштовує Wi-Fi.',
   no_stations: 'Список станцій порожній.',
-  input_unavailable: 'Цей вхід недоступний для поточного аудіопроцесора.',
   input_disabled: 'Цей вхід вимкнено в налаштуваннях.',
   station_out_of_range: 'Такої станції немає в списку.',
   index_out_of_range: 'Такої станції немає в списку.',
   volume_out_of_range: 'Гучність поза допустимими межами.',
-  gain_out_of_range: 'Підсилення поза допустимими межами.',
   out_of_range: 'Значення поза допустимими межами.',
-  i2c_failed: 'Аудіопроцесор не відповів.',
-  not_supported: 'Аудіопроцесор цього не підтримує.',
-  audio_unavailable: 'Аудіопроцесор недоступний.',
+  apply_failed: 'Пристрій не зміг застосувати зміну.',
   busy: 'Пристрій зайнятий. Спробуйте ще раз.',
   restart_pending: 'Пристрій уже перезапускається.',
   // Загальні помилки запиту
@@ -174,7 +171,7 @@ const REASONS = {
   no_code_for_action: 'Для цієї кнопки немає навченого коду.',
   not_in_conflict: 'Конфлікту вже немає.',
   invalid_name: 'Недопустима назва входу.',
-  expected_array_of_4: 'Некоректний список назв входів.',
+  expected_array_of_3: 'Потрібно рівно 3 назви входів.',
   empty_request: 'Порожній запит.',
   // Wi-Fi (P29)
   wifi_ssid_invalid: 'Некоректна назва мережі: 1…32 байти, без керівних символів.',
@@ -186,7 +183,7 @@ const REASONS = {
 
 function errorText(e) {
   if (!(e instanceof ApiError)) return (e && e.message) || 'Невідома помилка.';
-  if (e.status === 502 && e.code === 'error') return REASONS.i2c_failed;   // POST /api/settings: збій I2C
+  if (e.status === 502 && e.code === 'error') return REASONS.apply_failed;  // POST /api/settings: 502 без коду (зарезервовано, web_api.md §1.1)
   let t = REASONS[e.reason] || REASONS[e.code];
   if (!t) return 'Помилка: ' + (e.reason || e.code || e.status);
   const d = (Array.isArray(e.data.errors) && e.data.errors[0]) || e.data;   // POST /api/settings кладе min/max у errors[0]
@@ -335,6 +332,10 @@ const api = (() => {
     if (d) base = 'http://' + d;
   } catch (_) { /* sessionStorage недоступний - працюємо без dev-режиму */ }
 
+  // '?input=N' лише для цілого 0..inputCount-1; інакше без параметра (= активний вхід).
+  const inputQuery = (input) => (Number.isInteger(input) ? '?input=' + input : '');
+  const inputBody = (body, input) => (Number.isInteger(input) ? Object.assign({}, body, { input }) : body);
+
   // ОДНА послідовна черга для всіх запитів: ESP має мало одночасних зʼєднань.
   let chain = Promise.resolve();
   function enqueue(job) {
@@ -384,6 +385,14 @@ const api = (() => {
     send: (method, path, body, type, timeoutMs) => enqueue(() => run(method, path, body, timeoutMs, { type })),
     /* GET файлу -> Promise<Blob>. */
     blob: (path, timeoutMs) => enqueue(() => run('GET', path, undefined, timeoutMs, { blob: true })),
+    /* Баланс (web_api.md §13). input не задано = активний вхід. Відповідь GET: {input, balance}; POST: {ok, input, balance}. */
+    getBalance: (input, timeoutMs) => enqueue(() => run('GET', '/api/balance' + inputQuery(input), undefined, timeoutMs)),
+    setBalance: (value, input, timeoutMs) => enqueue(() => run('POST', '/api/balance',
+      inputBody({ value }, input), timeoutMs)),
+    /* Еквалайзер (§11). getEq -> {input, gainsDb[5], freqHz[5], minDb, maxDb, stepDb};
+       setEq(body, input): body = {gainsDb:[…]} або {band, gainDb}; відповідь як у GET + ok. */
+    getEq: (input, timeoutMs) => enqueue(() => run('GET', '/api/eq' + inputQuery(input), undefined, timeoutMs)),
+    setEq: (body, input, timeoutMs) => enqueue(() => run('POST', '/api/eq', inputBody(body, input), timeoutMs)),
   };
 })();
 
@@ -588,13 +597,13 @@ async function rebootAndWait(path, body, before) {
 }
 
 /* ---------- Вимкнені входи (Prompt 39b; web_api.md §12) ---------- */
-/* Спільний кеш GET /api/inputs для «Головної», «Аудіо» і «Налаштувань».
+/* Спільний кеш GET /api/inputs (рівно 3 входи) для «Головної», «Аудіо» і «Налаштувань».
    /api/status.inputs[] не містить enabled, тож сторінки фільтрують списки входів через isInputEnabled(). */
 const inputsState = { data: null, sig: '', input: null, busy: null, dirty: false, nextAt: 0, listeners: [] };
 
 /* Підписка на зміну списку входів (дані реально змінилися). */
 function onInputsChange(fn) { inputsState.listeners.push(fn); }
-/* Останні дані {inputs:[{index,name,available,enabled,selectable,canDisable}], enabledMask, input} або null. */
+/* Останні дані {inputs:[{index,name,available,enabled,selectable,canDisable}×3], enabledMask, input} або null. */
 function getInputs() { return inputsState.data; }
 /* true, якщо вхід не вимкнено. Невідомо (кеш ще не завантажено) -> true; радіо (0) -> завжди true. */
 function isInputEnabled(index) {
@@ -661,3 +670,4 @@ function initShell(activeId) {
   if (typeof renderNav === 'function') renderNav(activeId);
   if (api.base()) setBanner('dev', 'Режим розробки: пристрій ' + api.base().slice(7), 'info');
 }
+
