@@ -262,3 +262,12 @@ fieldset.group-bare{border:0;padding:0;margin:0}
 @media (max-width:479px){.station-level{display:none}}
 .level-val{min-width:4.2em;text-align:right;font-weight:650}
 
+/* --- Налаштування → Входи: галочка + повзунок чутливості VU (V3) --- */
+.in-row+.in-row{margin-top:var(--sp-4);padding-top:var(--sp-4);border-top:1px solid var(--line)}
+.in-row>.switch{min-height:var(--tap)}
+.in-row .param-row{align-items:center}
+.in-row .param-row .slider{flex:1;min-width:0}
+.in-row .param-val{flex:none;min-width:4.8em;text-align:right}
+.in-row .btn-zero{flex:none}
+.in-row>.hint{margin-top:var(--sp-1)}
+

@@ -79,6 +79,8 @@ const CONFIG = {
   // --- Відключення входів (Prompt 39b; web_api.md §12) ---
   inputsRefreshMs: 10000,    // як часто перечитувати GET /api/inputs (зміна з іншого клієнта); зміна активного входу перечитує одразу
   inputsRetryMs: 5000,       // пауза після невдалого GET /api/inputs
+    // --- Чутливість VU по входах (V3; web_api.md §15). Реальні межі повертає GET /api/vu ---
+  vuSensMinDb: -20, vuSensMaxDb: 20, vuSensStepDb: 1, // запасні значення до першої відповіді
 };
 
 /* ---------- Помилки API ---------- */
@@ -394,6 +396,10 @@ const api = (() => {
        setEq(body, input): body = {gainsDb:[…]} або {band, gainDb}; відповідь як у GET + ok. */
     getEq: (input, timeoutMs) => enqueue(() => run('GET', '/api/eq' + inputQuery(input), undefined, timeoutMs)),
     setEq: (body, input, timeoutMs) => enqueue(() => run('POST', '/api/eq', inputBody(body, input), timeoutMs)),
+        /* Чутливість VU по входах (§15). getVu -> {input, minDb, maxDb, stepDb, inputs:[{index, sensitivityDb}×3]};
+       setVu(value, input) -> {ok, input, sensitivityDb}. input не задано = активний вхід. */
+    getVu: (timeoutMs) => enqueue(() => run('GET', '/api/vu', undefined, timeoutMs)),
+    setVu: (value, input, timeoutMs) => enqueue(() => run('POST', '/api/vu', inputBody({ value }, input), timeoutMs)),
   };
 })();
 

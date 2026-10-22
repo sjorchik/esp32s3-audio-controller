@@ -2,7 +2,9 @@
 /* Сторінка «Налаштування» (Prompt 23). Залежить від common.js і nav.js.
    Лише конфігурація пристрою (звук — на «Аудіо»). Назви входів — масив рівно з 3 елементів; яскравість і
    displayFlipped — окремі POST /api/settings (P51a: тип процесора й тембр прибрано).
-   Блок Wi-Fi — короткий підсумок поточної мережі; керування мережами — сторінка «Wi-Fi» (Prompt 29b). */
+   Блок «Входи» (V3): у кожному рядку — галочка активації входу (POST /api/inputs) і повзунок чутливості VU
+   (GET / POST /api/vu, web_api.md §15). Блок Wi-Fi — короткий підсумок поточної мережі; керування мережами —
+   сторінка «Wi-Fi» (Prompt 29b). */
 (() => {
   const g = (id) => document.getElementById(id);
   const ui = {
@@ -12,6 +14,7 @@
   };
   const CTRL = /[\u0000-\u001f\u007f]/;
   const MODES = { OtaUpdate: 'Іде оновлення прошивки', IrLearn: 'Іде навчання пульта', WifiSetup: 'Пристрій налаштовує Wi-Fi' };
+  const isNum = (n) => typeof n === 'number' && isFinite(n);
 
   let st = null;              // /api/status
   let cfg = null;             // /api/settings (збережені значення)
@@ -19,6 +22,9 @@
   let flipBusy = false;       // триває запит перемикача: опитування його не чіпає
   let loadingCfg = false;
   let cfgFailed = false;
+  let vu = null;              // {minDb, maxDb, stepDb, vals[3]} з GET /api/vu; null = ще не прочитано
+  let vuLoading = false;
+  let vuFailed = false;
   const hideTimers = {};
 
   /* ---------- Дрібні помічники ---------- */
@@ -108,16 +114,39 @@
   }
   ui.btnNames.addEventListener('click', saveNames);
 
-  /* ---------- Входи (P39b; web_api.md §12) ---------- */
-  let inputsBusy = false;     // триває POST /api/inputs: перемикачі заблоковані, checked не перезаписується
+  /* ---------- Входи + чутливість VU (V3; web_api.md §12, §15) ---------- */
+  let inputsBusy = false;     // триває POST /api/inputs: галочки заблоковані, checked не перезаписується
+  const fmtVu = (v) => fmtSigned(v) + ' дБ';
+  // Чутливість активного входу недоступна в standby (409 standby з POST /api/vu).
+  const sensLocked = (i) => !!st && i === st.input && (st.standby === true || st.mode === 'Standby');
+
   const inRows = Array.from({ length: CONFIG.inputCount }, (_, i) => {
     const box = el('input', { type: 'checkbox', id: 'inen-' + i });
     const name = el('span');
     const note = el('p', { class: 'hint', hidden: true });
-    const wrap = el('div', { class: 'param', hidden: true }, el('label', { class: 'switch' }, box, name), note);
+    const out = el('output', { class: 'param-val num' }, fmtVu(0));
+    const input = el('input', { class: 'slider slider-c', type: 'range', min: CONFIG.vuSensMinDb, max: CONFIG.vuSensMaxDb,
+      step: CONFIG.vuSensStepDb, value: 0, 'aria-label': 'Чутливість VU: вхід ' + (i + 1) });
+    const zero = el('button', { class: 'btn btn-zero', type: 'button', 'aria-label': 'Скинути чутливість VU' }, '0');
+    const r = { box, name, note, input, out, zero, wrap: null, ctl: null, set: null };
+    r.ctl = createSlider(input, {
+      send: async (v) => applyVu(await api.setVu(v, i), i),
+      onInput: (v) => setText(out, fmtVu(v)),
+      onFail: () => renderInputsCard(),
+    });
+    r.set = (v) => {
+      v = clamp(v, Number(input.min), Number(input.max));
+      input.value = v; setText(out, fmtVu(v));
+      r.ctl.send(v);
+    };
+    zero.addEventListener('click', () => r.set(0));
     box.addEventListener('change', () => toggleInput(i, box.checked));
-    ui.inputsList.append(wrap);
-    return { box, name, note, wrap };
+    r.wrap = el('div', { class: 'param in-row', hidden: true },
+      el('label', { class: 'switch' }, box, name),
+      el('div', { class: 'param-row' }, input, out, zero),
+      note);
+    ui.inputsList.append(r.wrap);
+    return r;
   });
 
   function renderInputsCard() {
@@ -128,14 +157,69 @@
       r.wrap.hidden = !x;
       if (!x) return;
       const radio = i === 0;
+      const active = !!st && st.input === i;
       const avail = x.available !== false;
+
+      // Галочка активації (як раніше)
       setText(r.name, x.name || CONFIG.inputDefaultNames[i] || 'Вхід ' + i);
       if (!inputsBusy) r.box.checked = radio ? true : x.enabled !== false;
       r.box.disabled = radio || x.canDisable === false || !avail || inputsBusy;
-      const t = radio ? 'Радіо завжди доступне.' : !avail ? 'Вхід апаратно недоступний.' : '';
-      setText(r.note, t);
-      r.note.hidden = !t;
+
+      // Повзунок чутливості VU
+      if (vu) {
+        setAttr(r.input, 'min', vu.minDb);             // min / max / step — ПЕРЕД value
+        setAttr(r.input, 'max', vu.maxDb);
+        setAttr(r.input, 'step', vu.stepDb);
+        if (!r.ctl.held()) { r.input.value = vu.vals[i]; setText(r.out, fmtVu(vu.vals[i])); }
+      }
+      const off = !vu || sensLocked(i);
+      r.input.disabled = off;
+      r.zero.disabled = off;
+
+      // Пояснення: лише там, де воно справді потрібне
+      const notes = [];
+      if (radio) notes.push('Радіо завжди доступне.');
+      else if (!avail) notes.push('Вхід апаратно недоступний.');
+      if (vu && !active) notes.push('Не активний вхід: чутливість діє після перемикання на нього.');
+      if (sensLocked(i)) notes.push('У режимі очікування чутливість активного входу не змінюється.');
+      setText(r.note, notes.join(' '));
+      r.note.hidden = !notes.length;
     });
+  }
+
+  function applyVu(d, i) {
+    if (vu && d && isNum(d.sensitivityDb) && (!isNum(d.input) || d.input === i)) vu.vals[i] = d.sensitivityDb;
+    renderInputsCard();
+  }
+
+  function applyVuState(d) {
+    if (!d || !Array.isArray(d.inputs)) throw new ApiError(200, null, 'bad_response');
+    const vals = new Array(CONFIG.inputCount).fill(0);
+    d.inputs.forEach((x) => {
+      if (x && isNum(x.index) && x.index >= 0 && x.index < CONFIG.inputCount && isNum(x.sensitivityDb)) {
+        vals[x.index] = x.sensitivityDb;
+      }
+    });
+    vu = {
+      minDb: isNum(d.minDb) ? d.minDb : CONFIG.vuSensMinDb,
+      maxDb: isNum(d.maxDb) ? d.maxDb : CONFIG.vuSensMaxDb,
+      stepDb: isNum(d.stepDb) && d.stepDb > 0 ? d.stepDb : CONFIG.vuSensStepDb,
+      vals,
+    };
+  }
+
+  async function loadVu() {
+    if (vuLoading) return;
+    vuLoading = true;
+    try {
+      applyVuState(await api.get('/api/vu'));
+      vuFailed = false;
+    } catch (e) {
+      if (!vuFailed) toast('Чутливість VU: ' + errorText(e), 'error');
+      vuFailed = true;
+    }
+    vuLoading = false;
+    renderInputsCard();
   }
 
   async function toggleInput(i, want) {
@@ -147,7 +231,7 @@
       saved('inputs');
       if (wasActive) toast('Активний вхід вимкнено: пристрій перемкнувся на радіо.', 'ok');
     } catch (e) {
-      toast(errorText(e), 'error');                       // 409 / 400 / 503: перемикач повернеться зі збереженого стану
+      toast(errorText(e), 'error');                       // 409 / 400 / 503: галочка повернеться зі збереженого стану
     }
     inputsBusy = false;
     renderInputsCard();
@@ -217,6 +301,7 @@
     st = await api.get('/api/status');
     syncInputs(st.input);
     if (!cfg) loadSettings();
+    if (!vu) loadVu();                                    // чутливість читаємо, доки не отримали; далі — з відповідей POST
     render();
   }
   const poller = createPoller(refreshStatus, { intervalMs: CONFIG.settingsPollMs });
@@ -241,6 +326,6 @@
   onInputsChange(renderInputsCard);
   render();
   loadSettings();
+  loadVu();
   poller.start();
 })();
-
