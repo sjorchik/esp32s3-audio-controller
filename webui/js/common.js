@@ -73,8 +73,9 @@ const CONFIG = {
   // --- Еквалайзер радіо (Prompt 30b; web_api.md §11). Реальні межі й частоти повертає GET /api/eq ---
   eqMinDb: -12, eqMaxDb: 12, eqStepDb: 1,          // запасні значення до першої відповіді
   eqBandFreqHz: [60, 250, 1000, 4000, 12000],      // запасні підписи смуг (eq_cfg::kBandFreqHz)
-  eqRadioInput: 0,           // вхід 0 = радіо (P51b замінить показ EQ на «по входах»)
+  eqRadioInput: 0,           // ЗАСТАРІЛЕ (P51b): сторінка «Аудіо» більше не читає; лишено, поки не підтверджено, що жодна інша сторінка не вживає
   eqRetryMs: 5000,           // пауза перед повтором невдалого GET /api/eq
+  audioPollMs: 3000,         // сторінка «Аудіо» (P51b): період опитування /api/status + EQ і баланс вибраного входу (≥ 3 с)
   // --- Відключення входів (Prompt 39b; web_api.md §12) ---
   inputsRefreshMs: 10000,    // як часто перечитувати GET /api/inputs (зміна з іншого клієнта); зміна активного входу перечитує одразу
   inputsRetryMs: 5000,       // пауза після невдалого GET /api/inputs
@@ -656,6 +657,16 @@ async function setInputEnabled(index, enabled) {
   applyInputs(d);
   return d;
 }
+/* Назва входу для підписів: кеш GET /api/inputs → (необовʼязково) масив status.inputs[] → типова з CONFIG.
+   Повертає звичайний рядок; вставляти в DOM лише через textContent / el() / setText (P51b). */
+function inputName(index, statusInputs) {
+  const d = inputsState.data;
+  const a = d && d.inputs.find((x) => x.index === index);
+  if (a && a.name) return a.name;
+  const b = Array.isArray(statusInputs) && statusInputs.find((x) => x && x.index === index);
+  if (b && b.name) return b.name;
+  return CONFIG.inputDefaultNames[index] || 'Вхід ' + (index + 1);
+}
 /* Після невдалої команди: якщо вхід виявився вимкненим (гонка з іншим клієнтом) - перечитати список. */
 function noteInputError(e) {
   if (e instanceof ApiError && (e.reason === 'input_disabled' || e.code === 'input_disabled')) loadInputs().catch(() => {});
@@ -670,4 +681,5 @@ function initShell(activeId) {
   if (typeof renderNav === 'function') renderNav(activeId);
   if (api.base()) setBanner('dev', 'Режим розробки: пристрій ' + api.base().slice(7), 'info');
 }
+
 

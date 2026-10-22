@@ -1,5 +1,5 @@
 'use strict';
-/* Сторінка «Пульт» (Prompt 22). Залежить від common.js і nav.js.
+/* Сторінка «Пульт» (Prompt 22; P51b: українські підписи, лише навчальні дії, назви входів). Залежить від common.js і nav.js.
    Навчання виконує пристрій (режим IrLearn); сторінка ініціює його й опитує /api/ir/learn/status.
    Таймаути навчання (Waiting / Conflict) на пристрої є: статус Timeout лишається, доки не буде cancel / нове навчання. */
 (() => {
@@ -11,22 +11,27 @@
     over: g('l-over'), cancel: g('l-cancel'),
   };
 
-  /* Групи та українські назви; ключ — імʼя дії з API. Невідома дія → «Інше» з сирим імʼям. */
+  /* Групи та українські назви; ключ — імʼя дії з API. Невідома дія → «Інше» із сирим імʼям.
+     Підписи «Вхід: <назва>» для INPUT_* будуються з назв входів (inputName, кеш /api/inputs) під час buildMap. */
   const GROUPS = [['power', 'Живлення'], ['vol', 'Гучність і мʼют'], ['input', 'Вхід'], ['play', 'Станції й плеєр'],
-    ['tone', 'Тембр, баланс, підсилення'], ['nav', 'Навігація'], ['other', 'Інше']];
+    ['bal', 'Баланс'], ['nav', 'Навігація'], ['other', 'Інше']];
   const NAMES = {
     POWER: ['Живлення', 'power'],
-    VOL_UP: ['Гучніше', 'vol'], VOL_DOWN: ['Тихіше', 'vol'], MUTE: ['Вимкнути звук', 'vol'],
-    INPUT_RADIO: ['Вхід 1', 'input'], INPUT_TV: ['Вхід 2', 'input'],
-    INPUT_PC: ['Вхід 3', 'input'], INPUT_AUX: ['Вхід 4', 'input'],
-    BASS_UP: ['Тембр НЧ +', 'tone'], BASS_DOWN: ['Тембр НЧ \u2212', 'tone'],
-    TREBLE_UP: ['Тембр ВЧ +', 'tone'], TREBLE_DOWN: ['Тембр ВЧ \u2212', 'tone'],
-    BALANCE_UP: ['Баланс +', 'tone'], BALANCE_DOWN: ['Баланс \u2212', 'tone'],
-    GAIN_UP: ['Підсилення +', 'tone'], GAIN_DOWN: ['Підсилення \u2212', 'tone'],
+    VOL_UP: ['Гучність +', 'vol'], VOL_DOWN: ['Гучність \u2212', 'vol'], MUTE: ['Мʼют', 'vol'],
+    BALANCE_UP: ['Баланс вправо (+1 дБ)', 'bal'], BALANCE_DOWN: ['Баланс вліво (\u22121 дБ)', 'bal'],
     UP: ['Вгору', 'nav'], DOWN: ['Вниз', 'nav'], LEFT: ['Вліво', 'nav'], RIGHT: ['Вправо', 'nav'],
     OK: ['OK', 'nav'], BACK: ['Назад', 'nav'], MENU: ['Меню', 'nav'],
   };
+  const INPUT_ACTIONS = { INPUT_RADIO: 0, INPUT_TV: 1, INPUT_PC: 2 };   // → індекс логічного входу
+  /* Дії, які не навчаються (web_api.md §6.5): ENC_*, BASS_*, TREBLE_*, GAIN_*, INPUT_AUX.
+     Контракт їх у /api/ir/actions не віддає, а поле `learnable` (якщо з'явиться) має пріоритет;
+     шаблон — страховка на випадок, якщо пристрій їх усе ж поверне. */
+  const NOT_LEARNABLE = /^(ENC_|BASS_|TREBLE_|GAIN_)|^INPUT_AUX$/;
+  const isLearnable = (a) => !!a && typeof a.action === 'string' && a.learnable !== false && !NOT_LEARNABLE.test(a.action);
   function info(a) {
+    if (Object.prototype.hasOwnProperty.call(INPUT_ACTIONS, a)) {
+      return { n: 'Вхід: ' + inputName(INPUT_ACTIONS[a], st && st.inputs), g: 'input' };
+    }
     if (NAMES[a]) return { n: NAMES[a][0], g: NAMES[a][1] };
     const m = /^DIGIT_(\d)$/.exec(a);
     return m ? { n: 'Цифра ' + m[1], g: 'play' } : { n: a, g: 'other' };
@@ -116,7 +121,7 @@
     loading = true;
     try {
       const r = await api.get('/api/ir/actions', CONFIG.stationsTimeoutMs);
-      actions = Array.isArray(r) ? r : [];
+      actions = Array.isArray(r) ? r.filter(isLearnable) : [];     // нелернабельні дії не показуємо
       loaded = true; loadError = false;
       buildMap();
     } catch (e) {
@@ -275,6 +280,7 @@
   /* ---------- Опитування ---------- */
   async function refreshStatus() {
     st = await api.get('/api/status');
+    syncInputs(st.input);                         // назви входів для підписів «Вхід: <назва>»
     if (!loaded && !loading && Date.now() >= nextTry) loadMap();
     render();
   }
@@ -300,7 +306,9 @@
 
   initShell('ir');
   onConnectionChange(render);
+  onInputsChange(() => { if (loaded) { buildMap(); render(); } });   // назви входів змінились → оновити підписи
   render();
   loadMap();
   statusPoller.start();
 })();
+

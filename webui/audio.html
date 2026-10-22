@@ -20,72 +20,41 @@
 <main class="page">
   <div id="banners" class="banners"></div>
 
-  <section id="standby" class="card row-flex" hidden>
-    <p class="spacer">Пристрій у режимі очікування. Гучність, підсилення і вхід недоступні.</p>
-    <button id="btn-wake" class="btn btn-primary" type="button"><span data-icon="power"></span>Увімкнути</button>
-  </section>
-  <p id="no-proc" class="card hint" hidden>Аудіопроцесор недоступний, тому налаштувань звуку зараз немає.</p>
+  <fieldset id="grp" class="group group-bare stack" disabled>
+    <legend class="visually-hidden">Еквалайзер і баланс по входах</legend>
 
-  <div id="main" class="home-grid">
-    <div class="col">
-      <fieldset id="grp-volume" class="group card">
-        <legend class="visually-hidden">Гучність</legend>
+    <section class="card">
+      <div class="card-head">
+        <h2 class="card-title">Вхід для редагування</h2>
+      </div>
+      <div id="tabs" class="seg" role="radiogroup" aria-label="Вхід для редагування"></div>
+      <p id="scope" class="hint"></p>
+      <div class="toolbar param-actions">
+        <button id="btn-reset-input" class="btn" type="button"><span data-icon="reset"></span>Скинути вхід</button>
+      </div>
+    </section>
+
+    <div class="home-grid">
+      <section class="card">
         <div class="card-head">
-          <h2 class="card-title">Гучність</h2>
-          <span id="chip" class="badge" title="Тип аудіопроцесора">…</span>
-        </div>
-        <div class="vol-head"><span class="muted">Рівень</span><output id="vol-out" class="num" for="vol">0</output></div>
-        <div class="vol-row">
-          <button id="vol-dn" class="btn btn-icon" type="button" aria-label="Тихіше" data-icon="minus"></button>
-          <input id="vol" class="slider" type="range" min="0" max="100" step="1" value="0" aria-label="Гучність">
-          <button id="vol-up" class="btn btn-icon" type="button" aria-label="Гучніше" data-icon="plus"></button>
-          <button id="btn-mute" class="btn btn-icon" type="button" aria-pressed="false" aria-label="Вимкнути звук" data-icon="volume"></button>
-        </div>
-      </fieldset>
-
-      <fieldset id="grp-gain" class="group card">
-        <legend class="card-title">Підсилення входу</legend>
-        <div class="vol-head"><span class="muted">Поточний вхід</span><span id="gain-input"></span></div>
-        <div id="gain-seg" class="seg" role="radiogroup" aria-label="Підсилення"></div>
-        <p id="gain-db" class="hint num"></p>
-        <p class="hint">Усі значення звуку (гучність, підсилення, тембр НЧ, тембр ВЧ, баланс, тонкомпенсація) запамʼятовуються окремо для кожного входу й зберігаються після перезапуску.</p>
-      </fieldset>
-
-      <fieldset id="grp-input" class="group card">
-        <legend class="card-title">Вхід</legend>
-        <div id="inputs" class="seg" role="radiogroup" aria-label="Вхід"></div>
-        <p class="hint">Перемикання входу змінює джерело звуку й застосовує значення звуку, запамʼятовані для цього входу.</p>
-      </fieldset>
-    </div>
-
-    <div class="col">
-      <fieldset id="grp-tone" class="group card">
-        <legend class="card-title">Тембр і баланс</legend>
-        <div id="params"></div>
-        <div id="loud-box">
-          <label class="switch"><input id="loud" type="checkbox"><span>Тонкомпенсація (loudness)</span></label>
-        </div>
-        <p id="loud-no" class="hint" hidden>Цей чип або версія корпуса не підтримує тонкомпенсацію.</p>
-        <p class="hint">Тембр НЧ, тембр ВЧ, баланс і тонкомпенсація діють для поточного входу й запамʼятовуються лише для нього.</p>
-        <div class="toolbar param-actions">
-          <button id="btn-reset" class="btn" type="button"><span data-icon="reset"></span>Скинути тембр</button>
-        </div>
-      </fieldset>
-      <fieldset id="grp-eq" class="group card" hidden disabled>
-        <legend class="visually-hidden">Еквалайзер</legend>
-        <div class="card-head">
-          <h2 class="card-title">Еквалайзер радіо</h2>
+          <h2 class="card-title">Еквалайзер</h2>
           <span class="hint">5 смуг</span>
         </div>
-        <div id="eq-bands"></div>
+        <div id="eq-panels"></div>
         <p id="eq-err" class="field-error" role="alert" hidden></p>
-        <p class="hint">Один набір для всіх станцій і входів. Діє лише на інтернет-радіо, тому секція видима лише на вході «WiFi Radio». «Скинути тембр» еквалайзер не чіпає.</p>
-        <div class="toolbar param-actions">
-          <button id="btn-eq-reset" class="btn" type="button"><span data-icon="reset"></span>Скинути еквалайзер</button>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2 class="card-title">Баланс</h2>
+          <span class="hint">«+» — вправо</span>
         </div>
-      </fieldset>
+        <div id="bal-panels"></div>
+        <p id="bal-note" class="hint" hidden></p>
+        <p id="bal-err" class="field-error" role="alert" hidden></p>
+      </section>
     </div>
-  </div>
+  </fieldset>
 </main>
 
 <script src="/js/common.js"></script>
