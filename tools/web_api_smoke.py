@@ -8,7 +8,7 @@
 
 Режими:
     (без прапорців)   лише GET. Нічого не змінює на пристрої.
-    --write           POST/PUT/DELETE-перевірки: гучність, мʼют, баланс (активний і неактивний вхід), яскравість,
+    --write           POST/PUT/DELETE-перевірки: гучність, мʼют, баланс і чутливість VU (активний і неактивний вхід), яскравість,
                       вхід (без зміни), станція-тимчасова (додається й видаляється), негативні випадки
                       (очікувані 400/404: застарілі ключі /api/settings, /api/gain тощо).
                       Кожна зміна повертається до початкового значення.
@@ -21,6 +21,8 @@
 /api/power (standby), реальні factory-reset / wifi-reset.
 
 Оновлено в P50a: без processor / gain / тембру; додано GET /api/balance, menuContext, 3 входи.
+Оновлено у V2: GET /api/vu, status.vuSens; з --write — чутливість VU активного й неактивного входу (зміна й повернення),
+негативні випадки POST /api/vu (value поза діапазоном, невідомий ключ, input = 3).
 
 Код виходу: 0 — немає FAIL; 1 — є хоча б один FAIL; 2 — пристрій недоступний.
 """
@@ -36,6 +38,7 @@ PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
 VOLUME_MIN, VOLUME_MAX = 0, 100          # audio_cfg::kVolumeUiMin / kVolumeUiMax (processor.capabilities прибрано в P50a)
 INPUT_COUNT = 3                          # defaults::kInputCount (0 радіо, 1 TV Box, 2 Computer)
 BALANCE_MIN, BALANCE_MAX = -20, 20       # balance_cfg::kMinDb / kMaxDb
+VU_MIN, VU_MAX, VU_STEP = -20, 20, 1     # vu_sens_cfg::kMinDb / kMaxDb / kStepDb (V2)
 MENU_CONTEXTS = ("None", "StationList", "EqBalance")
 REMOVED_STATUS_KEYS = ("processor", "bass", "treble", "gain", "loudness")
 REMOVED_SETTINGS_KEYS = ("processorType", "bass", "treble", "balance", "loudness")
@@ -115,7 +118,7 @@ def expect(name, got, want_status, want_keys=None, want_error=None):
 # --------------------------------------------------------------------------
 def read_checks(d):
     ok, st = expect("GET /api/status", d.get("/api/status"), 200,
-                    ["mode", "menuContext", "standby", "input", "inputName", "inputs", "volume", "balance", "mute",
+                    ["mode", "menuContext", "standby", "input", "inputName", "inputs", "volume", "balance", "vuSens", "mute",
                      "playing", "streamStatus", "station", "track", "wifi", "otaProgress", "heap", "uptimeMs"])
     if ok:
         record("status.station.{index,count,max}", has_keys(st["station"], ["index", "count", "max", "name"]))
@@ -132,6 +135,9 @@ def read_checks(d):
         record("status.balance ціле в %d..%d" % (BALANCE_MIN, BALANCE_MAX),
                isinstance(st["balance"], int) and BALANCE_MIN <= st["balance"] <= BALANCE_MAX,
                "got %r" % (st["balance"],))
+        record("status.vuSens ціле в %d..%d" % (VU_MIN, VU_MAX),
+               isinstance(st["vuSens"], int) and not isinstance(st["vuSens"], bool) and VU_MIN <= st["vuSens"] <= VU_MAX,
+               "got %r" % (st["vuSens"],))
     ok_s, sett = expect("GET /api/settings", d.get("/api/settings"), 200,
                         ["inputNames", "brightness", "displayFlipped", "lastInput", "lastStation", "lastVolume",
                          "lastMute"])
@@ -161,6 +167,29 @@ def read_checks(d):
            "HTTP %s %s" % (status, str(body)[:80]))
     expect("GET /api/balance?input=-1 -> 400", d.get("/api/balance?input=-1"), 400, ["error"], "out_of_range")
     expect("GET /api/balance?input=x -> 400", d.get("/api/balance?input=x"), 400, ["error"], "invalid_value")
+
+    # --- GET /api/vu (V2) ---
+    ok_v, vu = expect("GET /api/vu", d.get("/api/vu"), 200, ["input", "minDb", "maxDb", "stepDb", "inputs"])
+    if ok_v:
+        record("vu: межі й крок == %d / %d / %d" % (VU_MIN, VU_MAX, VU_STEP),
+               vu["minDb"] == VU_MIN and vu["maxDb"] == VU_MAX and vu["stepDb"] == VU_STEP,
+               "%s / %s / %s" % (vu["minDb"], vu["maxDb"], vu["stepDb"]))
+        vins = vu["inputs"]
+        good = (isinstance(vins, list) and len(vins) == INPUT_COUNT and
+                all(has_keys(i, ["index", "sensitivityDb"]) for i in vins) and
+                [i["index"] for i in vins] == list(range(INPUT_COUNT)))
+        record("vu.inputs[] рівно %d, index 0..%d, має sensitivityDb" % (INPUT_COUNT, INPUT_COUNT - 1), good, str(vins)[:100])
+        if good:
+            record("vu: sensitivityDb цілі в %d..%d" % (VU_MIN, VU_MAX),
+                   all(isinstance(i["sensitivityDb"], int) and not isinstance(i["sensitivityDb"], bool) and
+                       VU_MIN <= i["sensitivityDb"] <= VU_MAX for i in vins), str(vins)[:100])
+        if ok:
+            record("vu: input == status.input", vu["input"] == st["input"], "%s vs %s" % (vu["input"], st["input"]))
+            if good and not st["standby"] and 0 <= st["input"] < INPUT_COUNT:
+                # у standby AppState.vuSensDb не гарантовано відображає профіль -> порівнюємо лише при працюючому пристрої
+                record("vu: inputs[active].sensitivityDb == status.vuSens",
+                       vins[st["input"]]["sensitivityDb"] == st["vuSens"],
+                       "%s vs %s" % (vins[st["input"]]["sensitivityDb"], st["vuSens"]))
 
     # --- видалені маршрути ---
     expect("GET /api/gain -> 404", d.get("/api/gain"), 404, ["error"], "not_found")
@@ -241,6 +270,23 @@ def write_checks(d, st, args):
     expect("POST /api/balance input=%d -> 400 out_of_range" % INPUT_COUNT,
            d.post("/api/balance", {"value": 0, "input": INPUT_COUNT}), 400, ["error", "min", "max"], "out_of_range")
 
+    # --- V2: POST /api/vu, негативні (валідація йде до застосування: побічних ефектів немає) ---
+    expect("POST /api/vu {} -> 400 missing_field", d.post("/api/vu", {}), 400, ["error"], "missing_field")
+    expect("POST /api/vu unknown field -> 400", d.post("/api/vu", {"value": 0, "x": 1}), 400, ["error"],
+           "unknown_field")
+    expect("POST /api/vu value=1.5 -> 400 invalid_value", d.post("/api/vu", {"value": 1.5}), 400, ["error"],
+           "invalid_value")
+    expect("POST /api/vu value=%d -> 400 out_of_range" % (VU_MAX + 1),
+           d.post("/api/vu", {"value": VU_MAX + 1}), 400, ["error", "min", "max"], "out_of_range")
+    expect("POST /api/vu value=%d -> 400 out_of_range" % (VU_MIN - 1),
+           d.post("/api/vu", {"value": VU_MIN - 1}), 400, ["error", "min", "max"], "out_of_range")
+    expect("POST /api/vu input=%d -> 400 out_of_range" % INPUT_COUNT,
+           d.post("/api/vu", {"value": 0, "input": INPUT_COUNT}), 400, ["error", "min", "max"], "out_of_range")
+    status, body = d.post("/api/vu", {"value": VU_MAX + 1})
+    record("POST /api/vu out_of_range: field=value, min/max == %d/%d" % (VU_MIN, VU_MAX),
+           status == 400 and isinstance(body, dict) and body.get("field") == "value" and
+           body.get("min") == VU_MIN and body.get("max") == VU_MAX, "HTTP %s %s" % (status, str(body)[:80]))
+
     vmin, vmax = VOLUME_MIN, VOLUME_MAX
     expect("POST /api/volume above max -> 400", d.post("/api/volume", {"value": vmax + 1}), 400, ["error", "min", "max"],
            "out_of_range")
@@ -266,11 +312,36 @@ def write_checks(d, st, args):
     else:
         record("balance неактивного входу", False, "не вдалося прочитати", skip=True)
 
+    # --- V2: чутливість VU неактивного входу: дозволено й у standby (лише профіль у Settings) ---
+    status, w0 = d.get("/api/vu")
+    if status == 200 and isinstance(w0, dict) and isinstance(w0.get("inputs"), list) and len(w0["inputs"]) == INPUT_COUNT:
+        vu_act = w0["input"]
+        vu_other = (vu_act + 1) % INPUT_COUNT
+        u0 = w0["inputs"][vu_other]["sensitivityDb"]
+        u1 = u0 + 1 if u0 < VU_MAX else u0 - 1
+        ok, b = expect("POST /api/vu {value, input:%d} (неактивний)" % vu_other,
+                       d.post("/api/vu", {"value": u1, "input": vu_other}), 200, ["input", "sensitivityDb"])
+        if ok:
+            record("vu (неактивний): відповідь input == %d, sensitivityDb == %d" % (vu_other, u1),
+                   b["input"] == vu_other and b["sensitivityDb"] == u1, str(b))
+            status, now = d.get("/api/vu")
+            record("vu (неактивний): GET inputs[%d] == %d" % (vu_other, u1),
+                   status == 200 and now["inputs"][vu_other]["sensitivityDb"] == u1, str(now)[:100])
+            if status == 200:
+                others_ok = all(now["inputs"][i]["sensitivityDb"] == w0["inputs"][i]["sensitivityDb"]
+                                for i in range(INPUT_COUNT) if i != vu_other)
+                record("vu (неактивний): інші входи не змінились", others_ok, str(now["inputs"])[:100])
+        expect("POST /api/vu повернути %d (вхід %d)" % (u0, vu_other),
+               d.post("/api/vu", {"value": u0, "input": vu_other}), 200, ["input", "sensitivityDb"])
+    else:
+        record("vu неактивного входу", False, "не вдалося прочитати", skip=True)
+
     if standby:
         record("volume/mute/balance(активний) зміни", False, "пристрій у standby (очікувано 409)", skip=True)
         expect("POST /api/volume у standby -> 409", d.post("/api/volume", {"value": st["volume"]}), 409, ["error"], "standby")
         expect("POST /api/balance (активний) у standby -> 409", d.post("/api/balance", {"value": st["balance"]}), 409,
                ["error"], "standby")
+        expect("POST /api/vu (активний) у standby -> 409", d.post("/api/vu", {"value": 0}), 409, ["error"], "standby")
     else:
         # --- гучність ---
         v0 = st["volume"]
@@ -304,6 +375,25 @@ def write_checks(d, st, args):
             status, now = d.get("/api/balance")
             record("balance: GET /api/balance == %d" % c1, status == 200 and now.get("balance") == c1, str(now))
         expect("POST /api/balance повернути %d" % c0, d.post("/api/balance", {"value": c0}), 200, ["input", "balance"])
+
+        # --- V2: чутливість VU активного входу (через AppController) ---
+        k0 = st["vuSens"]
+        k1 = k0 + 1 if k0 < VU_MAX else k0 - 1
+        ok, b = expect("POST /api/vu {value} (активний вхід)", d.post("/api/vu", {"value": k1}), 200,
+                       ["input", "sensitivityDb"])
+        if ok:
+            record("vu: відповідь input == status.input, sensitivityDb == %d" % k1,
+                   b["input"] == st["input"] and b["sensitivityDb"] == k1, str(b))
+            status, now = d.get("/api/status")
+            record("vu: /api/status.vuSens == %d" % k1, status == 200 and now.get("vuSens") == k1,
+                   "got %s" % (now.get("vuSens") if isinstance(now, dict) else now))
+            status, now = d.get("/api/vu")
+            record("vu: GET /api/vu inputs[active] == %d" % k1,
+                   status == 200 and now["inputs"][st["input"]]["sensitivityDb"] == k1, str(now)[:100])
+        expect("POST /api/vu повернути %d" % k0, d.post("/api/vu", {"value": k0}), 200, ["input", "sensitivityDb"])
+        status, now = d.get("/api/vu")
+        record("vu: після повернення inputs[active] == %d" % k0,
+               status == 200 and now["inputs"][st["input"]]["sensitivityDb"] == k0, str(now)[:100])
 
     # --- яскравість (не залежить від standby) ---
     br0 = st["brightness"]

@@ -15,6 +15,9 @@
 //   POST /api/player/station   {"index":N[,"switchInput":true]}
 //   GET  /api/balance          (P50a) [?input=N] -> {"input":N,"balance":V}
 //   POST /api/balance          (P48b) {"value":N[,"input":M]} баланс ±20 дБ активного (або вказаного) входу
+//   GET  /api/vu               (V2) чутливість VU по входах: межі + значення всіх 3 входів
+//   POST /api/vu               (V2) {"value":N[,"input":M]} чутливість VU ±20 дБ активного (або вказаного) входу;
+//                              лише відображення VU, на звук не впливає
 //   GET  /api/eq               (P30) пресет еквалайзера радіо
 //   POST /api/eq               (P30) {"gainsDb":[a,b,c,d,e]} або {"band":N,"gainDb":X}
 //   GET  /api/inputs           (P39) входи: назва, апаратна доступність, дозвіл (маска)

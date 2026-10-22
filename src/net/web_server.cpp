@@ -1,4 +1,6 @@
 // net/web_server.cpp (Prompt 13): інфраструктура, /api/status, /api/settings.
+// [V2] GET /api/status: ДОДАНО поле "vuSens" = AppStateData::vuSensDb (чутливість VU активного входу, дБ, −20..+20) поруч із
+// "balance". Решту не змінено.
 // [P50a] GET /api/status: прибрано bass / treble / gain / loudness і обʼєкт processor; додано menuContext.
 // GET /api/settings без processorType / bass / treble / balance / loudness; POST /api/settings цих ключів
 // більше не приймає (400 unknown_field). Тип процесора й заглушки чипів видалено.
@@ -165,6 +167,7 @@ void handleStatus(AsyncWebServerRequest* req) {
     doc["inputName"] = inputName;
     doc["volume"] = st.volume;
     doc["balance"] = st.balanceDb;  // дБ активного входу (−20..+20; додатне = вправо)
+    doc["vuSens"] = st.vuSensDb;    // [V2] чутливість VU активного входу, дБ (−20..+20; на звук не впливає)
     doc["mute"] = st.mute;
     // [Prompt 18] ДОДАНО
     doc["standby"] = (st.mode == Mode::Standby);

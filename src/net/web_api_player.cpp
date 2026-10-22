@@ -9,6 +9,10 @@
 // [Prompt 48b] + POST /api/balance {"value":N[,"input":M]}: цифровий баланс ±20 дБ (balance_cfg), індивідуальний для кожного
 // входу. Активний вхід (без `input` або input == поточний) — через AppController::runWebCommand(BalanceSet): DSP
 // радіо / проходу + профіль; НЕАКТИВНИЙ вхід — лише запис у Settings (як /api/eq), застосується при перемиканні.
+// [V2] + GET /api/vu і POST /api/vu {"value":N[,"input":M]}: чутливість VU (vu_sens_cfg, ±20 дБ) індивідуальна для кожного
+// входу. Зразок — /api/balance: активний вхід (без `input` або input == поточний) — через
+// AppController::runWebCommand(VuSensSet) (VU реагує одразу + профіль); НЕАКТИВНИЙ вхід — лише запис у Settings
+// (застосується при перемиканні на вхід). Чутливість VU — лише зсув показу, на звук не впливає.
 // [Prompt 46a] Пресет EQ тепер ПО ВХОДАХ (Settings::profiles[i].eqGainsDb): /api/eq читає й пише профіль
 // ПОТОЧНОГО входу (AppState.inputIndex); на екземпляр радіо (eq::setAllDb) значення потрапляє лише коли
 // поточний вхід 0. Форма запиту/відповіді не змінилась (поле `input` — у P46b).
@@ -37,6 +41,7 @@
 #include "config/audio_config.h"     // [P48a] kVolumeUiMin / kVolumeUiMax
 #include "config/balance_config.h"   // [Prompt 48b] isValidDb / kMinDb / kMaxDb
 #include "config/settings_config.h"  // [Prompt 39] normalizeInputMask
+#include "config/vu_sens_config.h"    // [V2] isValidDb / sanitizeDb / kMinDb / kMaxDb / kStepDb
 #include "core/app_controller.h"
 #include "core/app_state.h"
 #include "core/settings.h"
@@ -622,6 +627,119 @@ void handleBalance(AsyncWebServerRequest* req) {
 }
 
 // ---------------------------------------------------------------------------
+// [V2] GET /api/vu, POST /api/vu — чутливість VU по входах (vu_sens_cfg: −20..+20 дБ, крок 1, 0 = нейтрально)
+//   Чутливість — зсув рівня показу VU в дБ; на звук (гучність, EQ, баланс, ЦАП) НЕ впливає. Додатне = VU реагує
+//   сильніше, відʼємне = слабше. Індивідуальна для кожного входу (Settings::profiles[i].vuSensDb, NVS v8).
+//   GET : {"input":A,"minDb":-20,"maxDb":20,"stepDb":1,
+//          "inputs":[{"index":0,"sensitivityDb":V0},{"index":1,"sensitivityDb":V1},{"index":2,"sensitivityDb":V2}]}
+//         A = активний вхід; значення — з профілів входів (Settings), без запису й обчислень; параметрів запиту немає.
+//         Доступний завжди (також у standby й під час OTA).
+//   POST: {"value":V[,"input":N]} — V ціле vu_sens_cfg::kMinDb..kMaxDb; input 0..kInputCount−1, без поля — ПОТОЧНИЙ вхід.
+//         Поточний вхід (або input == поточний): AppController::runWebCommand(VuSensSet) — VU змінюється одразу +
+//           профіль; відмови як у /api/balance (409 standby | ota_in_progress | ir_learn_active, 400
+//           vu_sens_out_of_range, 503 busy).
+//         Неактивний вхід: лише профіль у Settings (NVS з дебаунсом); VU не змінюється до перемикання на цей вхід.
+//           Дозволено й у standby; під час OTA — 409 ota_in_progress.
+//         -> 200 {"ok":true,"input":N,"sensitivityDb":V}; 400 no_body | invalid_json | unknown_field | missing_field |
+//            invalid_value | out_of_range (value / input), 413, 409, 503.
+// ---------------------------------------------------------------------------
+struct VuSensStoreCtx {
+    uint8_t input;
+    int8_t db;
+};
+
+void storeVuSens(Settings& s, void* ctx) {
+    const VuSensStoreCtx* c = static_cast<const VuSensStoreCtx*>(ctx);
+    if (c->input < defaults::kInputCount) {
+        s.profiles[c->input].vuSensDb = vu_sens_cfg::sanitizeDb(c->db);
+    }
+}
+
+void handleVuGet(AsyncWebServerRequest* req) {
+    if (!exactUrl(req, "/api/vu")) return;
+    WEB_API_LOG("%s %s", req->methodToString(), req->url().c_str());
+    const Settings s = SettingsStore::snapshot();
+    JsonDocument doc;
+    doc["input"] = static_cast<int>(eqInputIndex());  // активний вхід (AppState), поза межами профілів -> 0
+    doc["minDb"] = static_cast<int>(vu_sens_cfg::kMinDb);
+    doc["maxDb"] = static_cast<int>(vu_sens_cfg::kMaxDb);
+    doc["stepDb"] = static_cast<int>(vu_sens_cfg::kStepDb);
+    JsonArray arr = doc["inputs"].to<JsonArray>();
+    for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+        JsonObject o = arr.add<JsonObject>();
+        o["index"] = static_cast<int>(i);
+        o["sensitivityDb"] = static_cast<int>(s.profiles[i].vuSensDb);
+    }
+    sendJson(req, 200, doc);
+}
+
+void handleVuPost(AsyncWebServerRequest* req) {
+    if (!exactUrl(req, "/api/vu")) return;
+    WEB_API_LOG("%s %s", req->methodToString(), req->url().c_str());
+
+    JsonDocument in;
+    if (!readJsonObjectBody(req, in)) return;
+    JsonObjectConst root = in.as<JsonObjectConst>();
+    if (!allowKeys(req, root, "value", "input")) return;
+
+    JsonVariantConst vv = root["value"];
+    if (vv.isNull()) {
+        sendFieldError(req, 400, "missing_field", "value");
+        return;
+    }
+    if (!vv.is<int>()) {
+        sendFieldError(req, 400, "invalid_value", "value");
+        return;
+    }
+    const int x = vv.as<int>();
+    if (!vu_sens_cfg::isValidDb(x)) {
+        sendRangeError(req, "value", vu_sens_cfg::kMinDb, vu_sens_cfg::kMaxDb);
+        return;
+    }
+
+    const uint8_t active = eqInputIndex();  // поточний вхід (AppState), поза межами профілів -> 0
+    uint8_t input = active;
+    JsonVariantConst vi = root["input"];
+    if (!vi.isNull()) {
+        if (!vi.is<int>()) {
+            sendFieldError(req, 400, "invalid_value", "input");
+            return;
+        }
+        const int n = vi.as<int>();
+        if (n < 0 || n >= defaults::kInputCount) {
+            sendRangeError(req, "input", 0, defaults::kInputCount - 1);
+            return;
+        }
+        input = static_cast<uint8_t>(n);
+    }
+
+    if (input == active) {
+        const char* why = nullptr;
+        const WebCommand c = {WebCmdType::VuSensSet, static_cast<int32_t>(x), false};
+        const WebCmdResult r = AppController::runWebCommand(c, &why);
+        WEB_API_LOG("vu %d -> result %d (%s)", x, static_cast<int>(r), why != nullptr ? why : "-");
+        if (r != WebCmdResult::Ok) {
+            sendResult(req, r, why);  // OutOfRange -> 400 "vu_sens_out_of_range" (на практиці недосяжно: межі перевірено вище)
+            return;
+        }
+    } else {
+        if (AppState::snapshot().mode == Mode::OtaUpdate) {
+            sendError(req, 409, "ota_in_progress");
+            return;
+        }
+        VuSensStoreCtx ctx;
+        ctx.input = input;
+        ctx.db = static_cast<int8_t>(x);
+        SettingsStore::modify(storeVuSens, &ctx);  // профіль входу в Settings; NVS — з дебаунсом
+    }
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["input"] = input;
+    doc["sensitivityDb"] = x;
+    sendJson(req, 200, doc);
+}
+
+// ---------------------------------------------------------------------------
 // [Prompt 39] GET /api/inputs, POST /api/inputs — доступність і відключення входів
 //   GET : {"inputs":[{"index":0,"name":"WiFi Radio","available":true,"enabled":true,
 //                     "selectable":true,"canDisable":false}, ... 3 входи (P48a) ...],
@@ -764,6 +882,8 @@ void registerPlayerRoutes(AsyncWebServer& server) {  // [P48a] без AudioProce
     server.on("/api/volume", HTTP_POST, handleVolume, nullptr, web_api::jsonBodyCallback);
     server.on("/api/balance", HTTP_GET, handleBalanceGet);  // [P50a]
     server.on("/api/balance", HTTP_POST, handleBalance, nullptr, web_api::jsonBodyCallback);  // [Prompt 48b]
+    server.on("/api/vu", HTTP_GET, handleVuGet);                                                 // [V2]
+    server.on("/api/vu", HTTP_POST, handleVuPost, nullptr, web_api::jsonBodyCallback);          // [V2]
     server.on("/api/input", HTTP_POST, handleInput, nullptr, web_api::jsonBodyCallback);
 
     // [Prompt 30] Еквалайзер радіо.
