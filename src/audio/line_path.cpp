@@ -18,6 +18,8 @@
 // EQ (processFloat) -> VU (піки після EQ, ДО гучності) -> гучність (processFloat) -> ОДНЕ насичення й
 // перетворення в int32 -> піки виходу -> TX. Проміжних округлень і насичень немає. clipCount = лише
 // фінальне насичення (після гучності). VU публікується в VuSourceLinePath (шкала int16 + kVuOffsetDb).
+// [VU1] VU_MEASURE_MODE == 1 (за замовчуванням): замість піка блоку публікується сума квадратів (після зняття DC,
+// після EQ, ДО гучності) — VuSourceLinePath::publishEnergy; усереднення, корінь і дБ — у display-задачі.
 //
 // МЬЮТИ (P47b): два джерела, одна функція applyMute(). Ефективний цифровий мʼют =
 //   s_userMute || (s_state != Running).
@@ -221,6 +223,9 @@ float    s_vuScale = 32768.0f;                    // int16-шкала × 10^(kVu
 float    s_vuDcL = 0.0f, s_vuDcR = 0.0f;
 bool     s_vuDcInit = false;
 uint32_t s_vuMaxL = 0, s_vuMaxR = 0;              // макс. опублікований пік з lp.reset (для lp.stat)
+#if VU_MEASURE_MODE == 1
+float    s_vuMaxMsqL = 0.0f, s_vuMaxMsqR = 0.0f;  // [VU1] макс. середній квадрат БЛОКУ (int16², з kVuOffsetDb) з lp.reset
+#endif
 #endif
 
 // Діагностика пам'яті / стека.
@@ -507,6 +512,44 @@ void resetDsp() {
 // ---------------------------------------------------------------------------
 
 #if ENABLE_VU
+#if VU_MEASURE_MODE == 1
+// [VU1] VU (RMS): сума квадратів блоку ПІСЛЯ EQ і ДО гучності, у шкалі int16 з калібруванням kVuOffsetDb;
+// зняття DC — те саме, що й для піка (лише для виміру). Лише float множення-додавання, без sqrtf / log10f / double.
+void publishVu(const float* f, int32_t n) {
+  float dcL = s_vuDcL;
+  float dcR = s_vuDcR;
+  if (!s_vuDcInit) {  // перший блок: без стрибка від нульового стану фільтра
+    dcL = f[0];
+    dcR = f[1];
+    s_vuDcInit = true;
+  }
+  const float a = cfg::kVuDcAlpha;
+  float       sl = 0.0f;
+  float       sr = 0.0f;
+  for (int32_t i = 0; i < n; ++i) {
+    const float xl = f[0];
+    const float xr = f[1];
+    f += 2;
+    dcL += a * (xl - dcL);
+    dcR += a * (xr - dcR);
+    const float yl = xl - dcL;
+    const float yr = xr - dcR;
+    sl += yl * yl;
+    sr += yr * yr;
+  }
+  s_vuDcL = dcL;
+  s_vuDcR = dcR;
+  const float k2 = s_vuScale * s_vuScale;  // амплітудний масштаб у квадраті
+  sl *= k2;
+  sr *= k2;
+  if (n > 0) {  // макс. середній квадрат блоку — лише для lp.stat
+    const float inv = 1.0f / static_cast<float>(n);
+    if (sl * inv > s_vuMaxMsqL) s_vuMaxMsqL = sl * inv;
+    if (sr * inv > s_vuMaxMsqR) s_vuMaxMsqR = sr * inv;
+  }
+  VuSourceLinePath::publishEnergy(sl, sr, static_cast<uint32_t>(n));
+}
+#else
 // VU: пік по блоку ПІСЛЯ EQ і ДО гучності, у шкалі int16 з калібруванням kVuOffsetDb; зняття DC лише для виміру.
 void publishVu(const float* f, int32_t n) {
   float dcL = s_vuDcL;
@@ -542,6 +585,7 @@ void publishVu(const float* f, int32_t n) {
   if (ur > s_vuMaxR) s_vuMaxR = ur;
   VuSourceLinePath::publishPeaks(ul, ur, static_cast<uint32_t>(n));
 }
+#endif  // VU_MEASURE_MODE
 #endif  // ENABLE_VU
 
 // Обробка блоку (P47d): float-конвеєр з одним насиченням у кінці.
@@ -1145,7 +1189,13 @@ bool startLocked(bool wait) {
   d.heapFreeAfter = s_heapFreeAfter;
   d.heapLargestAfter = s_heapLargestAfter;
   d.recoveries = s_recoveries;
-#if ENABLE_VU
+#if ENABLE_VU && VU_MEASURE_MODE == 1
+  // [VU1] У режимі RMS поля vuPeak*Dbfs містять максимальний RMS БЛОКУ (дБFS, шкала екрана, без +3 дБ калібрування).
+  d.vuPeakLeftDbfs = (s_vuMaxMsqL > 0.0f)
+                         ? 10.0f * log10f(s_vuMaxMsqL / (vu_cfg::kFullScale * vu_cfg::kFullScale)) : -99.0f;
+  d.vuPeakRightDbfs = (s_vuMaxMsqR > 0.0f)
+                          ? 10.0f * log10f(s_vuMaxMsqR / (vu_cfg::kFullScale * vu_cfg::kFullScale)) : -99.0f;
+#elif ENABLE_VU
   d.vuPeakLeftDbfs = (s_vuMaxL > 0) ? 20.0f * log10f(static_cast<float>(s_vuMaxL) / vu_cfg::kFullScale) : -99.0f;
   d.vuPeakRightDbfs = (s_vuMaxR > 0) ? 20.0f * log10f(static_cast<float>(s_vuMaxR) / vu_cfg::kFullScale) : -99.0f;
 #else
@@ -1218,8 +1268,13 @@ void printStats() {
   lineOut("[LINE] peaks since lp.reset: in L %.1f R %.1f dBFS | out L %.1f R %.1f dBFS\n",
           static_cast<double>(s.peakLeftDbfs), static_cast<double>(s.peakRightDbfs),
           static_cast<double>(s.peakOutLeftDbfs), static_cast<double>(s.peakOutRightDbfs));
+#if VU_MEASURE_MODE == 1
+  lineOut("[LINE] vu max block RMS since lp.reset (screen scale, offset %+.0f dB, after EQ, before volume): "
+          "L %.1f R %.1f dBFS\n",
+#else
   lineOut("[LINE] vu peak since lp.reset (screen scale, offset %+.0f dB, after EQ, before volume): "
           "L %.1f R %.1f dBFS\n",
+#endif
           static_cast<double>(cfg::kVuOffsetDb), static_cast<double>(d.vuPeakLeftDbfs),
           static_cast<double>(d.vuPeakRightDbfs));
   lineOut("[LINE] eq: clipCount=%lu (final saturation after volume) bypass=%d gains=%d %d %d %d %d dB\n",
@@ -1374,8 +1429,9 @@ void cmdCycle(int n) {
           minLargest, LP_UL(sumRx), LP_UL(sumTx), LP_UL(LinePath::stats().allocFailures));
 }
 
-// lp.vu: 3 с друкує рівні VU (0..1 за шкалою екрана) раз на kVuTestPrintMs. Читає ті самі атомарні піки, що й
-// екран (exchange), тож на цей час дає йому частину пікiв: лише для налагодження.
+// lp.vu: 3 с друкує рівні VU (0..1 за шкалою екрана) раз на kVuTestPrintMs. Режим піка (VU_MEASURE_MODE == 0):
+// читає ті самі атомарні піки, що й екран (exchange), тож на цей час дає йому частину пікiв. Режим RMS (1): власний
+// курсор різниць кумулятивних лічильників, екран нічого не втрачає. Лише для налагодження.
 void cmdVu() {
   static VuSourceLinePath src;
   lineOut("[LINE] vu: %lu ms, norm 0..1 (0 dBFS = 1.0, floor %.0f dB); the screen meter may flicker meanwhile\n",
@@ -2048,6 +2104,10 @@ void LinePath::resetStats() {
 #if ENABLE_VU
   s_vuMaxL = 0;
   s_vuMaxR = 0;
+#if VU_MEASURE_MODE == 1
+  s_vuMaxMsqL = 0.0f;
+  s_vuMaxMsqR = 0.0f;
+#endif
 #endif
 }
 
@@ -2134,3 +2194,4 @@ float LinePath::diagToneHz() { return 0.0f; }
 #endif
 
 #endif  // LINE_PATH_ENABLE
+

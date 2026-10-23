@@ -2,6 +2,7 @@
 
 // Спільна математика VU (шкала dBFS і балістика) для VuSourceDecodedPcm (радіо) та
 // VuSourceLinePath (зовнішні входи). Винесена з audio/vu_source.cpp без зміни поведінки.
+// [VU1] + msqToNorm(): середній квадрат (RMS) -> 0..1 тією самою шкалою; peakToNorm() і ballistics() не змінено.
 
 #include <math.h>
 #include <stdint.h>
@@ -33,6 +34,28 @@ inline float peakToNorm(uint32_t peak, float sensDb = 0.0f) {
     return n;
 }
 
+// [VU1] Середній квадрат за вікно (одиниці int16², повна шкала 32768 -> 2^30) -> 0..1 тією самою шкалою, що й
+// peakToNorm(): дБ = 10*log10((RMS / повна шкала)²) + kRmsOffsetDb + sensDb. kRmsOffsetDb (+3,01 дБ) вирівнює
+// синус 0 dBFS із показом за піком; sensDb (V1) додається після нього. Цифрова тиша (meanSq <= 0 або NaN) ->
+// 0.0f без log10(0) / -inf. Викликається лише з display-задачі (read()), не з гарячого шляху аудіо.
+inline float msqToNorm(float meanSq, float sensDb = 0.0f) {
+    if (!(meanSq > 0.0f)) {
+        return 0.0f;
+    }
+    float r = meanSq / (vu_cfg::kFullScale * vu_cfg::kFullScale);
+    if (r > vu_cfg::kRmsRatioCap) {
+        r = vu_cfg::kRmsRatioCap;
+    }
+    const float db = 10.0f * log10f(r) + vu_cfg::kRmsOffsetDb + sensDb;
+    float n = 1.0f - db / vu_cfg::kDbFloor;  // 0 дБ -> 1, kDbFloor -> 0
+    if (n < 0.0f) {
+        n = 0.0f;
+    } else if (n > 1.0f) {
+        n = 1.0f;
+    }
+    return n;
+}
+
 // Балістика: швидка атака (вгору), повільний спад (вниз); dt-залежна.
 inline float ballistics(float level, float target, float dtMs) {
     const float tau = (target > level) ? vu_cfg::kAttackMs : vu_cfg::kReleaseMs;
@@ -44,3 +67,4 @@ inline float ballistics(float level, float target, float dtMs) {
 }
 
 }  // namespace vu_math
+

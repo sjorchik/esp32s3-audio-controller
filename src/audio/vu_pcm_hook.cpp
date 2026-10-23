@@ -19,6 +19,11 @@
 //   -> radio_volume::process (гучність користувача, мʼют). VU міряється ДО обох послаблень (P34/P35).
 // Без логування, блокувань і millis(); мінімум обчислень.
 //
+// [VU1] VU_MEASURE_MODE == 1 (RMS, за замовчуванням): замість піка за блок міряється СУМА КВАДРАТІВ окремо для
+// L і R у шкалі int16 (відлік >> 16, float-множення-додавання, без double / sqrtf / log10f / malloc) і
+// публікується VuSourceDecodedPcm::publishEnergy(sumL, sumR, frames). Корінь, дБ і усереднення за інтервал між
+// кадрами UI робить display-задача. VU_MEASURE_MODE == 0 — піковий шлях без змін.
+//
 // [Prompt 47a] Без хука гучності радіо НЕ керується (повна шкала ЦАП на підсилювач), тому
 // VU_PCM_HOOK_STYLE != 1 -> #error (раніше #warning). Компілюється незалежно від ENABLE_VU
 // (публікація піків — лише при ENABLE_VU).
@@ -53,6 +58,19 @@ void audio_process_i2s(int32_t* outBuff, int16_t validSamples, bool* continueI2S
     if (scan > vu_cfg::kMaxFramesPerBlock) {
         scan = vu_cfg::kMaxFramesPerBlock;  // захист від виходу за буфер
     }
+#if VU_MEASURE_MODE == 1
+    // [VU1] RMS: сума квадратів у шкалі int16 (|відлік >> 16| <= 32768, квадрат <= 2^30, точний у float).
+    float sumSqL = 0.0f;
+    float sumSqR = 0.0f;
+    const int32_t* p = outBuff;
+    for (int32_t i = 0; i < scan; ++i) {
+        const float l = static_cast<float>(p[0] >> 16);
+        const float r = static_cast<float>(p[1] >> 16);
+        p += 2;
+        sumSqL += l * l;
+        sumSqR += r * r;
+    }
+#else
     uint32_t peakL = 0;
     uint32_t peakR = 0;
     const int32_t* p = outBuff;
@@ -66,13 +84,19 @@ void audio_process_i2s(int32_t* outBuff, int16_t validSamples, bool* continueI2S
         if (al > peakL) peakL = al;
         if (ar > peakR) peakR = ar;
     }
+#endif  // VU_MEASURE_MODE
 #endif  // ENABLE_VU
     // [Prompt 25] Рівень станції: послаблюємо ВЕСЬ блок (validSamples — довжина буфера).
     output_trim::process(outBuff, frames);
     // [Prompt 47a] Гучність користувача (дБ) і мʼют: останній крок; стартує замʼюченою.
     radio_volume::process(outBuff, frames);
 #if ENABLE_VU
+#if VU_MEASURE_MODE == 1
+    // [VU1] Енергія блоку (шкала int16²) — одна публікація на блок.
+    VuSourceDecodedPcm::publishEnergy(sumSqL, sumSqR, static_cast<uint32_t>(scan));
+#else
     // 2^31 -> 2^15: шкала vu_cfg::kFullScale (32768).
     VuSourceDecodedPcm::publishPeaks(peakL >> 16, peakR >> 16, static_cast<uint32_t>(scan));
+#endif  // VU_MEASURE_MODE
 #endif  // ENABLE_VU
 }

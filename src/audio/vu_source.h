@@ -14,8 +14,34 @@
 //   споживач  — ui/screens (display-задача, ядро 0): VuSourceDecodedPcm::read().
 // Обмін — без мʼютекса: lock-free atomics (див. vu_source.cpp).
 // read() викликає ОДНА задача (display); стан згладжування — у екземплярі.
+//
+// [VU1] Режим вимірювання (config/vu_config.h, VU_MEASURE_MODE): 0 = пік за блок (publishPeaks, як було),
+// 1 = RMS (publishEnergy: сума квадратів + кількість кадрів; споживач усереднює за інтервал між read()).
+// Інтерфейс read() не змінено, publishPeaks() збережено (у режимі 1 не викликається).
 
 #include <stdint.h>
+
+// [VU1] Стан споживача RMS (ЛИШЕ display-задача, лише VU_MEASURE_MODE == 1); логіка — vu_source.cpp.
+// Лічильники base* — опубліковані продюсером кумулятивні значення (за модулем 2^32) на початок поточного
+// вікна усереднення; msq* — середній квадрат останнього завершеного вікна (одиниці int16²).
+struct VuRmsState {
+    bool     init = false;
+    bool     flowing = false;
+    bool     everFlowed = false;
+    bool     warnedNoData = false;
+    uint32_t lastReadMs = 0;
+    uint32_t sinceMs = 0;
+    uint32_t lastBlocks = 0;
+    uint32_t lastChangeMs = 0;
+    uint32_t windowStartMs = 0;
+    uint32_t baseL = 0;
+    uint32_t baseR = 0;
+    uint32_t baseFrames = 0;
+    float    msqL = 0.0f;
+    float    msqR = 0.0f;
+    float    levelL = 0.0f;
+    float    levelR = 0.0f;
+};
 
 // [V1] Чутливість VU по входах: статичні VuSource::setSensitivityDb() / sensitivityDb() (див. нижче), застосовується в
 // read() обох джерел через vu_math::peakToNorm(peak, sensDb). Решту інтерфейсу не змінено.
@@ -49,7 +75,14 @@ public:
     // Без блокувань, без логування; при ENABLE_VU == 0 порожня.
     static void publishPeaks(uint32_t peakL, uint32_t peakR, uint32_t frames);
 
+    // [VU1] ДОДАНО: продюсер RMS (VU_MEASURE_MODE == 1). Викликається з аудіо-callback-а ядра 1 один раз на блок:
+    // sumSqL / sumSqR — сума квадратів семплів блоку в шкалі int16 (повна шкала 32768 -> 2^30 на кадр),
+    // frames — кількість стереокадрів у блоці. Лише float, без блокувань, логів, double і malloc;
+    // вимір суми квадратів робить викликач. Єдиний письменник — задача продюсера. При ENABLE_VU == 0 порожня.
+    static void publishEnergy(float sumSqL, float sumSqR, uint32_t frames);
+
 private:
+    VuRmsState m_rms;               // [VU1] лише display-задача
     // Лише display-задача.
     bool     m_init = false;
     bool     m_flowing = false;     // нові блоки надходять (для логу)
@@ -77,7 +110,13 @@ public:
     // (з урахуванням калібрування), frames — кількість стереокадрів у блоці.
     static void publishPeaks(uint32_t peakL, uint32_t peakR, uint32_t frames);
 
+    // [VU1] ДОДАНО: продюсер RMS (VU_MEASURE_MODE == 1), лише задача line_path (ядро 1), раз на блок.
+    // sumSqL / sumSqR — сума квадратів у шкалі int16 З урахуванням калібрування kVuOffsetDb (після EQ, ДО гучності),
+    // frames — кількість стереокадрів у блоці. Решта правил — як у VuSourceDecodedPcm::publishEnergy().
+    static void publishEnergy(float sumSqL, float sumSqR, uint32_t frames);
+
 private:
+    VuRmsState m_rms;               // [VU1] лише display-задача
     // Лише display-задача.
     bool     m_init = false;
     bool     m_flowing = false;
@@ -90,3 +129,4 @@ private:
     float    m_levelL = 0.0f;
     float    m_levelR = 0.0f;
 };
+
