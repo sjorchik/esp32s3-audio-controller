@@ -3,6 +3,8 @@
 
 Кожен файл стискається gzip (рівень 9, mtime=0 -> детермінований вихід) і
 вбудовується в прошивку масивом const uint8_t[] + таблицею kWebAssets[].
+(H2) Якщо gzip не зменшує файл (типово PNG), він зберігається сирим: запис
+kWebAssets[].gzip = false, і web_static віддає його без Content-Encoding.
 
 Два режими:
   * PlatformIO:  extra_scripts = pre:tools/build_web.py  (виконується перед кожною збіркою);
@@ -32,9 +34,20 @@ MIME = {
     ".ico": "image/x-icon",
     ".png": "image/png",
     ".txt": "text/plain; charset=utf-8",
+    ".webmanifest": "application/manifest+json",  # H2
 }
 # Текстові типи: CRLF -> LF перед стисканням (однаковий вихід на Windows і Linux).
-TEXT_EXT = {".html", ".css", ".js", ".svg", ".json", ".txt"}
+TEXT_EXT = {".html", ".css", ".js", ".svg", ".json", ".txt", ".webmanifest"}
+
+# (H2) Файли ярлика: їх відсутність лише попередження, збірку не ламає.
+EXPECTED_ICON_FILES = [
+    "/apple-touch-icon.png",
+    "/icon-192.png",
+    "/icon-512.png",
+    "/manifest.webmanifest",
+]
+# (H2) /favicon.ico (браузери просять його самі) -> той самий PNG, якщо власного файлу немає.
+FAVICON_ICO_SOURCE = "/icon-192.png"
 
 # ---------------------------------------------------------------------------
 # Визначення кореня проєкту (PlatformIO / звичайний запуск)
@@ -76,12 +89,14 @@ def gzip_bytes(data):
     return buf.getvalue()
 
 
-def aliases_for(url):
-    """Додаткові шляхи: /index.html -> /, /x.html -> /x."""
+def aliases_for(url, all_urls):
+    """Додаткові шляхи: /index.html -> /, /x.html -> /x, (H2) /icon-192.png -> /favicon.ico."""
     if url == "/index.html":
         return ["/"]
     if url.endswith(".html"):
         return [url[:-5]]
+    if url == FAVICON_ICO_SOURCE and "/favicon.ico" not in all_urls:
+        return ["/favicon.ico"]
     return []
 
 
@@ -97,7 +112,7 @@ def render_cpp(assets):
     w("// Source: webui/**, gzip level %d, mtime=0.\n\n" % GZIP_LEVEL)
     w('#include "net/web_assets.h"\n\nnamespace {\n\n')
     for i, a in enumerate(assets):
-        w("// %s (%d bytes gzip)\n" % (a["url"], len(a["gz"])))
+        w("// %s (%d bytes %s)\n" % (a["url"], len(a["gz"]), "gzip" if a["is_gz"] else "raw"))
         w("const uint8_t kAsset%d[] = {\n" % i)
         gz = a["gz"]
         for pos in range(0, len(gz), BYTES_PER_LINE):
@@ -109,10 +124,11 @@ def render_cpp(assets):
     rows = []
     for i, a in enumerate(assets):
         for path in [a["url"]] + a["aliases"]:
-            rows.append((path, a["mime"], i, len(a["gz"])))
+            rows.append((path, a["mime"], i, len(a["gz"]), a["is_gz"]))
     w("const WebAsset kWebAssets[] = {\n")
-    for path, mime, i, n in rows:
-        w("    {%s, %s, kAsset%d, %d},\n" % (c_string(path), c_string(mime), i, n))
+    for path, mime, i, n, is_gz in rows:
+        w("    {%s, %s, kAsset%d, %d, %s},\n" % (c_string(path), c_string(mime), i, n,
+                                              "true" if is_gz else "false"))
     w("};\n\n")
     w("const size_t kWebAssetCount = %d;\n" % len(rows))
     return "".join(out), len(rows)
@@ -125,7 +141,13 @@ def main():
         fail("directory not found: %s" % root)
 
     assets = []
-    for url, abs_path in collect_files(root):
+    found = collect_files(root)
+    all_urls = set(u for u, _ in found)
+    for need in EXPECTED_ICON_FILES:
+        if need not in all_urls:
+            sys.stderr.write("[build_web] WARNING: %s not found in %s (shortcut icon will be missing)\n"
+                             % (need, WEBUI_DIR))
+    for url, abs_path in found:
         ext = os.path.splitext(url)[1].lower()
         if ext not in MIME:
             fail("unsupported file type '%s' (%s); add it to MIME" % (ext, url))
@@ -133,8 +155,11 @@ def main():
             raw = f.read()
         if ext in TEXT_EXT:
             raw = raw.replace(b"\r\n", b"\n")
+        gz = gzip_bytes(raw)
+        is_gz = len(gz) < len(raw)  # H2: gzip, що збільшує файл (PNG), не застосовуємо
         assets.append({"url": url, "mime": MIME[ext], "raw": len(raw),
-                       "gz": gzip_bytes(raw), "aliases": aliases_for(url)})
+                       "gz": gz if is_gz else raw, "is_gz": is_gz,
+                       "aliases": aliases_for(url, all_urls)})
     if not assets:
         fail("no files under %s" % root)
 
@@ -151,10 +176,11 @@ def main():
         with open(out_path, "wb") as f:
             f.write(new_bytes)
 
-    print("[build_web] %-28s %9s %9s" % ("file", "raw", "gzip"))
+    print("[build_web] %-28s %9s %9s %s" % ("file", "raw", "stored", "enc"))
     tot_raw = tot_gz = 0
     for a in assets:
-        print("[build_web] %-28s %9d %9d" % (a["url"], a["raw"], len(a["gz"])))
+        print("[build_web] %-28s %9d %9d %s" % (a["url"], a["raw"], len(a["gz"]),
+                                              "gzip" if a["is_gz"] else "raw"))
         tot_raw += a["raw"]
         tot_gz += len(a["gz"])
     print("[build_web] %-28s %9d %9d" % ("TOTAL", tot_raw, tot_gz))

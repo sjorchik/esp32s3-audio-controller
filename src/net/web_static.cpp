@@ -1,4 +1,4 @@
-// net/web_static.cpp (Prompt 19): GET-маршрути для вбудованих gzip-ресурсів.
+// net/web_static.cpp (Prompt 19, H2): GET-маршрути для вбудованих ресурсів (gzip або сирі байти).
 
 #include "net/web_static.h"
 
@@ -23,7 +23,10 @@ void serveAsset(AsyncWebServerRequest* req, const WebAsset* asset) {
         req->send(503);
         return;
     }
-    res->addHeader("Content-Encoding", web_static_cfg::kContentEncoding);
+    // (H2) Двійкові ресурси, які gzip не зменшує (PNG), лежать сирими - без Content-Encoding.
+    if (asset->gzip) {
+        res->addHeader("Content-Encoding", web_static_cfg::kContentEncoding);
+    }
     res->addHeader("Cache-Control", web_static_cfg::kCacheControl);
     req->send(res);
 }

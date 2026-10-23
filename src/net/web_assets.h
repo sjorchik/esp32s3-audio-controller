@@ -12,8 +12,9 @@
 struct WebAsset {
     const char* path;     // абсолютний URL-шлях: "/", "/index.html", "/css/app.css"
     const char* mime;     // повний Content-Type (з charset для тексту)
-    const uint8_t* data;  // gzip-байти (у flash, .rodata)
+    const uint8_t* data;  // байти (у flash, .rodata): gzip, або сирі, якщо gzip не зменшує розмір
     size_t len;           // довжина data
+    bool gzip;            // (H2) true -> віддавати з Content-Encoding: gzip; false -> сирі байти (PNG)
 };
 
 extern const WebAsset kWebAssets[];
