@@ -1,0 +1,250 @@
+// Serial-тест Settings. Протокол — у settings_test.h.
+// [Prompt 21b] Поле vol змінює профіль входу Settings::lastInput; set.show друкує профілі всіх входів.
+// [Prompt 46a] Профіль = {volume, eqGainsDb[5]}: команди bass/treble/balance/loud/gain прибрано.
+// [Prompt 48a] Команду set.proc і поле processorType прибрано (аудіочіпи вирізано); show друкує balanceDb.
+
+#include "core/settings_test.h"
+
+#include "config/settings_config.h"
+
+#if SETTINGS_TEST
+
+#include <Arduino.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "config/defaults.h"
+#include "core/settings.h"
+
+namespace {
+
+constexpr const char* kPrefix = "set.";
+
+enum class Field : uint8_t {
+    Bright, Flip, Input, Station, Vol, Mute, Name, RampVol,
+};
+
+struct Edit {
+    Field field;
+    int32_t value;
+    uint8_t index;
+    char text[32];
+};
+
+// Виконується під мʼютексом SettingsStore::modify().
+void applyEdit(Settings& s, void* ctx) {
+    const Edit& e = *static_cast<const Edit*>(ctx);
+    // [Prompt 21b] Профіль входу, який зараз «активний» у Settings (lastInput).
+    InputProfile& prof = s.profiles[s.lastInput < defaults::kInputCount ? s.lastInput : 0];
+    switch (e.field) {
+        case Field::Bright:   s.brightness = static_cast<uint8_t>(e.value); break;
+        case Field::Flip:     s.displayFlipped = (e.value != 0); break;
+        case Field::Input:    s.lastInput = static_cast<uint8_t>(e.value); break;
+        case Field::Station:  s.lastStation = static_cast<uint16_t>(e.value); break;
+        case Field::Vol:      prof.volume = static_cast<int8_t>(e.value); break;
+        case Field::RampVol:  prof.volume = static_cast<int8_t>(e.value); break;
+        case Field::Mute:     s.lastMute = (e.value != 0); break;
+        case Field::Name:
+            snprintf(s.inputNames[e.index], sizeof(s.inputNames[e.index]), "%s", e.text);
+            break;
+    }
+}
+
+struct NumericCmd {
+    const char* name;
+    Field field;
+    long minV;
+    long maxV;
+};
+
+const NumericCmd kNumeric[] = {
+    {"bright",  Field::Bright,  0, 255},
+    {"flip",    Field::Flip,    0, 1},
+    {"input",   Field::Input,   0, defaults::kInputCount - 1},
+    {"station", Field::Station, 0, 65535},
+    {"vol",     Field::Vol,     -128, 127},
+    {"mute",    Field::Mute,    0, 1},
+};
+
+void printHelp() {
+    Serial.println("[SET] commands (all start with 'set.'):");
+    Serial.println("[SET]   set.show | set.save | set.ramp | set.reset | set.erase | set.help");
+    Serial.println("[SET]   set.bright 0..255   set.flip 0|1");
+    Serial.println("[SET]   set.vol -128..127   set.mute 0|1");
+    Serial.println("[SET]   (vol edits the profile of input lastInput)");
+    Serial.printf("[SET]   set.input 0..%u   set.station 0..65535   set.name <idx> <text>\n",
+                  static_cast<unsigned>(defaults::kInputCount - 1));
+}
+
+void printShow() {
+    const Settings s = SettingsStore::snapshot();
+    Serial.println("[SET] ---- settings ----");
+    for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+        Serial.printf("[SET] inputNames[%u]=\"%s\"\n", static_cast<unsigned>(i), s.inputNames[i]);
+    }
+    Serial.printf("[SET] brightness=%u displayFlipped=%d\n", static_cast<unsigned>(s.brightness),
+                  s.displayFlipped ? 1 : 0);
+    Serial.printf("[SET] lastInput=%u lastStation=%u lastMute=%d\n",
+                  static_cast<unsigned>(s.lastInput), static_cast<unsigned>(s.lastStation),
+                  s.lastMute ? 1 : 0);
+    for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+        const InputProfile& p = s.profiles[i];
+        Serial.printf("[SET] profile[%u]%s vol=%d eq=[%d %d %d %d %d] bal=%d\n", static_cast<unsigned>(i),
+                      i == s.lastInput ? "*" : " ", static_cast<int>(p.volume),
+                      static_cast<int>(p.eqGainsDb[0]), static_cast<int>(p.eqGainsDb[1]),
+                      static_cast<int>(p.eqGainsDb[2]), static_cast<int>(p.eqGainsDb[3]),
+                      static_cast<int>(p.eqGainsDb[4]), static_cast<int>(p.balanceDb));
+    }
+    Serial.printf("[SET] dirty=%d nvsWrites=%u\n", SettingsStore::isDirty() ? 1 : 0,
+                  static_cast<unsigned>(SettingsStore::writeCount()));
+}
+
+// Розбір цілого: усе слово має бути числом.
+bool parseLong(const char* str, long& out) {
+    if (str == nullptr || *str == '\0') {
+        return false;
+    }
+    char* end = nullptr;
+    out = strtol(str, &end, 10);
+    return end != str && *end == '\0';
+}
+
+void reportScheduled(const char* what, long value) {
+    Serial.printf("[SET] %s = %ld (pending, NVS write in ~%u ms; 'set.save' to force)\n", what,
+                  value, static_cast<unsigned>(settings_cfg::kSaveDebounceMs));
+}
+
+void runRamp() {
+    const uint32_t writesBefore = SettingsStore::writeCount();
+    Serial.printf("[SET] ramp: %u requestSave() calls, %u ms apart\n",
+                  static_cast<unsigned>(settings_cfg::kTestRampSteps),
+                  static_cast<unsigned>(settings_cfg::kTestRampStepMs));
+    for (uint16_t i = 0; i < settings_cfg::kTestRampSteps; ++i) {
+        Edit e{};
+        e.field = Field::RampVol;
+        e.value = i % 100;
+        SettingsStore::modify(applyEdit, &e);
+        vTaskDelay(pdMS_TO_TICKS(settings_cfg::kTestRampStepMs));
+    }
+    Serial.printf("[SET] ramp done: NVS writes during ramp = %u (expected 0), dirty=%d\n",
+                  static_cast<unsigned>(SettingsStore::writeCount() - writesBefore),
+                  SettingsStore::isDirty() ? 1 : 0);
+    Serial.println("[SET] one write should follow after the debounce; check with 'set.show'");
+}
+
+void testTask(void*) {
+    char buf[settings_cfg::kTestLineMax];
+    size_t len = 0;
+    bool overflow = false;
+
+    for (;;) {
+        while (Serial.available() > 0) {
+            const int c = Serial.read();
+            if (c == '\r' || c == '\n') {
+                if (len > 0 && !overflow) {
+                    buf[len] = '\0';
+                    SettingsTest::handleLine(buf);
+                }
+                len = 0;
+                overflow = false;
+            } else if (len < sizeof(buf) - 1) {
+                buf[len++] = static_cast<char>(c);
+            } else {
+                overflow = true;  // надто довгий рядок — відкидаємо цілком
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(settings_cfg::kTestPollMs));
+    }
+}
+
+}  // namespace
+
+bool SettingsTest::begin() {
+    const BaseType_t ok = xTaskCreatePinnedToCore(
+        testTask, "settings_test", settings_cfg::kTestTaskStackBytes, nullptr,
+        settings_cfg::kTestTaskPriority, nullptr, settings_cfg::kTestTaskCore);
+    return ok == pdPASS;
+}
+
+void SettingsTest::handleLine(const char* line) {
+    if (line == nullptr || strncmp(line, kPrefix, strlen(kPrefix)) != 0) {
+        return;  // чужі команди (інші тестові режими) ігноруємо мовчки
+    }
+
+    // Локальна копія: розбираємо на команду й залишок.
+    char buf[settings_cfg::kTestLineMax];
+    snprintf(buf, sizeof(buf), "%s", line + strlen(kPrefix));
+
+    char* cmd = buf;
+    char* args = strchr(buf, ' ');
+    if (args != nullptr) {
+        *args++ = '\0';
+        while (*args == ' ') {
+            ++args;
+        }
+    }
+    const char* argStr = (args != nullptr) ? args : "";
+
+    if (strcmp(cmd, "show") == 0) {
+        printShow();
+    } else if (strcmp(cmd, "help") == 0) {
+        printHelp();
+    } else if (strcmp(cmd, "save") == 0) {
+        Serial.printf("[SET] save: %s\n", SettingsStore::save() ? "ok" : "FAILED");
+    } else if (strcmp(cmd, "ramp") == 0) {
+        runRamp();
+    } else if (strcmp(cmd, "reset") == 0) {
+        Serial.printf("[SET] reset to defaults: %s\n",
+                      SettingsStore::resetToDefaults() ? "ok" : "FAILED");
+    } else if (strcmp(cmd, "erase") == 0) {
+        Serial.printf("[SET] erase stored key: %s (reboot to test first-run path)\n",
+                      SettingsStore::eraseStored() ? "ok" : "FAILED");
+    } else if (strcmp(cmd, "name") == 0) {
+        // set.name <idx> <текст>
+        char* text = strchr(const_cast<char*>(argStr), ' ');
+        long idx = 0;
+        if (text != nullptr) {
+            *text++ = '\0';
+        }
+        if (text == nullptr || *text == '\0' || !parseLong(argStr, idx) || idx < 0 ||
+            idx >= defaults::kInputCount) {
+            Serial.printf("[SET] usage: set.name <0..%u> <text>\n",
+                          static_cast<unsigned>(defaults::kInputCount - 1));
+            return;
+        }
+        Edit e{};
+        e.field = Field::Name;
+        e.index = static_cast<uint8_t>(idx);
+        snprintf(e.text, sizeof(e.text), "%s", text);
+        SettingsStore::modify(applyEdit, &e);
+        Serial.printf("[SET] inputNames[%ld] = \"%s\" (pending)\n", idx, e.text);
+    } else {
+        for (const NumericCmd& n : kNumeric) {
+            if (strcmp(cmd, n.name) != 0) {
+                continue;
+            }
+            long v = 0;
+            if (!parseLong(argStr, v) || v < n.minV || v > n.maxV) {
+                Serial.printf("[SET] usage: set.%s <%ld..%ld>\n", n.name, n.minV, n.maxV);
+                return;
+            }
+            Edit e{};
+            e.field = n.field;
+            e.value = static_cast<int32_t>(v);
+            SettingsStore::modify(applyEdit, &e);
+            reportScheduled(n.name, v);
+            return;
+        }
+        Serial.printf("[SET] unknown command 'set.%s' (try set.help)\n", cmd);
+    }
+}
+
+#else  // !SETTINGS_TEST
+
+bool SettingsTest::begin() {
+    return false;
+}
+
+void SettingsTest::handleLine(const char*) {}
+
+#endif  // SETTINGS_TEST

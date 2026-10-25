@@ -1,0 +1,107 @@
+#pragma once
+
+// Сховище станцій у LittleFS, формат JSON.
+// Імпорт: M3U / PLS / JSON.
+// Експорт: JSON.
+//
+// [Prompt 11] Заглушку замінено реалізацією (station_store.cpp). Публічний API
+// і struct Station НЕ змінено.
+// [Prompt 14] ДОДАНО: add/update/remove/move (редагування з вебу) та
+// lastImportError(). Наявні методи й struct Station не змінено.
+// [Prompt 25] ДОДАНО: поле Station::levelDb (В КІНЕЦЬ структури; рівень виходу декодера, дБ)
+// і код "level_out_of_range" у lastImportError(). Сигнатури методів не змінено. Формат файлу
+// сховища лишається version 1: поле необовʼязкове (немає -> дефолт), тож старі файли читаються.
+//
+// StationStore — модуль ЧИСТИХ ДАНИХ (як UiFonts/UiIcons): не апаратний, не
+// читає EventBus, не впливає на звуковий тракт. Тому його можуть читати
+// напряму і AppController, і ui/screens (а згодом веб-сервер).
+//
+// Потокобезпечність: усі методи можна викликати з будь-якої задачі.
+// get()/count() беруть короткий мьютекс; імпорт/експорт серіалізуються окремим
+// мьютексом і тривають довго (файловий ввід/вивід) — не викликати з
+// UI-задачі чи з обробника події.
+
+#include <Arduino.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "config/station_level_config.h"
+
+// Опис станції.
+struct Station {
+    uint16_t id;      // індекс у списку (заповнюється при читанні)
+    char name[64];
+    char url[192];
+    // [Prompt 25] Рівень виходу декодера для цієї станції, дБ: ціле, лише послаблення,
+    // station_level_cfg::kLevelMinDb..kLevelMaxDb (-24..0), 0 = без змін. Дефолт
+    // (station_level_cfg::kDefaultStationLevelDb; [Prompt 25c] -20 дБ) діє для
+    // `Station st;` без явного присвоєння, але memset(&st, 0, ...) дає 0 дБ — після memset
+    // поле виставляти явно. add()/update() відхиляють значення поза межами (false).
+    int8_t levelDb = static_cast<int8_t>(station_level_cfg::kDefaultStationLevelDb);
+};
+
+class StationStore {
+public:
+    // Ініціалізація сховища: завантажує /stations.json (station_store_cfg::kStoragePath).
+    // Якщо файл відсутній, порожній, пошкоджений або іншої версії — одноразовий
+    // seed вбудованого списку з негайним записом у файл. Повторні виклики
+    // безпечні. true — є хоча б одна станція (навіть якщо запис у файл не вдався).
+    // LittleFS має бути змонтовано раніше (main.cpp).
+    static bool begin();
+
+    // Кількість станцій (0 до успішного begin()).
+    static size_t count();
+
+    // Отримати станцію за індексом: копіює в out (out.id = index). false —
+    // індекс за межами списку або модуль не готовий.
+    static bool get(size_t index, Station& out);
+
+    // Імпорт списків відтворення з файлу, що вже лежить у LittleFS. Повністю
+    // заміняє список; при помилці (парсинг, переповнення, 0 валідних станцій,
+    // збій запису) старий список лишається незмінним. Після успіху список
+    // записано у сховище.
+    static bool importM3u(const char* path);
+    static bool importPls(const char* path);
+    static bool importJson(const char* path);
+
+    // Експорт: записує поточний список у path (може збігатися зі сховищем).
+    // Формат ідентичний файлу сховища: {"version":1,"stations":[{"name","url"},..]}.
+    static bool exportJson(const char* path);
+
+    // --- [Prompt 14] Редагування -------------------------------------------
+    // Спільний механізм: під мʼютексом IO зміна готується в ТИМЧАСОВІЙ копії
+    // списку, копія пишеться у файл (.tmp -> rename) і лише після успішного
+    // запису під мʼютексом даних підміняє живий список. Якщо запис не вдався,
+    // живий список не змінювався взагалі (читачі ніколи не бачать «фантомного»
+    // стану), тож відкат = відкинути копію. Станція валідується як в імпорті:
+    // url починається з http:// або https:// (і вміщується в буфер), levelDb у межах
+    // [Prompt 25] kLevelMinDb..kLevelMaxDb (поза ними — false), name
+    // непорожнє після обрізання пробілів, довше за kNameMax-1 байт — обрізається
+    // по межі UTF-8-символу. Поле st.id ігнорується.
+    // Усі чотири можуть блокуватись на запис у flash (до десятків мс) — не
+    // викликати з UI-задачі.
+
+    // true й у *outIndex (якщо не nullptr) — індекс нової станції (в кінці).
+    // false — список повний (kMaxStations), дані невалідні, запис не вдався.
+    static bool add(const Station& st, size_t* outIndex = nullptr);
+
+    // Замінює станцію за індексом. false — індекс поза межами, дані невалідні
+    // або запис не вдався.
+    static bool update(size_t index, const Station& st);
+
+    // Видаляє станцію, решта зсувається. false — індекс поза межами чи збій запису.
+    static bool remove(size_t index);
+
+    // Переміщує станцію з fromIndex на toIndex (після операції вона стоїть
+    // саме на toIndex, решта зсувається). from == to — успіх без запису.
+    // false — індекс поза межами чи збій запису.
+    static bool move(size_t fromIndex, size_t toIndex);
+
+    // Код причини останньої невдалої операції імпорту (snake_case, статичний
+    // рядок): "busy", "out_of_memory", "file_not_found", "empty", "too_big",
+    // "version_mismatch", "parse_error", "too_many_stations", "io_error",
+    // "storage_write_failed", [Prompt 25] "level_out_of_range" (JSON-імпорт: levelDb не ціле чи
+    // поза -24..0). Після успіху — "ok". Значення спільне для всіх
+    // викликів: читати одразу після імпорту (імпорти й так серіалізовані).
+    static const char* lastImportError();
+};

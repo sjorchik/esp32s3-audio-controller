@@ -1,0 +1,30 @@
+#pragma once
+
+// Веб-API керування (Prompt 18): живлення, мʼют, гучність, вибір входу, плеєр,
+// вибір станції. Усі зміни йдуть ЛИШЕ через AppController::runWebCommand(); модуль не
+// чіпає AudioPlayer напряму. [P48a] AudioProcessor вирізано: registerPlayerRoutes() без proc.
+// [Prompt 30] ВИНЯТОК: /api/eq (еквалайзер радіо) — чисто програмний DSP без заліза й без
+// стану контролера: обробник напряму викликає eq::set*() і SettingsStore::modify().
+//
+// Маршрути (докладно — docs/web_api.md):
+//   POST /api/power            {"state":"on"|"off"|"toggle"}
+//   POST /api/mute             {"mute":true|false|"toggle"}
+//   POST /api/volume           {"value":N}  або  {"step":N}
+//   POST /api/input            {"index":N}
+//   POST /api/player/{play|pause|stop|toggle|next|prev}
+//   POST /api/player/station   {"index":N[,"switchInput":true]}
+//   GET  /api/balance          (P50a) [?input=N] -> {"input":N,"balance":V}
+//   POST /api/balance          (P48b) {"value":N[,"input":M]} баланс ±20 дБ активного (або вказаного) входу
+//   GET  /api/vu               (V2) чутливість VU по входах: межі + значення всіх 3 входів
+//   POST /api/vu               (V2) {"value":N[,"input":M]} чутливість VU ±20 дБ активного (або вказаного) входу;
+//                              лише відображення VU, на звук не впливає
+//   GET  /api/eq               (P30) пресет еквалайзера радіо
+//   POST /api/eq               (P30) {"gainsDb":[a,b,c,d,e]} або {"band":N,"gainDb":X}
+//   GET  /api/inputs           (P39) входи: назва, апаратна доступність, дозвіл (маска)
+//   POST /api/inputs           (P39) {"enabled":[b|null x3]} або {"index":N,"enabled":bool}; йде через
+//                              AppController::runWebCommand(InputsEnabledSet)
+
+#include <ESPAsyncWebServer.h>
+
+// Реєструє маршрути на сервері. Викликати з web_server.cpp (registerRoutes) один раз.
+void registerPlayerRoutes(AsyncWebServer& server);

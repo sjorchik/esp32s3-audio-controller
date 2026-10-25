@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Аудіо</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+<link rel="icon" type="image/png" sizes="512x512" href="/icon-512.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#0e1116">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-row">
+    <h1 class="brand" id="brand"></h1>
+    <span id="wifi" class="wifi" role="img"></span>
+  </div>
+  <nav id="nav" class="nav" aria-label="Розділи"></nav>
+</header>
+
+<main class="page">
+  <div id="banners" class="banners"></div>
+
+  <fieldset id="grp" class="group group-bare stack" disabled>
+    <legend class="visually-hidden">Еквалайзер і баланс по входах</legend>
+
+    <section class="card">
+      <div class="card-head">
+        <h2 class="card-title">Вхід для редагування</h2>
+      </div>
+      <div id="tabs" class="seg" role="radiogroup" aria-label="Вхід для редагування"></div>
+      <p id="scope" class="hint"></p>
+      <div class="toolbar param-actions">
+        <button id="btn-reset-input" class="btn" type="button"><span data-icon="reset"></span>Скинути вхід</button>
+      </div>
+    </section>
+
+    <div class="home-grid">
+      <section class="card">
+        <div class="card-head">
+          <h2 class="card-title">Еквалайзер</h2>
+          <span class="hint">5 смуг</span>
+        </div>
+        <div id="eq-panels"></div>
+        <p id="eq-err" class="field-error" role="alert" hidden></p>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2 class="card-title">Баланс</h2>
+          <span class="hint">«+» — вправо</span>
+        </div>
+        <div id="bal-panels"></div>
+        <p id="bal-note" class="hint" hidden></p>
+        <p id="bal-err" class="field-error" role="alert" hidden></p>
+      </section>
+    </div>
+  </fieldset>
+</main>
+
+<script src="/js/common.js"></script>
+<script src="/js/nav.js"></script>
+<script src="/js/audio.js"></script>
+</body>
+</html>

@@ -1,0 +1,342 @@
+# Веб-інтерфейс: каркас фронтенду (Prompt 19, доповнено Prompt 20, 21, 22, 23, 24, 25b, 29b, 39b, 51a, 51b, V3 і H2)
+
+Документ для наступних промптів (P25+). Нові сторінки додаються **лише змінами в `webui/`** — без правок C++.
+Контракт API — `docs/web_api.md`.
+
+## 1. Як це працює
+
+```
+webui/**  --tools/build_web.py-->  src/net/web_assets_gen.cpp  --компіляція-->  gzip-масиви у flash прошивки
+```
+
+- Вихідники — `webui/` (читабельні, у git). Згенерований `src/net/web_assets_gen.cpp` у `.gitignore`.
+- `platformio.ini`: `extra_scripts = pre:tools/build_web.py` — скрипт виконується перед КОЖНОЮ збіркою. Вручну: `python tools/build_web.py` (друкує таблицю «файл / сирий / gzip»). Файл переписується лише якщо вміст змінився.
+- Для кожного `x.html` автоматично є псевдонім `/x`; `/` = `/index.html`. Нові `.html/.css/.js/.svg/.json/.ico/.png/.txt/.webmanifest` у `webui/` підхоплюються самі (інше розширення = помилка збірки).
+- Сторінки НЕ в LittleFS: `uploadfs` їх не чіпає, і вони оновлюються з прошивкою (у т.ч. через OTA). Після зміни `webui/` потрібна перепрошивка.
+- Режим AP (captive portal) має власний сервер у `wifi_manager.cpp`; вбудовані сторінки віддає лише сервер STA.
+
+## 2. Структура `webui/`
+
+| Файл | Призначення |
+|---|---|
+| `index.html` | сторінка «Головна» |
+| `css/app.css` | усі спільні стилі й токени |
+| `js/common.js` | спільний код (підключати ПЕРШИМ) |
+| `js/nav.js` | список сторінок + `renderNav()` (підключати ДРУГИМ) |
+| `js/home.js` | логіка Головної |
+| `stations.html`, `js/stations.js` | сторінка «Станції» (P20): список, форма, переміщення, імпорт / експорт; рівень станції `levelDb` — поле форми, «Застосувати», бейдж у списку (P25b) |
+| `audio.html`, `js/audio.js` | сторінка «Аудіо» (P51b, переписана): EQ (5 смуг) і баланс ДЛЯ КОЖНОГО з 3 входів — вкладки входів, повзунки, скидання параметра й «Скинути вхід»; гучність / мʼют / перемикання входу — на «Головній» (див. §5.2, §5.7) |
+| `ir.html`, `js/ir.js` | сторінка «Пульт» (P22, `/ir`; P51b: лише навчальні дії, українські підписи, «Вхід: <назва>»): мапа дій по групах, навчання, очищення, імпорт / експорт; зразок довгої операції з опитуванням статусу |
+| `settings.html`, `js/settings.js` | сторінка «Налаштування» (P23, `/settings`; з P50a / P51a — без типу процесора, 3 входи): назви входів; блок «Входи» (V3): у кожному з 3 входів галочка активації (вхід 0 завжди активний) і повзунок чутливості VU (`/api/vu`); яскравість і орієнтація дисплея, короткий підсумок Wi-Fi з посиланням на `/wifi.html`; кожне поле зберігається окремим `POST /api/settings` |
+| `wifi.html`, `js/wifi.js` | сторінка «Wi-Fi» (P29b, `/wifi`): поточне зʼєднання, збережені мережі (пріоритет, зміна пароля, видалення, «Підключитись»), скан і додавання; зразок «скан + форма» і очікування після зміни мережі (§5.6) |
+| `system.html`, `js/system.js` | сторінка «Система» (P23, `/system`): інформація з `/api/system` (за кнопкою), картка «Оновлення прошивки» (OTA, P24), сервісні дії з підтвердженням |
+| `favicon.svg` | іконка вкладки |
+| `apple-touch-icon.png` (180×180), `icon-192.png`, `icon-512.png`, `manifest.webmanifest` | іконки й маніфест ярлика на головному екрані Android / iOS (H2, §5.9) |
+
+Скрипти — класичні (`<script src>`, не модулі): `const`/функції верхнього рівня `common.js` і `nav.js` видимі в решті скриптів.
+
+## 3. Як додати сторінку
+
+1. Створіть `webui/<id>.html` за шаблоном:
+
+```html
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Станції</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+<link rel="icon" type="image/png" sizes="512x512" href="/icon-512.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#0e1116">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-row">
+    <h1 class="brand" id="brand"></h1>
+    <span id="wifi" class="wifi" role="img"></span>
+    <button id="btn-power" class="btn btn-icon" type="button" aria-pressed="false" aria-label="Живлення" data-icon="power"></button>
+  </div>
+  <nav id="nav" class="nav" aria-label="Розділи"></nav>
+</header>
+<main class="page">
+  <div id="banners" class="banners"></div>
+  <!-- вміст сторінки -->
+</main>
+<script src="/js/common.js"></script>
+<script src="/js/nav.js"></script>
+<script src="/js/stations.js"></script>
+</body>
+</html>
+```
+
+   Кнопка живлення й індикатор Wi-Fi в шапці — частина каркаса; їх поведінку зараз реалізує `home.js`. Для інших сторінок або винесіть цю логіку в `common.js`, або не показуйте елементи. Сторінка «Станції» лишає лише `#brand`, `#nav` і `#wifi` (індикатор малює `renderWifi(node, st.wifi)` зі `status`); кнопки живлення там немає.
+2. Створіть `webui/js/<id>.js`; на початку викличте `initShell('<id>')`.
+3. У `nav.js` переведіть `enabled: false` → `true` для цієї сторінки. `href` має збігатися з файлом (`/stations.html`).
+4. `python tools/build_web.py` → збірка → прошивка.
+
+## 4. CSS-компоненти (`app.css`)
+
+Токени — CSS-змінні в `:root` (темна за замовчуванням, світла через `prefers-color-scheme`): кольори `--bg --surface --surface-2 --line --text --muted --accent --accent-ink --ok --err --info`; відступи `--sp-1..--sp-6` (4/8/12/16/24/32 px); радіуси `--r-s --r-m --r-l`; `--tap` (44 px). Кольорів у компонентах не хардкодьте.
+
+| Клас | Призначення |
+|---|---|
+| `.page` | контейнер вмісту (max 960 px) |
+| `.home-grid` + `.col` | одна колонка на телефоні, дві ≥ 860 px |
+| `.card`, `.card-head`, `.card-title` | картка, її шапка, заголовок |
+| `fieldset.group` | група елементів; `disabled` на fieldset вимикає всі контролі всередині |
+| `.btn` | кнопка (≥ 44×44) |
+| `.btn-primary` / `.btn-ghost` / `.btn-danger` | варіанти |
+| `.btn-icon` / `.btn-lg` / `.btn-xl` | квадратна / велика / кругла велика; `aria-pressed="true"` підсвічує кнопку |
+| `.slider` | `<input type="range">` |
+| `.badge` + `.badge-ok/.badge-warn/.badge-err` | бейдж статусу (без модифікатора — нейтральний) |
+| `.banner` + `.banner-warn/.banner-error`, `.progress` | банер (створюйте через `setBanner`) |
+| `.toast`, `.toasts` | створюються через `toast()` |
+| `.dialog` | створюється через `confirmDialog()` |
+| `.list`, `.row` (`.idx`, `.name`, `aria-current="true"`) | прокручуваний список кнопок |
+| `.seg` (кнопки з `role="radio"`, `aria-checked`) | сегментований перемикач; `data-active="true"` на кнопці додає крапку «активний» (P51b: вкладка входу, що зараз грає на пристрої) |
+| `.form`, `.field` (`<label>` + `.input`/`.select`), `.field-error`, `.switch` | форми |
+| `.table-wrap` + `.table` | таблиця (обгортка дає горизонтальну прокрутку) |
+| `.marquee` (> `<span>`) | біжучий рядок; керується `home.js: setMarquee` |
+| `.toolbar` | ряд кнопок, що переноситься (кнопки розтягуються) |
+| `.param` > `.param-head` (назва + `output.param-val`) + `.param-row` (−, `.slider`, +, `.btn-zero`) | рядок параметра з повзунком (P21); `.slider-c` додає позначку центру. P51b: `.bal-wrap` (повзунок + `.bal-scale` «Л · 0 · П» під ним) замінює `.slider` у `.param-row` балансу; `.in-panel` — набір повзунків одного входу (ховається атрибутом `hidden`); `fieldset.group-bare` — `fieldset` без рамки й відступів (обгортка без вигляду картки) |
+| `.in-row` (+ `.param`) | рядок входу на «Налаштуваннях» (V3): `label.switch` (галочка + назва) зверху, `.param-row` (`.slider`, `output.param-val`, `.btn-zero`) знизу; рядки розділяє лінія; на вузьких екранах складання не потрібне (структура вже в два ряди) |
+| `.station-list` > `li.station` | список-картки станцій: `.station-main` (`.idx`, `.station-text` > `.station-name` + `.station-url`), `.station-actions`; `aria-current="true"` = поточна |
+| `.dialog.dialog-form` | діалог із формою (`h2`, `.form` > `.field`, `.dialog-actions`) |
+| `.badge.station-level` | приглушений бейдж рівня в `.station-main` (P25b); без крапки, ховається < 480 px |
+| `.level-val` | підпис значення («−20 дБ») праворуч від повзунка у `.param-row` форми станції (P25b) |
+| `fieldset.group.is-busy` | разом із `disabled`: «зайнято» без сильного затемнення (на час запиту) |
+| `.ir-learn`, `.ir-target` | панель навчання кнопки пульта (P22): рамка акценту, велика назва цілі; кнопки — `.dialog-actions`. Рядки дій на сторінці «Пульт» — це `ul.station-list` / `li.station` (див. вище), групи — `section.card` |
+| `.lock` | значок замка (`icon('lock')`) поруч із SSID захищеної мережі (P29b); списки мереж — це `ul.station-list` / `li.station`, смужки сигналу — `.wifi` усередині `.station-main` |
+| `.kv` | таблиця «параметр — значення» (`table.table.kv`): перша колонка приглушена, значення переносяться по символах |
+| `.danger-zone` | картка з небезпечними діями (рамка `--err`); дії — `ul.station-list` / `li.station` + `.btn-danger` для незворотних |
+| `.ota-file`, `.ota-name`, `.ota-pick`, `.ota-prog` | картка OTA (P24): рядок вибору файлу, блок передачі з `.progress` (12 px) і кнопкою «Скасувати» (поза `fieldset`) |
+| `.wait`, `.wait-box`, `.spinner` | екран очікування перезапуску (створює `waitScreen`); `p` у ньому зберігає переноси рядків |
+| `.stack`, `.row-flex`, `.spacer`, `.muted`, `.hint`, `.num`, `.visually-hidden` | службові |
+
+Правила: цілі натискання ≥ 44 px; фокус видно через `:focus-visible`; `[hidden]` завжди ховає елемент.
+
+## 5. Публічні функції `common.js`
+
+Усі глобальні. Єдиний об'єкт налаштувань — `CONFIG` на початку файлу (інтервали, тайм-аути, пороги; додавайте нові ключі туди, а не «магічні» числа в код сторінок).
+
+| Сигнатура | Опис |
+|---|---|
+| `api.get(path, timeoutMs?) → Promise<json>` | GET; JSON-відповідь |
+| `api.post(path, body?, timeoutMs?) → Promise<json>` | POST із JSON (`{}` за замовчуванням) |
+| `api.getVu(timeoutMs?) → Promise<json>` | `GET /api/vu` (V3): `{input, minDb, maxDb, stepDb, inputs:[{index, sensitivityDb}×3]}` |
+| `api.setVu(value, input?, timeoutMs?) → Promise<json>` | `POST /api/vu` (V3): `input` передавайте явно (як у `setBalance`); відповідь `{ok, input, sensitivityDb}` |
+| `api.base() → string` | базова адреса (порожня в продакшені) |
+| `class ApiError { status, code, reason, data }` | кидається при будь-якій помилці. `code` = `error` з тіла (або `network`/`timeout`/`bad_response`), `reason` = `reason` з тіла, `data` — все тіло (`field`, `min`, `max`…) |
+| `errorText(e) → string` | українське повідомлення; пошук у `REASONS` за `reason`, потім за `code` |
+| `REASONS` | словник код → текст. Нові коди додавайте сюди |
+| `toast(text, kind?)` | `kind`: `'ok'` / `'error'` / інше = info; `aria-live` |
+| `confirmDialog(text, {okText, cancelText, danger}?) → Promise<boolean>` | модальний діалог (`<dialog>`) |
+| `setBanner(id, text\|null, kind?, {progress}?)` | показати/оновити/прибрати банер у `#banners`; `kind`: `'info'`/`'warn'`/`'error'`; `progress` 0..100 малює смугу |
+| `createPoller(fn, {intervalMs}?) → {start, stop, now}` | опитування (див. §6) |
+| `connection.offline`, `onConnectionChange(fn(offline))`, `setOffline(bool)` | стан звʼязку; банер «Немає звʼязку» керується пулером |
+| `el(tag, attrs?, ...children) → Element` | будівник DOM. Рядки-діти — ЗАВЖДИ текст; `onclick: fn` додає слухач; `false/null` пропускаються |
+| `$(sel, root?)` | `querySelector` |
+| `clamp(v, lo, hi)`, `setText(node, text)`, `setAttr(node, name, value)` | `setText`/`setAttr` пишуть лише при зміні |
+| `icon(name) → SVGElement`, `setIcon(node, name)`, `hydrateIcons(root?)` | іконки: `power play pause stop prev next volume mute minus plus refresh search edit trash arrow-up arrow-down move upload download check close reset lock`; `hydrateIcons` обробляє `[data-icon]` |
+| `api.put(path, body?, timeoutMs?)`, `api.del(path, timeoutMs?)` | PUT із JSON / DELETE без тіла (P20) |
+| `api.send(method, path, body, contentType, timeoutMs?) → Promise<json>` | СИРЕ тіло (`File`/`Blob`/рядок) із заданим `Content-Type`; відповідь — JSON. Для імпорту |
+| `api.blob(path, timeoutMs?) → Promise<Blob>` | GET файлу (експорт). Помилки — як у решти `api.*` (`ApiError`) |
+| `downloadBlob(blob, name)`, `fileStamp() → 'YYYY-MM-DD'` | зберегти Blob як файл; дата для імені файлу |
+| `byteLength(s)`, `formatBytes(n)`, `debounce(fn, ms)` | довжина в байтах UTF-8 (сервер рахує байти); «12.3 КБ» / «7.0 МБ» (не число → «—»); відкладений виклик |
+| `formatUptime(ms)` | «3 діб 4 год 5 хв»; менше хвилини — «42 с» |
+| `waitScreen(title, text, spin)` → `{set(title, text, spin, button?)}` | повноекранне очікування (`.wait`); сторінка під ним стає `inert`. Закрити не можна — лише `location.reload()` |
+| `waitForDevice({delayMs, timeoutMs, intervalMs, onTick})` → `Promise<bool>` | опитує `/api/status`, поки пристрій не відповість після перезапуску: була недоступність **або** `uptimeMs` менший за час очікування (швидкий reboot) |
+| `rebootAndWait(path, body, before)` | POST (`body === undefined` → без тіла) → `waitScreen` → `waitForDevice` → `location.reload()`; таймаут → кнопка «Оновити сторінку». Помилку запиту кидає (toast — у викликача); `before()` зупиняє опитування сторінки |
+| `rssiToBars(rssi) → 0..4`, `renderWifi(node, status.wifi)` | індикатор Wi-Fi |
+| `createSlider(input, {send, onInput, onFail}) → {held, hold, release, send}` | повзунок з тротлінгом і утриманням (P21), див. §5.2 |
+| `fmtSigned(v) → string` | `+3` / `0` / `−3` (P21) |
+| `formatEta(sec) → string` | залишок часу: «8 с», «1 хв 5 с»; не число → «—» (P24) |
+| `initShell(activeId)` | заголовок, іконки, навігація, dev-банер |
+
+Нова в P22: `CONFIG.irLearnPollMs` (400), `irStatusPollMs` (2000), `irImportMaxBytes` (8192); у `REASONS` — `not_learnable`, `unknown_action`, `invalid_action`, `no_code_for_action`, `not_in_conflict`. Нових іконок і функцій немає.
+
+Нова в P23: `CONFIG.settingsPollMs` (2000), `savedMs` (1800), `inputNameMaxBytes` (31), `processorInputs` (`Tda7318`: 4, `Pt2313l`: 3), `rebootPollMs` (1500), `rebootPingMs` (2500), `rebootTimeoutMs` (60000), `apSsid`, `apAddress`, `mdnsHost`; у `REASONS` — `invalid_name`, `expected_array_of_4`, `empty_request`. `errorText` бере `min` / `max` з `errors[0]` для `POST /api/settings`.
+
+Нова в P24: `CONFIG.otaMinBytes` (262144), `otaMaxBytes` (5767168, запасний ліміт), `otaMagic` (0xE9), `otaUploadTimeoutMs` (300000), `otaRebootDelayMs` (1500), `otaRebootTimeoutMs` (90000); у `REASONS` — `incomplete`, `begin_failed`, `write_failed`, `no_ota_partition`, `ota_done_restarting`; `formatEta`. Іконок нових немає.
+
+Нова в P25b: `CONFIG.stationLevelMinDb` (−24), `stationLevelMaxDb` (0), `stationLevelDefaultDb` (−20; P25c: було −6); у `REASONS` — `level_invalid`, `level_out_of_range`; `errorText` додає межі `min…max` до `level_out_of_range` так само, як до `out_of_range`. Нових іконок і функцій немає.
+
+Нова в P29b: `CONFIG.wifiPollMs` (3000), `wifiWriteTimeoutMs` (10000), `wifiScanPollMs` (1500), `wifiScanTimeoutMs` (20000), `wifiSwitchTimeoutMs` (60000), `wifiSsidMaxBytes` (32), `wifiPassMin` (8), `wifiPassMax` (63); у `REASONS` — `wifi_ssid_invalid`, `wifi_password_invalid`, `wifi_list_full`, `wifi_scan_busy`, `wifi_busy`; іконка `lock`. Коди `index_out_of_range` / `invalid_index` у `REASONS` написані для станцій, тому `wifi.js` підміняє їх (і `not_found`) своїм текстом про мережі через локальний `errText`.
+
+Нова в P51a (за поточним `common.js`): `CONFIG.inputCount` (3), `inputDefaultNames`, `volumeMin` / `volumeMax` (0 / 100), `balanceMinDb` / `balanceMaxDb` / `balanceStepDb` / `balanceNeutralDb` (−20 / 20 / 1 / 0); `api.getBalance(input?)`, `api.setBalance(value, input?)`, `api.getEq(input?)`, `api.setEq(body, input?)` (`input` — ціле 0..2; не задано = активний вхід); у `REASONS` — `expected_array_of_3` (замість `expected_array_of_4`). Прибрано: `CONFIG.processorInputs`, `audioNeutral`, `gainStepDb`.
+
+Нова в P51b: `CONFIG.audioPollMs` (3000) — період опитування сторінки «Аудіо»; `inputName(index, statusInputs?) → string` — назва входу: кеш `GET /api/inputs` → `status.inputs[]` → `CONFIG.inputDefaultNames`. `CONFIG.eqRadioInput` ЗАСТАРІЛЕ (його читав лише старий `audio.js`), лишено до підтвердження, що жодна інша сторінка його не вживає; `eqMinDb` / `eqMaxDb` / `eqStepDb` / `eqBandFreqHz` / `eqRetryMs` — лише запасні значення (сторінка «Аудіо» бере межі й частоти з відповіді `GET /api/eq`, кількість смуг — з `eqBandFreqHz.length`). Нових `REASONS` і іконок немає.
+
+Нова в V3 (чутливість VU по входах; перевірено на залізі 2026-10-22): `CONFIG.vuSensMinDb` (−20), `vuSensMaxDb` (20), `vuSensStepDb` (1) — лише запасні значення до першої відповіді `GET /api/vu` (реальні межі віддає прошивка); `api.getVu`, `api.setVu` (див. таблицю вище). Нових `REASONS` і іконок немає: `out_of_range` з `min` / `max` уже обробляється `errorText`.
+
+**Безпека:** усе, що походить від пристрою або потоку (назви станцій, ICY-заголовок, ssid), вставляйте ТІЛЬКИ через `textContent` / `el()` / `setText`. `innerHTML` не використовується ніде і не повинен.
+
+Приклад:
+
+```js
+try {
+  const r = await api.post('/api/volume', { step: 5 });
+  toast('Гучність: ' + r.state.volume, 'ok');
+} catch (e) {
+  toast(errorText(e), 'error');      // напр. «Пристрій у режимі очікування.»
+}
+if (await confirmDialog('Перезапустити пристрій?', { okText: 'Перезапустити', danger: true })) { /* … */ }
+```
+
+`nav.js`: `NAV_PAGES` (`{id, href, title, enabled}`), `pageById(id)`, `renderNav(activeId)`.
+
+### 5.1. Форми, діалоги, імпорт / експорт (P20)
+
+Зразок — `js/stations.js`.
+
+- **Діалог із формою.** `<dialog class="dialog dialog-form">` > `<form novalidate>`: `h2`, `div.form` > `div.field` (`label` + `input.input` + `div.field-error[role=alert][hidden]`), `div.dialog-actions` (Скасувати + `submit`). Відкривати `showModal()`, у `close` — `dlg.remove()`. На час запиту вимикайте кнопки й блокуйте `cancel` (Esc). `openForm({title, submit, fields, validate, save, level?})` у `stations.js` — готова обгортка (поки локальна; винесіть у `common.js`, коли знадобиться другій сторінці).
+- **Помилки полів.** Сервер повертає `field` у тілі (`name`, `url`…) → `ApiError.data.field`; показуйте `errorText(e)` у `.field-error` цього поля, решту — `toast`. Клієнтська валідація дзеркалить серверну, а числа — у `CONFIG` (`stationNameMaxBytes`, `stationUrlMaxBytes`). Довжини — **у байтах** (`byteLength`): кирилична літера = 2 байти.
+- **Позиційні списки.** Індекси зсуваються після видалення / переміщення / імпорту: після КОЖНОЇ зміни (навіть невдалої) перечитайте і список, і `/api/status` (`write()` у `stations.js`).
+- **Імпорт.** Файл → `api.send('POST', '/api/stations/import?format=json|m3u|pls', file, contentType, CONFIG.importTimeoutMs)`. Формат — за розширенням (`.m3u8` → `m3u`). Перевірте розмір (`CONFIG.importMaxBytes`) до відправки. Імпорт ЗАМІНЯЄ весь список — спершу `confirmDialog`. Режиму «додати» контракт не має. Результат — `{count, replaced}`; помилка — `ApiError` із `reason` (= `lastImportError`).
+- **Експорт.** `const b = await api.blob('/api/stations/export'); downloadBlob(b, 'stations-' + fileStamp() + '.json')` — працює і в dev-режимі (`?device=`), бо запит іде через `api`, а не посиланням.
+- **Блокування.** `<fieldset disabled>` навколо всього інтерактивного вмісту + `is-busy`, поки триває запит; у режимах OTA / IR / WifiSetup / офлайн — той самий `disabled` і банер.
+- **Рівень станції (P25b).** `openForm(..., level: {value, apply?})` додає після текстових полів блок «Рівень, дБ»: `.field` > `label` + `.param-row` (−, `.slider` `min`/`max`/`step=1` з `CONFIG.stationLevel*`, +, `output.level-val` зі `fmtSigned` і «дБ») + `.hint` + `.field-error`. Значення йде в `vals.levelDb` (число) і з `POST` / `PUT` відправляється ЗАВЖДИ; для нової станції — `stationLevelDefaultDb`, для редагування — `levelDb` рядка (немає в старій відповіді → дефолт). Помилка з `field: "levelDb"` потрапляє під повзунок тим самим механізмом, що й `name` / `url`.
+- **«Застосувати» (P25b, лише редагування).** `level.apply(db)` шле `PUT /api/stations/{index}` з ЗБЕРЕЖЕНИМИ `name` / `url` рядка (контракт вимагає обидва; значення форми не беруться, щоб правка URL не розʼїхалась зі станцією, що грає, і не зберігалась непомітно) та `levelDb` форми. Діалог не закривається; на час запиту «Зберегти», «Скасувати» й Esc вимкнені; успіх → бейдж `.badge-ok` «Застосовано» на `CONFIG.savedMs` (ховається при русі повзунка), список перечитується у тлі (`reload()` без `guarded`). Помилка — під повзунком. «Застосувати» вже записало рівень: «Скасувати» його не відкочує. Рівень звучить наживо, лише якщо станція з цим індексом зараз грає.
+- **Список (P25b).** `GET /api/stations` → `levelDb` → `.badge.station-level` («−20 дБ»); поле відсутнє — бейджа немає.
+
+### 5.2. Повзунки параметрів і баланс по входах (P21, P51b)
+
+Зразок — `js/audio.js`. Контракт — `web_api.md` §13 (`GET` / `POST /api/balance`), §1.3 (профілі входів).
+
+- `createSlider(input, {send, onInput, onFail})`: відправка не частіше `CONFIG.volumeSendMinMs`, остаточне значення на `change`, утримання `CONFIG.volumeHoldMs` після відпускання. `send(v)` — `async`, кидає `ApiError`; при відмові toast + `onFail()` (перемалюйте з кешу). Поки `ctl.held()`, опитування не перезаписує повзунок. Кнопки −/+/«0»: виставте `input.value`, оновіть підпис, викличте `ctl.send(v)`. Межі (`min` / `max` / `step`) ставте ПЕРЕД `value`.
+- **Баланс.** Межі фіксовані: `CONFIG.balanceMinDb` / `balanceMaxDb` / `balanceStepDb` / `balanceNeutralDb` (−20…+20, крок 1, 0); `GET /api/balance` меж не віддає. Підпис значення — `fmtSigned(v) + ' дБ'` (`+3`, `−5`, `0`); «+» = вправо (лівий канал послаблюється); під повзунком позначки «Л · 0 · П» (`.bal-scale`).
+- **Запис.** `api.setBalance(value, input)` (`POST /api/balance {value, input}`) — `input` передавайте ЗАВЖДИ явно: так повзунок, привʼязаний до входу, ніколи не потрапить у профіль іншого. Відповідь `{ok, input, balance}` кладіть у кеш профілю.
+- **Гейти.** OTA → `409 ota_in_progress` для будь-якого входу (сторінка `disabled`). Баланс АКТИВНОГО входу, крім того, відповідає `409 standby` / `ir_learn_active`, `503 busy`: рядок балансу `disabled` + пояснення (`#bal-note`); баланс неактивного входу (запис у профіль) дозволено і в standby, і під час навчання. EQ гейтиться лише OTA (див. §5.7).
+- Оптимістичні значення тримає сам `createSlider` (`held()`); окремих «оптимістичних» полів сторінка не має.
+
+### 5.3. Довга операція з опитуванням статусу (P22)
+
+Зразок — `js/ir.js` (навчання кнопки пульта).
+
+- **Два пулери.** Загальний `/api/status` (`CONFIG.irStatusPollMs`) працює завжди; пулер операції (`/api/ir/learn/status`, `CONFIG.irLearnPollMs`) запускається лише поки операція триває (`session` — запущена з цієї сторінки, або `mode === 'IrLearn'` — запущена на пристрої) і зупинюється в `render()`, коли потреба зникла.
+- **Панель операції ПОЗА `fieldset.group`.** Решта сторінки під час навчання `disabled` (пристрій відповідає `409 learning_active` / `ir_learn_active`), а «Скасувати» лишається доступною.
+- **Результат Success / Timeout лишається в статусі** до `cancel` або нового навчання, тому його обробляють один раз (прапорець `finalDone`) і не скидають зайвим `cancel` — пристрій сам показує результат ~1.5 с і повертає режим. Стан `Idle` без сесії = навчання завершено.
+- **Навчання з пристрою.** `mode === 'IrLearn'` без локальної сесії: банер + та сама панель (із «Скасувати» і, при `Conflict`, «Перезаписати»). Стару `Success` / `Idle` при цьому не показуємо.
+- **Таймаут.** Пристрій сам завершує навчання статусом `Timeout`, тому при закритті сторінки скасування не надсилається.
+- **Групи за словником.** Назви / групи — словник `NAMES` у `ir.js` (ключ — імʼя дії з API); невідома дія → група «Інше» із сирим імʼям. P51b: група «Баланс» (`BALANCE_UP` / `BALANCE_DOWN` → «Баланс вправо / вліво (±1 дБ)»); підписи `INPUT_RADIO` / `INPUT_TV` / `INPUT_PC` будуються як «Вхід: <назва>» через `inputName()` (сторінка викликає `syncInputs(st.input)` і перебудовує список по `onInputsChange`).
+- **Нелернабельні дії (P51b).** `loadMap()` відкидає дії, які не навчаються: поле `learnable === false` (якщо пристрій його віддає) АБО шаблон `/^(ENC_|BASS_|TREBLE_|GAIN_)|^INPUT_AUX$/`. Контракт (`web_api.md` §6.1) поля `learnable` зараз НЕ містить — такі дії просто відсутні у `GET /api/ir/actions`; шаблон лише страхує. Лічильник «навчено N з M» рахує тільки показані дії.
+- **Імпорт мапи.** `api.send('POST', '/api/ir/map/import', текст файлу, 'application/json', …)`; перед відправкою — розмір ≤ `CONFIG.irImportMaxBytes`, JSON-масив, `confirmDialog`. Експорт — `api.blob('/api/ir/map')` → `ir-map-YYYY-MM-DD.json`.
+
+### 5.4. Налаштування та сервісні дії (P23)
+
+- **Автозбереження.** Кожен елемент (select, перемикач, повзунок) шле власний `POST /api/settings` з одним полем і показує бейдж `.badge-ok` «Збережено» на `CONFIG.savedMs`. Помилка → toast і відкат елемента.
+- **Назви входів.** Масив завжди з 3 елементів: `null` = не змінювати. Клієнтська перевірка дзеркалить сервер (1…31 байт UTF-8, без керівних символів, `byteLength`); помилка сервера з `errors[i].index` показується під відповідним полем. Кількість полів фіксована (`CONFIG.inputCount` = 3).
+- **Деструктивні дії.** `confirmDialog` (що саме зміниться / не зміниться) → кнопки блокуються (`busy`) → запит. Перезапуск і скидання налаштувань — `rebootAndWait`; скидання Wi-Fi — `waitScreen` з інструкцією без очікування відповіді (мережа зміниться).
+- **Важкий ендпоінт.** `/api/system` не опитується: читається при відкритті та за кнопкою «Оновити».
+- **Блокування.** Лише `offline` / ще немає даних; режими `OtaUpdate` / `IrLearn` / `WifiSetup` на «Налаштуваннях» дають попередження без блокування (контракт їх не забороняє). На «Системі» під час OTA (з пристрою чи іншого клієнта) вимкнені сервісні дії та старт нового оновлення (див. §5.5).
+
+### 5.5. OTA-оновлення прошивки (P24)
+
+Зразок — картка «Оновлення прошивки» в `system.html` / `js/system.js`. Контракт — `web_api.md` §8.4.
+
+- **Запит.** Сире тіло `.bin`, `Content-Type: application/octet-stream`, без multipart; `Content-Length` ставить браузер (chunked пристрій не підтримує). Використовується `XMLHttpRequest` (`xhr.upload.onprogress` дає прогрес передачі; `fetch` — ні). URL — `api.base() + '/api/ota'`, тож працює і в dev-режимі. Запит **поза чергою `api.*`**, тайм-аут `CONFIG.otaUploadTimeoutMs`.
+- **Підготовка до старту.** `confirmDialog` (danger) → `uploading = true` → `poller.stop()` → `await api.get('/api/status')`: цей запит стає в чергу ПІСЛЯ вже відправлених, тож черга спорожніла; заодно режим перевіряється свіжим статусом (`OtaUpdate` / `IrLearn` / `WifiSetup` → відмова, `blockReason`).
+- **Блокування.** Поки `uploading`: усі `fieldset` сторінки `disabled`, кнопки «Оновити» (інформація) і вибору файлу вимкнені, опитувань немає, `beforeunload` просить підтвердити закриття / перехід. Блок прогресу стоїть ПОЗА `fieldset`, щоб «Скасувати» лишалась доступною (як панель навчання в §5.3).
+- **Перевірки файлу ДО відправки** (`checkImage`): розширення `.bin`; розмір > 0, ≥ `otaMinBytes` (відсікає `bootloader.bin`, `partitions.bin`), ≤ `ota.maxImageBytes` зі `/api/system` (запасно `otaMaxBytes`); перший байт = `otaMagic` (`file.slice(0, 1)`). Перевірка повторюється перед діалогом.
+- **Прогрес.** Смуга + «N% · відправлено з усього · швидкість (середня) · залишок». Коли `upload.onload` спрацював (`sent`) — смуга 100 %, текст «пристрій перевіряє образ…», «Скасувати» ховається (після повної передачі пристрій уже верифікує й перезапускається). Прогрес ЗАПИСУ на пристрої не опитується (опитування зупинені); показує лише передачу.
+- **Скасування.** `xhr.abort()` → пристрій бачить розрив зʼєднання й повертає режим і звук (за контрактом: «на помилці звук і режим відновлюються»); активний слот не змінюється, бо перемикання слота відбувається лише після успішної перевірки. Після скасування й після помилки опитування `/api/status` відновлюється.
+- **Помилки.** Відповідь із `ok:false` → `ApiError(status, data, data.error)` → `errorText` (спершу `reason`, потім `error`); результат — банер `ota-result` (error / info). Обрив `network` / `timeout` ДО кінця передачі → «стан пристрою невідомий». Обрив `network` ПІСЛЯ `upload.onload` (відповідь могла загубитись при перезапуску) → та сама гілка очікування, що й після успіху.
+- **Після успіху** (`200 {ok, restarting}`): `waitScreen` → `waitForDevice({delayMs: otaRebootDelayMs, timeoutMs: otaRebootTimeoutMs})` → `GET /api/system` → підсумок на екрані очікування: «Було» (останній `/api/system` до оновлення) / «Стало», час роботи, причина скидання; кнопка «Оновити сторінку». Висновку «успіх / невдача» за версією немає: `buildDate` — час компіляції окремого файлу і може не змінюватись. `restarting:false` → прохання перезапустити живленням (`/api/system/reboot` відхиляється, доки OTA не завершено). Таймаут → «Пристрій не відповідає… можливо, потрібна перепрошивка по USB».
+- **Безпека.** Імʼя файлу, версія, дата збірки — лише через `setText` / `textContent`.
+
+### 5.6. Wi-Fi: скан, додавання, зміна мережі (P29b)
+
+Зразок — `js/wifi.js`. Контракт — `web_api.md` §7.
+
+- **Позиційні індекси.** Рядки зі `GET /api/wifi` мають `index`; будь-яка дія (`act()`: `busy` → запит → завжди `GET /api/wifi`) блокує `fieldset`, а після неї, навіть невдалої, список перечитується. Перемальовування списків — лише якщо дані змінились (ключ `JSON.stringify`), щоб опитування не збивало фокус.
+- **Опитування.** `GET /api/status` (режими) + `GET /api/wifi` кожні `wifiPollMs`; поки триває дія чи скан, список не опитується.
+- **Скан.** `POST /api/wifi/scan` йде через `api.send('POST', …)` без тіла (контракт: «без тіла»); далі `GET /api/wifi/scan` кожні `wifiScanPollMs` до `done` / `failed` або `wifiScanTimeoutMs`. `409 wifi_scan_busy` не помилка: просто чекаємо результат. Перед першим скануванням у сесії — `confirmDialog` про можливу просадку звуку. Статус «збережена» у результатах рахується порівнянням SSID зі свіжим списком, а не з прапорця `saved` зі скану.
+- **Форма мережі.** `openNetForm({title, submit, ssid, fixed, mode, save})` (локальна у `wifi.js`): `mode` = `required` (захищена зі скану), `none` (відкрита зі скану, поля пароля немає), `optional` (вручну; порожній = відкрита), `edit` (зміна пароля наявної; порожній пароль не дозволений, відкритою мережу робить окремий перемикач). Пароль — `type=password` + «Показати пароль», `autocomplete="new-password"`; після відправки (успіх чи ні) поле очищається, значення ніде не зберігається й не логується. Помилки сервера з `field` (`ssid`, `password`) показуються під полем, решта — `toast`.
+- **Валідація.** SSID — 1…32 БАЙТИ UTF-8 (`byteLength`), пароль — порожній або 8…63 символи, без керівних символів. Нову мережу додає `POST /api/wifi/networks` без `position` (у кінець); наявний SSID — оновлення пароля (дозволене й при заповненому списку).
+- **Після зміни мережі (`connect`).** `confirmDialog` → `POST /api/wifi/connect {index}` (відповідь надходить ДО перемикання) → якщо `switching:false` — повідомлення «вже поточна»; інакше `poller.stop()` → `waitScreen` → `waitForDevice({delayMs: inMs, timeoutMs: wifiSwitchTimeoutMs})` → `location.reload()`. Якщо пристрій не відповів за тією ж адресою (IP міг змінитись) — екран з інструкцією (`audio.local` / адреса на екрані пристрою) і кнопкою «Оновити сторінку». Відповідь `waitForDevice` «true» вимагає, щоб було помічено розрив зʼєднання; дуже швидке перемикання без розриву дасть таймаут.
+- **Гейти.** `OtaUpdate` / `IrLearn` / `WifiSetup` / офлайн → банер і `fieldset disabled`; `409 ota_in_progress`, `ir_learn_active`, `503 busy` показуються через `errorText`.
+
+### 5.7. Сторінка «Аудіо»: EQ і баланс по входах (P30b → P51b)
+
+Зразок — `js/audio.js`. Контракт — `web_api.md` §11 (`GET` / `POST /api/eq`), §13 (баланс), §12 (вимкнені входи).
+
+- **Вкладки входів.** `#tabs` (`.seg`, `role="radiogroup"`): по одній кнопці на ВИДИМИЙ вхід; назви — `inputName(i, st.inputs)` (кеш `/api/inputs`), вимкнені входи (`isInputEnabled`) ховаються, як на «Головній». При відкритті обирається активний вхід (`status.input`); пізніші зміни активного входу на пристрої вибір НЕ переносять (лише якщо вибраний вхід зник зі списку). Активний вхід пристрою позначає `data-active="true"` (крапка) і `aria-label` «…, зараз грає». Клік по вкладці НІКОЛИ не шле `POST /api/input` — це лише вибір профілю для редагування; підпис `#scope` пояснює, що для неактивного входу звук не зміниться до перемикання на нього.
+- **Набір повзунків на кожен вхід.** `buildPanel(i)` створює для кожного входу власні 5 повзунків EQ + повзунок балансу (окремі `createSlider`, `.in-panel`, невибрані — `hidden`). Відкладена відправка повзунка ніколи не втрапить у профіль іншого входу після перемикання вкладки, а `held()` працює незалежно по входах. Усі `send` привʼязані до `i`: `api.setEq({band, gainDb}, i)`, `api.setBalance(v, i)`.
+- **Кеш профілів.** `prof[i] = {eq: {gainsDb, freqHz, minDb, maxDb, stepDb} | null, bal: число | null}`. Частоти (підписи «60 Гц», «1 кГц»), межі й крок беруться з відповіді `GET /api/eq?input=i` (до першої відповіді рядки `disabled` з підписами «Смуга N»). Відповідь з чужим `input` ігнорується.
+- **Опитування.** `createPoller(refresh, {intervalMs: CONFIG.audioPollMs})` (3 с; пауза в прихованій вкладці): `GET /api/status` → `syncInputs(st.input)` → `GET /api/eq?input=sel` + `GET /api/balance?input=sel` ВИБРАНОГО входу (зміни з екрана EQ на пристрої підтягуються). Повзунок, який тримають (`held()`), не перезаписується. Після кліку по вкладці — `poller.now()`. Помилки читання профілю (4xx) показуються під картками (`#eq-err`, `#bal-err`), збої звʼязку (`network` / `timeout`) віддаються пулеру (банер «Немає звʼязку»).
+- **Запис EQ.** Один повзунок → `POST /api/eq {band, gainDb, input}`; відповідь містить весь пресет → кеш → перемальовуються всі повзунки, крім тих, що тримають.
+- **Скидання.** Біля кожного повзунка «0» (лише цей параметр). «Скинути вхід» — `confirmDialog`, потім `POST /api/eq {gainsDb:[0,0,0,0,0], input}` і `POST /api/balance {value:0, input}` (два незалежні запити; якщо один відмовив — toast із причиною, інший виконується). Гучність не чіпається.
+- **Гейти.** `#grp` (`fieldset`) `disabled` лише при офлайні й OTA. Баланс активного входу додатково — у standby / `IrLearn` (див. §5.2). Банери: OTA, навчання пульта.
+- **Підпис.** Усе, що надходить від пристрою (назви входів), — лише через `textContent` (`el()` / `setText`).
+
+### 5.8. Відключення зовнішніх входів (P39b)
+
+Зразки — `js/settings.js` (блок «Входи»), `js/home.js` і `js/audio.js` (`visibleInputs` / `renderTabs`). Контракт — `web_api.md` §12 (`GET` / `POST /api/inputs`, `409 input_disabled` для `POST /api/input`).
+
+- **Спільний кеш у `common.js`.** `GET /api/status.inputs[]` не містить `enabled`, тому список вимкнених входів читається окремо й живе в одному кеші на сторінку: `getInputs()` (дані або `null`), `isInputEnabled(index)` (невідомо → `true`; радіо → завжди `true`), `loadInputs()` (злиті паралельні виклики, кидає `ApiError`), `syncInputs(currentInput)`, `setInputEnabled(index, enabled)` (`POST /api/inputs`, відповідь одразу в кеш), `onInputsChange(fn)` (виклик лише коли дані реально змінились), `noteInputError(e)`. Нові ключі `CONFIG.inputsRefreshMs` (10000) і `inputsRetryMs` (5000); `REASONS.input_disabled`.
+- **Оновлення списку.** Окремого пулера немає: кожна сторінка викликає `syncInputs(st.input)` у своєму `refreshStatus`. Список перечитується при першому виклику, одразу при зміні активного входу (в т.ч. коли пристрій сам перейшов на радіо після вимкнення активного входу) і не рідше ніж раз на `inputsRefreshMs`. Зміна з іншого клієнта видна не пізніше цього інтервалу; у прихованій вкладці опитування (а з ним і оновлення) стоїть. Помилка `GET /api/inputs` не показується (повтор через `inputsRetryMs`), доки список не завантажено, вхід вважається ввімкненим.
+- **«Головна» і «Аудіо».** Вимкнені входи ПРИХОВУЮТЬСЯ (не дизейблються): фільтр `available && isInputEnabled(index)`; на «Аудіо» (P51b) це вкладки входів, `index < CONFIG.inputCount`, підпис вкладок (`tabsSig`) лише з видимих входів, `onInputsChange` викликає `render()`. На «Головній» невдала команда входу викликає `noteInputError(e)`: для `input_disabled` показується toast і список перечитується одразу (на «Аудіо» вхід не перемикається). Сторінка «Пульт» (P51b) лише бере назви входів для підписів «Вхід: <назва>».
+- **«Налаштування → Входи» (V3).** Кожен з 3 входів — окремий рядок: галочка активації (`POST /api/inputs {index, enabled}`, назва з `GET /api/inputs`) і поруч повзунок чутливості VU (`GET` / `POST /api/vu`, web_api §15). Радіо — галочка завжди ввімкнена й неактивна («Радіо завжди доступне»). Вхід, недоступний апаратно (`available:false`), показується з поясненням. Вимкнені входи на цій сторінці НЕ ховаються (на відміну від «Головної»): рядок лишається, повзунок доступний — чутливість можна налаштувати до ввімкнення. Межі, крок і початкові значення — з `GET /api/vu` (`minDb` / `maxDb` / `stepDb`, `inputs[i].sensitivityDb`), значення підписане зі знаком (`+3 дБ`, `−5 дБ`, `0 дБ`), кнопка «0» скидає вхід у нейтраль. Повзунок змінює значення через `createSlider` (тротлінг, утримання `held()`, опитування його не перезаписує); `send` привʼязаний до входу: `api.setVu(v, i)`. Для активного входу зміна діє на VU одразу; для неактивного — лише запис у профіль, діє після перемикання на цей вхід (пояснення під рядком). Повзунок АКТИВНОГО входу вимкнено в standby (сервер відповідає `409 standby`). Під час запиту галочки заблоковані; помилки (`409 ota_in_progress` / `ir_learn_active` / `standby`, `503 busy`, `400 out_of_range`) — toast через `errorText`, галочка і повзунок повертаються до збереженого стану. Вимкнення активного входу — toast «пристрій перемкнувся на радіо». Секція працює в standby, і під час OTA / IR / WifiSetup (помилка пояснюється сервером); лише offline вимикає весь `fieldset`.
+- **Обмеження.** Назви входів у блоці «Входи» оновлюються після «Зберегти назви» та за періодичним оновленням; зовнішня зміна маски з пристрою неможлива (на дисплеї й пульті керування немає).
+
+### 5.9. Іконка ярлика на головному екрані (H2)
+
+Проблема: Android-браузери (Chromium, Opera) для «Додати на головний екран» не беруть SVG і без PNG-іконки малюють літерну плитку.
+
+- **Файли** (кладуться в корінь `webui/`, створює власник, чат їх не змінює): `apple-touch-icon.png` (180×180), `icon-192.png`, `icon-512.png` — повнорозмірний темний квадрат без прозорості, графіка в центральній «безпечній зоні» (для `maskable`); `manifest.webmanifest` (`name` «Аудіоконтролер», `short_name` «Аудіо», `start_url` `/`, `display` `standalone`, іконки 192 / 512 з `purpose: "any maskable"`, `theme_color` / `background_color` `#0e1116`).
+- **Теги в `<head>` КОЖНОЇ сторінки** (після `favicon.svg`; нову сторінку робити за шаблоном §3): `apple-touch-icon`, два `icon` PNG (192 і 512), `manifest`, `meta theme-color #0e1116`.
+- **Збірка.** `build_web.py` знає `.webmanifest` (`application/manifest+json`). gzip застосовується лише коли справді зменшує файл; PNG зазвичай лишається сирим (таблиця збірки показує `gzip` / `raw`), для таких ресурсів `kWebAssets[].gzip = false`, і `web_static` не додає `Content-Encoding`. Якщо якогось з чотирьох файлів немає в `webui/`, збірка друкує `WARNING` і триває. `/favicon.ico` автоматично віддає `icon-192.png` (якщо немає власного `webui/favicon.ico`).
+- **Як перегенерувати PNG.** Заміни файли в `webui/` (тими самими іменами й розмірами: 180, 192, 512 px), перепрошити. Хеша / версії в URL немає: ресурси віддаються з тим самим `Cache-Control`, що й сторінки (§9), тож після зміни іконки на телефоні треба ВИДАЛИТИ старий ярлик і додати новий.
+- **Обмеження.** Сторінка по HTTP, тому «установлення PWA» (WebAPK) недоступне: ярлик — звичайна закладка з іконкою, яку браузер знайшов за `<link>`. Чи візьме Opera саме ці файли, перевіряється лише на пристрої (`hwcheck_h2.md`).
+
+## 6. Шаблон опитування
+
+```js
+let st = null;
+async function refresh() {
+  st = await api.get('/api/status');   // кинути помилку = невдача
+  render();
+}
+const poller = createPoller(refresh, { intervalMs: CONFIG.pollStatusMs });
+poller.start();
+// після команди: poller.now();
+```
+
+- Запити НІКОЛИ не йдуть паралельно: усі `api.*` виконуються однією послідовною чергою, пулер починає наступний цикл лише після завершення попереднього.
+- На прихованій вкладці (`document.hidden`) опитування призупиняється й відновлюється одразу при поверненні.
+- Помилка → інтервал ×`pollBackoffFactor` (до `pollBackoffMaxMs`); після `offlineAfterFailures` збоїв ЗВʼЯЗКУ (`network`/`timeout`) з'являється банер «Немає звʼязку з пристроєм». Інші помилки (4xx/5xx) банер не вмикають.
+- Окремі пулери для `/api/ir/learn/status` (300–500 мс) і `/api/system` (≥ 5 с) створюйте тим самим `createPoller(fn, {intervalMs})`; не запускайте кілька одночасно, якщо в цьому немає потреби.
+- Команди керування повертають `{ok, state}` — використайте для миттєвого оновлення UI, потім `poller.now()`.
+
+## 7. Словник `reason`
+
+Повний словник — об'єкт `REASONS` у `common.js` (коди керування: `standby`, `ota_in_progress`, `ir_learn_active`, `not_radio_input`, `wifi_setup`, `no_stations`, `input_disabled` (P39b), `station_out_of_range`, `index_out_of_range`, `volume_out_of_range`, `out_of_range`, `apply_failed`, `busy`, `restart_pending`; а також загальні, станцій/імпорту (з P25b — `level_invalid`, `level_out_of_range`), OTA (`bad_image`, `bad_magic`, `too_small`, `image_too_large`, `verify_failed`, `incomplete`, `begin_failed`, `write_failed`, `no_ota_partition`, `ota_busy`, `ota_done_restarting`, `length_required`, `unsupported_content_type`), IR). Кодів `input_unavailable`, `gain_out_of_range`, `not_supported` більше немає (P50a). Невідомий код → «Помилка: <код>». Для `out_of_range` з `min`/`max` межі додаються до тексту автоматично (баланс і EQ — `400 out_of_range`).
+
+## 8. Розробка на ПК
+
+1. У `config/web_api_config.h` поставте `#define WEB_API_DEV_CORS 1`, перепрошийте (лише для розробки!).
+2. `cd webui && python -m http.server 8000`.
+3. Відкрийте `http://localhost:8000/?device=192.168.x.x` — адреса пристрою запамʼятається в `sessionStorage` вкладки (скинути: `?device=`). Усі запити підуть на `http://192.168.x.x/api/...`; зверху зʼявиться банер «Режим розробки».
+4. Правки HTML/CSS/JS видно після перезавантаження сторінки, без перепрошивки. Для релізу: `WEB_API_DEV_CORS 0`, `python tools/build_web.py`, збірка, прошивка.
+5. Змішаний вміст: сторінка з `http://localhost` до `http://IP` дозволена; з `https://` — ні.
+
+## 9. Обмеження
+
+- Усі сторінки й API — HTTP, без автентифікації.
+- Кожен файл віддається з `Cache-Control: no-cache` без ETag — при кожному завантаженні сторінки браузер отримує файли повністю (gzip, ≈ 17 КБ для Головної).
+- Список станцій на сторінці «Станції» опитується повільніше за Головну (`CONFIG.stationsPollMs`); якщо `station.count` у статусі не збігається з довжиною списку — список перечитується автоматично (зміна з пристрою / іншого клієнта з тією самою кількістю станцій не помітна — є кнопка «Оновити»).
+- «Аудіо» (P51b): за один цикл опитування (3 с) іде 3 запити (`/api/status`, `/api/eq?input=N`, `/api/balance?input=N`) лише для ВИБРАНОГО входу; профілі інших входів читаються при першому виборі вкладки й далі оновлюються лише коли вкладку відкрито. Зміну профілю неактивного входу з іншого клієнта видно, коли вкладку відкрито.
+- Сторінка «Пульт» під час навчання опитує статус кожні `irLearnPollMs` (400 мс) паралельно з `/api/status` (послідовно, через чергу `api`); у прихованій вкладці опитування стоїть.
+- Після `reboot` / `factory-reset` сторінка чекає до `CONFIG.rebootTimeoutMs` (60 с); після скидання Wi-Fi очікування немає — адреса пристрою зміниться (скидання стирає ВСІ збережені мережі).
+- Wi-Fi (P29b): під час скану звук радіо може просісти; після `connect` зʼєднання обривається, IP може змінитись; паролі API не повертає, тож «поточний пароль» показати неможливо; кількість мереж обмежує `max` з `GET /api/wifi`.
+- OTA (P24): прогрес — лише передача (XHR), не запис на пристрої; автоматичного відкату й перевірки підпису / хеша немає; образ LittleFS не оновлюється (сторінки вбудовані в прошивку); під час передачі решта сторінки й опитування вимкнені, закриття вкладки перериває оновлення (пристрій відновить режим).
+- «Налаштування» (V3): чутливість VU читається `GET /api/vu` при відкритті сторінки (і повторно після першої невдачі); зміну з іншого клієнта або з іншого входу сторінка не підхоплює, доки її не перезавантажено. Значення з відповіді `POST /api/vu` одразу кладуться в стан.
+- Іконки ярлика (H2) ≈ 35 КБ у flash (PNG не стискаються); браузер може просити їх при кожному завантаженні сторінки — це додаткове навантаження на AsyncTCP.
+- Ресурси збільшують прошивку (розділ app0/app1 — 5 767 168 байт). Перед додаванням великих файлів дивіться таблицю, яку друкує `build_web.py`.
+
