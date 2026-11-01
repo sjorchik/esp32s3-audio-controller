@@ -2,6 +2,9 @@
 
 // [USB2] Постійний модуль монтування USB-флешки (USB-host MSC на рідному порту S3).
 // [USB4] begin() повертає true ЛИШЕ коли host піднято й драйвер MSC працює; додано needsReboot().
+// [USB5] end() не доходить до usb_host_uninstall() у небезпечному стані (перелічення / пристрій ще є): чекає тихе
+// вікно usb_lib, ALL_FREE, перевіряє num_devices == 0; якщо безпеку не встановлено — стек лишається піднятим,
+// Error + needsReboot()/lastError(), БЕЗ аборту. end() триває довше (див. kEndQuietMs).
 // [USB3] ДОДАНО end(): повне зняття драйвера USB-host (ліниве піднімання, варіант 2) і стан Off.
 // Лише монтування / розмонтування й діагностика: НІЧОГО не пише на носій і не форматує його.
 // Файли після монтування доступні через звичайний POSIX / VFS за шляхом mountPath() ("/usb").
@@ -63,6 +66,9 @@ bool begin();
 // usb_host_uninstall, завершення usb_mgr. Чекає не довше usb_host_cfg::kEndWaitMs.
 // true — стан Off (також коли вже було Off); false — таймаут або помилка (див. lastError() / usb.stat;
 // при таймауті зняття триває у фоні, при помилці стан Error і можна повторити end()).
+// [USB5] false з lastError().where = "end_not_quiet" / "end_not_quiet_post" / "devices_left" /
+// "devices_before_uninstall" означає ВІДМОВУ зняття заради безпеки (usb_host_uninstall не викликався); при
+// "end_not_quiet" стек повністю справний — end() можна повторити пізніше.
 bool end();
 
 // [USB3] true, якщо стек піднято (Up) або піднімається (життєвий цикл; НЕ гарантує справність — див. needsReboot()).
@@ -86,6 +92,7 @@ const char* stateName(State s);
 const char* errorName(int32_t code);
 
 #if USB_HOST_DIAG
+// [USB5] + usb.sweep <від> <до> <крок> [прогонів]; лог етапів зняття `endlog`.
 // [USB4] + usb.prio / usb.trace, `usb.begin [nowait]` із пробою етапів, відлуння «got: <команда>».
 // Опитування консолі Serial (usb.*). Викликати з loop(); команди обробляє той, хто викликав
 // (loopTask). Не споживає рядків, що не починаються з 'u' (щоб не красти їх у інших консолей).
@@ -96,4 +103,5 @@ void pollConsole();
 }  // namespace usb_msc_mount
 
 #endif  // FEATURE_USB_HOST
+
 

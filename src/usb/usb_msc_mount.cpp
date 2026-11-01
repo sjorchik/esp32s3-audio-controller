@@ -1,4 +1,8 @@
 // [USB2] Постійний модуль монтування USB-флешки (USB-host MSC). Замінює src/usb_host_test.*.
+// [USB5] Безпечне зняття стека: end() НЕ доходить до usb_host_uninstall(), поки usb_lib не «тиха» (немає подій і
+// обробник підключення не триває) і num_devices != 0; перед зупинкою usb_lib чекаємо ALL_FREE + друге тихе вікно;
+// перед КОЖНОЮ спробою usb_host_uninstall() перевіряємо num_devices == 0. Якщо безпеку не встановлено — стек
+// лишається піднятим, Error + needsReboot() (без аборту IDF). Діагностика: usb.sweep, лог етапів зняття.
 // [USB4] Виправлено дефекти begin() / стану Error (begin() true лише при працюючому MSC; стан «стек пошкоджено»
 // після невдалого end() — s_needReboot, begin() відмовляє) + діагностика (USB_HOST_DIAG): мітки часу етапів begin(),
 // проба `usb.begin`, `usb.prio`, `usb.trace`, розширений дамп збою end(), відлуння консолі. Дефолтні
@@ -45,7 +49,9 @@
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_intr_alloc.h"
+#include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -88,6 +94,14 @@ std::atomic<bool> s_mscUp{false};       // msc_host_install виконано й 
 std::atomic<bool> s_libStop{false};     // просить usb_lib завершитись
 std::atomic<bool> s_endOk{true};        // результат останнього зняття (для end() після таймауту)
 std::atomic<bool> s_needReboot{false};  // [USB4] MSC знято, а USB-host лишився піднятим (збій end()): begin() відмовляє
+// [USB5] Активність usb_lib: виклик usb_host_lib_handle_events() або чекає подію (≤ kLibWaitMs), або ОБРОБЛЯЄ її
+// (обробник підключення, перелічення). Другий випадок видно як дуже довгий виклик або як повернення ESP_OK.
+std::atomic<uint32_t> s_libCallStartMs{0};  // millis() початку поточного виклику handle_events
+std::atomic<bool> s_libInCall{false};       // usb_lib зараз усередині handle_events
+std::atomic<uint32_t> s_libActiveMs{0};     // millis() останнього «активного» повернення (ESP_OK або довгий виклик)
+#if USB_HOST_DIAG
+std::atomic<uint32_t> s_libGapMaxMs{0};     // найбільший проміжок між двома активними поверненнями (для kEndQuietMs)
+#endif
 
 // Статичні обʼєкти FreeRTOS (див. шапку файлу).
 StaticQueue_t s_queueCb;
@@ -298,10 +312,11 @@ void printLibInfo(const char* label) {
         err = usb_host_lib_info(&info);
     }
     Serial.printf("%s %s: lib_info=%s num_devices=%d num_clients=%d lib_events=%u lib_flags_or=0x%x present=%d "
-                  "state=%s need_reboot=%d\n",
+                  "state=%s need_reboot=%d lib_idle_ms=%u lib_gap_max_ms=%u\n",
                   kTag, label, errorName(err), info.num_devices, info.num_clients, (unsigned)s_libEvents.load(),
                   (unsigned)s_libFlagsOr.load(), (int)s_present.load(), stateName(s_state.load()),
-                  (int)s_needReboot.load());
+                  (int)s_needReboot.load(), (unsigned)(millis() - s_libActiveMs.load()),
+                  (unsigned)s_libGapMaxMs.load());
 }
 
 void printStageReport(const char* why) {
@@ -353,6 +368,30 @@ void dumpEndFailure() {
     }
     printHeap("end-failure");
 }
+
+// [USB5] Лог етапів зняття: t = мс від початку teardownStack(); після кожного рядка Serial.flush(), щоб при аборті
+// останній рядок не загубився. Лише друк, поведінки не змінює.
+uint32_t s_endT0 = 0;
+void endStage(const char* stage, esp_err_t err) {
+    int nd = -1, nc = -1;
+    if (s_hostUp.load()) {
+        usb_host_lib_info_t info = {};
+        if (usb_host_lib_info(&info) == ESP_OK) {
+            nd = info.num_devices;
+            nc = info.num_clients;
+        }
+    }
+    const uint32_t now = millis();
+    const bool busy = s_libInCall.load() && (now - s_libCallStartMs.load()) > (usb_host_cfg::kLibWaitMs + usb_host_cfg::kEndPollMs);
+    Serial.printf("%s endlog t=%u stage=%s res=%s num_devices=%d num_clients=%d lib_idle_ms=%u lib_busy=%d "
+                  "gap_max_ms=%u\n",
+                  kTag, (unsigned)(now - s_endT0), stage, errorName(err), nd, nc,
+                  (unsigned)(now - s_libActiveMs.load()), (int)busy, (unsigned)s_libGapMaxMs.load());
+    Serial.flush();
+}
+#define END_STAGE(stage, err) endStage((stage), (err))
+#else
+#define END_STAGE(stage, err) ((void)0)
 #endif  // USB_HOST_DIAG
 
 // [USB4] Мітки етапів: у релізі (USB_HOST_DIAG = 0) компілюються геть.
@@ -392,7 +431,24 @@ void libTask(void* arg) {
     (void)arg;
     while (!s_libStop.load()) {
         uint32_t flags = 0;
+        const uint32_t tCall = millis();
+        s_libCallStartMs.store(tCall);
+        s_libInCall.store(true);
         const esp_err_t err = usb_host_lib_handle_events(pdMS_TO_TICKS(usb_host_cfg::kLibWaitMs), &flags);
+        s_libInCall.store(false);
+        const uint32_t tNow = millis();
+        // [USB5] «Активне» повернення: події оброблено (ESP_OK) або виклик тривав довше за очікування події.
+        if (err == ESP_OK || (tNow - tCall) > (usb_host_cfg::kLibWaitMs + usb_host_cfg::kEndPollMs)) {
+#if USB_HOST_DIAG
+            if (err == ESP_OK) {
+                const uint32_t gap = tNow - s_libActiveMs.load();
+                if (gap > s_libGapMaxMs.load()) {
+                    s_libGapMaxMs.store(gap);
+                }
+            }
+#endif
+            s_libActiveMs.store(tNow);
+        }
         USB_TRACE(StLibWake, true);  // [USB4] перше повернення з очікування подій бібліотеки (будь-який код)
         if (err == ESP_OK) {
 #if USB_HOST_DIAG
@@ -587,6 +643,25 @@ void runCycle(uint16_t n) {
 
 // --- Інсталяція / зняття стеку ------------------------------------------------------------------
 // Інсталяція стеку USB: виконується в задачі usb_mgr (ядро 0), щоб ISR USB виділився на ядрі 0.
+// Створює задачу usb_lib. [USB5] Винесено з installStack(): те саме потрібне, щоб відновити usb_lib, якщо зняття
+// довелось перервати після її зупинки (під час зупинки зʼявився пристрій).
+esp_err_t startLibTask() {
+    s_libStop.store(false);
+    drain(s_libExited);
+    drain(s_allFree);
+    s_libActiveMs.store(millis());  // тихе вікно відлічується від запуску usb_lib
+    s_libInCall.store(false);
+    const BaseType_t ok = xTaskCreatePinnedToCore(libTask, "usb_lib", usb_host_cfg::kLibTaskStack, nullptr,
+                                                  libPrio(), &s_libTask, usb_host_cfg::kTaskCore);
+    if (ok != pdPASS) {
+        Serial.printf("%s usb_lib task create failed\n", kTag);
+        s_libTask = nullptr;
+        setError(ESP_ERR_NO_MEM, "usb_lib_task");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
 esp_err_t installStack() {
 #if USB_HOST_DIAG
     // Діагностика монтування: рядки драйвера MSC, FatFS і диск-драйвера. [USB1]
@@ -608,17 +683,12 @@ esp_err_t installStack() {
     s_hostUp.store(true);
     USB_TRACE(StHostInstalled, true);  // [USB4]
 
-    s_libStop.store(false);
-    drain(s_libExited);
-    drain(s_allFree);
-    const BaseType_t ok = xTaskCreatePinnedToCore(libTask, "usb_lib", usb_host_cfg::kLibTaskStack, nullptr,
-                                                  libPrio(), &s_libTask,
-                                                  usb_host_cfg::kTaskCore);
-    if (ok != pdPASS) {
-        Serial.printf("%s usb_lib task create failed\n", kTag);
-        s_libTask = nullptr;
-        setError(ESP_ERR_NO_MEM, "usb_lib_task");
-        return ESP_ERR_NO_MEM;
+#if USB_HOST_DIAG
+    s_libGapMaxMs.store(0);
+#endif
+    err = startLibTask();
+    if (err != ESP_OK) {
+        return err;
     }
 
     msc_host_driver_config_t mscCfg = {};
@@ -700,14 +770,90 @@ bool waitAllFree() {
 #endif
 }
 
-// Зняття стеку за стадіями (прапорці s_mscUp / s_hostUp / s_libTask): ідемпотентне, повторний виклик після
+// [USB5] true, якщо usb_lib зараз усередині тривалого виклику usb_host_lib_handle_events() (обробляє подію:
+// підключення / перелічення). Звичайне очікування події триває ≤ kLibWaitMs, тож виклик довший за
+// kLibWaitMs + kEndPollMs — це обробка.
+bool libBusyNow() {
+    return s_libInCall.load() &&
+           (millis() - s_libCallStartMs.load()) > (usb_host_cfg::kLibWaitMs + usb_host_cfg::kEndPollMs);
+}
+
+// [USB5] Чекає, поки usb_lib буде «тихою» протягом usb_host_cfg::kEndQuietMs: за цей час жодного активного
+// повернення handle_events і жодного спостереження «обробка триває» (опитуємо кожні kEndPollMs, тож тривалий
+// виклик помічаємо не пізніше ніж через kLibWaitMs + kEndPollMs). Вікно відлічується від початку спостереження.
+// false — не вдалось за kEndStepWaitMs (перелічення / обробка не завершується).
+// ОБМЕЖЕННЯ: пристрій, що підключиться (інтерфейс USB) саме наприкінці вікна, цим не виявляється.
+bool waitLibQuiet(const char* label) {
+    const uint32_t t0 = millis();
+    uint32_t lastChange = t0;
+    uint32_t seenActive = s_libActiveMs.load();
+    for (;;) {
+        const uint32_t now = millis();
+        if (libBusyNow()) {
+            lastChange = now;
+        }
+        const uint32_t a = s_libActiveMs.load();
+        if (a != seenActive) {
+            seenActive = a;
+            lastChange = now;
+        }
+        if ((now - lastChange) >= usb_host_cfg::kEndQuietMs) {
+            Serial.printf("%s quiet(%s): ok after %u ms\n", kTag, label, (unsigned)(now - t0));
+            return true;
+        }
+        if ((now - t0) >= usb_host_cfg::kEndStepWaitMs) {
+            Serial.printf("%s quiet(%s): NOT reached in %u ms (lib busy=%d, idle=%u ms)\n", kTag, label,
+                          (unsigned)usb_host_cfg::kEndStepWaitMs, (int)libBusyNow(),
+                          (unsigned)(now - s_libActiveMs.load()));
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(usb_host_cfg::kEndPollMs));
+    }
+}
+
+// [USB5] Кількість пристроїв за usb_host_lib_info(); -1, якщо дізнатись не вдалось.
+int libDevices() {
+    usb_host_lib_info_t info = {};
+    if (usb_host_lib_info(&info) != ESP_OK) {
+        return -1;
+    }
+    return info.num_devices;
+}
+
+// [USB5] Зняття стеку за стадіями (прапорці s_mscUp / s_hostUp / s_libTask): ідемпотентне, повторний виклик після
 // помилки продовжує з місця зупинки. Викликається лише з usb_mgr, після unmountLocked().
+// Порядок (обґрунтування — IDF v5.5.2, див. звіт USB5):
+//   0. тихе вікно usb_lib (ДО msc_host_uninstall: якщо не тихо — стек лишається повністю справним, end() можна
+//      повторити);
+//   1. msc_host_uninstall;
+//   2. usb_host_device_free_all + ALL_FREE (usb_lib ЖИВА: пристрій і його EP0-пайп звільняються в задачі usb_lib);
+//      після ALL_FREE — друге тихе вікно;
+//   3. num_devices == 0, лише тоді зупинка usb_lib;
+//   4. num_devices == 0 перед КОЖНОЮ спробою usb_host_uninstall (його внутрішні шари — ESP_ERROR_CHECK: помилка
+//      = аборт, тож викликати лише коли безпечно); спроб ≤ 1 + kEndUninstallRetries.
+// usb_host_lib_set_root_port_power(false) НАВМИСНЕ не викликається окремо (див. звіт: гілка CONNECTION безумовно
+// ставить ENABLED, повторний POWER_OFF у usb_host_uninstall дав би assert; а POWER_OFF при живій usb_lib без
+// вузла пристрою веде до dev_tree_node_dev_gone — його тіла у дампі немає).
 esp_err_t teardownStack() {
     esp_err_t err = ESP_OK;
+#if USB_HOST_DIAG
+    s_endT0 = millis();
+#endif
+    END_STAGE("begin", ESP_OK);
+
+    if (s_hostUp.load() && s_libTask != nullptr) {
+        if (!waitLibQuiet("pre")) {
+            setError(ESP_ERR_TIMEOUT, "end_not_quiet");
+            END_STAGE("quiet_pre", ESP_ERR_TIMEOUT);
+            return ESP_ERR_TIMEOUT;  // MSC ще піднято: стек справний, end() можна повторити
+        }
+        END_STAGE("quiet_pre", ESP_OK);
+    }
 
     if (s_mscUp.load()) {
         err = msc_host_uninstall();  // INVALID_STATE: драйвер не встановлено або пристрій ще відкрито
         Serial.printf("%s msc_host_uninstall: %s (0x%x)\n", kTag, errorName(err), (unsigned)err);
+        END_STAGE("msc_uninstall", err);
         if (err != ESP_OK) {
             setError(err, "msc_host_uninstall");
             return err;
@@ -733,6 +879,7 @@ esp_err_t teardownStack() {
             drain(s_allFree);
             err = usb_host_device_free_all();
             Serial.printf("%s usb_host_device_free_all: %s (0x%x)\n", kTag, errorName(err), (unsigned)err);
+            END_STAGE("free_all", err);
             if (err == ESP_ERR_NOT_FINISHED) {
                 if (!waitAllFree()) {
                     Serial.printf("%s ALL_FREE not received in %u ms\n", kTag,
@@ -744,31 +891,63 @@ esp_err_t teardownStack() {
                     return ESP_ERR_TIMEOUT;
                 }
                 Serial.printf("%s USB_HOST_LIB_EVENT_FLAGS_ALL_FREE received\n", kTag);
+                END_STAGE("all_free", ESP_OK);
+                // [USB5] Друге тихе вікно: звільнення пристрою й пайпа виконує usb_lib (usbh_process) — дати їй
+                // закінчити, а не зупиняти посеред обробки.
+                if (!waitLibQuiet("post_free")) {
+                    setError(ESP_ERR_TIMEOUT, "end_not_quiet_post");
+                    END_STAGE("quiet_post", ESP_ERR_TIMEOUT);
+                    return ESP_ERR_TIMEOUT;
+                }
+                END_STAGE("quiet_post", ESP_OK);
             } else if (err != ESP_OK) {
                 setError(err, "device_free_all");
                 return err;
             }
 
+            const int devs = libDevices();
+            if (devs != 0) {
+                Serial.printf("%s teardown stopped: num_devices=%d after free_all (not safe to stop usb_lib)\n",
+                              kTag, devs);
+                setError(ESP_ERR_INVALID_STATE, "devices_left");
+                END_STAGE("devices_check", ESP_ERR_INVALID_STATE);
+                return ESP_ERR_INVALID_STATE;  // usb_lib ЛИШАЄТЬСЯ живою
+            }
+            END_STAGE("devices_check", ESP_OK);
+
             err = stopLibTask();
+            END_STAGE("lib_stop", err);
             if (err != ESP_OK) {
                 return err;
             }
         }
 
-        // usb_lib зупинено: події бібліотеки на час повторів обробляє usb_mgr (єдиний виклик handle_events).
-        const uint32_t t0 = millis();
+        // usb_lib зупинено (або вже була): події бібліотеки на час повторів обробляє usb_mgr (єдиний виклик
+        // handle_events). Перед КОЖНОЮ спробою — перевірка num_devices == 0 (інакше hcd_port_deinit → аборт).
         uint32_t retries = 0;
         for (;;) {
+            const int devs = libDevices();
+            if (devs != 0) {
+                Serial.printf("%s teardown stopped before usb_host_uninstall: num_devices=%d (retry %u)\n", kTag,
+                              devs, (unsigned)retries);
+                setError(ESP_ERR_INVALID_STATE, "devices_before_uninstall");
+                END_STAGE("uninstall_guard", ESP_ERR_INVALID_STATE);
+                // Повернути usb_lib, щоб пристрій, що зʼявився, могли обробити (стек лишається піднятим).
+                (void)startLibTask();
+                return ESP_ERR_INVALID_STATE;
+            }
+            END_STAGE("uninstall_try", ESP_OK);
             err = usb_host_uninstall();
-            if (err != ESP_ERR_INVALID_STATE || (millis() - t0) >= usb_host_cfg::kEndStepWaitMs) {
+            END_STAGE("uninstall", err);
+            if (err != ESP_ERR_INVALID_STATE || retries >= usb_host_cfg::kEndUninstallRetries) {
                 break;
             }
             ++retries;
             uint32_t flags = 0;
             (void)usb_host_lib_handle_events(pdMS_TO_TICKS(usb_host_cfg::kEndPollMs), &flags);
         }
-        Serial.printf("%s usb_host_uninstall: %s (0x%x) retries=%u in %u ms\n", kTag, errorName(err),
-                      (unsigned)err, (unsigned)retries, (unsigned)(millis() - t0));
+        Serial.printf("%s usb_host_uninstall: %s (0x%x) retries=%u\n", kTag, errorName(err), (unsigned)err,
+                      (unsigned)retries);
         if (err != ESP_OK) {
             setError(err, "usb_host_uninstall");
             return err;
@@ -1185,6 +1364,50 @@ void probeAfterBegin(bool beginOk) {
     }
 }
 
+// [USB5] Результат одного циклу begin() -> пауза -> end() (для usb.beginend і usb.sweep).
+struct BeginEndResult {
+    bool okBegin;
+    bool okEnd;
+    uint32_t endMs;
+    uint32_t freeBefore, largestBefore;
+    uint32_t freeAfter, largestAfter;
+    bool needReboot;
+    State stateAfter;
+};
+
+// begin() і через <ms> мс від його виклику — end(). verbose: докладні рядки + звіт про етапи begin().
+void beginEndOnce(uint32_t ms, bool verbose, BeginEndResult* r) {
+    r->freeBefore = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    r->largestBefore = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    const uint32_t t0 = millis();
+    r->okBegin = begin();
+    const uint32_t spent = millis() - t0;
+    if (spent < ms) {
+        vTaskDelay(pdMS_TO_TICKS(ms - spent));
+    }
+    if (verbose) {
+        Serial.printf("%s beginend: begin=%s, calling end() at t=%u ms (state=%s present=%d)\n", kTag,
+                      r->okBegin ? "ok" : "FAILED", (unsigned)(millis() - t0), stateName(s_state.load()),
+                      (int)s_present.load());
+    }
+    const uint32_t te = millis();
+    r->okEnd = end();
+    r->endMs = millis() - te;
+    r->needReboot = s_needReboot.load();
+    r->stateAfter = s_state.load();
+    r->freeAfter = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    r->largestAfter = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    if (verbose) {
+        Serial.printf("%s beginend: end=%s in %u ms (state=%s life=%s need_reboot=%d)\n", kTag,
+                      r->okEnd ? "ok" : "FAILED", (unsigned)r->endMs, stateName(r->stateAfter),
+                      lifeName(s_life.load()), (int)r->needReboot);
+        Serial.printf("%s beginend: heap internal free/largest before %u/%u, after %u/%u\n", kTag,
+                      (unsigned)r->freeBefore, (unsigned)r->largestBefore, (unsigned)r->freeAfter,
+                      (unsigned)r->largestAfter);
+        printStageReport("after usb.beginend (stages reached before end)");
+    }
+}
+
 // [USB4] usb.beginend <ms>: begin() і через <ms> мс від його виклику — end(); ОДНА команда, тож час між ними
 // детермінований (вставка двох рядків у монітор не годиться: рядки склеюються). Орієнтири з логів (флешка вставлена,
 // radio): enum_seen ≈ 340–400, connected ≈ 410–510, dev_installed ≈ 690–790, mounted ≈ 700–800 мс.
@@ -1198,21 +1421,87 @@ void cmdBeginEnd(const char* arg) {
         Serial.printf("%s beginend: need life=Off (run usb.end first), now %s\n", kTag, lifeName(s_life.load()));
         return;
     }
-    const uint32_t t0 = millis();
-    const bool okBegin = begin();
-    const uint32_t spent = millis() - t0;
-    if (spent < (uint32_t)ms) {
-        vTaskDelay(pdMS_TO_TICKS((uint32_t)ms - spent));
+    BeginEndResult r = {};
+    beginEndOnce((uint32_t)ms, true, &r);
+}
+
+// [USB5] usb.sweep <від> <до> <крок> [прогонів 1..10]: послідовність begin() -> пауза -> end() для кожного
+// значення паузи (мс). Результат КОЖНОГО кроку друкується до наступного (з Serial.flush()); перед кроком у RTC-памʼять
+// (RTC_NOINIT, переживає перезавантаження після аборту) пишеться «крок у роботі»: після аборту / перезавантаження
+// pollConsole() друкує, на якому кроці він стався. Якщо end() не вдався — sweep зупиняється сам.
+// УВАГА: блокує викликача (loopTask) на весь sweep; лише для USB_HOST_DIAG.
+constexpr uint32_t kSweepMagic = 0x55534235u;  // «USB5»
+struct SweepRtc {
+    uint32_t magic;
+    uint32_t inStep;  // 1 — крок розпочато й не завершено
+    int32_t from, to, step, runs;
+    int32_t cur, run;
+};
+RTC_NOINIT_ATTR SweepRtc s_sweepRtc;
+
+void cmdSweep(const char* arg) {
+    long from = -1, to = -1, step = -1, runs = 1;
+    const int n = (arg != nullptr) ? sscanf(arg, "%ld %ld %ld %ld", &from, &to, &step, &runs) : 0;
+    if (n < 3 || from < 0 || from > 3000 || to < from || to > 3000 || step < 1 || runs < 1 || runs > 10) {
+        Serial.printf("%s sweep: usage usb.sweep <from 0..3000> <to> <step >=1> [runs 1..10]\n", kTag);
+        return;
     }
-    Serial.printf("%s beginend: begin=%s, calling end() at t=%u ms (state=%s present=%d)\n", kTag,
-                  okBegin ? "ok" : "FAILED", (unsigned)(millis() - t0), stateName(s_state.load()),
-                  (int)s_present.load());
-    const uint32_t te = millis();
-    const bool okEnd = end();
-    Serial.printf("%s beginend: end=%s in %u ms (state=%s life=%s need_reboot=%d)\n", kTag,
-                  okEnd ? "ok" : "FAILED", (unsigned)(millis() - te), stateName(s_state.load()),
-                  lifeName(s_life.load()), (int)s_needReboot.load());
-    printStageReport("after usb.beginend (stages reached before end)");
+    if (s_life.load() != Life::Off) {
+        Serial.printf("%s sweep: need life=Off (run usb.end first), now %s\n", kTag, lifeName(s_life.load()));
+        return;
+    }
+    s_sweepRtc.magic = kSweepMagic;
+    s_sweepRtc.from = (int32_t)from;
+    s_sweepRtc.to = (int32_t)to;
+    s_sweepRtc.step = (int32_t)step;
+    s_sweepRtc.runs = (int32_t)runs;
+    Serial.printf("%s SWEEP start from=%ld to=%ld step=%ld runs=%ld (device presence is NOT checked: note it)\n",
+                  kTag, from, to, step, runs);
+    uint32_t steps = 0;
+    for (long ms = from; ms <= to; ms += step) {
+        for (long run = 1; run <= runs; ++run) {
+            s_sweepRtc.cur = (int32_t)ms;
+            s_sweepRtc.run = (int32_t)run;
+            s_sweepRtc.inStep = 1;
+            Serial.printf("%s SWEEP step ms=%ld run=%ld/%ld BEGIN\n", kTag, ms, run, runs);
+            Serial.flush();
+            BeginEndResult r = {};
+            beginEndOnce((uint32_t)ms, false, &r);
+            s_sweepRtc.inStep = 0;
+            ++steps;
+            Serial.printf("%s SWEEP step ms=%ld run=%ld/%ld RESULT begin=%s end=%s end_ms=%u need_reboot=%d "
+                          "state=%s free_before=%u largest_before=%u free_after=%u largest_after=%u d_free=%d\n",
+                          kTag, ms, run, runs, r.okBegin ? "ok" : "FAILED", r.okEnd ? "ok" : "FAILED",
+                          (unsigned)r.endMs, (int)r.needReboot, stateName(r.stateAfter), (unsigned)r.freeBefore,
+                          (unsigned)r.largestBefore, (unsigned)r.freeAfter, (unsigned)r.largestAfter,
+                          (int)r.freeAfter - (int)r.freeBefore);
+            Serial.flush();
+            if (!r.okBegin || !r.okEnd) {
+                Serial.printf("%s SWEEP STOPPED at ms=%ld run=%ld: %s failed (last error 0x%x '%s'); no abort/reboot "
+                              "happened\n", kTag, ms, run, !r.okBegin ? "begin()" : "end()",
+                              (unsigned)lastError().code, lastError().where);
+                return;
+            }
+        }
+    }
+    Serial.printf("%s SWEEP done: %u steps, all begin()/end() ok, no abort\n", kTag, (unsigned)steps);
+}
+
+// Друкується один раз після завантаження (з першого pollConsole): якщо попередній sweep обірвався під час кроку.
+void reportSweepAfterBoot() {
+    const esp_reset_reason_t rr = esp_reset_reason();
+    if (rr == ESP_RST_POWERON || s_sweepRtc.magic != kSweepMagic) {
+        memset(&s_sweepRtc, 0, sizeof(s_sweepRtc));  // RTC_NOINIT після повного вимкнення — сміття
+        s_sweepRtc.magic = kSweepMagic;
+        return;
+    }
+    if (s_sweepRtc.inStep != 0) {
+        Serial.printf("%s SWEEP ABORTED: reset (reason=%d, 4=panic/abort) during step ms=%d run=%d "
+                      "(sweep from=%d to=%d step=%d runs=%d). Sweep was NOT finished.\n", kTag, (int)rr,
+                      (int)s_sweepRtc.cur, (int)s_sweepRtc.run, (int)s_sweepRtc.from, (int)s_sweepRtc.to,
+                      (int)s_sweepRtc.step, (int)s_sweepRtc.runs);
+        s_sweepRtc.inStep = 0;
+    }
 }
 
 void cmdBegin(const char* arg) {
@@ -1449,6 +1738,8 @@ void handleLine(const char* line) {
         cmdBegin(skipSpaces(line + strlen("usb.begin")));
     } else if (isCmd(line, "usb.beginend")) {
         cmdBeginEnd(skipSpaces(line + strlen("usb.beginend")));
+    } else if (isCmd(line, "usb.sweep")) {
+        cmdSweep(skipSpaces(line + strlen("usb.sweep")));
     } else if (isCmd(line, "usb.prio")) {
         cmdPrio(skipSpaces(line + strlen("usb.prio")));
     } else if (isCmd(line, "usb.trace")) {
@@ -1457,7 +1748,7 @@ void handleLine(const char* line) {
         cmdEnd();
     } else if (isCmd(line, "usb.help")) {
         Serial.printf("%s commands: usb.stat | usb.ls [path] | usb.cycle N | usb.life N | usb.heap | "
-                      "usb.begin [nowait] | usb.beginend <ms> | usb.end | usb.prio [<lib> <msc> <mgr> | default] | usb.trace\n",
+                      "usb.begin [nowait] | usb.beginend <ms> | usb.sweep <from> <to> <step> [runs] | usb.end | usb.prio [<lib> <msc> <mgr> | default] | usb.trace\n",
                       kTag);
     } else {
         Serial.printf("%s unknown command (usb.help)\n", kTag);
@@ -1469,6 +1760,11 @@ void handleLine(const char* line) {
 void pollConsole() {
     static char line[usb_host_cfg::kConsoleLineMax];
     static size_t len = 0;
+    static bool s_bootReported = false;
+    if (!s_bootReported) {
+        s_bootReported = true;
+        reportSweepAfterBoot();  // [USB5]
+    }
     while (Serial.available() > 0) {
         // Не чіпаємо рядки інших консолей (xsmt.*, lp.*, st.*, set.* …): беремо байт лише якщо рядок
         // уже почато нами або починається з 'u'. (Інші консолі, що читають Serial з власних задач,

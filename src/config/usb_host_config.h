@@ -81,6 +81,23 @@ constexpr uint32_t kEndStepWaitMs = 2000;
 // потоків одночасно). [ГАДКА]
 constexpr uint32_t kEndPollMs = 50;
 
+// --- [USB5] Безпечне зняття стеку ---------------------------------------------------------
+// Тихе вікно usb_lib: end() не переходить до наступного етапу зняття, поки протягом цього часу usb_lib не мала
+// жодної активності (повернення usb_host_lib_handle_events() з ESP_OK або тривалий виклик = обробка події,
+// див. libBusyNow()). Використовується двічі: до msc_host_uninstall і після ALL_FREE.
+// ПРИПУЩЕННЯ — уточнюється sweep'ом (`usb.sweep`, лог `endlog` і `lib_gap_max_ms`). Точка відліку: тривалість
+// перелічення з USB4 (connected ≈ 413–506 мс, mounted ≈ 691–794 мс) — НЕ значення вікна; вікно має перекривати
+// найбільшу паузу між подіями usb_lib під час перелічення (її друкує `lib_gap_max_ms`, поки невідома).
+// Нижня межа обмежена коректністю виявлення «обробка триває»: ≥ kLibWaitMs + 2 × kEndPollMs (static_assert нижче).
+// Ціна: end() триває щонайменше kEndQuietMs (без флешки) або ≈ 2 × kEndQuietMs (з флешкою) + кроки зняття.
+constexpr uint32_t kEndQuietMs = 250;  // ПРИПУЩЕННЯ — уточнюється sweep'ом
+
+// Кількість ПОВТОРІВ usb_host_uninstall() після ESP_ERR_INVALID_STATE («є незавершені дії»: ненульові прапорці
+// подій у usb_host.c v5.5.2; цей шлях повертає помилку БЕЗ аборту). Перед кожною спробою — num_devices == 0.
+// Між спробами usb_mgr обробляє події (kEndPollMs). [ГАДКА] 5 × 50 мс ≈ 250 мс — поки без вимірювання, скільки
+// повторів потрібно; sweep покаже, чи повтори взагалі виникають (рядок `uninstall` у `endlog`).
+constexpr uint32_t kEndUninstallRetries = 5;
+
 // Таймаут usb_host_lib_handle_events() у задачі usb_lib (замість portMAX_DELAY): щоб задача бачила
 // прапорець зупинки навіть якщо usb_host_lib_unblock() не «запамʼятовується» (заголовок цього не гарантує).
 // ESP_ERR_TIMEOUT у цьому режимі — норма. [ГАДКА]
@@ -118,5 +135,12 @@ constexpr uint32_t kProbePollMs = 20;
 // очікування лише ділиться на кроки, щоб бачити, чи змінюється num_devices. [ГАДКА]
 constexpr uint32_t kEndDiagSliceMs = 250;
 
+// [USB5] Інваріанти тихого вікна й очікувань зняття.
+static_assert(kEndQuietMs >= kLibWaitMs + 2 * kEndPollMs,
+              "USB5: quiet window must exceed a 'waiting' handle_events call plus two polls to detect a busy call");
+static_assert(kEndStepWaitMs > kEndQuietMs, "USB5: quiet wait is bounded by kEndStepWaitMs, must be longer than the window");
+static_assert(kEndUninstallRetries >= 1 && kEndUninstallRetries <= 20, "USB5: sane retry count");
+
 }  // namespace usb_host_cfg
+
 
