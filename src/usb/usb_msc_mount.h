@@ -5,6 +5,7 @@
 // [USB5] end() не доходить до usb_host_uninstall() у небезпечному стані (перелічення / пристрій ще є): чекає тихе
 // вікно usb_lib, ALL_FREE, перевіряє num_devices == 0; якщо безпеку не встановлено — стек лишається піднятим,
 // Error + needsReboot()/lastError(), БЕЗ аборту. end() триває довше (див. kEndQuietMs).
+// [USB6] ДОДАНО volumeLock / volumeUnlock / volumeGenerationLocked (блокування тому для fs::FS-обгортки).
 // [USB3] ДОДАНО end(): повне зняття драйвера USB-host (ліниве піднімання, варіант 2) і стан Off.
 // Лише монтування / розмонтування й діагностика: НІЧОГО не пише на носій і не форматує його.
 // Файли після монтування доступні через звичайний POSIX / VFS за шляхом mountPath() ("/usb").
@@ -81,6 +82,15 @@ bool isStarted();
 bool needsReboot();
 
 bool isMounted();
+
+// [USB6] Блокування тому для fs::FS-обгортки (src/usb/usb_fs.*). volumeLock(ms) тримає той самий мьютекс,
+// що чекає unmountLocked(): тримати коротко (одна операція VFS), не викликати begin() / end() під ним
+// і не брати його вкладено. false — мьютекса ще немає або таймаут.
+bool volumeLock(uint32_t waitMs);
+void volumeUnlock();
+// [USB6] Викликати ЛИШЕ під volumeLock(). 0 = том не змонтовано (або знімається); інакше покоління
+// поточного монтування: змінюється при кожному монтуванні й розмонтуванні.
+uint32_t volumeGenerationLocked();
 State state();
 LastError lastError();
 const char* mountPath();
@@ -103,5 +113,3 @@ void pollConsole();
 }  // namespace usb_msc_mount
 
 #endif  // FEATURE_USB_HOST
-
-

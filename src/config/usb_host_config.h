@@ -2,6 +2,7 @@
 
 // [USB2] Константи модуля монтування USB-флешки (src/usb/usb_msc_mount.*).
 // [USB3] ДОДАНО константи end() / usb.life (блок «Життєвий цикл»). Решта значень — без змін.
+// [USB6] ДОДАНО блок fs::FS-обгортки (наприкінці файлу). Решта значень — без змін.
 // [USB4] ДОДАНО блок «Діагностика begin() / end()» (лише USB_HOST_DIAG). Решта значень і ВСІ дефолти
 // пріоритетів / таймаутів — без змін.
 // Прапорці умовної компіляції (FEATURE_USB_HOST, USB_HOST_DIAG, USB_HOST_AUTOSTART) — у config/features.h.
@@ -141,6 +142,19 @@ static_assert(kEndQuietMs >= kLibWaitMs + 2 * kEndPollMs,
 static_assert(kEndStepWaitMs > kEndQuietMs, "USB5: quiet wait is bounded by kEndStepWaitMs, must be longer than the window");
 static_assert(kEndUninstallRetries >= 1 && kEndUninstallRetries <= 20, "USB5: sane retry count");
 
+// --- [USB6] fs::FS-обгортка над /usb (src/usb/usb_fs.*) ----------------------------------------
+// Очікування блокування тому на одну операцію VFS (usb_msc_mount::volumeLock). Тримається лише на час
+// однієї операції; unmount чекає його. Таймаут = том «зайнятий»: операція відмовляє, файл осиротіє. [ГАДКА]
+constexpr uint32_t kFsLockWaitMs = 1000;
+// Розмір блоку читання (як у USB2 / usb.fs.read). [USB2]
+constexpr size_t kFsChunk = 4096;
+// Блок selftest: CRC32 рахується на кожен блок 64 КБ. [ГАДКА]
+constexpr size_t kFsSelftestBlock = 65536;
+// selftest зберігає CRC перших стількох блоків (512 × 64 КБ = 32 МБ). [ГАДКА]
+constexpr size_t kFsSelftestMaxBlocks = 512;
+// Скільки випадкових seek з перевіркою CRC робить selftest (прохід 2). [ГАДКА]
+constexpr uint32_t kFsSeekChecks = 32;
+// Верхня межа N для usb.fs.multi (скільки файлів одночасно відкрити). [ГАДКА]
+constexpr uint32_t kFsMultiMax = 8;
+
 }  // namespace usb_host_cfg
-
-

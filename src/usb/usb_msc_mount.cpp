@@ -7,6 +7,8 @@
 // після невдалого end() — s_needReboot, begin() відмовляє) + діагностика (USB_HOST_DIAG): мітки часу етапів begin(),
 // проба `usb.begin`, `usb.prio`, `usb.trace`, розширений дамп збою end(), відлуння консолі. Дефолтні
 // пріоритети й таймаути НЕ змінено.
+// [USB6] ДОДАНО блокування тому (volumeLock / volumeUnlock) і покоління монтування для fs::FS-обгортки
+// (src/usb/usb_fs.*); стан s_volReady / s_volGen змінюється під s_ioMutex у unmountLocked().
 // [USB3] ДОДАНО end() і ліниве піднімання: begin() / end() можна викликати багато разів.
 // Лише монтування / розмонтування й діагностика. Нічого не пишемо на носій, не форматуємо.
 //
@@ -46,6 +48,9 @@
 #include <atomic>
 
 #include "config/usb_host_config.h"
+#if USB_HOST_DIAG
+#include "usb/usb_fs.h"  // [USB6] usb.fs.* (диспетчеризація в handleLine)
+#endif
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_intr_alloc.h"
@@ -94,6 +99,10 @@ std::atomic<bool> s_mscUp{false};       // msc_host_install виконано й 
 std::atomic<bool> s_libStop{false};     // просить usb_lib завершитись
 std::atomic<bool> s_endOk{true};        // результат останнього зняття (для end() після таймауту)
 std::atomic<bool> s_needReboot{false};  // [USB4] MSC знято, а USB-host лишився піднятим (збій end()): begin() відмовляє
+// [USB6] Стан для fs::FS-обгортки. s_volReady = true від успішного монтування до початку розмонтування
+// (змінюється лише під s_ioMutex); s_volGen змінюється при кожному монтуванні й розмонтуванні.
+std::atomic<bool> s_volReady{false};
+std::atomic<uint32_t> s_volGen{1};
 // [USB5] Активність usb_lib: виклик usb_host_lib_handle_events() або чекає подію (≤ kLibWaitMs), або ОБРОБЛЯЄ її
 // (обробник підключення, перелічення). Другий випадок видно як дуже довгий виклик або як повернення ESP_OK.
 std::atomic<uint32_t> s_libCallStartMs{0};  // millis() початку поточного виклику handle_events
@@ -493,12 +502,16 @@ esp_err_t doMount(uint8_t addr) {
         setError(err, "vfs_register");
         return err;
     }
+    s_volGen.fetch_add(1);   // [USB6]
+    s_volReady.store(true);  // [USB6]
     return ESP_OK;
 }
 
 // Порядок: спершу VFS, потім пристрій. Тримає s_ioMutex: чекає завершення usb.ls (яке перериває s_abortIo).
 void unmountLocked() {
     xSemaphoreTake(s_ioMutex, portMAX_DELAY);
+    s_volReady.store(false);  // [USB6] до розмонтування: обгортка більше не звертається до VFS
+    s_volGen.fetch_add(1);    // [USB6]
     if (s_vfs != nullptr) {
         const esp_err_t err = msc_host_vfs_unregister(s_vfs);
         Serial.printf("%s msc_host_vfs_unregister: %s\n", kTag, errorName(err));
@@ -1206,6 +1219,24 @@ bool needsReboot() { return s_needReboot.load(); }
 
 bool isMounted() { return s_state.load() == State::Mounted; }
 
+// [USB6] Блокування тому для fs::FS-обгортки (див. usb_msc_mount.h).
+bool volumeLock(uint32_t waitMs) {
+    if (s_ioMutex == nullptr) {
+        return false;
+    }
+    return xSemaphoreTake(s_ioMutex, pdMS_TO_TICKS(waitMs)) == pdTRUE;
+}
+
+void volumeUnlock() {
+    if (s_ioMutex != nullptr) {
+        xSemaphoreGive(s_ioMutex);
+    }
+}
+
+uint32_t volumeGenerationLocked() {
+    return s_volReady.load() ? s_volGen.load() : 0;
+}
+
 State state() { return s_state.load(); }
 
 LastError lastError() {
@@ -1750,6 +1781,10 @@ void handleLine(const char* line) {
         Serial.printf("%s commands: usb.stat | usb.ls [path] | usb.cycle N | usb.life N | usb.heap | "
                       "usb.begin [nowait] | usb.beginend <ms> | usb.sweep <from> <to> <step> [runs] | usb.end | usb.prio [<lib> <msc> <mgr> | default] | usb.trace\n",
                       kTag);
+#if USB_HOST_DIAG
+    } else if (strncmp(line, "usb.fs.", 7) == 0) {
+        usb_fs::handleConsoleLine(line);  // [USB6]
+#endif
     } else {
         Serial.printf("%s unknown command (usb.help)\n", kTag);
     }
