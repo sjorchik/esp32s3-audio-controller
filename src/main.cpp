@@ -60,6 +60,7 @@
 #include "stations/station_store_test.h"  // [Prompt 11] ДОДАНО
 #include "ui/display.h"    // [Prompt 4] ДОДАНО
 #include "ui/screens.h"   // [Prompt 9] ДОДАНО
+#include "usb_host_test.h"
 
 // Друк інформації про чіп і памʼять.
 static void printChipInfo() {
@@ -408,6 +409,7 @@ void setup() {
 
     Serial.println("[MAIN] Skeleton ready");
     XSMT_EVT("setup done");
+    usb_host_test_begin();
 }
 
 void loop() {
@@ -418,6 +420,7 @@ void loop() {
     xsmt_trace::pollConsole();
     vTaskDelay(pdMS_TO_TICKS(xsmt_cfg::kConsolePollMs));
 #else
+    usb_host_test_loop();
     vTaskDelay(pdMS_TO_TICKS(1000));
 #endif
 }
