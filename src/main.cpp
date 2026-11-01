@@ -26,6 +26,9 @@
 // - [Prompt 47d] adc_vu видалено: VU зовнішніх входів виробляє line_path (initAdcVu() більше немає).
 // - [Prompt 23c] Перший рядок setup() — AmpStandby::begin(): пін standby підсилювача в LOW
 //   до ініціалізації аудіо; HIGH ставить лише AppController (powerOnTransition()).
+// - [USB2] Тестовий код usb_host_test.* замінено модулем usb/usb_msc_mount (USB-host MSC, монтування
+//   флешки в /usb); старт — в кінці setup() за FEATURE_USB_HOST && USB_HOST_AUTOSTART; діагностична
+//   консоль usb.* (USB_HOST_DIAG) опитується в loop().
 
 #include <Arduino.h>
 #include <LittleFS.h>
@@ -60,7 +63,10 @@
 #include "stations/station_store_test.h"  // [Prompt 11] ДОДАНО
 #include "ui/display.h"    // [Prompt 4] ДОДАНО
 #include "ui/screens.h"   // [Prompt 9] ДОДАНО
-#include "usb_host_test.h"
+#if FEATURE_USB_HOST
+#include "config/usb_host_config.h"  // [USB2] ДОДАНО (kConsolePollMs)
+#include "usb/usb_msc_mount.h"        // [USB2] ДОДАНО
+#endif
 
 // Друк інформації про чіп і памʼять.
 static void printChipInfo() {
@@ -314,6 +320,23 @@ static void initStationStoreTest() {
 #endif
 }
 
+// [USB2] ДОДАНО: USB-host MSC (монтування флешки в /usb). begin() створює задачу usb_mgr на ядрі 0 й чекає
+// завершення інсталяції (не довше usb_host_cfg::kInstallWaitMs). При USB_HOST_AUTOSTART = 0 старт — лише
+// консольною командою `usb.begin` (потрібна USB_HOST_DIAG = 1).
+#if FEATURE_USB_HOST
+static void initUsbHost() {
+#if USB_HOST_AUTOSTART
+    if (usb_msc_mount::begin()) {
+        Serial.println("[MAIN] USB host ready");
+    } else {
+        Serial.println("[MAIN] USB host init failed");
+    }
+#else
+    Serial.println("[MAIN] USB host: autostart off (use 'usb.begin')");
+#endif
+}
+#endif
+
 void setup() {
 #if FEATURE_AMP_STANDBY
     // [Prompt 23c] Найраніше, що можна зробити в прошивці: пін standby підсилювача в LOW.
@@ -409,18 +432,27 @@ void setup() {
 
     Serial.println("[MAIN] Skeleton ready");
     XSMT_EVT("setup done");
-    usb_host_test_begin();
+
+#if FEATURE_USB_HOST
+    // [USB2] Останнім: USB-host не має впливати на старт решти модулів.
+    initUsbHost();
+#endif
 }
 
 void loop() {
     // [Prompt 8] ЗМІНЕНО: уся логіка — в задачах (AppController, введення, аудіо,
     // дисплей). loopTask живе на ядрі 1 поруч з аудіо, тому лише спить.
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+    // [USB2] Консоль usb.*: СПОЧАТКУ наша (беремо лише рядки, що починаються з 'u'), потім xsmt.*.
+    usb_msc_mount::pollConsole();
+#endif
 #if XSMT_TRACE
     // [Prompt X1] Консоль xsmt.cfg / xsmt.set (без нової задачі): loopTask опитує Serial.
     xsmt_trace::pollConsole();
     vTaskDelay(pdMS_TO_TICKS(xsmt_cfg::kConsolePollMs));
+#elif FEATURE_USB_HOST && USB_HOST_DIAG
+    vTaskDelay(pdMS_TO_TICKS(usb_host_cfg::kConsolePollMs));  // [USB2] швидше опитування консолі
 #else
-    usb_host_test_loop();
     vTaskDelay(pdMS_TO_TICKS(1000));
 #endif
 }

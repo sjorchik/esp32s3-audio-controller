@@ -3,6 +3,9 @@
 // Єдина мапа пінів проекту.
 // Джерело: MASTER_SPEC, розділ 4.
 // Заборонені піни ESP32-S3: GPIO 26..37 (flash/PSRAM), 19/20 (USB).
+// [USB2] GPIO19 (D−) і GPIO20 (D+) при FEATURE_USB_HOST = 1 зайняті USB-host (гніздо USB-A,
+// src/usb/usb_msc_mount.*); констант під них тут немає. Рідний Type-C разом із USB-A не
+// використовувати (спільні лінії D+ / D−).
 // Не змінювати без прямої вказівки.
 
 #include <stdint.h>
@@ -62,3 +65,4 @@ constexpr int kUart0Tx = 43;
 constexpr int kUart0Rx = 44;
 
 }  // namespace pins
+
