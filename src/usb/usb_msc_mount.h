@@ -1,6 +1,7 @@
 #pragma once
 
 // [USB2] Постійний модуль монтування USB-флешки (USB-host MSC на рідному порту S3).
+// [USB4] begin() повертає true ЛИШЕ коли host піднято й драйвер MSC працює; додано needsReboot().
 // [USB3] ДОДАНО end(): повне зняття драйвера USB-host (ліниве піднімання, варіант 2) і стан Off.
 // Лише монтування / розмонтування й діагностика: НІЧОГО не пише на носій і не форматує його.
 // Файли після монтування доступні через звичайний POSIX / VFS за шляхом mountPath() ("/usb").
@@ -29,6 +30,7 @@ enum class State : uint8_t {
     Mounting,  // носій вставлено, іде монтування
     Mounted,   // том змонтовано у mountPath()
     Error,     // носій є, але змонтувати не вдалося (lastError()), або end() не зміг зняти стек
+               // ([USB4] після збою end() з needsReboot() == true стан Error ЛИШАЄТЬСЯ, його не маскує NoDevice)
     Off,       // [USB3] USB-host не піднято (до begin() або після end())
 };
 
@@ -50,8 +52,11 @@ struct LastError {
 using EventCallback = void (*)(Event ev, void* arg);
 
 // Запуск USB-host і драйвера MSC. Працює повторно після end().
-// Повертає true, якщо стек піднято протягом usb_host_cfg::kInstallWaitMs; якщо вже піднято — true
-// (нешкідливо); якщо йде зняття (end) — false. [USB3: раніше «один раз»]
+// Повертає true, лише якщо стек піднято протягом usb_host_cfg::kInstallWaitMs І працює драйвер MSC
+// (клієнт зареєстровано в USB-host); якщо вже піднято й справний — true (нешкідливо); якщо йде зняття
+// (end) — false. [USB3: раніше «один раз»]
+// [USB4] Якщо стек пошкоджено (needsReboot()), begin() повертає false, стан Error, lastError() лишає
+// першопричину; раніше після невдалого end() повертав true при вимкненому MSC.
 bool begin();
 
 // [USB3] Повне зняття: розмонтування, msc_host_uninstall, звільнення пристроїв, зупинка usb_lib,
@@ -60,8 +65,14 @@ bool begin();
 // при таймауті зняття триває у фоні, при помилці стан Error і можна повторити end()).
 bool end();
 
-// [USB3] true, якщо стек піднято (Up) або піднімається.
+// [USB3] true, якщо стек піднято (Up) або піднімається (життєвий цикл; НЕ гарантує справність — див. needsReboot()).
 bool isStarted();
+
+// [USB4] true, якщо після збою зняття (напр. all_free_timeout) драйвер MSC уже знято, а USB-host лишився
+// піднятим: begin() відмовляє. Легальний шлях відновлення без перезавантаження НЕ підтверджено
+// (можна лише повторити end(); чи допоможе вийняття носія — перевіряється кроком USB4, M2-R).
+// Скидається успішним end().
+bool needsReboot();
 
 bool isMounted();
 State state();
@@ -75,6 +86,7 @@ const char* stateName(State s);
 const char* errorName(int32_t code);
 
 #if USB_HOST_DIAG
+// [USB4] + usb.prio / usb.trace, `usb.begin [nowait]` із пробою етапів, відлуння «got: <команда>».
 // Опитування консолі Serial (usb.*). Викликати з loop(); команди обробляє той, хто викликав
 // (loopTask). Не споживає рядків, що не починаються з 'u' (щоб не красти їх у інших консолей).
 // УВАГА: usb.life N блокує викликача на час N циклів.
@@ -84,3 +96,4 @@ void pollConsole();
 }  // namespace usb_msc_mount
 
 #endif  // FEATURE_USB_HOST
+

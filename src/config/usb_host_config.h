@@ -2,6 +2,8 @@
 
 // [USB2] Константи модуля монтування USB-флешки (src/usb/usb_msc_mount.*).
 // [USB3] ДОДАНО константи end() / usb.life (блок «Життєвий цикл»). Решта значень — без змін.
+// [USB4] ДОДАНО блок «Діагностика begin() / end()» (лише USB_HOST_DIAG). Решта значень і ВСІ дефолти
+// пріоритетів / таймаутів — без змін.
 // Прапорці умовної компіляції (FEATURE_USB_HOST, USB_HOST_DIAG, USB_HOST_AUTOSTART) — у config/features.h.
 //
 // Позначки джерел значень:
@@ -109,4 +111,12 @@ constexpr uint32_t kLifePresentWaitMs = 1500;  // [ГАДКА]
 constexpr uint32_t kLifeMountWaitMs =
     kMountMaxAttempts * (kMountSlowWarnMs + kMountRetryDelayMs);
 
+// --- [USB4] Діагностика begin() / end() (використовується лише при USB_HOST_DIAG = 1) -----------
+// Крок опитування usb_host_lib_info() у `usb.begin` (проба появи пристрою). [ГАДКА]
+constexpr uint32_t kProbePollMs = 20;
+// Крок друку стану під час очікування ALL_FREE в end(): сумарне очікування лишається kEndStepWaitMs,
+// очікування лише ділиться на кроки, щоб бачити, чи змінюється num_devices. [ГАДКА]
+constexpr uint32_t kEndDiagSliceMs = 250;
+
 }  // namespace usb_host_cfg
+

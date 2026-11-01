@@ -1,4 +1,8 @@
 // [USB2] Постійний модуль монтування USB-флешки (USB-host MSC). Замінює src/usb_host_test.*.
+// [USB4] Виправлено дефекти begin() / стану Error (begin() true лише при працюючому MSC; стан «стек пошкоджено»
+// після невдалого end() — s_needReboot, begin() відмовляє) + діагностика (USB_HOST_DIAG): мітки часу етапів begin(),
+// проба `usb.begin`, `usb.prio`, `usb.trace`, розширений дамп збою end(), відлуння консолі. Дефолтні
+// пріоритети й таймаути НЕ змінено.
 // [USB3] ДОДАНО end() і ліниве піднімання: begin() / end() можна викликати багато разів.
 // Лише монтування / розмонтування й діагностика. Нічого не пишемо на носій, не форматуємо.
 //
@@ -83,6 +87,7 @@ std::atomic<bool> s_hostUp{false};      // usb_host_install виконано й 
 std::atomic<bool> s_mscUp{false};       // msc_host_install виконано й ще не знято
 std::atomic<bool> s_libStop{false};     // просить usb_lib завершитись
 std::atomic<bool> s_endOk{true};        // результат останнього зняття (для end() після таймауту)
+std::atomic<bool> s_needReboot{false};  // [USB4] MSC знято, а USB-host лишився піднятим (збій end()): begin() відмовляє
 
 // Статичні обʼєкти FreeRTOS (див. шапку файлу).
 StaticQueue_t s_queueCb;
@@ -144,6 +149,21 @@ const char* lifeName(Life l) {
     return "?";
 }
 
+// [USB4] Ефективні пріоритети задач USB. У релізі (USB_HOST_DIAG = 0) — константи з usb_host_config.h;
+// при USB_HOST_DIAG = 1 їх можна змінити командою `usb.prio` для НАСТУПНОГО begin() (дефолти не чіпаємо).
+#if USB_HOST_DIAG
+std::atomic<unsigned> s_prioLib{usb_host_cfg::kLibTaskPriority};
+std::atomic<unsigned> s_prioMsc{usb_host_cfg::kMscTaskPriority};
+std::atomic<unsigned> s_prioMgr{usb_host_cfg::kMgrTaskPriority};
+unsigned libPrio() { return s_prioLib.load(); }
+unsigned mscPrio() { return s_prioMsc.load(); }
+unsigned mgrPrio() { return s_prioMgr.load(); }
+#else
+constexpr unsigned libPrio() { return usb_host_cfg::kLibTaskPriority; }
+constexpr unsigned mscPrio() { return usb_host_cfg::kMscTaskPriority; }
+constexpr unsigned mgrPrio() { return usb_host_cfg::kMgrTaskPriority; }
+#endif
+
 void setError(esp_err_t code, const char* where) {
     portENTER_CRITICAL(&s_mux);
     s_lastErr.code = static_cast<int32_t>(code);
@@ -180,6 +200,170 @@ void printHeap(const char* label) {
 }
 #endif
 
+#if USB_HOST_DIAG
+// [USB4] Мітки часу етапів begin() (мс від виклику begin(), що почав чистий старт) і знімки внутрішньої RAM.
+// Порядок «конвеєра»: host_installed -> msc_installed -> ready -> enum_seen -> connected -> dev_installed -> mounted.
+// lib_wake (перше повернення usb_host_lib_handle_events у usb_lib) і begin_returned — окремо.
+// «Перша подія клієнта» НЕ спостережувана окремо без правки lib/usb_host_msc (заборонено): її заміняє connected
+// (колбек MSC після NEW_DEV + перевірки класу пристрою); enum_seen = usb_host_lib_info().num_devices > 0 (проба).
+constexpr uint32_t kNotReached = 0xFFFFFFFFu;
+enum Stage : uint8_t {
+    StHostInstalled = 0,
+    StMscInstalled,
+    StReady,
+    StEnumSeen,
+    StConnected,
+    StDevInstalled,
+    StMounted,
+    StLibWake,
+    StBeginReturned,
+    StCount
+};
+constexpr uint8_t kPipelineCount = StMounted + 1;
+const char* const kStageNames[StCount] = {"host_installed", "msc_installed", "ready",      "enum_seen",
+                                          "connected",      "dev_installed", "mounted",    "lib_wake",
+                                          "begin_returned"};
+
+std::atomic<uint32_t> s_t0{0};
+std::atomic<bool> s_traceValid{false};
+std::atomic<uint32_t> s_stageMs[StCount];
+uint32_t s_stageFree[StCount];
+uint32_t s_stageLargest[StCount];
+uint32_t s_stageMin[StCount];
+std::atomic<uint32_t> s_libEvents{0};   // кількість повернень usb_host_lib_handle_events з ESP_OK
+std::atomic<uint32_t> s_libFlagsOr{0};  // OR усіх прапорців подій бібліотеки (сирі біти)
+
+void traceReset() {
+    for (uint8_t i = 0; i < StCount; ++i) {
+        s_stageMs[i].store(kNotReached);
+        s_stageFree[i] = 0;
+        s_stageLargest[i] = 0;
+        s_stageMin[i] = 0;
+    }
+    s_libEvents.store(0);
+    s_libFlagsOr.store(0);
+    s_t0.store(millis());
+    s_traceValid.store(true);
+}
+
+void traceHeap(Stage s) {
+    s_stageFree[s] = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    s_stageLargest[s] = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    s_stageMin[s] = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+}
+
+// Фіксує ПЕРШЕ досягнення етапу. heap = true: знімок RAM (лише з контекстів задач, не з колбека MSC).
+void traceMark(Stage s, bool heap) {
+    if (!s_traceValid.load()) {
+        return;
+    }
+    uint32_t expected = kNotReached;
+    const uint32_t dt = millis() - s_t0.load();
+    if (s_stageMs[s].compare_exchange_strong(expected, dt) && heap) {
+        traceHeap(s);
+    }
+}
+
+// Етап уже позначено з колбека (без RAM) — дописати знімок RAM (трохи пізніше за мітку часу).
+void traceHeapIfMissing(Stage s) {
+    if (s_traceValid.load() && s_stageMs[s].load() != kNotReached && s_stageFree[s] == 0) {
+        traceHeap(s);
+    }
+}
+
+const char* furthestStage() {
+    const char* last = "none";
+    for (uint8_t i = 0; i < kPipelineCount; ++i) {
+        if (s_stageMs[i].load() != kNotReached) {
+            last = kStageNames[i];
+        }
+    }
+    return last;
+}
+
+void printTaskInfo(const char* name, TaskHandle_t h, uint32_t stackTotal) {
+    if (h == nullptr) {
+        Serial.printf("%s trace: task %-8s not running\n", kTag, name);
+        return;
+    }
+    // IDF: uxTaskGetStackHighWaterMark повертає БАЙТИ (мінімум вільного стеку за час роботи).
+    Serial.printf("%s trace: task %-8s prio=%u stack min free=%u of %u bytes\n", kTag, name,
+                  (unsigned)uxTaskPriorityGet(h), (unsigned)uxTaskGetStackHighWaterMark(h), (unsigned)stackTotal);
+}
+
+void printLibInfo(const char* label) {
+    usb_host_lib_info_t info = {};
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    if (s_hostUp.load()) {
+        err = usb_host_lib_info(&info);
+    }
+    Serial.printf("%s %s: lib_info=%s num_devices=%d num_clients=%d lib_events=%u lib_flags_or=0x%x present=%d "
+                  "state=%s need_reboot=%d\n",
+                  kTag, label, errorName(err), info.num_devices, info.num_clients, (unsigned)s_libEvents.load(),
+                  (unsigned)s_libFlagsOr.load(), (int)s_present.load(), stateName(s_state.load()),
+                  (int)s_needReboot.load());
+}
+
+void printStageReport(const char* why) {
+    if (!s_traceValid.load()) {
+        Serial.printf("%s trace: no begin() trace yet\n", kTag);
+        return;
+    }
+    Serial.printf("%s trace: %s (ms since begin() call; heap = internal free/largest/min_free at the stage)\n", kTag,
+                  why);
+    for (uint8_t i = 0; i < StCount; ++i) {
+        const uint32_t v = s_stageMs[i].load();
+        if (v == kNotReached) {
+            Serial.printf("%s trace   %-15s not reached\n", kTag, kStageNames[i]);
+        } else if (s_stageFree[i] == 0) {
+            Serial.printf("%s trace   %-15s %6u ms  heap=-\n", kTag, kStageNames[i], (unsigned)v);
+        } else {
+            Serial.printf("%s trace   %-15s %6u ms  free=%u largest=%u min_free=%u\n", kTag, kStageNames[i],
+                          (unsigned)v, (unsigned)s_stageFree[i], (unsigned)s_stageLargest[i],
+                          (unsigned)s_stageMin[i]);
+        }
+    }
+    Serial.printf("%s trace: furthest pipeline stage=%s\n", kTag, furthestStage());
+    printLibInfo("trace");
+    if (s_life.load() != Life::Off && s_mgrTask != nullptr) {
+        printTaskInfo("usb_mgr", s_mgrTask, usb_host_cfg::kMgrTaskStack);
+    }
+    if (s_libTask != nullptr) {
+        printTaskInfo("usb_lib", s_libTask, usb_host_cfg::kLibTaskStack);
+    }
+    // Фонова задача драйвера MSC створена всередині msc_host_install() з іменем "USB MSC" (msc_host.c), без
+    // повернення handle: шукаємо за іменем.
+    if (s_mscUp.load()) {
+        printTaskInfo("USB MSC", xTaskGetHandle("USB MSC"), usb_host_cfg::kMscTaskStack);
+    }
+    printHeap("trace");
+}
+
+// Дамп при збої зняття (all_free_timeout): те, що можна дізнатись лише з API, наявних у збірці.
+// Список адрес пристроїв, що лишились, НЕ друкуємо: потрібний API з usb/usb_host.h не прикладено (див. звіт).
+void dumpEndFailure() {
+    Serial.printf("%s end-failure dump: s_dev=%p s_vfs=%p msc_up=%d host_up=%d lib_task=%d mgr_task=%d\n", kTag,
+                  (void*)s_dev, (void*)s_vfs, (int)s_mscUp.load(), (int)s_hostUp.load(), (int)(s_libTask != nullptr),
+                  (int)(s_mgrTask != nullptr));
+    printLibInfo("end-failure");
+    Serial.printf("%s end-failure dump: USB MSC task %s\n", kTag,
+                  xTaskGetHandle("USB MSC") != nullptr ? "STILL EXISTS" : "gone");
+    if (s_libTask != nullptr) {
+        printTaskInfo("usb_lib", s_libTask, usb_host_cfg::kLibTaskStack);
+    }
+    printHeap("end-failure");
+}
+#endif  // USB_HOST_DIAG
+
+// [USB4] Мітки етапів: у релізі (USB_HOST_DIAG = 0) компілюються геть.
+#if USB_HOST_DIAG
+#define USB_TRACE(stage, heap) traceMark(stage, heap)
+#define USB_TRACE_HEAP(stage) traceHeapIfMissing(stage)
+#else
+#define USB_TRACE(stage, heap) ((void)0)
+#define USB_TRACE_HEAP(stage) ((void)0)
+#endif
+
 // --- Колбек драйвера MSC (задача драйвера; без блокувань і без роботи з FS) -------------------
 void mscEventCb(const msc_host_event_t* event, void* arg) {
     (void)arg;
@@ -188,6 +372,7 @@ void mscEventCb(const msc_host_event_t* event, void* arg) {
         m.type = MsgType::Connected;
         m.addr = event->device.address;
         s_present.store(true);
+        USB_TRACE(StConnected, false);  // [USB4] лише мітка часу (без RAM: колбек не блокуємо)
     } else if (event->event == msc_host_event_t::MSC_DEVICE_DISCONNECTED) {
         m.type = MsgType::Disconnected;
         s_present.store(false);
@@ -208,7 +393,12 @@ void libTask(void* arg) {
     while (!s_libStop.load()) {
         uint32_t flags = 0;
         const esp_err_t err = usb_host_lib_handle_events(pdMS_TO_TICKS(usb_host_cfg::kLibWaitMs), &flags);
+        USB_TRACE(StLibWake, true);  // [USB4] перше повернення з очікування подій бібліотеки (будь-який код)
         if (err == ESP_OK) {
+#if USB_HOST_DIAG
+            s_libEvents.fetch_add(1);
+            s_libFlagsOr.fetch_or(flags);
+#endif
             if ((flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) != 0) {
                 xSemaphoreGive(s_allFree);
             }
@@ -229,6 +419,7 @@ esp_err_t doMount(uint8_t addr) {
         setError(err, "install_device");
         return err;
     }
+    USB_TRACE(StDevInstalled, true);  // [USB4]
 
     // Конфіг монтування обовʼязковий і НЕ порожній (NULL дає ESP_ERR_INVALID_ARG). [USB1]
     esp_vfs_fat_mount_config_t cfg = {};
@@ -295,6 +486,7 @@ bool mountWithRetry(uint8_t addr) {
                 Serial.printf("%s WARNING: mount took %u ms (> %u ms)\n", kTag, (unsigned)dt,
                               (unsigned)usb_host_cfg::kMountSlowWarnMs);
             }
+            USB_TRACE(StMounted, true);  // [USB4]
             setState(State::Mounted);
             emit(Event::Mounted);
             return true;
@@ -326,6 +518,7 @@ void handleConnected(uint8_t addr) {
         return;
     }
     s_addr = addr;
+    USB_TRACE_HEAP(StConnected);  // [USB4] знімок RAM для етапу connected (трохи пізніше за мітку часу колбека)
     Serial.printf("%s device inserted addr=%u\n", kTag, (unsigned)addr);
     setState(State::Mounting);
     emit(Event::Inserted);
@@ -413,12 +606,13 @@ esp_err_t installStack() {
         return err;
     }
     s_hostUp.store(true);
+    USB_TRACE(StHostInstalled, true);  // [USB4]
 
     s_libStop.store(false);
     drain(s_libExited);
     drain(s_allFree);
     const BaseType_t ok = xTaskCreatePinnedToCore(libTask, "usb_lib", usb_host_cfg::kLibTaskStack, nullptr,
-                                                  usb_host_cfg::kLibTaskPriority, &s_libTask,
+                                                  libPrio(), &s_libTask,
                                                   usb_host_cfg::kTaskCore);
     if (ok != pdPASS) {
         Serial.printf("%s usb_lib task create failed\n", kTag);
@@ -429,7 +623,7 @@ esp_err_t installStack() {
 
     msc_host_driver_config_t mscCfg = {};
     mscCfg.create_backround_task = true;  // (sic) так названо поле в msc_host.h
-    mscCfg.task_priority = usb_host_cfg::kMscTaskPriority;
+    mscCfg.task_priority = mscPrio();
     mscCfg.stack_size = usb_host_cfg::kMscTaskStack;
     mscCfg.core_id = usb_host_cfg::kTaskCore;
     mscCfg.callback = mscEventCb;
@@ -441,6 +635,21 @@ esp_err_t installStack() {
         return err;
     }
     s_mscUp.store(true);
+    USB_TRACE(StMscInstalled, true);  // [USB4]
+
+    // [USB4] Перевірка, що драйвер MSC справді працює: його клієнт зареєстровано в USB-host
+    // (msc_host_install() викликає usb_host_client_register — msc_host.c). Критерій «num_clients >= 1» спирається
+    // на опис usb_host_lib_info_t (usb/usb_host.h НЕ прикладено до кроку): якщо тут буде false-негатив —
+    // M1 покаже num_clients = 0 при працюючому MSC, тоді перевірку треба послабити.
+    usb_host_lib_info_t info = {};
+    const esp_err_t ierr = usb_host_lib_info(&info);
+    Serial.printf("%s install check: usb_host_lib_info %s num_devices=%d num_clients=%d\n", kTag, errorName(ierr),
+                  info.num_devices, info.num_clients);
+    if (ierr == ESP_OK && info.num_clients < 1) {
+        Serial.printf("%s install check FAILED: MSC client is not registered\n", kTag);
+        setError(ESP_ERR_INVALID_STATE, "msc_no_client");
+        return ESP_ERR_INVALID_STATE;
+    }
     return ESP_OK;
 }
 
@@ -461,6 +670,34 @@ esp_err_t stopLibTask() {
     }
     s_libTask = nullptr;
     return ESP_OK;
+}
+
+// [USB4] Очікування події ALL_FREE після usb_host_device_free_all() (сумарно kEndStepWaitMs, як і раніше).
+// При USB_HOST_DIAG очікування ділиться на кроки kEndDiagSliceMs з друком num_devices / num_clients:
+// видно, чи лишок пристроїв коли-небудь зменшується. Загальний час очікування не змінюється.
+bool waitAllFree() {
+#if USB_HOST_DIAG
+    const uint32_t t0 = millis();
+    for (;;) {
+        const uint32_t waited = millis() - t0;
+        if (waited >= usb_host_cfg::kEndStepWaitMs) {
+            return false;
+        }
+        uint32_t slice = usb_host_cfg::kEndStepWaitMs - waited;
+        if (slice > usb_host_cfg::kEndDiagSliceMs) {
+            slice = usb_host_cfg::kEndDiagSliceMs;
+        }
+        if (xSemaphoreTake(s_allFree, pdMS_TO_TICKS(slice)) == pdTRUE) {
+            Serial.printf("%s ALL_FREE after %u ms\n", kTag, (unsigned)(millis() - t0));
+            return true;
+        }
+        char label[24];
+        snprintf(label, sizeof(label), "wait_all_free %u ms", (unsigned)(millis() - t0));
+        printLibInfo(label);
+    }
+#else
+    return xSemaphoreTake(s_allFree, pdMS_TO_TICKS(usb_host_cfg::kEndStepWaitMs)) == pdTRUE;
+#endif
 }
 
 // Зняття стеку за стадіями (прапорці s_mscUp / s_hostUp / s_libTask): ідемпотентне, повторний виклик після
@@ -497,10 +734,13 @@ esp_err_t teardownStack() {
             err = usb_host_device_free_all();
             Serial.printf("%s usb_host_device_free_all: %s (0x%x)\n", kTag, errorName(err), (unsigned)err);
             if (err == ESP_ERR_NOT_FINISHED) {
-                if (xSemaphoreTake(s_allFree, pdMS_TO_TICKS(usb_host_cfg::kEndStepWaitMs)) != pdTRUE) {
+                if (!waitAllFree()) {
                     Serial.printf("%s ALL_FREE not received in %u ms\n", kTag,
                                   (unsigned)usb_host_cfg::kEndStepWaitMs);
                     setError(ESP_ERR_TIMEOUT, "all_free_timeout");
+#if USB_HOST_DIAG
+                    dumpEndFailure();  // [USB4] лише друк, поведінку не змінює
+#endif
                     return ESP_ERR_TIMEOUT;
                 }
                 Serial.printf("%s USB_HOST_LIB_EVENT_FLAGS_ALL_FREE received\n", kTag);
@@ -547,6 +787,11 @@ void mgrTask(void* arg) {
         const esp_err_t terr = teardownStack();
         Serial.printf("%s install failed, cleanup: %s\n", kTag, errorName(terr));
         s_installed.store(false);
+        if (terr != ESP_OK) {
+            // [USB4] Прибрати не вдалося: частину стеку лишено піднятою; begin() відмовлятиме до перезавантаження.
+            s_needReboot.store(true);
+            Serial.printf("%s install cleanup incomplete: reboot required\n", kTag);
+        }
         setState(State::Error);
         s_mgrTask = nullptr;
         const Life prev = s_life.exchange(Life::Off);
@@ -564,9 +809,8 @@ void mgrTask(void* arg) {
     Life expected = Life::Starting;
     s_life.compare_exchange_strong(expected, Life::Up);  // якщо вже Stopping — не затираємо
     Serial.printf("%s ready: core=%d prio lib/msc/mgr=%u/%u/%u mount=%s\n", kTag,
-                  (int)usb_host_cfg::kTaskCore, usb_host_cfg::kLibTaskPriority,
-                  usb_host_cfg::kMscTaskPriority, usb_host_cfg::kMgrTaskPriority,
-                  usb_host_cfg::kMountPath);
+                  (int)usb_host_cfg::kTaskCore, libPrio(), mscPrio(), mgrPrio(), usb_host_cfg::kMountPath);
+    USB_TRACE(StReady, true);  // [USB4]
     xSemaphoreGive(s_installDone);
 
     for (;;) {
@@ -600,6 +844,16 @@ void mgrTask(void* arg) {
                     Serial.printf("%s end FAILED: %s (0x%x) at '%s'\n", kTag, errorName(terr), (unsigned)terr,
                                   lastError().where);
                     setState(State::Error);
+                    // [USB4] Якщо драйвер MSC уже знято (s_mscUp = false), а host лишився піднятим — стек
+                    // непридатний: begin() відмовляє (needsReboot()). Інакше (MSC ще працює, напр. пристрій
+                    // відкритий) стек справний, end() можна повторити.
+                    const bool degraded = !s_mscUp.load();
+                    s_needReboot.store(degraded);
+                    s_installed.store(s_mscUp.load() && s_hostUp.load());
+                    if (degraded) {
+                        Serial.printf("%s stack DEGRADED: MSC driver already uninstalled, USB host still up; "
+                                      "recovery without reboot is NOT verified (end() may be retried)\n", kTag);
+                    }
                     s_endOk.store(false);
                     s_life.store(Life::Up);
                     xSemaphoreGive(s_endDone);
@@ -608,6 +862,7 @@ void mgrTask(void* arg) {
                 xQueueReset(s_queue);  // події, що прийшли під час зняття, вже не актуальні
                 s_present.store(false);
                 s_installed.store(false);
+                s_needReboot.store(false);  // [USB4] успішне (в т.ч. повторне) зняття знімає позначку
                 setState(State::Off);
                 s_endOk.store(true);
                 s_mgrTask = nullptr;
@@ -654,7 +909,23 @@ bool begin() {
     bool result = false;
     const Life life = s_life.load();
     if (life == Life::Up) {
-        result = s_installed.load();  // уже піднято: нешкідливо
+        // [USB4] «Піднято» = host піднято І драйвер MSC працює І стек не позначено пошкодженим.
+        result = s_installed.load() && s_hostUp.load() && s_mscUp.load() && !s_needReboot.load();
+        if (!result) {
+            Serial.printf("%s begin: stack not usable (installed=%d host_up=%d msc_up=%d need_reboot=%d); "
+                          "reboot required (last error 0x%x at '%s')\n",
+                          kTag, (int)s_installed.load(), (int)s_hostUp.load(), (int)s_mscUp.load(),
+                          (int)s_needReboot.load(), (unsigned)lastError().code, lastError().where);
+            if (lastError().code == 0) {
+                setError(ESP_ERR_INVALID_STATE, "begin_degraded");
+            }
+            setState(State::Error);
+        }
+    } else if (life == Life::Off && s_needReboot.load()) {
+        // [USB4] Прибирання після збійної інсталяції не вдалося: заново піднімати не можна.
+        Serial.printf("%s begin: refused, previous cleanup failed (reboot required, last error 0x%x at '%s')\n",
+                      kTag, (unsigned)lastError().code, lastError().where);
+        setState(State::Error);
     } else if (life != Life::Off) {
         Serial.printf("%s begin: busy (life=%s)\n", kTag, lifeName(life));
     } else {
@@ -668,11 +939,13 @@ bool begin() {
         s_abortIo.store(false);
         s_present.store(false);
         s_installed.store(false);
+#if USB_HOST_DIAG
+        traceReset();  // [USB4] t = 0 у момент чистого старту begin()
+#endif
         s_life.store(Life::Starting);
 
         const BaseType_t ok = xTaskCreatePinnedToCore(mgrTask, "usb_mgr", usb_host_cfg::kMgrTaskStack, nullptr,
-                                                      usb_host_cfg::kMgrTaskPriority, &s_mgrTask,
-                                                      usb_host_cfg::kTaskCore);
+                                                      mgrPrio(), &s_mgrTask, usb_host_cfg::kTaskCore);
         if (ok != pdPASS) {
             Serial.printf("%s usb_mgr task create failed\n", kTag);
             s_mgrTask = nullptr;
@@ -682,9 +955,17 @@ bool begin() {
         } else if (xSemaphoreTake(s_installDone, pdMS_TO_TICKS(usb_host_cfg::kInstallWaitMs)) != pdTRUE) {
             Serial.printf("%s install wait timeout (%u ms); installation continues in background\n", kTag,
                           (unsigned)usb_host_cfg::kInstallWaitMs);
+#if USB_HOST_DIAG
+            printStageReport("begin: install wait timeout (stuck before 'ready')");
+#endif
         } else {
-            result = s_installed.load();
+            result = s_installed.load() && s_hostUp.load() && s_mscUp.load();
+            if (!result) {
+                Serial.printf("%s begin: install FAILED (last error 0x%x at '%s')\n", kTag,
+                              (unsigned)lastError().code, lastError().where);
+            }
         }
+        USB_TRACE(StBeginReturned, true);  // [USB4]
     }
     xSemaphoreGive(s_lifeMutex);
     return result;
@@ -742,6 +1023,8 @@ bool isStarted() {
     return l == Life::Up || l == Life::Starting;
 }
 
+bool needsReboot() { return s_needReboot.load(); }
+
 bool isMounted() { return s_state.load() == State::Mounted; }
 
 State state() { return s_state.load(); }
@@ -785,6 +1068,161 @@ void cmdStat() {
     if (lib != nullptr) {
         Serial.printf("%s stat: usb_lib stack min free=%u of %u bytes\n", kTag,
                       (unsigned)uxTaskGetStackHighWaterMark(lib), (unsigned)usb_host_cfg::kLibTaskStack);
+    }
+    // [USB4] Стан «стек пошкоджено», чинні та дефолтні пріоритети, фонова задача MSC.
+    Serial.printf("%s stat: need_reboot=%d prio lib/msc/mgr (effective, used by next begin)=%u/%u/%u "
+                  "defaults=%u/%u/%u\n", kTag, (int)s_needReboot.load(), libPrio(), mscPrio(), mgrPrio(),
+                  usb_host_cfg::kLibTaskPriority, usb_host_cfg::kMscTaskPriority, usb_host_cfg::kMgrTaskPriority);
+    if (s_mscUp.load()) {
+        printTaskInfo("USB MSC", xTaskGetHandle("USB MSC"), usb_host_cfg::kMscTaskStack);
+    }
+}
+
+// [USB4] usb.prio <lib> <msc> <mgr>: пріоритети задач USB-host для НАСТУПНОГО begin() (без перезбірки).
+// Без аргументів — чинні / дефолтні значення й пріоритети відомих задач (для порівняння); `usb.prio default` —
+// повернути дефолти з usb_host_config.h. Дефолти в конфігу НЕ змінюються.
+void printKnownTaskPrios() {
+    static const char* const kNames[] = {"tcpip_thread", "wifi",       "esp_timer", "sys_evt", "async_tcp",
+                                         "app_ctrl",     "loopTask",   "PeriodicTask", "line_path", "IDLE0",
+                                         "IDLE1"};
+    Serial.printf("%s prio: tasks found by name (prio only; core not shown):\n", kTag);
+    for (const char* name : kNames) {
+        const TaskHandle_t h = xTaskGetHandle(name);
+        if (h != nullptr) {
+            Serial.printf("%s prio:   %-14s %u\n", kTag, name, (unsigned)uxTaskPriorityGet(h));
+        } else {
+            Serial.printf("%s prio:   %-14s (not found)\n", kTag, name);
+        }
+    }
+}
+
+void cmdPrio(const char* arg) {
+    const unsigned maxPrio = static_cast<unsigned>(configMAX_PRIORITIES - 1);
+    if (arg == nullptr || arg[0] == '\0') {
+        Serial.printf("%s prio: effective lib/msc/mgr=%u/%u/%u defaults=%u/%u/%u allowed 1..%u (used by NEXT begin)\n",
+                      kTag, libPrio(), mscPrio(), mgrPrio(), usb_host_cfg::kLibTaskPriority,
+                      usb_host_cfg::kMscTaskPriority, usb_host_cfg::kMgrTaskPriority, maxPrio);
+        printKnownTaskPrios();
+        return;
+    }
+    if (strncmp(arg, "default", 7) == 0) {
+        s_prioLib.store(usb_host_cfg::kLibTaskPriority);
+        s_prioMsc.store(usb_host_cfg::kMscTaskPriority);
+        s_prioMgr.store(usb_host_cfg::kMgrTaskPriority);
+        Serial.printf("%s prio: reset to defaults %u/%u/%u (used by NEXT begin)\n", kTag, libPrio(), mscPrio(),
+                      mgrPrio());
+        return;
+    }
+    unsigned a = 0;
+    unsigned b = 0;
+    unsigned d = 0;
+    char extra = 0;
+    if (sscanf(arg, "%u %u %u %c", &a, &b, &d, &extra) != 3) {
+        Serial.printf("%s prio: usage usb.prio <lib> <msc> <mgr> | usb.prio default | usb.prio\n", kTag);
+        return;
+    }
+    if (a < 1 || a > maxPrio || b < 1 || b > maxPrio || d < 1 || d > maxPrio) {
+        Serial.printf("%s prio: each value must be 1..%u (configMAX_PRIORITIES - 1); nothing changed\n", kTag,
+                      maxPrio);
+        return;
+    }
+    s_prioLib.store(a);
+    s_prioMsc.store(b);
+    s_prioMgr.store(d);
+    Serial.printf("%s prio: set lib/msc/mgr=%u/%u/%u for the NEXT begin()%s\n", kTag, a, b, d,
+                  s_life.load() != Life::Off ? " (stack is up now: unchanged until usb.end + usb.begin)" : "");
+}
+
+// [USB4] usb.begin: після begin() (якщо не `nowait`) проба появи пристрою й монтування з мітками етапів.
+// Проба опитує usb_host_lib_info() із loopTask паралельно з usb_lib (потокобезпечність за usb/usb_host.h НЕ
+// перевірена: заголовок не прикладено; у teardown той самий виклик робить usb_mgr).
+void probeAfterBegin(bool beginOk) {
+    const uint32_t tp = millis();
+    while ((millis() - tp) < usb_host_cfg::kLifePresentWaitMs) {
+        if (s_stageMs[StConnected].load() != kNotReached) {
+            break;
+        }
+        if (s_hostUp.load()) {
+            usb_host_lib_info_t info = {};
+            if (usb_host_lib_info(&info) == ESP_OK && info.num_devices > 0) {
+                traceMark(StEnumSeen, true);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(usb_host_cfg::kProbePollMs));
+    }
+    const bool enumSeen = s_stageMs[StEnumSeen].load() != kNotReached;
+    const bool connected = s_stageMs[StConnected].load() != kNotReached;
+    if (connected) {
+        const uint32_t tm = millis();
+        while ((millis() - tm) < usb_host_cfg::kLifeMountWaitMs) {
+            const State st = state();
+            if (st == State::Mounted || st == State::Error || !s_present.load()) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(usb_host_cfg::kProbePollMs));
+        }
+    }
+    printStageReport("after usb.begin");
+    const State st = state();
+    if (!beginOk) {
+        Serial.printf("%s VERDICT: begin() FAILED; furthest stage=%s; last error 0x%x (%s) at '%s'\n", kTag,
+                      furthestStage(), (unsigned)lastError().code, errorName(lastError().code), lastError().where);
+    } else if (connected && st == State::Mounted) {
+        Serial.printf("%s VERDICT: ok, device mounted\n", kTag);
+    } else if (connected && st == State::Error) {
+        Serial.printf("%s VERDICT: device seen, mount FAILED (last error 0x%x at '%s')\n", kTag,
+                      (unsigned)lastError().code, lastError().where);
+    } else if (connected) {
+        Serial.printf("%s VERDICT: STUCK after 'connected' (state=%s, furthest stage=%s): mount did not finish in %u ms\n",
+                      kTag, stateName(st), furthestStage(), (unsigned)usb_host_cfg::kLifeMountWaitMs);
+    } else if (enumSeen) {
+        Serial.printf("%s VERDICT: STUCK: host library sees a device (num_devices>0) but the MSC 'connected' callback "
+                      "did not arrive within %u ms (furthest stage=%s)\n",
+                      kTag, (unsigned)usb_host_cfg::kLifePresentWaitMs, furthestStage());
+    } else {
+        Serial.printf("%s VERDICT: no device seen by host library within %u ms (no flash, or enumeration slower "
+                      "than the wait)\n", kTag, (unsigned)usb_host_cfg::kLifePresentWaitMs);
+    }
+}
+
+// [USB4] usb.beginend <ms>: begin() і через <ms> мс від його виклику — end(); ОДНА команда, тож час між ними
+// детермінований (вставка двох рядків у монітор не годиться: рядки склеюються). Орієнтири з логів (флешка вставлена,
+// radio): enum_seen ≈ 340–400, connected ≈ 410–510, dev_installed ≈ 690–790, mounted ≈ 700–800 мс.
+void cmdBeginEnd(const char* arg) {
+    const long ms = (arg != nullptr && arg[0] != '\0') ? strtol(arg, nullptr, 10) : -1;
+    if (ms < 0 || ms > 3000) {
+        Serial.printf("%s beginend: usage usb.beginend <ms 0..3000>\n", kTag);
+        return;
+    }
+    if (s_life.load() != Life::Off) {
+        Serial.printf("%s beginend: need life=Off (run usb.end first), now %s\n", kTag, lifeName(s_life.load()));
+        return;
+    }
+    const uint32_t t0 = millis();
+    const bool okBegin = begin();
+    const uint32_t spent = millis() - t0;
+    if (spent < (uint32_t)ms) {
+        vTaskDelay(pdMS_TO_TICKS((uint32_t)ms - spent));
+    }
+    Serial.printf("%s beginend: begin=%s, calling end() at t=%u ms (state=%s present=%d)\n", kTag,
+                  okBegin ? "ok" : "FAILED", (unsigned)(millis() - t0), stateName(s_state.load()),
+                  (int)s_present.load());
+    const uint32_t te = millis();
+    const bool okEnd = end();
+    Serial.printf("%s beginend: end=%s in %u ms (state=%s life=%s need_reboot=%d)\n", kTag,
+                  okEnd ? "ok" : "FAILED", (unsigned)(millis() - te), stateName(s_state.load()),
+                  lifeName(s_life.load()), (int)s_needReboot.load());
+    printStageReport("after usb.beginend (stages reached before end)");
+}
+
+void cmdBegin(const char* arg) {
+    const bool nowait = (arg != nullptr) && strncmp(arg, "nowait", 6) == 0;
+    const uint32_t t0 = millis();
+    const bool ok = begin();
+    Serial.printf("%s begin: %s in %u ms\n", kTag, ok ? "ok" : "failed (see usb.stat / usb.trace)",
+                  (unsigned)(millis() - t0));
+    if (!nowait) {
+        probeAfterBegin(ok);
     }
 }
 
@@ -973,8 +1411,9 @@ void cmdLife(const char* arg) {
 void cmdEnd() {
     const uint32_t t0 = millis();
     const bool ok = end();
-    Serial.printf("%s end: %s in %u ms (state=%s life=%s)\n", kTag, ok ? "ok" : "failed (see usb.stat)",
-                  (unsigned)(millis() - t0), stateName(s_state.load()), lifeName(s_life.load()));
+    Serial.printf("%s end: %s in %u ms (state=%s life=%s need_reboot=%d)\n", kTag,
+                  ok ? "ok" : "failed (see usb.stat)", (unsigned)(millis() - t0), stateName(s_state.load()),
+                  lifeName(s_life.load()), (int)s_needReboot.load());
 }
 
 // Пропуск пробілів на початку аргументу.
@@ -991,6 +1430,11 @@ bool isCmd(const char* line, const char* name) {
 }
 
 void handleLine(const char* line) {
+    // [USB4] Відлуння: видно, що саме розібрано (рядки в терміналі можуть склеюватись).
+    Serial.printf("%s got: %s\n", kTag, line);
+    if (strstr(line + 1, "usb.") != nullptr) {
+        Serial.printf("%s WARNING: several commands glued in one line - send one command per line\n", kTag);
+    }
     if (isCmd(line, "usb.stat")) {
         cmdStat();
     } else if (isCmd(line, "usb.heap")) {
@@ -1002,12 +1446,18 @@ void handleLine(const char* line) {
     } else if (isCmd(line, "usb.life")) {
         cmdLife(skipSpaces(line + strlen("usb.life")));
     } else if (isCmd(line, "usb.begin")) {
-        const bool ok = begin();
-        Serial.printf("%s begin: %s\n", kTag, ok ? "ok" : "failed (see usb.stat)");
+        cmdBegin(skipSpaces(line + strlen("usb.begin")));
+    } else if (isCmd(line, "usb.beginend")) {
+        cmdBeginEnd(skipSpaces(line + strlen("usb.beginend")));
+    } else if (isCmd(line, "usb.prio")) {
+        cmdPrio(skipSpaces(line + strlen("usb.prio")));
+    } else if (isCmd(line, "usb.trace")) {
+        printStageReport("manual");
     } else if (isCmd(line, "usb.end")) {
         cmdEnd();
     } else if (isCmd(line, "usb.help")) {
-        Serial.printf("%s commands: usb.stat | usb.ls [path] | usb.cycle N | usb.life N | usb.heap | usb.begin | usb.end\n",
+        Serial.printf("%s commands: usb.stat | usb.ls [path] | usb.cycle N | usb.life N | usb.heap | "
+                      "usb.begin [nowait] | usb.beginend <ms> | usb.end | usb.prio [<lib> <msc> <mgr> | default] | usb.trace\n",
                       kTag);
     } else {
         Serial.printf("%s unknown command (usb.help)\n", kTag);
