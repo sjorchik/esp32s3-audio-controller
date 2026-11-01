@@ -1,12 +1,13 @@
 #pragma once
 
 // [USB2] Константи модуля монтування USB-флешки (src/usb/usb_msc_mount.*).
+// [USB3] ДОДАНО константи end() / usb.life (блок «Життєвий цикл»). Решта значень — без змін.
 // Прапорці умовної компіляції (FEATURE_USB_HOST, USB_HOST_DIAG, USB_HOST_AUTOSTART) — у config/features.h.
 //
 // Позначки джерел значень:
 //   [USB1]  — значення з перевіреного на залізі тесту USB1 (src/usb_host_test.cpp);
 //   [W1]    — випливає з правила проєкту про ядра / пріоритети (MASTER SPEC, розділ 5, урок W1);
-//   [ГАДКА] — вибір планування БЕЗ вимірювання, ПОТРЕБУЄ ПІДТВЕРДЖЕННЯ на залізі (hwcheck_USB2.md).
+//   [ГАДКА] — вибір планування БЕЗ вимірювання, ПОТРЕБУЄ ПІДТВЕРДЖЕННЯ на залізі (hwcheck_USB2.md / hwcheck_USB3.md).
 
 #include <stddef.h>
 #include <stdint.h>
@@ -61,6 +62,36 @@ constexpr uint32_t kMountSlowWarnMs = 3000;  // [ГАДКА]
 // begin() чекає завершення інсталяції USB-host (usb_mgr) не довше цього часу.
 constexpr uint32_t kInstallWaitMs = 1500;  // [ГАДКА]
 
+// --- [USB3] Життєвий цикл: end() ----------------------------------------------------------
+// end() (виклик із будь-якої задачі) чекає завершення зняття в usb_mgr не довше цього часу.
+// Запас на найгірший випадок «end() під час монтування»: усі спроби монтування
+// (kMountMaxAttempts × kMountSlowWarnMs + паузи між ними) + кроки зняття нижче.
+// Це поріг очікування, а не гарантія: при таймауті end() повертає false, зняття триває у фоні.
+constexpr uint32_t kEndWaitMs = 10000;  // [ГАДКА] перевірити виміром (usb.end під час монтування)
+
+// Очікування одного кроку зняття (у задачі usb_mgr): подія ALL_FREE після usb_host_device_free_all(),
+// вихід задачі usb_lib, повтори usb_host_uninstall() при ESP_ERR_INVALID_STATE («є незавершені дії»,
+// usb/usb_host.h). Джерело: у заголовках таймаутів немає. [ГАДКА]
+constexpr uint32_t kEndStepWaitMs = 2000;
+
+// Крок опитування подій бібліотеки з usb_mgr між повторами usb_host_uninstall() (usb_lib на цей час уже
+// зупинено, тож usb_host_lib_handle_events() викликає лише usb_mgr — заголовок забороняє виклик з двох
+// потоків одночасно). [ГАДКА]
+constexpr uint32_t kEndPollMs = 50;
+
+// Таймаут usb_host_lib_handle_events() у задачі usb_lib (замість portMAX_DELAY): щоб задача бачила
+// прапорець зупинки навіть якщо usb_host_lib_unblock() не «запамʼятовується» (заголовок цього не гарантує).
+// ESP_ERR_TIMEOUT у цьому режимі — норма. [ГАДКА]
+constexpr uint32_t kLibWaitMs = 100;
+
+// Пауза в end() після успішного зняття: задача, що видалила себе (vTaskDelete), звільняє стек і TCB
+// лише в idle-задачі; без паузи вимір free одразу після end() занижений. [ГАДКА]
+constexpr uint32_t kEndSettleMs = 100;
+
+// begin() / end() чекають мьютекс життєвого циклу не довше: найдовше утримання — end() (kEndWaitMs)
+// або begin() (kInstallWaitMs) + запас.
+constexpr uint32_t kLifeLockWaitMs = kEndWaitMs + kInstallWaitMs + 1000;
+
 // --- Діагностична консоль (USB_HOST_DIAG) ------------------------------------------------
 constexpr uint32_t kConsolePollMs = 50;     // [ГАДКА] період опитування Serial у loop() (за відсутності xsmt-консолі)
 constexpr size_t kConsoleLineMax = 64;      // [ГАДКА] довжина рядка команди
@@ -68,6 +99,14 @@ constexpr size_t kPathMax = 256;            // [USB1] (у тесті буфер 
 constexpr int kLsMaxLines = 50;             // [ГАДКА] ліміт рядків `usb.ls`
 constexpr uint32_t kLsLockWaitMs = 1000;    // [ГАДКА] очікування мʼютекса вводу-виводу в `usb.ls`
 constexpr uint32_t kCycleGapMs = 500;       // [ГАДКА] пауза між розмонтуванням і монтуванням у `usb.cycle`
-constexpr uint32_t kCycleMaxCount = 100;    // [ГАДКА] верхня межа N для `usb.cycle N`
+constexpr uint32_t kCycleMaxCount = 100;    // [ГАДКА] верхня межа N для `usb.cycle N` і `usb.life N`
+
+// [USB3] usb.life: після begin() чекати появи носія (подія драйвера) не довше; без флешки цикл
+// триває цей час щоразу.
+constexpr uint32_t kLifePresentWaitMs = 1500;  // [ГАДКА]
+// usb.life: очікування стану Mounted після появи носія = усі спроби монтування з паузами та порогом
+// «повільного» монтування (виводиться з констант вище, а не вигадується).
+constexpr uint32_t kLifeMountWaitMs =
+    kMountMaxAttempts * (kMountSlowWarnMs + kMountRetryDelayMs);
 
 }  // namespace usb_host_cfg

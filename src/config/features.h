@@ -27,20 +27,20 @@
 
 // [USB2] USB-host (рідний порт S3, GPIO19 = D−, GPIO20 = D+) з драйвером MSC: монтування
 // USB-флешки в /usb (модуль src/usb/usb_msc_mount.*, константи — config/usb_host_config.h).
-// 1 — модуль збирається й стартує (за USB_HOST_AUTOSTART); 0 — модуль, бібліотека lib/usb_host_msc
-// і USB-host не потрапляють у збірку (RAM / Flash не змінюються).
-// Значення за замовчуванням 1 лише для кроку USB2 (власник перевіряє на залізі, hwcheck_USB2.md).
+// 1 — модуль збирається й може стартувати (begin() / end(), див. USB_HOST_AUTOSTART); 0 — модуль,
+// бібліотека lib/usb_host_msc і USB-host не потрапляють у збірку (RAM / Flash не змінюються).
 // Рідний Type-C НЕ використовувати одночасно з гніздом USB-A (спільні D+ / D−).
 #define FEATURE_USB_HOST 1
 
-// [USB2] Діагностична консоль USB (Serial: usb.stat / usb.ls / usb.cycle / usb.heap / usb.begin).
-// Діє лише при FEATURE_USB_HOST = 1. За замовчуванням 1, бо потрібна для hwcheck_USB2.md
-// (вимірювання RAM, цикли монтування); у РЕЛІЗІ ставити 0 (при 0 увесь діагностичний код,
-// DEBUG-рівні логів драйвера MSC й опитування Serial у loop() компілюються геть).
+// [USB2] Діагностична консоль USB (Serial: usb.stat / usb.ls / usb.cycle / usb.heap / usb.begin;
+// [USB3] + usb.end / usb.life N). Діє лише при FEATURE_USB_HOST = 1. За замовчуванням 1, бо потрібна для
+// hwcheck_USB2.md / hwcheck_USB3.md (вимірювання RAM, цикли begin / end); у РЕЛІЗІ ставити 0 (при 0 увесь
+// діагностичний код, DEBUG-рівні логів драйвера MSC й опитування Serial у loop() компілюються геть).
 #define USB_HOST_DIAG 1
 
-// [USB2] Автозапуск USB-host в кінці setup(). 1 — begin() викликається автоматично (поведінка
-// для цього кроку); 0 — USB не запускається, поки не прийде консольна команда `usb.begin`
-// (потрібно для вимірювання RAM «до begin()», лише при USB_HOST_DIAG = 1; без діагностики
-// 0 означає, що USB не стартує взагалі).
-#define USB_HOST_AUTOSTART 1
+// [USB2] Автозапуск USB-host в кінці setup(). 1 — begin() викликається автоматично; 0 — USB не запускається,
+// поки його не підніме команда `usb.begin` (USB_HOST_DIAG = 1) або майбутній режим «USB».
+// [USB3] ЗМІНЕНО: за замовчуванням 0 (рішення власника, варіант 2: USB-host піднімається лише в режимі «USB»;
+// USB-host без носія ≈ 18,8 КБ внутрішньої RAM). Без діагностики (USB_HOST_DIAG = 0) значення 0 означає, що USB
+// не стартує взагалі, доки режим «USB» не додано в AppController (крок g).
+#define USB_HOST_AUTOSTART 0
