@@ -1,3 +1,5 @@
+// [USB7] ДОДАНО лічильники читань у UsbFileImpl::read (readStats / resetReadStats, лише USB_HOST_DIAG); логіка
+// блокувань і поколінь без змін.
 // [USB6] fs::FS-обгортка над VFS-монтуванням USB-флешки (/usb) + діагностика читання (usb.fs.*).
 //
 // Архітектура:
@@ -19,16 +21,38 @@
 #include <Arduino.h>
 #include <string.h>
 #include <stdlib.h>
+#include <atomic>
 #include <memory>
 
 #include "config/usb_host_config.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"  // [USB7] esp_timer_get_time() для лічильників читань
 #include "usb/usb_msc_mount.h"
 #include "vfs_api.h"  // VFSImpl / VFSFileImpl з бібліотеки FS (ядро Arduino-ESP32 3.3.7)
 
 namespace usb_fs {
 
 namespace {
+
+#if USB_HOST_DIAG
+// [USB7] Лічильники читань (атомарні, relaxed): пише задача, що читає (декодер, ядро 1; або консоль), читає консоль.
+std::atomic<uint32_t> s_rdCount{0};
+std::atomic<uint32_t> s_rdMaxUs{0};
+std::atomic<uint32_t> s_rdSlow{0};
+std::atomic<uint32_t> s_rdBytes{0};
+
+void noteRead(int64_t us, size_t got) {
+    const uint32_t u = (us < 0) ? 0u : (us > 0xFFFFFFFFLL ? 0xFFFFFFFFu : static_cast<uint32_t>(us));
+    s_rdCount.fetch_add(1, std::memory_order_relaxed);
+    s_rdBytes.fetch_add(static_cast<uint32_t>(got), std::memory_order_relaxed);
+    if (u >= usb_host_cfg::kFsSlowReadUs) {
+        s_rdSlow.fetch_add(1, std::memory_order_relaxed);
+    }
+    uint32_t cur = s_rdMaxUs.load(std::memory_order_relaxed);
+    while (u > cur && !s_rdMaxUs.compare_exchange_weak(cur, u, std::memory_order_relaxed)) {
+    }
+}
+#endif  // USB_HOST_DIAG
 
 // Шлях: з '/' на початку, без "..", з запасом у буфері kPathMax (з префіксом точки монтування).
 bool pathOk(const char* path) {
@@ -86,11 +110,20 @@ public:
     }
 
     size_t read(uint8_t* buf, size_t size) override {
-        VolumeGuard g;
-        if (!g.sameMount(_gen)) {
-            return 0;
+#if USB_HOST_DIAG
+        const int64_t t0 = esp_timer_get_time();  // [USB7] разом з очікуванням блокування тому
+#endif
+        size_t got = 0;
+        {
+            VolumeGuard g;
+            if (g.sameMount(_gen)) {
+                got = _inner->read(buf, size);
+            }
         }
-        return _inner->read(buf, size);
+#if USB_HOST_DIAG
+        noteRead(esp_timer_get_time() - t0, got);
+#endif
+        return got;
     }
 
     void flush() override {}
@@ -263,6 +296,24 @@ fs::FS& volume() {
     static fs::FS s_volume(std::make_shared<UsbVolumeImpl>());
     return s_volume;
 }
+
+#if USB_HOST_DIAG
+ReadStats readStats() {  // [USB7]
+    ReadStats r;
+    r.count = s_rdCount.load(std::memory_order_relaxed);
+    r.maxUs = s_rdMaxUs.load(std::memory_order_relaxed);
+    r.slowCount = s_rdSlow.load(std::memory_order_relaxed);
+    r.bytes = s_rdBytes.load(std::memory_order_relaxed);
+    return r;
+}
+
+void resetReadStats() {  // [USB7]
+    s_rdCount.store(0, std::memory_order_relaxed);
+    s_rdMaxUs.store(0, std::memory_order_relaxed);
+    s_rdSlow.store(0, std::memory_order_relaxed);
+    s_rdBytes.store(0, std::memory_order_relaxed);
+}
+#endif
 
 #if USB_HOST_DIAG
 

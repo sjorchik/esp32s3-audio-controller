@@ -1,4 +1,6 @@
 // [USB2] Постійний модуль монтування USB-флешки (USB-host MSC). Замінює src/usb_host_test.*.
+// [USB7] ДОДАНО лише диспетчеризацію консольних команд відтворення (usb.play / usb.pstat / usb.seek / usb.stopf /
+// usb.ended -> usb/usb_play_diag.*) і рядок usb.help; логіка монтування / зняття без змін.
 // [USB5] Безпечне зняття стека: end() НЕ доходить до usb_host_uninstall(), поки usb_lib не «тиха» (немає подій і
 // обробник підключення не триває) і num_devices != 0; перед зупинкою usb_lib чекаємо ALL_FREE + друге тихе вікно;
 // перед КОЖНОЮ спробою usb_host_uninstall() перевіряємо num_devices == 0. Якщо безпеку не встановлено — стек
@@ -50,6 +52,7 @@
 #include "config/usb_host_config.h"
 #if USB_HOST_DIAG
 #include "usb/usb_fs.h"  // [USB6] usb.fs.* (диспетчеризація в handleLine)
+#include "usb/usb_play_diag.h"  // [USB7] usb.play / usb.pstat / usb.seek / usb.stopf / usb.ended
 #endif
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -1779,9 +1782,12 @@ void handleLine(const char* line) {
         cmdEnd();
     } else if (isCmd(line, "usb.help")) {
         Serial.printf("%s commands: usb.stat | usb.ls [path] | usb.cycle N | usb.life N | usb.heap | "
-                      "usb.begin [nowait] | usb.beginend <ms> | usb.sweep <from> <to> <step> [runs] | usb.end | usb.prio [<lib> <msc> <mgr> | default] | usb.trace\n",
+                      "usb.begin [nowait] | usb.beginend <ms> | usb.sweep <from> <to> <step> [runs] | usb.end | usb.prio [<lib> <msc> <mgr> | default] | usb.trace | "
+                      "usb.play <path> [start_sec] | usb.pstat | usb.seek <sec> | usb.stopf | usb.ended [take] | usb.fx [extra <ms> | dig <ms|-1> | level <dB>]\n",
                       kTag);
 #if USB_HOST_DIAG
+    } else if (usb_play_diag::isPlayCommand(line)) {
+        usb_play_diag::handleConsoleLine(line);  // [USB7]
     } else if (strncmp(line, "usb.fs.", 7) == 0) {
         usb_fs::handleConsoleLine(line);  // [USB6]
 #endif

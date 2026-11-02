@@ -14,6 +14,9 @@
 // [Prompt 25] ДОДАНО: setOutputTrimDb()/outputTrimDb() — рівень виходу декодера по станціях.
 // [Prompt 44] ДОДАНО: setFixedOutputRate()/fixedOutputRate() — фіксація 48 кГц на I2S0 для line_path.
 //
+// [USB7] ДОДАНО: playFile() і допоміжні (файлове джерело з USB-флешки через Audio::connecttoFS, секція «Файл»
+// нижче). Публічний інтерфейс радіо, begin() та сигнатури наявних методів НЕ змінено.
+//
 // [Prompt 5] Заглушку замінено. Позначки:
 //   ЗМІНЕНО — сигнатура відрізняється від заглушки (розділ 12);
 //   ДОДАНО  — нове.
@@ -120,6 +123,61 @@ public:
     // [Prompt X1] ДОДАНО: негайно підтягнути XSMT до LOW (мʼют ЦАП) з будь-якої задачі, без очікувань.
     // Для «тихого» перезапуску: гарантує XSMT LOW перед ESP.restart(). Стан плеєра не змінює.
     static void forceDacMute();
+
+    // ------------------------------------------------------------------------------------------------
+    // [USB7] Файл з USB-флешки (/usb через usb_fs::volume()). Усі команди асинхронні (виконує задача плеєра).
+    // Керування лише з діагностичної консолі (USB_HOST_DIAG); режим «USB», навігація, автоперехід — крок g.
+    // ------------------------------------------------------------------------------------------------
+
+    // Запит на відтворення файлу. path — БЕЗ точки монтування, з '/' на початку (напр. "/song.mp3"; Audio::connecttoFS
+    // сам додасть '/' за відсутності). startSec >= 0 — стартова секунда (connecttoFS, абсолютна), -1 — з початку.
+    // Передумови (інакше false і рядок «[PLAYER] playFile refused: ...» у Serial): плеєр запущено, том USB
+    // змонтовано (usb_msc_mount::isMounted()), радіо НЕ грає / не запитане, прохід line_path не піднято і I2S0 не
+    // зафіксовано на 48 кГц (перемикання режимів — крок g). Якщо вже грає інший ФАЙЛ — він зупиняється штатним шляхом
+    // (мʼют ЦАП + пауза, stopSong). true — запит прийнято, не означає, що звук уже є (стежити за state() / usb.pstat).
+    // Рівень виходу (output_trim) на час файлу = file_player_cfg::kFileLevelDb (ПРИПУЩЕННЯ, див. hwcheck_USB7.md);
+    // гучність користувача — той самий radio_volume (веде AppController, плеєр його не чіпає).
+    static bool playFile(const char* path, int32_t startSec = -1);
+
+    // true — поточне джерело плеєра файл (активний АБО завершений / зупинений до наступного playUrl / playFile).
+    static bool isFileSource();
+
+    // true — файл відкрито й відтворюється (стани Buffering / Playing, до кінця / зупинки / збою).
+    static bool fileActive();
+
+    // Прапорець «файл закінчився природно (eof)». Піднімається ПІСЛЯ паузи kEndTailMs, мʼюту ЦАП і переходу в Idle;
+    // скидається при старті НОВОГО файлу. НЕ піднімається при stop(), збої читання й вийнятті флешки (тоді стан
+    // Error + lastFileError()). takeFileEnded() — читання зі скиданням; fileEndedPending() — лише перегляд.
+    // Автопереходу на наступний трек НЕМАЄ.
+    static bool takeFileEnded();
+    static bool fileEndedPending();
+    // millis() моменту, коли піднято прапорець (0 — не піднімався).
+    static uint32_t fileEndedAtMs();
+
+    // Тривалість і позиція, секунди. Кеш, який оновлює задача плеєра кожні file_player_cfg::kPosPollMs
+    // (Audio::getAudioFileDuration / getAudioCurrentTime); 0 — невідомо / файл не грає. Роздільність 1 с.
+    static uint32_t fileDurationSec();
+    static uint32_t filePositionSec();
+
+    // Запит на зсув позиції: тонка обгортка над Audio::setTimeOffset(int). ВІДНОСНИЙ зсув у секундах (знак — напрям):
+    // підтверджено на залізі (USB7, партія 2: +30 з 6 с -> 37 с, -10 з 41 с -> 32 с). Точність у межах ~1 с на CBR
+    // 128 кбіт/с; VBR не вимірювалось. false — файл не грає.
+    static bool seekFileSec(int32_t sec);
+
+    // [USB7] Налаштування на льоту для підбору клацань на старті (консоль `usb.fx`; діють на НАСТУПНИЙ файл).
+    //  extraMs  — додаткова пауза перед XSMT HIGH (поверх xsmt::clockSettleMs());
+    //  digMs    — пауза між XSMT HIGH і цифровим розмʼютом radio_volume; -1 = розмʼютити радіо-DSP одразу при
+    //             старті файлу (поведінка до виправлення, коли ЦАП відкривався посеред сигналу);
+    //  levelDb  — рівень виходу декодера для файлу, дБ (station_level_cfg::kLevelMinDb..kLevelMaxDb).
+    // Значення обрізаються до допустимих меж. Будь-яка задача.
+    static void setFileTune(uint32_t extraMs, int32_t digMs, int levelDb);
+    static void getFileTune(uint32_t* extraMs, int32_t* digMs, int* levelDb);
+
+    // Копіює шлях останнього запитаного файлу (порожній рядок, якщо файлу не було). true — шлях непорожній.
+    static bool currentFilePath(char* out, size_t cap);
+
+    // Причина останнього збою файлу (статичний рядок) або nullptr. Скидається при старті нового файлу.
+    static const char* lastFileError();
 
     // [Prompt 17] Декодовані PCM-семпли для VU перехоплює вільна функція
     // audio_process_i2s(int32_t*, int16_t, bool*) в audio/vu_pcm_hook.cpp (за VU_PCM_HOOK_STYLE

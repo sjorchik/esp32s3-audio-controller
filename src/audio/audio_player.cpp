@@ -11,23 +11,36 @@
 //   стиль 2: Audio::audio_info_callback, Audio::msg_t, Audio::evt_info,
 //            evt_bitrate, evt_eof, evt_name, evt_streamtitle, evt_id3data;
 
+// [USB7] ДОДАНО файлове джерело (AudioPlayer::playFile, Audio::connecttoFS(usb_fs::volume(), ...)): окремі гілки
+// doPlayFile / failFile / finishFile / monitorFile; радіо-логіка (reconnect, backoff, буфер, недовантаження) для
+// файлу НЕ виконується (s_source == Source::File). Решта файлу для радіо — без змін.
+
 #include "audio/audio_player.h"
 
 #include <Audio.h>
 
 #include <driver/gpio.h>  // [X1b] gpio_set_level
+#include <atomic>
 #include <new>
 #include <stdlib.h>
 #include <string.h>
 
 #include "audio/eq.h"
+#include "audio/line_path.h"  // [USB7] передумова playFile: прохід зовнішніх входів не піднято
 #include "audio/output_trim.h"
+#include "audio/radio_volume.h"  // [USB7] цифровий мʼют радіо: AppController тримає його після паузи (s_stopHold)
 #include "audio/xsmt_trace.h"            // [Prompt X1]
 #include "config/audio_player_config.h"
 #include "config/eq_config.h"
+#include "config/features.h"            // [USB7] FEATURE_USB_HOST
+#include "config/file_player_config.h"  // [USB7]
 #include "config/line_path_config.h"  // [Prompt 48d] LINE_PATH_ENABLE (раніше ADC_VU_ENABLE через adc_vu_config.h)
 #include "config/pins.h"
 #include "config/xsmt_config.h"          // [Prompt X1]
+#if FEATURE_USB_HOST
+#include "usb/usb_fs.h"         // [USB7] usb_fs::volume() для connecttoFS
+#include "usb/usb_msc_mount.h"  // [USB7] isMounted()
+#endif
 
 #if AUDIO_PLAYER_DEBUG
 #define PLAYER_LOG(...) Serial.printf(__VA_ARGS__)
@@ -361,7 +374,7 @@ void copyUtf8Trunc(char* dst, size_t cap, const char* src) {
 // Стан плеєра
 // ===========================================================================
 
-enum class Cmd : uint8_t { None, Play, Stop };
+enum class Cmd : uint8_t { None, Play, Stop, PlayFile };  // [USB7] + PlayFile
 
 // [Prompt 44] Запит на зміну фіксації частоти I2S0: 0 — немає, 1 — 48 кГц, 2 — частота джерела.
 // Пише setFixedOutputRate() (будь-яка задача), виконує й скидає задача плеєра.
@@ -390,6 +403,39 @@ volatile bool s_evtBitrate = false;
 volatile bool s_evtStreamReady = false;
 volatile bool s_evtSampleRate = false;   // [X1d] бібліотека надрукувала "SampleRate (Hz): N" (декодер встановив частоту)
 volatile uint32_t s_rateEvtAtMs = 0;
+
+// [USB7] Файлове джерело. Джерело (Radio / File) і прапорці пише лише задача плеєра (крім s_evtFileEof — callback
+// бібліотеки в контексті Audio::loop()).
+enum class Source : uint8_t { Radio, File };
+volatile Source s_source = Source::Radio;
+// true між успішним connecttoFS і зупинкою / збоєм / кінцем: лише тоді eof-подія вважається ПРИРОДНИМ кінцем файлу.
+// Скидається ДО кожного власного stopSong(), тож eof від нашої зупинки не плутається з кінцем файлу.
+volatile bool s_fileActive = false;
+volatile bool s_evtFileEof = false;       // callback: природний eof файлу
+std::atomic<bool> s_fileEnded{false};     // прапорець «файл закінчився» (takeFileEnded)
+volatile uint32_t s_fileEndedAtMs = 0;
+volatile uint32_t s_filePosSec = 0;       // кеш позиції / тривалості (оновлює задача плеєра)
+volatile uint32_t s_fileDurSec = 0;
+volatile bool s_seekPending = false;
+volatile int32_t s_seekSec = 0;
+const char* volatile s_fileError = nullptr;  // статичний рядок
+// Під мʼютексом: запит playFile і шлях активного / останнього файлу.
+char s_pendingFile[file_player_cfg::kPathMax];
+int32_t s_pendingStartSec = -1;
+char s_filePath[file_player_cfg::kPathMax];
+// Лише задача плеєра. [USB7] Цифровий мʼют radio_volume: після паузи радіо AppController тримає його (s_stopHold до
+// наступного startStream()), тож на час файлу плеєр сам його знімає і ПОВЕРТАЄ при зупинці / кінці / збої.
+volatile uint32_t s_fxExtraSettleMs = file_player_cfg::kExtraSettleMs;      // usb.fx extra
+volatile int32_t s_fxDigDelayMs = static_cast<int32_t>(file_player_cfg::kDigitalUnmuteDelayMs);  // usb.fx dig
+volatile int32_t s_fxLevelDb = file_player_cfg::kFileLevelDb;                // usb.fx level
+bool s_fileRadioMuteTouched = false;
+bool s_fileRadioPrevMuted = true;
+bool s_fileDigitalUnmuted = false;  // radio_volume вже розмʼючено для поточного файлу
+bool s_fileDacOpenSeen = false;     // XSMT уже високо для поточного файлу
+uint32_t s_fileDacOpenAtMs = 0;
+bool s_fileEofPending = false;
+uint32_t s_fileEofAtMs = 0;
+uint32_t s_filePosPollMs = 0;
 
 // Тільки задача плеєра.
 char s_url[player_cfg::kUrlMax];
@@ -558,6 +604,17 @@ void handleBitrate(const char* text) {
 }
 
 void handleEof(const char* text) {
+    // [USB7] Файлове джерело: eof ПРИХОДИТЬ ПІСЛЯ stopSong() з іменем файлу (контракт, розділ 11). Радіо-прапорець
+    // s_evtEof (-> failStream -> reconnect) для файлу НЕ чіпаємо. Природний кінець — лише поки s_fileActive.
+    if (s_source == Source::File) {
+        if (s_fileActive) {
+            s_evtFileEof = true;
+            PLAYER_LOG("[PLAYER] file eof: %s\n", (text != nullptr) ? text : "?");
+        } else {
+            PLAYER_LOG("[PLAYER] file eof ignored (own stop): %s\n", (text != nullptr) ? text : "?");
+        }
+        return;
+    }
     s_evtEof = true;
     PLAYER_LOG("[PLAYER] eof: %s\n", (text != nullptr) ? text : "?");
 }
@@ -617,10 +674,19 @@ void connectNow(bool isReconnect) {
     setState(PlayerState::Buffering, "connected");
 }
 
+void fileRestoreRadioVolume();  // [USB7] визначено нижче (блок «Файлове джерело»)
+
 void doPlay(const char* url) {
     XSMT_EVT("player doPlay (command received by player task)");
+    // [USB7] Якщо грав файл: eof від нашого stopSong() не має вважатись його кінцем (s_fileActive = false ДО stopSong).
+    s_fileActive = false;
+    s_fileEofPending = false;
+    s_evtFileEof = false;
+    s_seekPending = false;
     muteDacWithLead("play");  // [X1] ПОРЯДОК ВИПРАВЛЕНО: мʼют (+пауза) ДО stopSong(), раніше — після
     s_audio->stopSong();  // безпечно, якщо нічого не грало
+    s_source = Source::Radio;  // [USB7] eof від stopSong() вище ще оброблено як файловий (ігнорується)
+    s_fileRadioMuteTouched = false;  // [USB7] радіо стартує: цифровим мʼютом далі керує AppController (не повертаємо!)
     strcpy(s_url, url);  // довжину перевірено в playUrl()
     s_wantPlaying = true;
     s_backoffMs = player_cfg::kReconnectInitialMs;
@@ -633,8 +699,14 @@ void doPlay(const char* url) {
 void doStop() {
     s_wantPlaying = false;
     XSMT_EVT("player doStop (command received by player task)");
+    // [USB7] Зупинка файлу: eof від stopSong() не є природним кінцем (прапорець «файл закінчився» НЕ піднімається).
+    s_fileActive = false;
+    s_fileEofPending = false;
+    s_evtFileEof = false;
+    s_seekPending = false;
     muteDacWithLead("stop");  // [X1] ПОРЯДОК ВИПРАВЛЕНО: мʼют (+пауза) ДО stopSong(), раніше — після
     s_audio->stopSong();
+    fileRestoreRadioVolume();  // [USB7] лише якщо грав файл (інакше нічого не робить)
     s_stableDone = false;
     s_rebuffering = false;
     s_notRunning = false;
@@ -643,10 +715,220 @@ void doStop() {
     setState(PlayerState::Idle, "stop");
 }
 
+// ===========================================================================
+// [USB7] Файлове джерело (виконується лише в задачі плеєра)
+// ===========================================================================
+
+bool fileElapsed(uint32_t now, uint32_t since, uint32_t ms) {
+    return static_cast<int32_t>(now - since - ms) >= 0;
+}
+
+// Чому playFile зараз неможливий (nullptr — можна). Викликається і з API, і повторно із задачі плеєра.
+// Радіо «активне», якщо його запитано (s_wantPlaying), line_path — якщо ресурси підняті, I2S0 зафіксовано на 48 кГц.
+const char* fileBlockReason() {
+    if (LinePath::resourcesUp() || LinePath::isRunning()) {
+        return "line_path active";
+    }
+    if (s_clkFixed) {
+        return "I2S0 fixed to 48 kHz (line_path owns it)";
+    }
+    if (s_wantPlaying) {
+        return "radio active";
+    }
+#if FEATURE_USB_HOST
+    if (!usb_msc_mount::isMounted()) {
+        return "usb volume not mounted";
+    }
+    return nullptr;
+#else
+    return "usb host disabled (FEATURE_USB_HOST = 0)";
+#endif
+}
+
+// Тримає цифровий мʼют радіо (radio_volume) ВКЛЮЧЕНИМ від старту файлу: попередній стан запамʼятовується один раз,
+// миттєва тиша виконується першим блоком хука. Розмʼют — лише після розмʼюту ЦАП (fileUnmuteRadioVolume):
+// [USB7, клацання на старті музики] ЦАП (XSMT) відкривається під цифровою тишею, а звук нарощує DSP (плавно),
+// а не стрибком у середині сигналу.
+void fileHoldRadioVolume() {
+    if (!s_fileRadioMuteTouched) {
+        s_fileRadioPrevMuted = radio_volume::muted();
+        s_fileRadioMuteTouched = true;
+    }
+    radio_volume::setMute(true);
+    radio_volume::requestForceMute();
+    s_fileDigitalUnmuted = false;
+    s_fileDacOpenSeen = false;
+}
+
+// Знімає цифровий мʼют радіо на час файлу: DSP плавно підніме звук (dsp_volume_cfg). Мʼют користувача / standby
+// AppController сюди не передає: кнопка мʼюту повторно мʼютить радіо-DSP, тож заглушить і файл.
+void fileUnmuteRadioVolume() {
+    radio_volume::setMute(false);
+    s_fileDigitalUnmuted = true;
+}
+
+// Повертає цифровий мʼют радіо як було ДО файлу. Викликати ПІСЛЯ мʼюту ЦАП (XSMT) і stopSong(): звуку вже немає,
+// тож додатково просимо миттєвий мʼют для першого блоку наступного потоку (як це робить AppController).
+void fileRestoreRadioVolume() {
+    if (!s_fileRadioMuteTouched) {
+        return;
+    }
+    s_fileRadioMuteTouched = false;
+    s_fileDigitalUnmuted = false;
+    radio_volume::setMute(s_fileRadioPrevMuted);  // як було ДО файлу (hold міг лишити мʼют увімкненим)
+    if (s_fileRadioPrevMuted) {
+        radio_volume::requestForceMute();
+    }
+}
+
+// Збій файлу (читання, вийняття флешки, таймаут старту): мʼют, зупинка, стан Error. БЕЗ reconnect і backoff
+// (s_wantPlaying для файлу завжди false, тож гілка Error -> connectNow радіо не спрацьовує).
+void failFile(const char* reason) {
+    s_fileActive = false;  // ДО stopSong(): eof від нашої зупинки не є кінцем файлу
+    s_fileEofPending = false;
+    s_evtFileEof = false;
+    s_seekPending = false;
+    muteDacWithLead("file failure");
+    s_audio->stopSong();
+    fileRestoreRadioVolume();
+    s_stableDone = false;
+    s_rebuffering = false;
+    s_notRunning = false;
+    s_fileError = reason;
+    Serial.printf("[PLAYER] file failure: %s (t=%lu ms, pos=%lu/%lu s)\n", reason,
+                  static_cast<unsigned long>(millis()), static_cast<unsigned long>(s_filePosSec),
+                  static_cast<unsigned long>(s_fileDurSec));
+    setState(PlayerState::Error, reason);
+}
+
+// Природний кінець файлу (пауза kEndTailMs після eof вже минула): мʼют ЦАП, Idle, прапорець «файл закінчився».
+void finishFile() {
+    s_fileActive = false;
+    muteDacWithLead("file end");
+    s_audio->stopSong();  // бібліотека вже зупинилась; повторний виклик безпечний (як у doStop)
+    fileRestoreRadioVolume();
+    s_stableDone = false;
+    s_notRunning = false;
+    setState(PlayerState::Idle, "file ended");
+    const uint32_t now = millis();
+    s_fileEndedAtMs = now;
+    s_fileEnded.store(true);
+    Serial.printf("[PLAYER] file ended t=%lu ms (pos=%lu/%lu s)\n", static_cast<unsigned long>(now),
+                  static_cast<unsigned long>(s_filePosSec), static_cast<unsigned long>(s_fileDurSec));
+}
+
+void doPlayFile(const char* path, int32_t startSec) {
+    XSMT_EVT("player doPlayFile (command received by player task)");
+    const char* why = fileBlockReason();  // стан міг змінитись між запитом і виконанням
+    if (why != nullptr) {
+        Serial.printf("[PLAYER] playFile refused in task: %s\n", why);
+        return;
+    }
+#if FEATURE_USB_HOST
+    // Поточне джерело (інший файл) зупиняється штатним шляхом: мʼют ЦАП (+пауза), eof від stopSong() ігнорується.
+    s_fileActive = false;
+    s_fileEofPending = false;
+    s_evtFileEof = false;
+    s_seekPending = false;
+    muteDacWithLead("play file");
+    s_audio->stopSong();  // безпечно, якщо нічого не грало
+
+    s_source = Source::File;
+    s_wantPlaying = false;  // радіо-перепідключення для файлу вимкнено
+    s_url[0] = '\0';
+    s_backoffMs = player_cfg::kReconnectInitialMs;
+    s_httpCode = 0;
+    s_fileError = nullptr;
+    s_fileEnded.store(false);
+    s_fileEndedAtMs = 0;
+    s_filePosSec = 0;
+    s_fileDurSec = 0;
+    s_filePosPollMs = millis();
+    clearMetadata();
+    {
+        Guard g;
+        if (g.ok()) {
+            strncpy(s_filePath, path, sizeof(s_filePath) - 1);
+            s_filePath[sizeof(s_filePath) - 1] = '\0';
+        }
+    }
+
+    fileHoldRadioVolume();  // цифрова тиша ДО першого блоку нового файлу (розмʼют — після відкриття ЦАП)
+
+    // Той самий скид службових прапорців, що й connectNow() для радіо (без радіо-таймерів).
+    s_rateSeen = 0;
+    s_rateSinceMs = millis();
+    s_stableDone = false;
+    s_rebuffering = false;
+    s_notRunning = false;
+    s_evtEof = false;
+    s_evtBitrate = false;
+    s_evtStreamReady = false;
+    s_evtSampleRate = false;
+    s_bufPercent = 0;
+
+    // ПРИПУЩЕННЯ: рівень файлу = типовий рівень станції (див. file_player_cfg::kFileLevelDb).
+    const int levelDb = static_cast<int>(s_fxLevelDb);
+    output_trim::setTargetDb(static_cast<int8_t>(levelDb));
+
+    Serial.printf("[PLAYER] play file: %s (start %ld s, level %d dB, extra %lu ms, dig %ld ms)\n", path,
+                  static_cast<long>(startSec), levelDb, static_cast<unsigned long>(s_fxExtraSettleMs),
+                  static_cast<long>(s_fxDigDelayMs));
+    setState(PlayerState::Connecting, path);
+    XSMT_EVT("player connecttoFS begin");
+    const bool ok = s_audio->connecttoFS(usb_fs::volume(), path, startSec);
+    s_connectedAtMs = millis();
+    XSMT_EVT("player connecttoFS end ok=%d", ok ? 1 : 0);
+    if (!ok) {
+        failFile("connecttoFS failed");
+        return;
+    }
+    s_fileActive = true;
+    if (s_fxDigDelayMs < 0) {  // usb.fx dig -1: радіо-DSP розмʼючується одразу (поведінка до виправлення)
+        fileUnmuteRadioVolume();
+    }
+    setState(PlayerState::Buffering, "file opened");
+#else
+    (void)path;
+    (void)startSec;
+#endif
+}
+
+void processSeek() {
+    if (!s_seekPending) {
+        return;
+    }
+    s_seekPending = false;
+    const int32_t sec = s_seekSec;
+    if (!s_fileActive || (s_state != PlayerState::Playing && s_state != PlayerState::Buffering)) {
+        Serial.println("[PLAYER] seek ignored: no file is playing");
+        return;
+    }
+    // Audio::setTimeOffset(int): семантика (відносний / абсолютний зсув) у закріпленому коміті не звірена.
+    s_audio->setTimeOffset(static_cast<int>(sec));
+    Serial.printf("[PLAYER] seek requested: setTimeOffset(%ld) at pos %lu s\n", static_cast<long>(sec),
+                  static_cast<unsigned long>(s_filePosSec));
+}
+
+void pollFilePosition(uint32_t now) {
+    if (s_source != Source::File || !s_fileActive || s_fileEofPending) {
+        return;
+    }
+    if (!fileElapsed(now, s_filePosPollMs, file_player_cfg::kPosPollMs)) {
+        return;
+    }
+    s_filePosPollMs = now;
+    s_filePosSec = static_cast<uint32_t>(s_audio->getAudioCurrentTime());
+    s_fileDurSec = static_cast<uint32_t>(s_audio->getAudioFileDuration());
+}
+
 void processCommands() {
     Cmd cmd = Cmd::None;
     char url[player_cfg::kUrlMax];
     url[0] = '\0';
+    char file[file_player_cfg::kPathMax];  // [USB7]
+    file[0] = '\0';
+    int32_t fileStart = -1;
     {
         Guard g;
         if (!g.ok()) {
@@ -656,12 +938,17 @@ void processCommands() {
         s_cmd = Cmd::None;
         if (cmd == Cmd::Play) {
             memcpy(url, s_pendingUrl, sizeof(url));
+        } else if (cmd == Cmd::PlayFile) {
+            memcpy(file, s_pendingFile, sizeof(file));
+            fileStart = s_pendingStartSec;
         }
     }
     if (cmd == Cmd::Play) {
         doPlay(url);
     } else if (cmd == Cmd::Stop) {
         doStop();
+    } else if (cmd == Cmd::PlayFile) {
+        doPlayFile(file, fileStart);
     }
 }
 
@@ -764,6 +1051,65 @@ bool elapsedAtLeast(uint32_t now, uint32_t since, uint32_t ms) {
     return static_cast<int32_t>(now - since - ms) >= 0;
 }
 
+// [USB7] Нагляд за файлом (Buffering / Playing). Замість monitorStream(): без reconnect, буфера й недовантажень.
+void monitorFile(uint32_t now) {
+    // Подія eof (прийшла ПІСЛЯ stopSong() бібліотеки). Якщо флешки вже немає — це НЕ кінець файлу (обгортка при
+    // розмонтуванні віддає 0 байт, бібліотека бачить «eof»): збій, а не прапорець «файл закінчився».
+    if (s_evtFileEof && !s_fileEofPending) {
+        s_evtFileEof = false;
+#if FEATURE_USB_HOST
+        if (!usb_msc_mount::isMounted()) {
+            failFile("volume removed (eof)");
+            return;
+        }
+#endif
+        s_fileEofPending = true;
+        s_fileEofAtMs = now;
+        const uint32_t pos = s_filePosSec;
+        const uint32_t dur = s_fileDurSec;
+        Serial.printf("[PLAYER] file eof event t=%lu ms (pos=%lu/%lu s)%s\n", static_cast<unsigned long>(now),
+                      static_cast<unsigned long>(pos), static_cast<unsigned long>(dur),
+                      (dur > 0 && pos + 3 < dur) ? " EARLY (read error?)" : "");
+    }
+    if (s_fileEofPending) {
+        if (elapsedAtLeast(now, s_fileEofAtMs, file_player_cfg::kEndTailMs)) {
+            s_fileEofPending = false;
+            finishFile();
+        }
+        return;
+    }
+#if FEATURE_USB_HOST
+    if (!usb_msc_mount::isMounted()) {
+        failFile("volume removed");
+        return;
+    }
+#endif
+
+    const bool running = s_audio->isRunning();
+    if (!running) {
+        if (!s_notRunning) {
+            s_notRunning = true;
+            s_notRunningSinceMs = now;
+        } else if (elapsedAtLeast(now, s_notRunningSinceMs, file_player_cfg::kNotRunningGraceMs)) {
+            failFile("decoder stopped");
+            return;
+        }
+    } else {
+        s_notRunning = false;
+    }
+
+    if (s_state == PlayerState::Buffering) {
+        // Для файлу «готовий» = декодер щось повідомив (bitrate / SampleRate / stream ready) або минув запасний час.
+        const bool ready = running && (s_evtBitrate || s_evtStreamReady || s_evtSampleRate ||
+                                       elapsedAtLeast(now, s_connectedAtMs, file_player_cfg::kAssumePlayingMs));
+        if (ready) {
+            setState(PlayerState::Playing, "file ready");
+        } else if (elapsedAtLeast(now, s_stateSinceMs, file_player_cfg::kStartTimeoutMs)) {
+            failFile("start timeout");
+        }
+    }
+}
+
 void applyMutePolicy(uint32_t now) {
     switch (s_state) {
         case PlayerState::Playing:
@@ -778,8 +1124,10 @@ void applyMutePolicy(uint32_t now) {
                 // (зміна частоти за getSampleRate / цей рядок).
                 const bool rateKnown = (s_rateSeen != 0) && s_evtSampleRate;
                 const uint32_t refMs = (static_cast<int32_t>(s_rateEvtAtMs - s_rateSinceMs) > 0) ? s_rateEvtAtMs : s_rateSinceMs;
-                const bool clockOk = rateKnown && elapsedAtLeast(now, refMs, xsmt::clockSettleMs());
-                const bool rateTimeout = elapsedAtLeast(now, s_playingSinceMs, xsmt::rateWaitMaxMs());
+                // [USB7] Для файлу додається налаштована пауза (usb.fx extra); для радіо extra = 0 (поведінка не змінена).
+                const uint32_t extra = (s_source == Source::File) ? s_fxExtraSettleMs : 0;
+                const bool clockOk = rateKnown && elapsedAtLeast(now, refMs, xsmt::clockSettleMs() + extra);
+                const bool rateTimeout = elapsedAtLeast(now, s_playingSinceMs, xsmt::rateWaitMaxMs() + extra);
                 if (clockOk || rateTimeout) {
                     muteDac(false, clockOk ? "clock stable" : "sample rate unknown, timeout");
                 }
@@ -801,7 +1149,31 @@ void applyMutePolicy(uint32_t now) {
     }
 }
 
+// [USB7] Автомат файлового джерела (замість радіо-гілки updateState). Error / Idle для файлу — кінцеві стани
+// до наступної команди: ніякого reconnect.
+void updateFileState(uint32_t now) {
+    if (s_state == PlayerState::Buffering || s_state == PlayerState::Playing) {
+        trackSampleRate(now);  // [X1] та сама логіка розмʼюту XSMT за рядком "SampleRate (Hz)"
+        monitorFile(now);
+    }
+    applyMutePolicy(now);
+    // [USB7] Цифровий розмʼют — лише після відкриття ЦАП + kDigitalUnmuteDelayMs (soft-unmute PCM5102).
+    if (s_fileActive && s_state == PlayerState::Playing && !s_dacMuted && !s_fileDigitalUnmuted) {
+        if (!s_fileDacOpenSeen) {
+            s_fileDacOpenSeen = true;
+            s_fileDacOpenAtMs = now;
+        } else if (elapsedAtLeast(now, s_fileDacOpenAtMs, static_cast<uint32_t>(s_fxDigDelayMs < 0 ? 0 : s_fxDigDelayMs))) {
+            fileUnmuteRadioVolume();
+            PLAYER_LOG("[PLAYER] file digital unmute (radio_volume)\n");
+        }
+    }
+}
+
 void updateState(uint32_t now) {
+    if (s_source == Source::File) {  // [USB7] файлове джерело: радіо-логіка (reconnect, буфер, недовантаження) не діє
+        updateFileState(now);
+        return;
+    }
     switch (s_state) {
         case PlayerState::Error:
             if (s_wantPlaying && timeReached(now, s_nextRetryMs)) {
@@ -885,6 +1257,8 @@ bool AudioPlayer::begin() {  // [P48a] без параметра AudioProcessor
     s_title[0] = '\0';
     s_pendingUrl[0] = '\0';
     s_url[0] = '\0';
+    s_pendingFile[0] = '\0';  // [USB7]
+    s_filePath[0] = '\0';
 
     // I2S ініціалізує бібліотека (конструктор + setPinout). DIN не чіпаємо.
     // [Prompt 37] MCLK (GPIO16, 256·fs) виводиться ЛИШЕ для АЦП PCM1808 (за LINE_PATH_ENABLE; P48d) (SCKI); PCM5102 його не
@@ -1009,6 +1383,7 @@ void AudioPlayer::taskLoop() {
     for (;;) {
         processClockRequest();  // [Prompt 44]
         processCommands();
+        processSeek();  // [USB7]
 #if AUDIO_PLAYER_CALL_LOOP
         // Бібліотека сама блокує там, де потрібно (внутрішній буфер).
         s_audio->loop();
@@ -1020,6 +1395,7 @@ void AudioPlayer::taskLoop() {
         eq::setSampleRate(s_audio->getSampleRate());
 #endif
         updateState(millis());
+        pollFilePosition(millis());  // [USB7] кеш позиції / тривалості файлу
         vTaskDelay(msToTicksAtLeastOne(player_cfg::kLoopDelayMs));
     }
 }
@@ -1060,4 +1436,117 @@ int AudioPlayer::lastHttpCode() { return s_httpCode; }
 
 const char* AudioPlayer::normalizeIcy(const char* in, char* out, size_t cap) {
     return icyToUtf8(in, out, cap);
+}
+
+// ===========================================================================
+// [USB7] Файл: публічний API
+// ===========================================================================
+
+bool AudioPlayer::playFile(const char* path, int32_t startSec) {
+    if (s_task == nullptr) {
+        Serial.println("[PLAYER] playFile refused: player not started");
+        return false;
+    }
+    if (path == nullptr || path[0] == '\0') {
+        Serial.println("[PLAYER] playFile refused: empty path");
+        return false;
+    }
+    if (strlen(path) >= file_player_cfg::kPathMax) {
+        Serial.println("[PLAYER] playFile refused: path too long");
+        return false;
+    }
+    if (startSec < -1) {
+        startSec = -1;
+    }
+    const char* why = fileBlockReason();
+    if (why != nullptr) {
+        Serial.printf("[PLAYER] playFile refused: %s\n", why);
+        return false;
+    }
+    Guard g;
+    if (!g.ok()) {
+        Serial.println("[PLAYER] playFile refused: player busy");
+        return false;
+    }
+    if (s_cmd == Cmd::Play) {  // запит радіо ще не виконано
+        Serial.println("[PLAYER] playFile refused: radio start is pending");
+        return false;
+    }
+    strncpy(s_pendingFile, path, sizeof(s_pendingFile) - 1);
+    s_pendingFile[sizeof(s_pendingFile) - 1] = '\0';
+    s_pendingStartSec = startSec;
+    s_cmd = Cmd::PlayFile;
+    XSMT_EVT("player playFile accepted");
+    return true;
+}
+
+bool AudioPlayer::isFileSource() { return s_source == Source::File; }
+
+bool AudioPlayer::fileActive() { return s_fileActive; }
+
+bool AudioPlayer::takeFileEnded() { return s_fileEnded.exchange(false); }
+
+bool AudioPlayer::fileEndedPending() { return s_fileEnded.load(); }
+
+uint32_t AudioPlayer::fileEndedAtMs() { return s_fileEndedAtMs; }
+
+uint32_t AudioPlayer::fileDurationSec() { return s_fileDurSec; }
+
+uint32_t AudioPlayer::filePositionSec() { return s_filePosSec; }
+
+bool AudioPlayer::seekFileSec(int32_t sec) {
+    if (s_task == nullptr || !s_fileActive) {
+        return false;
+    }
+    s_seekSec = sec;
+    s_seekPending = true;
+    return true;
+}
+
+bool AudioPlayer::currentFilePath(char* out, size_t cap) {
+    if (out == nullptr || cap == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    Guard g;
+    if (!g.ok()) {
+        return false;
+    }
+    copyUtf8Trunc(out, cap, s_filePath);
+    return out[0] != '\0';
+}
+
+const char* AudioPlayer::lastFileError() { return s_fileError; }
+
+void AudioPlayer::setFileTune(uint32_t extraMs, int32_t digMs, int levelDb) {
+    if (extraMs > file_player_cfg::kTuneMaxMs) {
+        extraMs = file_player_cfg::kTuneMaxMs;
+    }
+    if (digMs > static_cast<int32_t>(file_player_cfg::kTuneMaxMs)) {
+        digMs = static_cast<int32_t>(file_player_cfg::kTuneMaxMs);
+    }
+    if (digMs < -1) {
+        digMs = -1;
+    }
+    if (levelDb < station_level_cfg::kLevelMinDb) {
+        levelDb = station_level_cfg::kLevelMinDb;
+    }
+    if (levelDb > station_level_cfg::kLevelMaxDb) {
+        levelDb = station_level_cfg::kLevelMaxDb;
+    }
+    s_fxExtraSettleMs = extraMs;
+    s_fxDigDelayMs = digMs;
+    s_fxLevelDb = levelDb;
+}
+
+void AudioPlayer::getFileTune(uint32_t* extraMs, int32_t* digMs, int* levelDb) {
+    if (extraMs != nullptr) {
+        *extraMs = s_fxExtraSettleMs;
+    }
+    if (digMs != nullptr) {
+        *digMs = s_fxDigDelayMs;
+    }
+    if (levelDb != nullptr) {
+        *levelDb = static_cast<int>(s_fxLevelDb);
+    }
 }

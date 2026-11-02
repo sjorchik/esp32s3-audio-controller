@@ -1,5 +1,6 @@
 #pragma once
 
+// [USB7] ДОДАНО readStats() / resetReadStats() (лічильники читань; лише USB_HOST_DIAG). Решта — без змін.
 // [USB6] fs::FS-обгортка над VFS-монтуванням USB-флешки (точка монтування usb_host_cfg::kMountPath).
 // Потрібна для Audio::connecttoFS(fs::FS&, ...) у закріпленому коміті бібліотеки (розділ 11).
 //
@@ -24,6 +25,19 @@ namespace usb_fs {
 fs::FS& volume();
 
 #if USB_HOST_DIAG
+// [USB7] Лічильники читань обгортки (UsbFileImpl::read) з моменту останнього resetReadStats(): кількість викликів,
+// максимальна тривалість одного (мкс, разом з очікуванням блокування тому), скільки було >= usb_host_cfg::kFsSlowReadUs,
+// сума прочитаних байт (32 біти, обертається). Рахує УСІ читання через обгортку (і з usb.fs.*, і декодера).
+// Будь-яка задача; значення читаються без блокування (атомарні лічильники).
+struct ReadStats {
+    uint32_t count;
+    uint32_t maxUs;
+    uint32_t slowCount;
+    uint32_t bytes;
+};
+ReadStats readStats();
+void resetReadStats();
+
 // Діагностика usb.fs.* (викликається з usb_msc_mount::handleLine для рядків "usb.fs.*").
 // Викликається з loopTask, як і usb.*. Не створює задач, не пише на носій.
 void handleConsoleLine(const char* line);

@@ -3,6 +3,7 @@
 // [USB2] Константи модуля монтування USB-флешки (src/usb/usb_msc_mount.*).
 // [USB3] ДОДАНО константи end() / usb.life (блок «Життєвий цикл»). Решта значень — без змін.
 // [USB6] ДОДАНО блок fs::FS-обгортки (наприкінці файлу). Решта значень — без змін.
+// [USB7] ДОДАНО kFsSlowReadUs (лічильники читань у usb_fs, USB_HOST_DIAG). Решта значень — без змін.
 // [USB4] ДОДАНО блок «Діагностика begin() / end()» (лише USB_HOST_DIAG). Решта значень і ВСІ дефолти
 // пріоритетів / таймаутів — без змін.
 // Прапорці умовної компіляції (FEATURE_USB_HOST, USB_HOST_DIAG, USB_HOST_AUTOSTART) — у config/features.h.
@@ -156,5 +157,10 @@ constexpr size_t kFsSelftestMaxBlocks = 512;
 constexpr uint32_t kFsSeekChecks = 32;
 // Верхня межа N для usb.fs.multi (скільки файлів одночасно відкрити). [ГАДКА]
 constexpr uint32_t kFsMultiMax = 8;
+
+// --- [USB7] Лічильники читань usb_fs (лише USB_HOST_DIAG; usb.pstat) ---------------------------
+// Читання обгортки (UsbFileImpl::read, разом з очікуванням блокування тому) довше за цей поріг, мкс,
+// рахується як «повільне» (20 мс — поріг зі спеки / критеріїв USB6). [USB6]
+constexpr uint32_t kFsSlowReadUs = 20000;
 
 }  // namespace usb_host_cfg
