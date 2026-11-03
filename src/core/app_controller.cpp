@@ -236,6 +236,9 @@
 // й рівень НЕ чіпаємо (потік і його рівень узгоджені до наступного старту станції).
 // Публічний API AppController, AppStateData, Settings і NVS не змінено.
 #include "stations/station_store.h"  // [Prompt 11] ДОДАНО
+#if FEATURE_USB_MODE
+#include "usb/usb_mode.h"  // [USB9] requestExit() при standby
+#endif
 
 namespace cfg = app_controller_cfg;
 
@@ -333,6 +336,20 @@ uint8_t s_lineRelStep = 0;        // Releasing: 0 = чекаємо мʼют, 1 =
 bool s_lineRelCalled = false;     // returnToRadio() прийнято
 uint32_t s_lineT0 = 0;            // початок поточного кроку (WaitRetry: момент повтору)
 uint32_t s_lineRelayMs = 0;       // [P48a] коли востаннє виставляли реле-селектор
+#endif
+
+#if FEATURE_USB_MODE
+// --- [USB9] Режим «USB» (бекенд; див. app_controller.h). Режим НЕ є новим Mode: s_mode / s_input лишаються як були до входу.
+// s_usbMode = true між usbModeEnterLocked() і usbModeLeaveLocked(): запуск потоку радіо / проходу, зміна входу, станційні й
+// плеєрні команди заблоковано; гучність / баланс діють на DSP радіо (через нього грає файл).
+bool s_usbMode = false;
+bool s_usbHoldRelease = false;     // після зупинки радіо зняти s_stopHold, щойно плеєр Idle (інакше мʼют «залипне», USB7)
+bool s_usbPrevRadioPaused = false; // радіо до входу стояло на паузі
+uint8_t s_usbPrevInput = 0;
+uint16_t s_usbPrevStation = 0;
+inline bool usbModeOn() { return s_usbMode; }
+#else
+constexpr bool usbModeOn() { return false; }
 #endif
 
 uint32_t s_lastSyncMs = 0;
@@ -580,6 +597,14 @@ void applyStationLevel(int8_t db, uint16_t idx, const char* why) {
 }
 
 void startStream() {
+#if FEATURE_USB_MODE
+    // [USB9] У режимі «USB» радіо не запускається ніякими шляхами (єдина точка запуску потоку).
+    if (s_usbMode) {
+        s_playPending = false;
+        APP_LOG("stream start blocked (usb mode active)\n");
+        return;
+    }
+#endif
     // [Prompt 47c] Радіо-потік лише на вході 0: на зовнішньому вході його запуск зіпсував би прохід
     // (мультиплексор GPIO18, 48 кГц на I2S0). Усі радіо-команди й так гейтяться за s_input.
     if (s_input != 0) {
@@ -678,7 +703,7 @@ void lineApplyVolume() {
 
 // [Prompt 47c] Живе застосування гучності активного шляху: радіо (s_input == 0) або прохід.
 void applyActiveVolume() {
-    if (s_input == 0) {
+    if (s_input == 0 || usbModeOn()) {  // [USB9] файл звучить через DSP радіо
         applyRadioVolume();
     } else {
         lineApplyVolume();
@@ -714,7 +739,7 @@ void lineApplyBalance() {
 
 // Живе застосування балансу активного шляху: радіо (s_input == 0) або прохід.
 void applyActiveBalance() {
-    if (s_input == 0) {
+    if (s_input == 0 || usbModeOn()) {  // [USB9]
         applyRadioBalance();
     } else {
         lineApplyBalance();
@@ -1493,7 +1518,7 @@ void lineReleaseDone(uint32_t now) {
     const LineAfter after = s_lineAfter;
     s_lineAfter = LineAfter::Auto;
     lineSetState(LineState::Off);
-    if (logicallyStandby() || s_mode == Mode::OtaUpdate || restarting()) {
+    if (logicallyStandby() || s_mode == Mode::OtaUpdate || restarting() || usbModeOn()) {  // [USB9] + режим «USB»
         return;  // тиша; новий старт — при виході зі standby / невдачі OTA
     }
     if (s_input != 0) {
@@ -1637,6 +1662,12 @@ void lineService(uint32_t now) {
 
 // Спрямувати звук на s_input (s_input / профіль уже встановлено; пристрій «увімкнений»).
 void routeInput() {
+#if FEATURE_USB_MODE
+    if (s_usbMode) {  // [USB9]
+        APP_LOG("route blocked (usb mode active)\n");
+        return;
+    }
+#endif
     if (s_input == 0) {
         switch (s_lineState) {
             case LineState::Off:
@@ -1687,6 +1718,12 @@ inline void lineRelease() {}
 inline void lineService(uint32_t) {}
 inline bool lineSkipsSettle(uint8_t, uint8_t) { return false; }
 inline void routeInput() {
+#if FEATURE_USB_MODE
+    if (s_usbMode) {  // [USB9]
+        APP_LOG("route blocked (usb mode active)\n");
+        return;
+    }
+#endif
     if (s_input == 0) {
         radioBegin();
     } else {
@@ -1724,6 +1761,11 @@ void enterStandby() {
     ampRequestOff();      // [Prompt 23c]: пін LOW через kAmpOffDelayMs (у tick())
     stopStream();
     lineRelease();        // [Prompt 47c]: прохід замʼючено (desiredMute()), returnToRadio() через kExtMuteSettleMs
+#if FEATURE_USB_MODE
+    if (s_usbMode) {
+        usb_mode::requestExit(usb_mode::ExitCause::Standby);  // [USB9] файл зупинено вище; end() — у фоні
+    }
+#endif
     persist();
     SettingsStore::flush();
     s_persistNeeded = false;
@@ -1773,6 +1815,12 @@ uint8_t firstAvailableInput() {
 }
 
 void leaveStandby() {
+#if FEATURE_USB_MODE
+    if (s_usbMode) {  // [USB9] режим «USB» ще виходить (end() у фоні): вихід зі standby після його завершення
+        APP_LOG("usb mode active: wake ignored until the USB exit finishes\n");
+        return;
+    }
+#endif
     captureActiveProfile();  // [Prompt 21b] профіль «старого» входу, поки s_input ще його
     const Settings st = SettingsStore::snapshot();
     s_input = (st.lastInput < defaults::kInputCount) ? st.lastInput : 0;
@@ -1801,6 +1849,13 @@ void toggleUserMute() {
 }
 
 void changeInput(uint8_t newIdx) {
+#if FEATURE_USB_MODE
+    if (s_usbMode) {  // [USB9] кнопки, RC5, веб — усе йде сюди
+        APP_LOG("usb mode active: input change %u -> %u rejected\n", static_cast<unsigned>(s_input),
+                static_cast<unsigned>(newIdx));
+        return;
+    }
+#endif
     if (newIdx == s_input) {
         return;
     }
@@ -1862,6 +1917,12 @@ void selectInput(uint8_t idx) {
 // WifiManager), 3) перший не-радіо вхід через changeInput() — мʼют, профіль входу, розмʼют
 // як при звичайній зміні входу (підсилювач у WifiSetup уже працює: прогріву немає).
 bool startOfflineLocked() {
+#if FEATURE_USB_MODE
+    if (s_usbMode) {  // [USB9] офлайн перемикає вхід — у режимі «USB» відхиляється
+        APP_LOG("usb mode active: offline start rejected\n");
+        return false;
+    }
+#endif
     if (s_offline || restarting() || s_mode != Mode::WifiSetup) {
         return false;
     }
@@ -2101,17 +2162,17 @@ void handleMainEvent(const Event& e) {
             if (plain) stepInput(cfg::kInputDownStep);
             break;
         case Action::LEFT:
-            if (plain && s_input == 0 && s_mode != Mode::WifiSetup) {
+            if (plain && s_input == 0 && s_mode != Mode::WifiSetup && !usbModeOn()) {  // [USB9]
                 stepStation(cfg::kStationLeftStep);
             }
             break;
         case Action::RIGHT:
-            if (plain && s_input == 0 && s_mode != Mode::WifiSetup) {
+            if (plain && s_input == 0 && s_mode != Mode::WifiSetup && !usbModeOn()) {  // [USB9]
                 stepStation(cfg::kStationRightStep);
             }
             break;
         case Action::OK:
-            if (s_input == 0 && s_mode != Mode::WifiSetup) {  // [Prompt 12]: у WifiSetup потоку немає
+            if (s_input == 0 && s_mode != Mode::WifiSetup && !usbModeOn()) {  // [Prompt 12]: у WifiSetup потоку немає; [USB9] і в режимі «USB»
                 if (e.longPress) {
                     openStationList();
                 } else if (!e.repeat) {
@@ -2579,6 +2640,27 @@ void followWifiMode() {
     publishState();
 }
 
+#if FEATURE_USB_MODE
+// [USB9] Щотакту. (1) Після зупинки радіо при вході в режим знімає s_stopHold, щойно плеєр Idle: інакше syncRadioMute() вічно
+// тримав би radio_volume у мʼюті, і зняття мʼюту користувача не повертало б звук файлу (ризик USB7). Файл стартує на
+// radio_volume, який плеєр сам тримає в тиші до відкриття ЦАП. (2) Мʼют користувача / standby / Settle: плеєр розмʼючує
+// radio_volume при старті файлу, не знаючи про мʼют користувача, — тут мʼют повертається (файл іде далі, звуку нема).
+void usbModeService() {
+    if (!s_usbMode) {
+        return;
+    }
+    if (s_usbHoldRelease && AudioPlayer::state() == PlayerState::Idle) {
+        s_usbHoldRelease = false;
+        s_stopHold = false;
+        syncRadioMute(false);
+        APP_LOG("usb mode: radio mute hold released\n");
+    }
+    if (desiredMute() && !radio_volume::muted()) {
+        radio_volume::setMute(true);
+    }
+}
+#endif
+
 // --- Періодика (розмʼют, таймери, синхронізація) ---------------------------
 void tickLocked() {
     const uint32_t now = millis();
@@ -2586,6 +2668,9 @@ void tickLocked() {
     ampService(now);  // [Prompt 23c]
     restartService(now);  // [Prompt 28] (ESP.restart() не повертається)
     lineService(now);     // [Prompt 47c] автомат проходу зовнішніх входів
+#if FEATURE_USB_MODE
+    usbModeService();     // [USB9]
+#endif
 
     // [Prompt 49a] Екран «EQ + баланс»: вихід за таймаутом від останньої дії в екрані. (Автоповернення цілі
     // енкодера P31 / P48b прибрано: ціль завжди Volume; константа kAdjustTimeoutMs видалена в P48c.)
@@ -2703,6 +2788,82 @@ bool playerActive() {
     return AudioPlayer::state() != PlayerState::Idle || s_playPending;
 }
 
+#if FEATURE_USB_MODE
+// [USB9] Вхід у режим «USB». Викликати під s_lock. Прапорець ставиться ПЕРШИМ; далі тиха зупинка джерела штатними шляхами.
+bool usbModeEnterLocked(const char*& why) {
+    why = nullptr;
+    if (s_usbMode)                       { why = "already_active"; return false; }
+    if (restarting())                    { why = "restarting"; return false; }
+    if (s_mode == Mode::Standby)         { why = "standby"; return false; }
+    if (s_mode == Mode::OtaUpdate)       { why = "ota_in_progress"; return false; }
+    if (s_mode == Mode::IrLearn)         { why = "ir_learn_active"; return false; }
+    if (s_mode == Mode::WifiSetup)       { why = "wifi_setup"; return false; }
+    closeAnyMenu("usb_mode");  // список станцій / екран «EQ + баланс»
+    s_usbPrevInput = s_input;
+    s_usbPrevStation = s_station;
+    s_usbMode = true;
+    if (s_input == 0) {
+        s_usbPrevRadioPaused = !playerActive();
+        pauseRadio();  // плавний мʼют -> stop(); s_stopHold знімає usbModeService(), коли плеєр Idle
+        s_usbHoldRelease = s_stopHold;
+    } else {
+        s_usbPrevRadioPaused = false;
+        s_usbHoldRelease = false;
+        lineRelease();  // прохід замʼючено (lineMuteWanted()), returnToRadio(); lineReleaseDone() у режимі «USB» нічого не стартує
+    }
+    applyRadioVolume();   // файл звучить через DSP радіо: гучність / баланс активного профілю
+    applyRadioBalance();
+    APP_LOG("usb mode: enter (prev input=%u station=%u radio_paused=%d)\n", static_cast<unsigned>(s_usbPrevInput),
+            static_cast<unsigned>(s_usbPrevStation), s_usbPrevRadioPaused ? 1 : 0);
+    publishState();
+    return true;
+}
+
+// Вихід із режиму «USB». Викликати під s_lock. Ідемпотентний. Відновлення — штатним шляхом (як powerOnTransition()).
+void usbModeLeaveLocked() {
+    if (!s_usbMode) {
+        return;
+    }
+    s_usbMode = false;
+    s_usbHoldRelease = false;
+    APP_LOG("usb mode: leave (mode=%s)\n", modeName(s_mode));
+    if (restarting() || s_mode == Mode::Standby || s_mode == Mode::OtaUpdate) {
+        // Standby: далі штатний шлях (leaveStandby() візьме lastInput); OTA: leaveOtaLocked() сам запустить джерело.
+        publishState();
+        return;
+    }
+    if (!inputAvailable(s_input)) {  // вхід вимкнули маскою під час режиму
+        const uint8_t fb = firstAvailableInput();
+        APP_LOG("usb mode: input %u unavailable -> %u\n", static_cast<unsigned>(s_input), static_cast<unsigned>(fb));
+        captureActiveProfile();
+        s_input = fb;
+        if (s_mode == Mode::Radio || s_mode == Mode::ExternalInput) {
+            s_mode = (fb == 0) ? Mode::Radio : Mode::ExternalInput;
+        }
+        loadActiveFromProfile(fb);
+        s_usbPrevRadioPaused = false;
+        s_persistNeeded = true;
+    }
+    if (s_input == 0 && s_usbPrevRadioPaused) {
+        // Радіо до входу стояло на паузі — лишається на паузі (мʼют DSP тримається до наступного startStream()).
+        s_stopHold = true;
+        startTransition();
+        APP_LOG("usb mode: radio stays paused\n");
+    } else {
+        applyActiveVolume();
+        applyActiveBalance();
+        startTransition();  // мʼют; розмʼют у tick() після Settle
+        routeInput();       // радіо: та сама станція; зовнішній: автомат line_path (RAM після end() уже вільна)
+    }
+    publishStationName();
+    publishState();
+    if (s_persistNeeded) {
+        persist();
+        s_persistNeeded = false;
+    }
+}
+#endif  // FEATURE_USB_MODE
+
 WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
     why = nullptr;
     if (restarting()) {  // [Prompt 28] наявний код "busy" (503): нових reason не додаємо
@@ -2726,6 +2887,28 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
         return WebCmdResult::NotAllowed;
     }
 
+#if FEATURE_USB_MODE
+    // [USB9] Зміна входу й станційні / плеєрні команди в режимі «USB» відхиляються (g2 дасть їм сенс). Причини — наявні рядки.
+    if (s_usbMode) {
+        switch (c.type) {
+            case WebCmdType::InputSet:
+                APP_LOG("usb mode active: web input change rejected\n");
+                why = "input_unavailable";
+                return WebCmdResult::NotAllowed;
+            case WebCmdType::PlayerPlay:
+            case WebCmdType::PlayerPause:
+            case WebCmdType::PlayerToggle:
+            case WebCmdType::StationPlay:
+            case WebCmdType::StationNext:
+            case WebCmdType::StationPrev:
+                APP_LOG("usb mode active: web player/station command rejected\n");
+                why = "not_radio_input";
+                return WebCmdResult::NotAllowed;
+            default:
+                break;
+        }
+    }
+#endif
     switch (c.type) {
         case WebCmdType::VolumeSet:
             if (c.value < audio_cfg::kVolumeUiMin || c.value > audio_cfg::kVolumeUiMax) {
@@ -3098,6 +3281,47 @@ bool AppController::applyLineEq(uint8_t input, const int8_t gains[eq_cfg::kBandC
 #endif
     return true;
 }
+
+#if FEATURE_USB_MODE
+// [USB9] ДОДАНО: режим «USB» (див. app_controller.h)
+bool AppController::usbModeEnter(UsbModeSnapshot* prevOut, const char** whyOut) {
+    const char* why = "busy";
+    bool ok = false;
+    if (s_started && s_lock != nullptr &&
+        xSemaphoreTakeRecursive(s_lock, pdMS_TO_TICKS(cfg::kLockTimeoutMs)) == pdTRUE) {
+        ok = usbModeEnterLocked(why);
+        if (ok && prevOut != nullptr) {
+            prevOut->input = s_usbPrevInput;
+            prevOut->station = s_usbPrevStation;
+            prevOut->radioPaused = s_usbPrevRadioPaused;
+        }
+        xSemaphoreGiveRecursive(s_lock);
+    }
+    if (whyOut != nullptr) {
+        *whyOut = ok ? nullptr : why;
+    }
+    return ok;
+}
+
+bool AppController::usbModeLeave(UsbModeSnapshot* restoredOut) {
+    if (!s_started || s_lock == nullptr ||
+        xSemaphoreTakeRecursive(s_lock, pdMS_TO_TICKS(cfg::kLockTimeoutMs)) != pdTRUE) {
+        return false;
+    }
+    usbModeLeaveLocked();
+    if (restoredOut != nullptr) {
+        restoredOut->input = s_input;
+        restoredOut->station = s_station;
+        restoredOut->radioPaused = s_usbPrevRadioPaused;
+    }
+    xSemaphoreGiveRecursive(s_lock);
+    return true;
+}
+
+bool AppController::usbModeActive() {
+    return s_usbMode;
+}
+#endif  // FEATURE_USB_MODE
 
 bool AppController::begin() {
     if (s_started) {

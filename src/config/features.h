@@ -44,3 +44,13 @@
 // USB-host без носія ≈ 18,8 КБ внутрішньої RAM). Без діагностики (USB_HOST_DIAG = 0) значення 0 означає, що USB
 // не стартує взагалі, доки режим «USB» не додано в AppController (крок g).
 #define USB_HOST_AUTOSTART 0
+
+// [USB9] Режим «USB» (бекенд, крок g1): «диригент» життєвого циклу enter / exit USB-host і відтворення файлів
+// (src/usb/usb_mode.*, константи — config/usb_mode_config.h, мінімальні виклики в core/app_controller.*).
+// Керується лише діагностичною консоллю (usb.mode …, потребує USB_HOST_DIAG = 1); UI / RC5 / веб — крок g2.
+// 1 — модуль збирається, AppController отримує режим «USB» (команди зміни входу під час режиму відхиляються);
+// 0 — вся нова логіка не збирається, поведінка пристрою не змінюється. Потребує FEATURE_USB_HOST = 1.
+#define FEATURE_USB_MODE 1
+#if FEATURE_USB_MODE && !FEATURE_USB_HOST
+#error "FEATURE_USB_MODE = 1 requires FEATURE_USB_HOST = 1 (config/features.h)"
+#endif

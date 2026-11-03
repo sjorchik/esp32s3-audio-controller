@@ -55,6 +55,10 @@
 //             профілі входу (Settings::profiles[i].vuSensDb, NVS v8) і застосовується до VU при кожному застосуванні
 //             профілю (старт, зміна входу, вихід зі standby). Керування — лише веб; кнопок / енкодера / IR немає.
 //             Решту публічного інтерфейсу не змінено.
+// [USB9] ДОДАНО (лише під FEATURE_USB_MODE): usbModeEnter() / usbModeLeave() / usbModeActive() + UsbModeSnapshot — вхід для
+//             «диригента» режиму «USB» (src/usb/usb_mode.*). Режим «USB» не є новим Mode: AppController лишається в Radio /
+//             ExternalInput, але поки режим активний (s_usbMode) нічого не запускає на радіо / проході й відхиляє зміну входу.
+//             Решту публічного інтерфейсу не змінено.
 // [Prompt 46a] Чип — лише селектор входів; профіль входу = {гучність, пресет EQ}. ПУБЛІЧНІ СИГНАТУРИ НЕ ЗМІНЕНО,
 //             змінилась лише семантика: setTone() приймає й ІГНОРУЄ тембр/баланс/loudness (*Ok = true для
 //             запитаних полів, які мав чип; у чіп, профіль і AppState нічого не йде); WebCmdType::GainSet
@@ -62,6 +66,7 @@
 //             (ціль завжди гучність). [P48a] Нейтральні значення чіпа (kNeutral*) видалено разом із чіпом.
 
 #include "config/eq_config.h"  // [Prompt 47c] eq_cfg::kBandCount для applyLineEq()
+#include "config/features.h"   // [USB9] FEATURE_USB_MODE
 #include "core/events.h"
 
 // [Prompt 18] ДОДАНО: команда з вебу. Семантика полів залежить від type:
@@ -210,4 +215,28 @@ public:
     // false — контролер не запущено або мʼютекс зайнятий довше kLockTimeoutMs (пресет у Settings збережено,
     // звук оновиться при наступному перемиканні входу). При LINE_PATH_ENABLE == 0 — нічого не робить (true).
     static bool applyLineEq(uint8_t input, const int8_t gains[eq_cfg::kBandCount]);
+
+#if FEATURE_USB_MODE
+    // [USB9] ДОДАНО: режим «USB» (бекенд). Викликає лише src/usb/usb_mode.cpp (з власної одноразової задачі, ядро 0); усі
+    // методи беруть внутрішній мʼютекс контролера (рекурсивний) і НЕ блокують довше за kLockTimeoutMs + kRadioMuteWaitMs.
+    //
+    // usbModeEnter: ставить прапорець режиму ПЕРШИМ (відтоді зміна входу, запуск потоку радіо / проходу, станційні й
+    // плеєрні команди відхиляються з логом «usb mode active»), закриває список станцій / екран EQ, тихо зупиняє радіо
+    // (плавний мʼют -> stop()) або звільняє прохід line_path (lineRelease()), запамʼятовує поточний вхід / станцію / чи радіо
+    // було на паузі. Сам НЕ чекає завершення (радіо Idle, ресурси проходу звільнено, I2S0 розфіксовано) — це робить
+    // викликач опитуванням AudioPlayer / LinePath. false + *whyOut (статичний рядок): "busy", "already_active", "standby",
+    // "ota_in_progress", "ir_learn_active", "wifi_setup", "restarting".
+    // usbModeLeave: знімає прапорець; якщо пристрій не в Standby / OTA / перезапуску — відновлює запамʼятований вхід штатним
+    // шляхом (startTransition + routeInput: радіо — та сама станція, прохід — через автомат line_path; радіо на паузі лишається
+    // на паузі). У Standby лише знімає прапорець (далі штатний шлях standby). Ідемпотентний (поза режимом нічого не робить,
+    // true). false — контролер не запущено / мʼютекс зайнятий.
+    struct UsbModeSnapshot {
+        uint8_t input;       // вхід до входу в режим (після leave — відновлений)
+        uint16_t station;    // станція до входу в режим
+        bool radioPaused;    // вхід радіо стояв на паузі (Idle, без відкладеного старту)
+    };
+    static bool usbModeEnter(UsbModeSnapshot* prevOut, const char** whyOut = nullptr);
+    static bool usbModeLeave(UsbModeSnapshot* restoredOut = nullptr);
+    static bool usbModeActive();
+#endif
 };

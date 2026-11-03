@@ -16,6 +16,9 @@
 #include "freertos/task.h"
 #include "usb/usb_fs.h"
 #include "usb/usb_msc_mount.h"
+#if FEATURE_USB_MODE
+#include "usb/usb_mode.h"  // [USB9] usb.mode … (диспетчеризація тут: usb_msc_mount.cpp не змінюється)
+#endif
 
 namespace usb_play_diag {
 
@@ -37,7 +40,12 @@ bool matchWord(const char* s, const char* word, const char** rest) {
     return true;
 }
 
-const char* const kWords[] = {"usb.play", "usb.pstat", "usb.seek", "usb.stopf", "usb.ended", "usb.fx"};
+const char* const kWords[] = {"usb.play", "usb.pstat", "usb.seek", "usb.stopf", "usb.ended", "usb.fx"
+#if FEATURE_USB_MODE
+                                 ,
+                                 "usb.mode"  // [USB9]
+#endif
+};
 
 void printHeap(const char* label) {
     Serial.printf("%s heap[%s] internal free=%u largest=%u min_free=%u psram_free=%u\n", kTag, label,
@@ -230,6 +238,10 @@ void handleConsoleLine(const char* line) {
         cmdEnded(rest);
     } else if (matchWord(line, "usb.fx", &rest)) {
         cmdFx(rest);
+#if FEATURE_USB_MODE
+    } else if (matchWord(line, "usb.mode", &rest)) {
+        usb_mode::handleConsoleLine(line);  // [USB9]
+#endif
     } else {
         Serial.printf("%s play: unknown command\n", kTag);
     }
