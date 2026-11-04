@@ -45,6 +45,9 @@
 // AdjustTarget тепер {Volume, Balance}.
 // [V1] ДОДАНО: vuSensDb (лише в кінець структури) — чутливість VU АКТИВНОГО входу, дБ (vu_sens_cfg::kMinDb..kMaxDb,
 // 0 = нейтрально). Публікує AppController (publishState). Нуль = дефолт, тож app_state.cpp не змінюється.
+// [USB11] ДОДАНО: enum UsbUiState та поле usbUi (лише в кінець структури) — стан режиму «USB» для мінімального екрана
+// (ui/screens::drawUsb). Нуль = Off = режиму немає (екрани Radio / ExternalInput як раніше). Публікує AppController
+// (publishState + періодично syncPlayer: носій може зʼявитись / зникнути без події). Без FEATURE_USB_MODE завжди Off.
 // [Prompt 17] НЕ ВИКОРИСТОВУЮТЬСЯ: ui/screens читає рівні VU напряму з
 // VuSourceDecodedPcm::read() (частота кадру), минаючи AppState. Поля лишено, щоб не міняти POD-структуру.
 
@@ -91,6 +94,17 @@ enum class StreamStatus : uint8_t {
     Playing,      // потік грає
     Error,        // потік обірвався/не підключився
     Reconnecting, // повторна спроба підключення після Error
+};
+
+// [USB11] ДОДАНО: стан режиму «USB» для UI (похідний від usb_mode::state() / носія; Off = режиму нема).
+enum class UsbUiState : uint8_t {
+    Off,       // режиму «USB» нема: показуються екрани Radio / ExternalInput
+    Starting,  // іде вхід (радіо / прохід замовкають, піднімається USB-host, чекаємо носій)
+    Ready,     // режим активний, носій змонтовано
+    NoMedia,   // режим активний, флешки нема (монтування почнеться саме при вставленні)
+    Fault,     // носій вставлено, але змонтувати не вдалося
+    Stopping,  // іде вихід (зупинка файлу, зняття USB-host, відновлення входу)
+    Error,     // збій входу / виходу: стек не знято (AppController сам ініціює «тихий» перезапуск)
 };
 
 // [Prompt 15] ДОДАНО: стан навчання IR для UI/вебу. Незалежно від input/ir_rc5.h
@@ -211,6 +225,10 @@ struct AppStateData {
     // Чутливість VU активного входу, дБ (vu_sens_cfg::kMinDb..kMaxDb; 0 = без зсуву). Лише AppController пише.
     // Сам VU зсув застосовує audio/vu_source (VuSource::setSensitivityDb); поле — для веб-статусу й діагностики.
     int8_t vuSensDb;
+
+    // --- [USB11] ДОДАНО (в кінець структури) ---
+    // Стан режиму «USB» для мінімального екрана (UsbUiState::Off = режиму нема). Лише AppController пише.
+    UsbUiState usbUi;
 };
 
 class AppState {

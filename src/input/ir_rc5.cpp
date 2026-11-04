@@ -29,8 +29,11 @@ constexpr uint8_t kFrameBits     = 14;              // S1 S2 T A4..A0 C5..C0
 constexpr uint8_t kFrameHalfBits = kFrameBits * 2;  // 28
 constexpr uint8_t kRc5xCmdBit    = 0x40;            // 7-й біт команди
 
-// Усі дії до останньої (GAIN_DOWN, Prompt 7) включно: BASS_UP..GAIN_DOWN ідуть у enum Action одразу після DIGIT_9.
-constexpr uint8_t kActionCount = static_cast<uint8_t>(Action::GAIN_DOWN) + 1;
+// Усі дії до останньої (USB_MODE, [USB11]) включно: BASS_UP..GAIN_DOWN ідуть у enum Action одразу після DIGIT_9,
+// USB_MODE — одразу після GAIN_DOWN. [USB11] Було GAIN_DOWN + 1: формат NVS мапи не змінювався (записи зберігають
+// числове значення Action; старі мапи без USB_MODE валідні), але прошивка з вузьким kActionCount відхилила б мапу,
+// у якій навчено USB_MODE (action id >= kActionCount -> «invalid entry»).
+constexpr uint8_t kActionCount = static_cast<uint8_t>(Action::USB_MODE) + 1;
 
 constexpr size_t kEntryBytes   = 3;  // action, addr, cmd
 constexpr size_t kBlobMaxBytes = 2 + ir_cfg::kMaxMapEntries * kEntryBytes + 4;
@@ -80,6 +83,7 @@ const ActionName kActionNames[] = {
     {Action::BALANCE_DOWN, "BALANCE_DOWN"},
     {Action::GAIN_UP, "GAIN_UP"},
     {Action::GAIN_DOWN, "GAIN_DOWN"},
+    {Action::USB_MODE, "USB_MODE"},  // [USB11]
 };
 static_assert(sizeof(kActionNames) / sizeof(kActionNames[0]) == kActionCount,
               "kActionNames must list every Action");

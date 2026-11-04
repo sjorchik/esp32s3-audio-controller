@@ -96,6 +96,10 @@ State state();
 // true — режим займає шлях звуку (Entering / Ready / Playing / Exiting / Error).
 bool isActive();
 
+// [USB11] ДОДАНО: лише стан носія (без копіювання Info; дешево — для періодичної публікації стану в UI з AppController).
+// Media::None, якщо режиму нема.
+Media media();
+
 // Знімок усього стану й вимірів. Потокобезпечно (коротка критична секція), не блокує.
 Info info();
 

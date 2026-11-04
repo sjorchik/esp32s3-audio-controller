@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+#include "config/features.h"  // [USB11] FEATURE_USB_MODE
+
 namespace action_names {
 
 namespace {
@@ -25,6 +27,9 @@ const Info kTable[] = {
     {Action::INPUT_TV, "INPUT_TV", true},
     {Action::INPUT_PC, "INPUT_PC", true},
     {Action::INPUT_AUX, "INPUT_AUX", false},  // [P49e] вхід AUX видалено
+#if FEATURE_USB_MODE
+    {Action::USB_MODE, "USB_MODE", true},  // [USB11] перемикач режиму «USB»: увійти / вийти на попередній вхід
+#endif
     {Action::DIGIT_0, "DIGIT_0", true},
     {Action::DIGIT_1, "DIGIT_1", true},
     {Action::DIGIT_2, "DIGIT_2", true},

@@ -54,6 +54,8 @@
 // перевірки логіки P49a; справжні вертикальні стовпчики малює P49b. Читає лише AppState (eqSelected, eqGainsDb, balanceDb).
 // [Prompt 49b] Екран «EQ + Balance» — 6 вертикальних стовпчиків (5 смуг EQ + баланс), розкладка в
 // config/eq_screen_config.h; читає лише AppState (eqSelected, eqGainsDb, balanceDb, inputName).
+// [USB11] Режим «USB»: AppState.usbUi != Off на Mode::Radio / ExternalInput малює drawUsb() (текст «USB» / «No media» тощо
+// у слоті назви входу); VU і метадані в цьому режимі не показуються (повний екран — g2c).
 // [Prompt 17] ВИНЯТОК З ІЗОЛЯЦІЇ: рівні VU беруться напряму з VuSourceDecodedPcm::read() (з
 // частотою кадру), МИНАЮЧИ AppState; AppStateData.vuLeft/vuRight не використовуються.
 
@@ -494,6 +496,28 @@ void drawExternal(const AppStateData& s, int vuLitL, int vuLitR, int peakL, int 
     drawVu(vuLitL, vuLitR, peakL, peakR);
 }
 
+// [USB11] Мінімальний екран режиму «USB» (крок g2b-1): текст у місці назви входу (той самий слот kExtNameY, що в
+// ExternalInput). Список / «зараз грає» / VU — крок g2c. Написи англійською (розділ 10 MASTER SPEC).
+void drawUsb(const AppStateData& s) {
+    drawTopIcons(s, true);
+    drawNetInfo(s);
+    const char* text = "USB";
+    uint16_t color = dc::kColorFg;
+    switch (s.usbUi) {
+        case UsbUiState::Starting: text = "USB...";     color = c::kColorDim;    break;
+        case UsbUiState::NoMedia:  text = "No media";   color = c::kColorAccent; break;
+        case UsbUiState::Fault:    text = "Read error"; color = c::kColorBad;    break;
+        case UsbUiState::Stopping: text = "USB exit..."; color = c::kColorDim;   break;
+        case UsbUiState::Error:    text = "USB error";  color = c::kColorBad;    break;
+        case UsbUiState::Ready:
+        case UsbUiState::Off:
+            break;
+    }
+    char name[kInputFitCap];
+    fitText(text, name, sizeof(name), FontSize::XLarge, c::kContentW);
+    drawCentered(name, c::kExtNameY, FontSize::XLarge, color);
+}
+
 void drawStationList(const AppStateData& s) {
     D::drawText("Stations", c::kMargin, c::kListTitleY, FontSize::Small, c::kColorDim);
     D::drawLine(0, c::kListLineY, c::kW - 1, c::kListLineY, c::kColorDim);
@@ -838,8 +862,14 @@ bool frame() {
     }
     switch (s.mode) {
         case Mode::Standby:       drawStandby();                 break;
-        case Mode::Radio:         drawRadio(s, litL, litR, s_peakL.seg, s_peakR.seg); break;
-        case Mode::ExternalInput: drawExternal(s, litL, litR, s_peakL.seg, s_peakR.seg); break;   // [Prompt 37]
+        case Mode::Radio:         // [USB11] режим «USB» (s.mode лишається Radio / ExternalInput) — мінімальний екран
+            if (s.usbUi != UsbUiState::Off) drawUsb(s);
+            else                            drawRadio(s, litL, litR, s_peakL.seg, s_peakR.seg);
+            break;
+        case Mode::ExternalInput:
+            if (s.usbUi != UsbUiState::Off) drawUsb(s);
+            else                            drawExternal(s, litL, litR, s_peakL.seg, s_peakR.seg);   // [Prompt 37]
+            break;
         case Mode::Menu:
             if (s.menuContext == MenuContext::StationList)    drawStationList(s);
             else if (s.menuContext == MenuContext::EqBalance) drawEqBalance(s);   // [Prompt 49a/49b]

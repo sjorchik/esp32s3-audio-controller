@@ -63,7 +63,29 @@ constexpr uint32_t kCycleExitWaitMs =
 // у тому самому стані, що й базовий вимір. ПРИПУЩЕННЯ: TLS-підключення станції + наповнення буфера ≤ 15 с.
 constexpr uint32_t kRestoreSettleMs = 15000;
 
+// --- [USB11] Навігація: коло входів (Радіо -> TV Box -> Computer -> USB), дія USB_MODE, відкладена ціль входу -------
+// Логіка — core/app_controller.cpp (блок «USB11»); значення тут. Усе нижче — ПРИПУЩЕННЯ планування без вимірювання,
+// підтверджується в hwcheck_USB11.md.
+// Скільки повторювати usb_mode::requestEnter() щотакту, якщо він відмовив «busy» (попередня операція ще завершується
+// після Off: задача usb_mode знімає s_busy до стану, але сама ще видаляється). Далі ціль скидається з логом.
+constexpr uint32_t kNavEnterBusyRetryMs = 1000;
+// Страховка від зависання відкладеної цілі: найгірший вхід + найгірший вихід (виведено з уже наявних меж) + запас.
+// Типово вхід ≈ 1 с, вихід ≈ 1–2 с (USB9); перевищення означає збій автомата, а не повільний носій.
+// (kCycleEnterWaitMs / kCycleExitWaitMs оголошено вище.)
+constexpr uint32_t kNavPendingTimeoutMs = kCycleEnterWaitMs + kCycleExitWaitMs + 5000;
+// Стан Error із піднятим прапорцем режиму (end() не вдався / вхід не відкотився): «пристрій не лишається залиплим».
+// Пауза між появою Error і дією — щоб діагностичні рядки usb_mode / usb_msc_mount встигли вийти в Serial.
+constexpr uint32_t kNavErrorGraceMs = 300;
+// Скільки разів повторити usb_mode::requestExit() у Error, якщо стек справний (needsReboot() == false; end_not_quiet).
+// Після вичерпання — перезапуск. [ГАДКА]
+constexpr uint8_t kNavExitRetries = 2;
+// true: Error із піднятим прапорцем режиму -> «тихий» перезапуск (AppController::beginRestart: мʼют -> підсилювач
+// STBY -> пауза -> ESP.restart()), із чітким логом причини. false: пристрій лишається в режимі «USB» без звуку
+// (поведінка USB9), вихід — лише POWER-утримання / живлення. Режим «USB» НЕ відновлюється після перезапуску.
+constexpr bool kNavRestartOnError = true;
+
 static_assert(kEnterPresenceWaitMs >= 1 && kEnterMountWaitMs > kEnterPresenceWaitMs, "usb_mode: wait windows");
+static_assert(kNavEnterBusyRetryMs >= 1 && kNavExitRetries <= 10, "usb_mode: nav limits");
 static_assert(kCycleMaxCount >= 1 && kCycleMaxCount <= 1000, "usb_mode: sane cycle limit");
 static_assert(kTaskPriority <= 2, "usb_mode task must not outrank the network tasks (async_tcp = 2)");
 

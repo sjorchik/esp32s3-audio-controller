@@ -194,6 +194,23 @@
 // веб-команди станцій. VOL_UP / VOL_DOWN (IR) у екрані працюють; решта дій ігнорується (крім INPUT_RADIO / TV / PC:
 // вони міняють вхід і тим закривають екран). Лог — префікс [EQS].
 
+// [USB11] КОЛО ВХОДІВ З РЕЖИМОМ «USB» і дія Action::USB_MODE (крок g2b-1; усе під FEATURE_USB_MODE).
+// Позиції кола: 0 = радіо, 1 = TV Box, 2 = Computer, 3 (kNavUsb) = «USB». UP / DOWN (cfg::kInputUpStep / kInputDownStep) крокують
+// по колу від ПОЗИЦІЇ НАМІРУ (navPosition()): ціль, що чекає виконання, інакше режим «USB», якщо він є / піднімається, інакше s_input.
+// Вимкнені маскою входи й недоступне радіо в офлайні пропускаються (inputAvailable()); позиція «USB» маскою не вимикається
+// (маска — 3 біти, схема NVS не змінена) і пропускається лише коли стек USB потребує перезапуску (usb_mode::State::Error без
+// прапорця режиму). Прямі INPUT_RADIO / INPUT_TV / INPUT_PC і веб InputSet за правилами USB9: веб у режимі відхиляється,
+// INPUT_* виходять із режиму й вмикають вказаний вхід.
+// Автомат цілі (s_navWant; змінюється лише під s_lock; рушій — navReconcile(), викликається одразу після команди й щотакту):
+//   • режиму нема (Off): ціль «USB» -> usb_mode::requestEnter(); ціль-вхід -> changeInput() (звичайний шлях);
+//   • Entering: ціль «USB» знімається (вже входимо); ціль-вхід ЧЕКАЄ Ready / Error (вихід під час входу не ставимо в чергу);
+//   • Ready / Playing: ціль-вхід або «на попередній» -> usb_mode::requestExit(User); ціль «USB» знімається;
+//   • Exiting: чекаємо; ціль-вхід застосовує usbModeLeaveLocked() (без зайвого відновлення попереднього входу), а ціль «USB»
+//     (користувач передумав під час виходу) лишається й виконується, щойно режим стане Off (попередній вхід при цьому
+//     встигає відновитись — свідоме спрощення);
+//   • Error із піднятим прапорцем режиму (end() не вдався / вхід не відкотився): повтор requestExit() (лише якщо стек справний,
+//     <= kNavExitRetries), далі «тихий» перезапуск beginRestart() із логом причини (usb_mode_cfg::kNavRestartOnError).
+// Остання команда ЗАМІНЮЄ ціль. Страховка — kNavPendingTimeoutMs. Нові лог-рядки мають тег [USBN]; режим не зберігається в NVS.
 #include "core/app_controller.h"
 
 #include <Arduino.h>
@@ -237,7 +254,8 @@
 // Публічний API AppController, AppStateData, Settings і NVS не змінено.
 #include "stations/station_store.h"  // [Prompt 11] ДОДАНО
 #if FEATURE_USB_MODE
-#include "usb/usb_mode.h"  // [USB9] requestExit() при standby
+#include "config/usb_mode_config.h"  // [USB11] usb_mode_cfg::kNav*
+#include "usb/usb_mode.h"            // [USB9] requestExit() при standby
 #endif
 
 namespace cfg = app_controller_cfg;
@@ -348,8 +366,54 @@ bool s_usbPrevRadioPaused = false; // радіо до входу стояло н
 uint8_t s_usbPrevInput = 0;
 uint16_t s_usbPrevStation = 0;
 inline bool usbModeOn() { return s_usbMode; }
+// [USB11] LEFT / RIGHT / OK заблоковані не лише в режимі, а й під час Entering: прапорець s_usbMode ставить задача usb_mode
+// трохи пізніше за requestEnter() (десятки мс), і радіо за цей час не має перезапускатись зі станції / паузи.
+inline bool usbKeysLocked() { return s_usbMode || usb_mode::state() == usb_mode::State::Entering; }
+
+// --- [USB11] Ціль навігації (див. коментар у шапці файлу) ---
+constexpr int8_t kNavNone = -1;
+constexpr int8_t kNavUsb = static_cast<int8_t>(defaults::kInputCount);  // позиція «USB» у колі = після останнього входу
+constexpr int8_t kNavPrev = kNavUsb + 1;                                  // «вийти на попередній вхід» (дія USB_MODE)
+int8_t s_navWant = kNavNone;     // 0..kInputCount-1 = вхід, kNavUsb, kNavPrev, kNavNone
+uint32_t s_navT0 = 0;            // момент останнього запиту (страховка kNavPendingTimeoutMs і повтор «busy»)
+uint8_t s_navExitRetries = 0;    // повтори requestExit() у Error (скидаються після успішного виходу)
+bool s_navErrActive = false;     // епізод Error із піднятим прапорцем режиму вже зафіксовано
+uint32_t s_navErrT0 = 0;
+uint32_t s_navRequests = 0;      // діагностика (usb.mode stat)
+uint32_t s_navReplaced = 0;
+uint32_t s_navExitFailures = 0;
+uint32_t s_navRestarts = 0;
+inline bool navPending() { return s_navWant != kNavNone; }
+
+// Реалізація нижче (після usbModeService()); потрібні stepInput() / selectInput() / handleMainEvent() / handleLocked().
+void navRequest(int8_t pos);
+void navStep(int dir);
+void navToggle();
+
+// Стан режиму для UI: похідний від usb_mode::state() і носія. Error без прапорця режиму (стек не знято після standby) — Off.
+UsbUiState usbUiNow() {
+    switch (usb_mode::state()) {
+        case usb_mode::State::Off:      return UsbUiState::Off;
+        case usb_mode::State::Entering: return UsbUiState::Starting;
+        case usb_mode::State::Exiting:  return UsbUiState::Stopping;
+        case usb_mode::State::Error:    return s_usbMode ? UsbUiState::Error : UsbUiState::Off;
+        case usb_mode::State::Ready:
+        case usb_mode::State::Playing:
+            break;
+    }
+    switch (usb_mode::media()) {
+        case usb_mode::Media::Mounted:  return UsbUiState::Ready;
+        case usb_mode::Media::Mounting: return UsbUiState::Starting;
+        case usb_mode::Media::Fault:    return UsbUiState::Fault;
+        case usb_mode::Media::None:     break;
+    }
+    return UsbUiState::NoMedia;
+}
 #else
 constexpr bool usbModeOn() { return false; }
+constexpr bool usbKeysLocked() { return false; }
+constexpr bool navPending() { return false; }
+constexpr UsbUiState usbUiNow() { return UsbUiState::Off; }
 #endif
 
 uint32_t s_lastSyncMs = 0;
@@ -481,6 +545,7 @@ const char* actionName(Action a) {
         case Action::BALANCE_DOWN: return "BALANCE_DOWN";
         case Action::GAIN_UP:      return "GAIN_UP";
         case Action::GAIN_DOWN:    return "GAIN_DOWN";
+        case Action::USB_MODE:     return "USB_MODE";  // [USB11]
     }
     return "?";
 }
@@ -978,6 +1043,7 @@ struct PubCtx {
     char inputName[kInputNameMax];  // [Prompt 23b]
     bool popupDismissed;            // [Prompt 49d]
     int8_t vuSensDb;                // [V1]
+    UsbUiState usbUi;               // [USB11]
 };
 
 void applyPub(AppStateData& s, void* c) {
@@ -1001,6 +1067,7 @@ void applyPub(AppStateData& s, void* c) {
     memcpy(s.eqGainsDb, p->eqGainsDb, sizeof(s.eqGainsDb));  // [Prompt 49a]
     memcpy(s.inputName, p->inputName, sizeof(s.inputName));  // [Prompt 23b]
     s.vuSensDb = p->vuSensDb;                                // [V1]
+    s.usbUi = p->usbUi;                                      // [USB11]
 }
 
 void publishState() {
@@ -1010,6 +1077,7 @@ void publishState() {
     resolveInputName(s_input, p.inputName, sizeof(p.inputName));  // [Prompt 23b]
     p.popupDismissed = s_popupDismissed;                          // [Prompt 49d]
     p.vuSensDb = s_vuSens;                                        // [V1]
+    p.usbUi = usbUiNow();                                         // [USB11]
     // [Prompt 49a] Поки відкритий екран «EQ + баланс» — вибраний параметр і пресет EQ активного входу (з Settings:
     // джерело правди, тож зміна з вебу теж видна); інакше нулі.
     if (eqOpen()) {
@@ -1094,6 +1162,7 @@ struct SyncCtx {
     bool wifiApMode;
     char inputName[kInputNameMax];  // [Prompt 23b]: назва могла змінитись з вебу
     int8_t wifiRssi;                // [Prompt 36]: квантований RSSI STA (0 = невідомо)
+    UsbUiState usbUi;               // [USB11]: носій міг зʼявитись / зникнути без події
 };
 
 void applySync(AppStateData& s, void* c) {
@@ -1110,6 +1179,7 @@ void applySync(AppStateData& s, void* c) {
     s.wifiApMode = x->wifiApMode;
     memcpy(s.inputName, x->inputName, sizeof(s.inputName));  // [Prompt 23b]
     s.wifiRssi = x->wifiRssi;  // [Prompt 36]
+    s.usbUi = x->usbUi;        // [USB11]
 }
 
 // [Prompt 36] RSSI (дБм) -> значення для AppState: 0, якщо невідомо (>= 0), інакше обрізано знизу й
@@ -1164,6 +1234,7 @@ void syncPlayer() {
     c.wifiApMode = WifiManager::isApMode();
     c.wifiRssi = c.wifi ? quantizeRssi(WifiManager::rssi()) : 0;  // [Prompt 36]
     resolveInputName(s_input, c.inputName, sizeof(c.inputName));  // [Prompt 23b]
+    c.usbUi = usbUiNow();                                         // [USB11]
 
     // [Prompt 10] ДОДАНО: маппінг PlayerState → StreamStatus за назвою
     // audio_player.h::PlayerState і core/app_state.h::StreamStatus мають однакові
@@ -1762,6 +1833,7 @@ void enterStandby() {
     stopStream();
     lineRelease();        // [Prompt 47c]: прохід замʼючено (desiredMute()), returnToRadio() через kExtMuteSettleMs
 #if FEATURE_USB_MODE
+    s_navWant = kNavNone;  // [USB11] standby скасовує невиконану ціль навігації (вихід із режиму — нижче, у фоні)
     if (s_usbMode) {
         usb_mode::requestExit(usb_mode::ExitCause::Standby);  // [USB9] файл зупинено вище; end() — у фоні
     }
@@ -1890,6 +1962,9 @@ void changeInput(uint8_t newIdx) {
 }
 
 void stepInput(int dir) {
+#if FEATURE_USB_MODE
+    navStep(dir);  // [USB11] коло входів із позицією «USB» після останнього входу
+#else
     const int count = defaults::kInputCount;  // [P48a] 3 логічні входи; вимкнені маскою пропускаються
     // [Prompt 28] Недоступні входи (в офлайні — радіо) пропускаються. Без офлайну перший же
     // крок доступний, тож поведінка не змінилась.
@@ -1901,6 +1976,7 @@ void stepInput(int dir) {
             return;
         }
     }
+#endif
 }
 
 void selectInput(uint8_t idx) {
@@ -1909,7 +1985,11 @@ void selectInput(uint8_t idx) {
                 inputUnavailableWhy(idx));  // [Prompt 39]: no such input / disabled / offline
         return;
     }
+#if FEATURE_USB_MODE
+    navRequest(static_cast<int8_t>(idx));  // [USB11] у режимі «USB» — вихід із відкладеною ціллю; інакше changeInput()
+#else
     changeInput(idx);
+#endif
 }
 
 // [Prompt 28] Запуск офлайн-режиму. Лише з Mode::WifiSetup; викликати під s_lock. Порядок:
@@ -2146,6 +2226,9 @@ void handleEqEvent(const Event& e) {
         case Action::INPUT_RADIO: if (plain) selectInput(0); break;
         case Action::INPUT_TV:    if (plain) selectInput(1); break;
         case Action::INPUT_PC:    if (plain) selectInput(2); break;
+#if FEATURE_USB_MODE
+        case Action::USB_MODE:    if (plain) navToggle(); break;  // [USB11] вхід у режим закриває екран (usbModeEnterLocked)
+#endif
         default:
             break;  // решта дій у екрані ігнорується
     }
@@ -2162,17 +2245,17 @@ void handleMainEvent(const Event& e) {
             if (plain) stepInput(cfg::kInputDownStep);
             break;
         case Action::LEFT:
-            if (plain && s_input == 0 && s_mode != Mode::WifiSetup && !usbModeOn()) {  // [USB9]
+            if (plain && s_input == 0 && s_mode != Mode::WifiSetup && !usbKeysLocked()) {  // [USB9] [USB11] і під час Entering
                 stepStation(cfg::kStationLeftStep);
             }
             break;
         case Action::RIGHT:
-            if (plain && s_input == 0 && s_mode != Mode::WifiSetup && !usbModeOn()) {  // [USB9]
+            if (plain && s_input == 0 && s_mode != Mode::WifiSetup && !usbKeysLocked()) {  // [USB9] [USB11] і під час Entering
                 stepStation(cfg::kStationRightStep);
             }
             break;
         case Action::OK:
-            if (s_input == 0 && s_mode != Mode::WifiSetup && !usbModeOn()) {  // [Prompt 12]: у WifiSetup потоку немає; [USB9] і в режимі «USB»
+            if (s_input == 0 && s_mode != Mode::WifiSetup && !usbKeysLocked()) {  // [Prompt 12]: у WifiSetup потоку немає; [USB9] і в режимі «USB»; [USB11] і під час Entering
                 if (e.longPress) {
                     openStationList();
                 } else if (!e.repeat) {
@@ -2567,6 +2650,12 @@ void handleLocked(const Event& e) {
                 // [Prompt 48b] Баланс повернувся: IR BALANCE_UP / BALANCE_DOWN = ±kStepDb (повтор утримання — як у гучності).
                 case Action::BALANCE_UP:   adjustParam(AdjustTarget::Balance, +1); break;
                 case Action::BALANCE_DOWN: adjustParam(AdjustTarget::Balance, -1); break;
+#if FEATURE_USB_MODE
+                // [USB11] Перемикач режиму «USB»: увійти, якщо його нема; інакше вийти на попередній вхід (без repeat / long).
+                case Action::USB_MODE:
+                    if (!e.repeat && !e.longPress) navToggle();
+                    break;
+#endif
                 case Action::ENC_PRESS:
                     // [Prompt 49a] Головний екран (Radio / ExternalInput): коротке натискання = мʼют, довге утримання =
                     // екран «EQ + баланс». У списку станцій: довге = мʼют, коротке = запустити вибрану станцію (P49c, як OK).
@@ -2659,6 +2748,234 @@ void usbModeService() {
         radio_volume::setMute(true);
     }
 }
+
+// ---------------------------------------------------------------------------
+// [USB11] Навігація: коло входів (Радіо -> TV Box -> Computer -> USB), дія USB_MODE, відкладена ціль входу
+// ---------------------------------------------------------------------------
+// Усі функції викликати лише під s_lock (handleLocked / tickLocked / usbModeLeaveLocked). Опис автомата — у шапці файлу.
+const char* navPosName(int8_t pos) {
+    if (pos == kNavUsb) return "USB";
+    if (pos == kNavPrev) return "previous input";
+    if (pos >= 0 && pos < kNavUsb) return defaults::kInputNames[pos];
+    return "-";
+}
+
+// Режим «USB» займає шлях звуку або вже піднімається (для позиції наміру). Error без прапорця режиму — НЕ рахується
+// (стек лишився піднятим після невдалого end() у standby; пристрій при цьому працює на звичайному вході).
+bool usbIntentActive() {
+    if (s_usbMode) {
+        return true;
+    }
+    const usb_mode::State st = usb_mode::state();
+    return st == usb_mode::State::Entering || st == usb_mode::State::Ready || st == usb_mode::State::Playing;
+}
+
+// Чи варто пропонувати позицію «USB» у колі: ні під час перезапуску й коли стек USB потребує перезавантаження.
+bool usbNavAvailable() {
+    if (restarting()) {
+        return false;
+    }
+    if (s_usbMode) {
+        return true;
+    }
+    return usb_mode::state() != usb_mode::State::Error;
+}
+
+// Позиція НАМІРУ: звідки рахується наступний крок UP / DOWN. Невиконана ціль має пріоритет (швидкі натискання крокують
+// від останнього натиснутого, а не від реального стану, який ще наздоганяє).
+int8_t navPosition() {
+    if (s_navWant == kNavPrev) {
+        return static_cast<int8_t>(s_usbMode ? s_usbPrevInput : s_input);
+    }
+    if (s_navWant >= 0) {
+        return s_navWant;
+    }
+    if (usbIntentActive()) {
+        return kNavUsb;
+    }
+    return static_cast<int8_t>(s_input);
+}
+
+// Знімає ціль (виконана / недоречна / скасована) із логом.
+void navClear(const char* note) {
+    if (s_navWant != kNavNone) {
+        Serial.printf("[USBN] target %s cleared: %s\n", navPosName(s_navWant), note);
+        s_navWant = kNavNone;
+    }
+}
+
+// Error із піднятим прапорцем режиму (end() не вдався / вхід не відкотився): «пристрій не лишається залиплим».
+// Повтор requestExit() лише коли стек справний (needsReboot() == false); далі — тихий перезапуск або тиша (kNavRestartOnError).
+void navErrorService(uint32_t now) {
+    if (!s_navErrActive) {
+        s_navErrActive = true;
+        s_navErrT0 = now;
+        ++s_navExitFailures;
+        const usb_mode::Info inf = usb_mode::info();
+        Serial.printf("[USBN] ERROR: usb mode failed (reason=%s detail=%s need_reboot=%d retries=%u/%u)\n",
+                      inf.reason != nullptr ? inf.reason : "-", inf.detail != nullptr ? inf.detail : "-",
+                      inf.needsReboot ? 1 : 0, static_cast<unsigned>(s_navExitRetries),
+                      static_cast<unsigned>(usb_mode_cfg::kNavExitRetries));
+        return;  // дія — після kNavErrorGraceMs (діагностичні рядки usb_mode / usb_msc_mount встигають вийти)
+    }
+    if (static_cast<uint32_t>(now - s_navErrT0) < usb_mode_cfg::kNavErrorGraceMs || restarting()) {
+        return;
+    }
+    const usb_mode::Info inf = usb_mode::info();
+    if (!inf.needsReboot && s_navExitRetries < usb_mode_cfg::kNavExitRetries) {
+        ++s_navExitRetries;
+        Serial.printf("[USBN] retrying usb exit (%u/%u): stack is intact\n", static_cast<unsigned>(s_navExitRetries),
+                      static_cast<unsigned>(usb_mode_cfg::kNavExitRetries));
+        if (usb_mode::requestExit(usb_mode::ExitCause::User)) {
+            s_navErrActive = false;  // стан -> Exiting; новий Error зафіксується як новий епізод
+            return;
+        }
+        // requestExit() відмовив (стек не підлягає повтору) — далі як при needsReboot.
+    }
+    if (usb_mode_cfg::kNavRestartOnError) {
+        ++s_navRestarts;
+        s_navWant = kNavNone;
+        Serial.printf("[USBN] FATAL: usb exit failed (reason=%s detail=%s need_reboot=%d) -> quiet restart\n",
+                      inf.reason != nullptr ? inf.reason : "-", inf.detail != nullptr ? inf.detail : "-",
+                      inf.needsReboot ? 1 : 0);
+        beginRestart();  // мʼют -> підсилювач STBY -> пауза -> ESP.restart(); режим «USB» після перезапуску не відновлюється
+    } else if (s_navErrT0 != 0) {
+        Serial.printf("[USBN] usb mode stays in Error (kNavRestartOnError = false): hold POWER to restart\n");
+        s_navErrT0 = 0;  // повідомлення один раз за епізод
+    }
+}
+
+// Приводить дійсність до цілі (див. шапку файлу). Ідемпотентна: викликається після кожної команди й щотакту.
+void navReconcile() {
+    if (s_navWant == kNavNone) {
+        return;
+    }
+    if (restarting() || s_mode == Mode::Standby || s_mode == Mode::OtaUpdate || s_mode == Mode::IrLearn ||
+        s_mode == Mode::WifiSetup) {
+        navClear("device mode");
+        return;
+    }
+    const usb_mode::State us = usb_mode::state();
+    const bool wantUsb = (s_navWant == kNavUsb);
+
+    // Режиму нема: Off, або Error без прапорця режиму (стек не знято після standby, пристрій працює на звичайному вході).
+    if (us == usb_mode::State::Off || (us == usb_mode::State::Error && !s_usbMode)) {
+        if (s_usbMode) {
+            return;  // недосяжно (прапорець режиму знімає usbModeLeaveLocked() до Off); на випадок — чекаємо
+        }
+        if (s_navWant == kNavPrev) {
+            navClear("already out of usb mode");
+            return;
+        }
+        if (wantUsb) {
+            if (us == usb_mode::State::Error) {
+                navClear("usb stack needs a reboot");
+                return;
+            }
+            const char* why = nullptr;
+            if (usb_mode::requestEnter(&why)) {
+                Serial.printf("[USBN] entering usb mode (from input %u)\n", static_cast<unsigned>(s_input));
+                s_navWant = kNavNone;
+            } else if (why != nullptr && strcmp(why, "busy") == 0 &&
+                       static_cast<uint32_t>(millis() - s_navT0) < usb_mode_cfg::kNavEnterBusyRetryMs) {
+                // попередня операція ще завершується: повторимо на наступному такті
+            } else {
+                Serial.printf("[USBN] enter refused (%s)\n", why != nullptr ? why : "?");
+                s_navWant = kNavNone;
+            }
+            return;
+        }
+        const uint8_t target = static_cast<uint8_t>(s_navWant);
+        s_navWant = kNavNone;
+        changeInput(target);  // звичайний шлях (сам перевіряє inputAvailable() і збіг із s_input)
+        return;
+    }
+
+    switch (us) {
+        case usb_mode::State::Entering:
+            if (wantUsb) {
+                navClear("usb mode is already entering");
+            }
+            // Ціль-вхід / «на попередній»: чекаємо Ready або Error (рішення власника: спершу дочекатись, потім вихід).
+            return;
+        case usb_mode::State::Ready:
+        case usb_mode::State::Playing:
+            if (wantUsb) {
+                navClear("already in usb mode");
+                return;
+            }
+            Serial.printf("[USBN] leaving usb mode (target: %s)\n", navPosName(s_navWant));
+            usb_mode::requestExit(usb_mode::ExitCause::User);  // стан -> Exiting; ціль застосує usbModeLeaveLocked()
+            return;
+        case usb_mode::State::Exiting:
+            return;  // чекаємо; ціль-вхід застосує usbModeLeaveLocked(), ціль «USB» — після Off
+        case usb_mode::State::Error:
+            return;  // з піднятим прапорцем режиму (інакше — гілка вище): обробляє navErrorService()
+        case usb_mode::State::Off:
+            return;  // оброблено вище
+    }
+}
+
+// Новий намір користувача (UP / DOWN / INPUT_* / USB_MODE): ЗАМІНЮЄ ціль, що ще не виконалась.
+void navRequest(int8_t pos) {
+    ++s_navRequests;
+    if (s_navWant != kNavNone && s_navWant != pos) {
+        ++s_navReplaced;
+    }
+    s_navWant = pos;
+    s_navT0 = millis();
+    // Лог лише коли діє режим «USB» / чекає ціль / іде перехід: звичайна зміна входу (Off) не шумить.
+    if (pos == kNavUsb || pos == kNavPrev || usbIntentActive() || usb_mode::state() != usb_mode::State::Off) {
+        Serial.printf("[USBN] request -> %s (usb=%s, input=%u)\n", navPosName(pos), usb_mode::stateName(usb_mode::state()),
+                      static_cast<unsigned>(s_input));
+    }
+    navReconcile();
+}
+
+// Крок по колу: positions = kInputCount входів + «USB». Недоступні позиції пропускаються.
+void navStep(int dir) {
+    const int count = static_cast<int>(kNavUsb) + 1;
+    int n = navPosition();
+    for (int i = 0; i < count; ++i) {
+        n = (n + dir + count) % count;
+        if (n == kNavUsb) {
+            if (usbNavAvailable()) {
+                navRequest(kNavUsb);
+                return;
+            }
+        } else if (inputAvailable(static_cast<uint8_t>(n))) {
+            navRequest(static_cast<int8_t>(n));
+            return;
+        }
+    }
+}
+
+// Дія USB_MODE: режим є / піднімається -> вийти на попередній вхід; інакше -> увійти.
+void navToggle() {
+    if (navPosition() == kNavUsb) {
+        navRequest(kNavPrev);
+    } else if (usbNavAvailable()) {
+        navRequest(kNavUsb);
+    } else {
+        Serial.printf("[USBN] USB_MODE ignored: usb stack needs a reboot\n");
+    }
+}
+
+// Щотакту з tickLocked(): Error із прапорцем режиму, страховка цілі, виконання цілі, що чекала.
+void navService(uint32_t now) {
+    if (s_usbMode && usb_mode::state() == usb_mode::State::Error) {
+        navErrorService(now);
+    } else {
+        s_navErrActive = false;
+    }
+    if (s_navWant != kNavNone) {
+        if (static_cast<uint32_t>(millis() - s_navT0) >= usb_mode_cfg::kNavPendingTimeoutMs) {
+            navClear("timeout");
+        } else {
+            navReconcile();
+        }
+    }
+}
 #endif
 
 // --- Періодика (розмʼют, таймери, синхронізація) ---------------------------
@@ -2670,6 +2987,7 @@ void tickLocked() {
     lineService(now);     // [Prompt 47c] автомат проходу зовнішніх входів
 #if FEATURE_USB_MODE
     usbModeService();     // [USB9]
+    navService(now);      // [USB11]
 #endif
 
     // [Prompt 49a] Екран «EQ + баланс»: вихід за таймаутом від останньої дії в екрані. (Автоповернення цілі
@@ -2742,6 +3060,7 @@ void taskMain(void*) {
         const bool active =
             (s_phase != Phase::None) || (s_mode == Mode::IrLearn) ||
             lineBusy() ||  // [Prompt 47c]: автомат проходу рухається з активним періодом
+            navPending() ||  // [USB11]: ціль навігації чекає виходу / входу режиму «USB» — опитуємо з активним періодом
             ampBusy() ||  // [Prompt 23c]
             restarting();  // [Prompt 28]: чекаємо пін/паузу з активним періодом
         Event ev;
@@ -2826,11 +3145,41 @@ void usbModeLeaveLocked() {
     }
     s_usbMode = false;
     s_usbHoldRelease = false;
+    s_navExitRetries = 0;  // [USB11] вихід вдався
     APP_LOG("usb mode: leave (mode=%s)\n", modeName(s_mode));
+    // [USB11] Відкладена ціль входу (UP / DOWN / INPUT_* / USB_MODE, натиснуті в режимі «USB»): ціль-вхід застосовується тут,
+    // замість відновлення попереднього входу (щоб не піднімати радіо / прохід, який одразу доведеться зупиняти). Ціль «USB»
+    // (користувач передумав під час виходу) НЕ знімається: navService() увійде в режим знову, щойно usb_mode стане Off.
+    int8_t navTarget = kNavNone;
+    if (s_navWant >= 0 && s_navWant < kNavUsb) {
+        navTarget = s_navWant;
+        s_navWant = kNavNone;
+    } else if (s_navWant == kNavPrev) {
+        s_navWant = kNavNone;  // «на попередній вхід» = звичайне відновлення нижче
+    }
     if (restarting() || s_mode == Mode::Standby || s_mode == Mode::OtaUpdate) {
         // Standby: далі штатний шлях (leaveStandby() візьме lastInput); OTA: leaveOtaLocked() сам запустить джерело.
+        s_navWant = kNavNone;
         publishState();
         return;
+    }
+    closeEq("usb_exit");  // [USB11] екран «EQ + баланс» міг бути відкритий у режимі (довге утримання енкодера)
+    if (navTarget != kNavNone && navTarget != static_cast<int8_t>(s_input)) {
+        if (inputAvailable(static_cast<uint8_t>(navTarget))) {
+            Serial.printf("[USBN] leave: applying target input %d (%s) instead of restoring input %u\n",
+                          static_cast<int>(navTarget), navPosName(navTarget), static_cast<unsigned>(s_input));
+            captureActiveProfile();  // профіль входу до режиму (гучність / баланс, змінені в режимі)
+            s_input = static_cast<uint8_t>(navTarget);
+            if (s_mode == Mode::Radio || s_mode == Mode::ExternalInput) {
+                s_mode = (s_input == 0) ? Mode::Radio : Mode::ExternalInput;
+            }
+            loadActiveFromProfile(s_input);
+            s_usbPrevRadioPaused = false;  // новий вхід вмикається як звичайно (радіо — запуск станції, не пауза)
+            s_persistNeeded = true;
+        } else {
+            Serial.printf("[USBN] leave: target input %d is unavailable - restoring input %u\n", static_cast<int>(navTarget),
+                          static_cast<unsigned>(s_input));
+        }
     }
     if (!inputAvailable(s_input)) {  // вхід вимкнули маскою під час режиму
         const uint8_t fb = firstAvailableInput();
@@ -3320,6 +3669,26 @@ bool AppController::usbModeLeave(UsbModeSnapshot* restoredOut) {
 
 bool AppController::usbModeActive() {
     return s_usbMode;
+}
+
+// [USB11] ДОДАНО: діагностика навігації (usb.mode stat)
+bool AppController::usbNavStats(UsbNavStats* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    *out = UsbNavStats{};
+    out->pendingTarget = kNavNone;
+    if (!s_started || s_lock == nullptr ||
+        xSemaphoreTakeRecursive(s_lock, pdMS_TO_TICKS(cfg::kLockTimeoutMs)) != pdTRUE) {
+        return false;
+    }
+    out->pendingTarget = s_navWant;
+    out->requests = s_navRequests;
+    out->replaced = s_navReplaced;
+    out->exitFailures = s_navExitFailures;
+    out->restarts = s_navRestarts;
+    xSemaphoreGiveRecursive(s_lock);
+    return true;
 }
 #endif  // FEATURE_USB_MODE
 

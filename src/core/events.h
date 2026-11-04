@@ -49,6 +49,11 @@ enum class Action : uint8_t {
     BALANCE_DOWN,
     GAIN_UP,
     GAIN_DOWN,
+    // [USB11] ДОДАНО (лише в кінець): перемикач режиму «USB» (RC5; фізичної кнопки немає). Увійти в режим, якщо його
+    // нема; інакше вийти на попередній вхід. Дія існує в enum і в таблиці ir_rc5 ЗАВЖДИ (щоб мапа IR в NVS лишалась
+    // валідною при зміні FEATURE_USB_MODE), але AppController її обробляє, а action_names пропонує для навчання
+    // лише при FEATURE_USB_MODE = 1. УВАГА: ir_rc5::kActionCount тепер = USB_MODE + 1 (раніше GAIN_DOWN + 1).
+    USB_MODE,
 };
 
 // Джерело події.

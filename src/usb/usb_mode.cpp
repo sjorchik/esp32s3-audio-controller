@@ -509,6 +509,8 @@ Info info() {
     return out;
 }
 
+Media media() { return rawState() == State::Off ? Media::None : mediaNow(); }  // [USB11]
+
 bool requestEnter(const char** whyOut) {
     if (whyOut != nullptr) {
         *whyOut = nullptr;
@@ -635,6 +637,14 @@ void cmdStat() {
                   static_cast<unsigned>(i.mountMs), static_cast<unsigned>(i.exitMs), static_cast<unsigned>(i.fileStopMs),
                   static_cast<unsigned>(i.endMs), static_cast<unsigned>(i.restoreMs),
                   static_cast<unsigned>(i.taskStackMinFree));
+    // [USB11] Навігація (коло входів / USB_MODE): відкладена ціль і лічильники.
+    AppController::UsbNavStats nav = {};
+    const bool navOk = AppController::usbNavStats(&nav);
+    Serial.printf("%s stat: nav%s pending_target=%d (-1 none, 0..2 input, 3 usb, 4 previous) requests=%u replaced=%u "
+                  "exit_failures=%u restarts=%u\n",
+                  kTag, navOk ? "" : " (controller busy)", static_cast<int>(nav.pendingTarget),
+                  static_cast<unsigned>(nav.requests), static_cast<unsigned>(nav.replaced),
+                  static_cast<unsigned>(nav.exitFailures), static_cast<unsigned>(nav.restarts));
     printRam("now", ramNow());
     printRam("before enter", i.ramBeforeEnter);
     printRam("quiet (before begin)", i.ramQuiet);
