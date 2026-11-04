@@ -1,3 +1,4 @@
+// [USB10] ДОДАНО диспетчеризацію usb.dir / usb.cd / usb.pwd (usb_browser) і usb.q (usb_queue) — як usb.mode у USB9.
 // [USB7] Консоль відтворення файлу з /usb: usb.play / usb.pstat / usb.seek / usb.stopf / usb.ended.
 // Стиль — як у usb_msc_mount.cpp / usb_fs.cpp (тег «[USB]», відлуння «got:» друкує usb_msc_mount::handleLine).
 
@@ -18,6 +19,8 @@
 #include "usb/usb_msc_mount.h"
 #if FEATURE_USB_MODE
 #include "usb/usb_mode.h"  // [USB9] usb.mode … (диспетчеризація тут: usb_msc_mount.cpp не змінюється)
+#include "usb/usb_browser.h"  // [USB10] usb.dir / usb.cd / usb.pwd
+#include "usb/usb_queue.h"    // [USB10] usb.q …
 #endif
 
 namespace usb_play_diag {
@@ -44,6 +47,8 @@ const char* const kWords[] = {"usb.play", "usb.pstat", "usb.seek", "usb.stopf", 
 #if FEATURE_USB_MODE
                                  ,
                                  "usb.mode"  // [USB9]
+                                 ,
+                                 "usb.dir", "usb.cd", "usb.pwd", "usb.q"  // [USB10]
 #endif
 };
 
@@ -241,6 +246,10 @@ void handleConsoleLine(const char* line) {
 #if FEATURE_USB_MODE
     } else if (matchWord(line, "usb.mode", &rest)) {
         usb_mode::handleConsoleLine(line);  // [USB9]
+    } else if (matchWord(line, "usb.dir", &rest) || matchWord(line, "usb.cd", &rest) || matchWord(line, "usb.pwd", &rest)) {
+        usb_browser::handleConsoleLine(line);  // [USB10]
+    } else if (matchWord(line, "usb.q", &rest)) {
+        usb_queue::handleConsoleLine(line);  // [USB10]
 #endif
     } else {
         Serial.printf("%s play: unknown command\n", kTag);
