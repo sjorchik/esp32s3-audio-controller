@@ -54,6 +54,12 @@ enum class Action : uint8_t {
     // валідною при зміні FEATURE_USB_MODE), але AppController її обробляє, а action_names пропонує для навчання
     // лише при FEATURE_USB_MODE = 1. УВАГА: ir_rc5::kActionCount тепер = USB_MODE + 1 (раніше GAIN_DOWN + 1).
     USB_MODE,
+    // [USB14] ДОДАНО (лише в кінець): перемикачі режиму «USB» (RC5; фізичних кнопок немає). USB_SHUFFLE — перемішування,
+    // USB_REPEAT — повтор усього; діють ЛИШЕ в режимі «USB» (поза ним AppController їх ігнорує). Як і USB_MODE, існують в
+    // enum і в таблиці ir_rc5 ЗАВЖДИ (мапа IR в NVS валідна при будь-якому FEATURE_USB_MODE), а action_names пропонує їх для
+    // навчання лише при FEATURE_USB_MODE = 1. УВАГА: ir_rc5::kActionCount тепер = USB_REPEAT + 1 (раніше USB_MODE + 1).
+    USB_SHUFFLE,
+    USB_REPEAT,
 };
 
 // Джерело події.

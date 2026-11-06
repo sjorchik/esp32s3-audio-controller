@@ -252,6 +252,11 @@ bool readAndPublish(const char* path, uint8_t depth, uint32_t reqId, const char*
     return true;
 }
 
+// [USB14] Відкладений шлях команди goto (див. usb_browser.h: requestGoto). Під мьютексом.
+char s_gotoPath[usb_browser_cfg::kPathMax];
+uint8_t s_gotoDepth = 0;
+bool s_gotoPending = false;
+
 // Список недійсний (вийняття / перемонтування / вихід).
 void invalidateLive(const char* why) {
     lock(UINT32_MAX);
@@ -304,6 +309,23 @@ void handleCmd(const Cmd& c) {
     char path[usb_browser_cfg::kPathMax];
     switch (c.type) {
         case CmdType::Refresh: {
+            {  // [USB14] відкладений goto: читаємо вказану папку замість поточної
+                bool go = false;
+                uint8_t gd = 0;
+                lock(UINT32_MAX);
+                if (s_gotoPending) {
+                    strncpy(path, s_gotoPath, sizeof(path) - 1);
+                    path[sizeof(path) - 1] = '\0';
+                    gd = s_gotoDepth;
+                    s_gotoPending = false;
+                    go = true;
+                }
+                unlock();
+                if (go) {
+                    readAndPublish(path, gd, c.reqId, "goto");
+                    break;
+                }
+            }
             const char* p = s_live.valid ? s_live.cwd : "/";
             const uint8_t d = s_live.valid ? s_live.depth : 0;
             strncpy(path, p, sizeof(path) - 1);
@@ -377,6 +399,7 @@ void workerMain(void*) {
         lock(UINT32_MAX);
         s_active = true;
         s_lastError = nullptr;
+        s_gotoPending = false;  // [USB14]
         unlock();
         Serial.printf("%s worker: started (entries<=%u, pool=%u B, psram_free=%u)\n", kTag,
                       static_cast<unsigned>(usb_browser_cfg::kMaxEntries), static_cast<unsigned>(usb_browser_cfg::kNamePoolBytes),
@@ -763,6 +786,66 @@ bool requestEnterDir(uint16_t index, uint32_t expectVersion, uint32_t* reqId, co
 
 bool requestUp(uint32_t* reqId, const char** why) { return usb_nav::post(usb_nav::CmdType::Up, 0, 0, reqId, why); }
 
+// [USB14] Перехід за шляхом. Нормалізація: початковий «/», без порожніх компонентів / «.» / «..», кінцевий «/» відкидається.
+bool requestGoto(const char* path, uint32_t* reqId, const char** why) {
+    if (why != nullptr) {
+        *why = nullptr;
+    }
+    auto refuse = [&](const char* w) {
+        if (why != nullptr) {
+            *why = w;
+        }
+        return false;
+    };
+    if (path == nullptr || path[0] != '/') {
+        return refuse("bad_path");
+    }
+    char norm[usb_browser_cfg::kPathMax];
+    const size_t len = strlen(path);
+    if (len + strlen(usb_host_cfg::kMountPath) >= usb_browser_cfg::kPathMax) {
+        return refuse("path_too_long");
+    }
+    memcpy(norm, path, len + 1);
+    size_t n = len;
+    while (n > 1 && norm[n - 1] == '/') {
+        norm[--n] = '\0';
+    }
+    uint8_t depth = 0;
+    if (n > 1) {
+        const char* p = norm + 1;
+        while (*p != '\0') {
+            const char* e = strchr(p, '/');
+            const size_t cl = (e != nullptr) ? static_cast<size_t>(e - p) : strlen(p);
+            if (cl == 0 || (cl == 1 && p[0] == '.') || (cl == 2 && p[0] == '.' && p[1] == '.')) {
+                return refuse("bad_path");
+            }
+            ++depth;
+            p += cl;
+            if (*p == '/') {
+                ++p;
+            }
+        }
+    }
+    if (depth > usb_browser_cfg::kMaxDepth) {
+        return refuse("too_deep");
+    }
+    if (!usb_nav::lock(usb_browser_cfg::kApiLockWaitMs)) {
+        return refuse("busy");
+    }
+    memcpy(usb_nav::s_gotoPath, norm, n + 1);
+    usb_nav::s_gotoDepth = depth;
+    usb_nav::s_gotoPending = true;
+    usb_nav::unlock();
+    if (!usb_nav::post(usb_nav::CmdType::Refresh, 0, 0, reqId, why)) {
+        if (usb_nav::lock(usb_browser_cfg::kApiLockWaitMs)) {
+            usb_nav::s_gotoPending = false;
+            usb_nav::unlock();
+        }
+        return false;
+    }
+    return true;
+}
+
 #if USB_HOST_DIAG
 namespace {
 
@@ -897,8 +980,11 @@ void handleConsoleLine(const char* line) {
             const long idx = atol(rest);
             ok = requestEnterDir(static_cast<uint16_t>(idx), 0, &id, &why);
             report("cd", ok, id, why);
+        } else if (rest[0] == '/') {  // [USB14] перехід за шляхом
+            ok = requestGoto(rest, &id, &why);
+            report("cd path", ok, id, why);
         } else {
-            Serial.printf("%s usage: usb.cd <index|..>\n", kTagC);
+            Serial.printf("%s usage: usb.cd <index|..|/path>\n", kTagC);
             return;
         }
         printDir(1);

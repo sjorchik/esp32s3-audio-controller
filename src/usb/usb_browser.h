@@ -17,6 +17,9 @@
 //
 // Результат команди: Status::lastReqId / lastOk / lastWhy (ЛИШЕ остання завершена команда; команди виконуються по черзі).
 //
+// [USB14] ДОДАНО requestGoto(): перехід у папку за ПОВНИМ шляхом (для відновлення останньої папки при вході в режим). Решта
+// API без змін.
+//
 // Заголовок не підключає заголовки IDF, AppController, AudioPlayer.
 
 #include <stddef.h>
@@ -69,9 +72,16 @@ bool requestRefresh(uint32_t* reqId = nullptr, const char** why = nullptr);
 bool requestEnterDir(uint16_t index, uint32_t expectVersion = 0, uint32_t* reqId = nullptr, const char** why = nullptr);
 // Вихід на рівень вище (з кореня — відмова «at_root» у lastWhy).
 bool requestUp(uint32_t* reqId = nullptr, const char** why = nullptr);
+// [USB14] ДОДАНО: перехід у папку за повним шляхом від кореня флешки («/», «/Music/Rock»; без «.» / «..» / порожніх компонентів;
+// кінцевий «/» ігнорується). Працює і без дійсного списку. Після успіху поточний список — вміст цієї папки; після відмови
+// (lastOk = false, lastWhy: «open_failed» — папки нема, «not_dir», «media_changed», …) СПИСОК НЕ ЗМІНЮЄТЬСЯ. false — запит не
+// прийнято, *why: «bad_path», «too_deep», «path_too_long», «busy», «mode_not_ready», «task_create_failed», «queue_full».
+// Реалізація: окремої команди в usb_nav_internal.h немає — шлях кладеться в статичний буфер, а виконує його команда Refresh
+// (перша з черги, що знайде «відкладений» шлях).
+bool requestGoto(const char* path, uint32_t* reqId = nullptr, const char** why = nullptr);
 
 #if USB_HOST_DIAG
-// Консоль: usb.dir [сторінка | refresh] | usb.cd <індекс | ..> | usb.pwd. Викликається з loopTask; БЛОКУЄ її до завершення
+// Консоль: usb.dir [сторінка | refresh] | usb.cd <індекс | .. | /шлях> | usb.pwd. Викликається з loopTask; БЛОКУЄ її до завершення
 // команди (≤ usb_queue_cfg::kConsoleWaitMs), як usb.life / usb.mode cycle.
 bool isConsoleCommand(const char* line);
 void handleConsoleLine(const char* line);

@@ -29,6 +29,8 @@ const Info kTable[] = {
     {Action::INPUT_AUX, "INPUT_AUX", false},  // [P49e] вхід AUX видалено
 #if FEATURE_USB_MODE
     {Action::USB_MODE, "USB_MODE", true},  // [USB11] перемикач режиму «USB»: увійти / вийти на попередній вхід
+    {Action::USB_SHUFFLE, "USB_SHUFFLE", true},  // [USB14] перемішування (лише в режимі «USB»)
+    {Action::USB_REPEAT, "USB_REPEAT", true},    // [USB14] повтор усього (лише в режимі «USB»)
 #endif
     {Action::DIGIT_0, "DIGIT_0", true},
     {Action::DIGIT_1, "DIGIT_1", true},
@@ -94,3 +96,4 @@ bool isLearnable(Action action) {
 }
 
 }  // namespace action_names
+

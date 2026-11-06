@@ -38,6 +38,7 @@
 #include "config/line_path_config.h"  // [Prompt 48d] LINE_PATH_ENABLE (раніше ADC_VU_ENABLE через adc_vu_config.h)
 #include "config/pins.h"
 #include "config/xsmt_config.h"          // [Prompt X1]
+#include "config/player_mode_config.h"   // [USB14] kPauseFadeMs
 #include "core/ssl_workaround.h"         // [USB13b] WORKAROUND DEF-5: облік невдач підключення радіо після файлу
 #if FEATURE_USB_HOST
 #include "usb/usb_fs.h"         // [USB7] usb_fs::volume() для connecttoFS
@@ -423,6 +424,10 @@ volatile uint32_t s_filePosSec = 0;       // кеш позиції / трива�
 volatile uint32_t s_fileDurSec = 0;
 volatile bool s_seekPending = false;
 volatile int32_t s_seekSec = 0;
+// [USB14] Пауза файлу: запит (0 — немає, 1 — пауза, 2 — продовження; пише API, виконує й скидає задача плеєра) і стан
+// (пише лише задача плеєра; читається з будь-якої).
+volatile uint8_t s_pauseReq = 0;
+volatile bool s_filePaused = false;
 const char* volatile s_fileError = nullptr;  // статичний рядок
 // Під мʼютексом: запит playFile і шлях активного / останнього файлу.
 char s_pendingFile[file_player_cfg::kPathMax];
@@ -707,6 +712,8 @@ void doPlay(const char* url) {
     s_fileEofPending = false;
     s_evtFileEof = false;
     s_seekPending = false;
+    s_filePaused = false;  // [USB14]
+    s_pauseReq = 0;
     muteDacWithLead("play");  // [X1] ПОРЯДОК ВИПРАВЛЕНО: мʼют (+пауза) ДО stopSong(), раніше — після
     s_audio->stopSong();  // безпечно, якщо нічого не грало
     s_source = Source::Radio;  // [USB7] eof від stopSong() вище ще оброблено як файловий (ігнорується)
@@ -728,6 +735,8 @@ void doStop() {
     s_fileEofPending = false;
     s_evtFileEof = false;
     s_seekPending = false;
+    s_filePaused = false;  // [USB14] stopSong() знімає прапорець «running» бібліотеки
+    s_pauseReq = 0;
     muteDacWithLead("stop");  // [X1] ПОРЯДОК ВИПРАВЛЕНО: мʼют (+пауза) ДО stopSong(), раніше — після
     s_audio->stopSong();
     fileRestoreRadioVolume();  // [USB7] лише якщо грав файл (інакше нічого не робить)
@@ -812,6 +821,8 @@ void failFile(const char* reason) {
     s_fileEofPending = false;
     s_evtFileEof = false;
     s_seekPending = false;
+    s_filePaused = false;  // [USB14]
+    s_pauseReq = 0;
     muteDacWithLead("file failure");
     s_audio->stopSong();
     fileRestoreRadioVolume();
@@ -828,6 +839,8 @@ void failFile(const char* reason) {
 // Природний кінець файлу (пауза kEndTailMs після eof вже минула): мʼют ЦАП, Idle, прапорець «файл закінчився».
 void finishFile() {
     s_fileActive = false;
+    s_filePaused = false;  // [USB14] (на паузі eof не приходить; запобіжник)
+    s_pauseReq = 0;
     muteDacWithLead("file end");
     s_audio->stopSong();  // бібліотека вже зупинилась; повторний виклик безпечний (як у doStop)
     fileRestoreRadioVolume();
@@ -854,6 +867,8 @@ void doPlayFile(const char* path, int32_t startSec) {
     s_fileEofPending = false;
     s_evtFileEof = false;
     s_seekPending = false;
+    s_filePaused = false;  // [USB14] новий файл (також «наступний» на паузі) грає без паузи
+    s_pauseReq = 0;
     muteDacWithLead("play file");
     s_audio->stopSong();  // безпечно, якщо нічого не грало
 
@@ -936,6 +951,60 @@ void processSeek() {
     s_audio->setTimeOffset(static_cast<int>(sec));
     Serial.printf("[PLAYER] seek requested: setTimeOffset(%ld) at pos %lu s\n", static_cast<long>(sec),
                   static_cast<unsigned long>(s_filePosSec));
+}
+
+// [USB14] Пауза / продовження файлу (лише задача плеєра, поряд з loop() бібліотеки).
+// Пауза: 1) цифровий мʼют radio_volume (плавно ≈ 20 мс), чекаємо kPauseFadeMs; 2) XSMT LOW (+ kMuteLeadMs, якщо ЦАП був
+// відкритий); 3) pauseResume() — декодер стає, вихідні буфери очищено. Позиція фіксується (кеш). Продовження: «ЦАП закритий»
+// і цифрова тиша як на старті файлу (fileHoldRadioVolume), відлік стабільності клоку від ЗАРАЗ (інакше XSMT HIGH одразу:
+// s_rateSinceMs / s_playingSinceMs давні), pauseResume(); далі той самий розмʼют, що й на старті (applyMutePolicy +
+// updateFileState). Мʼют користувача повертає AppController::usbModeService() (як і після старту файлу).
+void processPause() {
+    const uint8_t req = s_pauseReq;
+    if (req == 0) {
+        return;
+    }
+    s_pauseReq = 0;
+    if (s_source != Source::File || !s_fileActive || s_fileEofPending) {
+        Serial.println("[PLAYER] pause request ignored: no file is playing");
+        return;
+    }
+    if (req == 1) {
+        if (s_filePaused || s_state != PlayerState::Playing) {
+            Serial.printf("[PLAYER] pause request ignored (paused=%d state=%s)\n", s_filePaused ? 1 : 0,
+                          AudioPlayer::stateName(s_state));
+            return;
+        }
+        radio_volume::setMute(true);  // плавно: DSP гасить звук ≈ 20 мс [P47a]
+        vTaskDelay(msToTicksAtLeastOne(player_mode_cfg::kPauseFadeMs));
+        muteDacWithLead("file pause");  // XSMT LOW (+ пауза kMuteLeadMs, якщо ЦАП був відкритий)
+        if (s_audio->isRunning()) {
+            s_audio->pauseResume();
+        }
+        s_filePosSec = static_cast<uint32_t>(s_audio->getAudioCurrentTime());
+        s_notRunning = false;
+        s_fileDigitalUnmuted = false;
+        s_fileDacOpenSeen = false;
+        s_filePaused = true;
+        Serial.printf("[PLAYER] file paused at %lu/%lu s\n", static_cast<unsigned long>(s_filePosSec),
+                      static_cast<unsigned long>(s_fileDurSec));
+    } else {
+        if (!s_filePaused) {
+            Serial.println("[PLAYER] resume request ignored: not paused");
+            return;
+        }
+        fileHoldRadioVolume();  // цифрова тиша ДО першого блоку; скидає s_fileDigitalUnmuted / s_fileDacOpenSeen
+        const uint32_t now = millis();
+        s_rateSinceMs = now;     // відлік kClockSettleMs для XSMT HIGH — від продовження
+        s_playingSinceMs = now;  // і запасний таймаут rate_wait
+        s_notRunning = false;
+        if (!s_audio->isRunning()) {
+            s_audio->pauseResume();
+        }
+        s_filePaused = false;
+        Serial.printf("[PLAYER] file resumed at %lu/%lu s\n", static_cast<unsigned long>(s_filePosSec),
+                      static_cast<unsigned long>(s_fileDurSec));
+    }
 }
 
 void pollFilePosition(uint32_t now) {
@@ -1113,6 +1182,10 @@ void monitorFile(uint32_t now) {
     }
 #endif
 
+    if (s_filePaused) {  // [USB14] пауза: декодер свідомо стоїть, це не збій («decoder stopped» не рахується)
+        s_notRunning = false;
+        return;
+    }
     const bool running = s_audio->isRunning();
     if (!running) {
         if (!s_notRunning) {
@@ -1143,7 +1216,7 @@ void applyMutePolicy(uint32_t now) {
         case PlayerState::Playing:
             // [X1] XSMT HIGH, щойно потік Playing і клок I2S0 стабільний kClockSettleMs (частота не змінювалась).
             // Раніше — лише через kUnmuteStableMs = 3000 мс стабільного Playing (головна причина затримки першого звуку).
-            if (s_dacMuted) {
+            if (s_dacMuted && !s_filePaused) {  // [USB14] на паузі ЦАП лишається замʼютованим
                 // [X1b] За логом власника: "stream ready" (-> Playing) приходить РАНІШЕ, ніж декодер розбирає заголовок і
                 // перемикає клок I2S0 (48000 -> 44100 через ≈ 37 мс після XSMT HIGH -> клацання на старті радіо). Тому
                 // потрібна ще й подія bitrate (приходить після встановлення частоти); без неї — лише таймаут rate_wait.
@@ -1412,6 +1485,7 @@ void AudioPlayer::taskLoop() {
         processClockRequest();  // [Prompt 44]
         processCommands();
         processSeek();  // [USB7]
+        processPause();  // [USB14]
 #if AUDIO_PLAYER_CALL_LOOP
         // Бібліотека сама блокує там, де потрібно (внутрішній буфер).
         s_audio->loop();
@@ -1531,6 +1605,27 @@ bool AudioPlayer::seekFileSec(int32_t sec) {
     return true;
 }
 
+bool AudioPlayer::setFilePaused(bool paused) {
+    if (s_task == nullptr) {
+        return false;
+    }
+    if (s_source != Source::File || !s_fileActive) {
+        Serial.println("[PLAYER] pause refused: no file is playing");
+        return false;
+    }
+    if (s_fileEnded.load() || s_state != PlayerState::Playing) {
+        Serial.printf("[PLAYER] pause refused: state %s\n", stateName(s_state));
+        return false;
+    }
+    if (paused == s_filePaused) {
+        return false;  // уже такий стан
+    }
+    s_pauseReq = paused ? 1 : 2;
+    return true;
+}
+
+bool AudioPlayer::filePaused() { return s_filePaused; }
+
 bool AudioPlayer::currentFilePath(char* out, size_t cap) {
     if (out == nullptr || cap == 0) {
         return false;
@@ -1578,3 +1673,4 @@ void AudioPlayer::getFileTune(uint32_t* extraMs, int32_t* digMs, int* levelDb) {
         *levelDb = static_cast<int>(s_fxLevelDb);
     }
 }
+

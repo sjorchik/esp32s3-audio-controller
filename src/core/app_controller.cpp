@@ -194,6 +194,21 @@
 // веб-команди станцій. VOL_UP / VOL_DOWN (IR) у екрані працюють; решта дій ігнорується (крім INPUT_RADIO / TV / PC:
 // вони міняють вхід і тим закривають екран). Лог — префікс [EQS].
 
+// [USB14] КЕРУВАННЯ ВІДТВОРЕННЯМ І ПРОФІЛЬ «PLAYER» у режимі «USB» (усе під FEATURE_USB_MODE).
+//   • Профіль: у режимі «USB» s_input лишається входом ДО режиму, а звук (гучність, баланс, чутливість VU, пресет EQ) веде
+//     4-й слот Settings::profiles[kInputCount] («Player»). profileIdx() = usbModeOn() ? kProfileIndex : s_input — єдине місце
+//     вибору профілю для captureActiveProfile / persist / баланс / VU / EQ. Вхід у режим: captureActiveProfile() (профіль
+//     попереднього входу) -> s_usbMode = true -> loadActiveFromProfile(kProfileIndex) (+ eq::setAllDb пресету «Player»);
+//     вихід: captureActiveProfile() («Player») -> s_usbMode = false -> loadActiveFromProfile(s_input) + applyRadioEq() -> persist().
+//     Коло входів, маска, веб (defaults::kInputCount = 3) профіль «Player» не бачать.
+//   • Кнопки / RC5 у режимі (головний екран): OK = пауза / продовження (або запуск підготовленого треку), LEFT = попередній,
+//     RIGHT = наступний (usb_queue::requestPrev / requestNext; їхні правила — розділ 11), довге OK = перемикання джерела
+//     плеєра (зараз єдине — лише лог «only one source»), USB_SHUFFLE / USB_REPEAT = перемикачі (Settings::playerShuffle /
+//     playerRepeat). Існуючі аналоги (events.h): OK, LEFT, RIGHT, довге натискання OK (кнопка OK має longPress). Поза режимом
+//     поведінка не змінена (LEFT / RIGHT / OK як раніше; USB_SHUFFLE / USB_REPEAT нічого не роблять).
+//   • Відновлення: usbModeService() один раз за сеанс після першого Mounted викликає usb_queue::requestResume().
+//   • Позиція в Settings передається при старті треку, паузі, кінці черги, виході з режиму (usb_queue) і з AppController
+//     перед standby / «тихим» перезапуском (usb_queue::commitResume() + SettingsStore::flush()).
 // [USB11] КОЛО ВХОДІВ З РЕЖИМОМ «USB» і дія Action::USB_MODE (крок g2b-1; усе під FEATURE_USB_MODE).
 // Позиції кола: 0 = радіо, 1 = TV Box, 2 = Computer, 3 (kNavUsb) = «USB». UP / DOWN (cfg::kInputUpStep / kInputDownStep) крокують
 // по колу від ПОЗИЦІЇ НАМІРУ (navPosition()): ціль, що чекає виконання, інакше режим «USB», якщо він є / піднімається, інакше s_input.
@@ -253,9 +268,11 @@
 // й рівень НЕ чіпаємо (потік і його рівень узгоджені до наступного старту станції).
 // Публічний API AppController, AppStateData, Settings і NVS не змінено.
 #include "stations/station_store.h"  // [Prompt 11] ДОДАНО
+#include "config/player_mode_config.h"  // [USB14] player_mode_cfg::kProfileIndex / kProfileCount, PlayerSource
 #if FEATURE_USB_MODE
 #include "config/usb_mode_config.h"  // [USB11] usb_mode_cfg::kNav*
 #include "usb/usb_mode.h"            // [USB9] requestExit() при standby
+#include "usb/usb_queue.h"           // [USB14] пауза / prev / next / відновлення / commitResume()
 #endif
 
 namespace cfg = app_controller_cfg;
@@ -317,7 +334,8 @@ int8_t s_volume = 0;  // ЦІЛЬОВА гучність
 bool s_userMute = false;
 // [Prompt 21b/46a] Гучності профілів усіх логічних входів (kInputCount = 3: радіо, TV Box, Computer).
 // Пресет EQ у контролері НЕ дублюється (живе лише в Settings::profiles[i].eqGainsDb).
-int8_t s_volumes[defaults::kInputCount] = {};
+// [USB14] + слот kInputCount (player_mode_cfg::kProfileIndex): профіль «Player» (режим «USB»); пресет EQ — також у Settings.
+int8_t s_volumes[player_mode_cfg::kProfileCount] = {};
 AdjustTarget s_target = AdjustTarget::Volume;  // [Prompt 49a] ціль обертання енкодера: ЗАВЖДИ Volume (цикл Volume <-> Balance прибрано)
 // [Prompt 49a] Екран «EQ + баланс»: вибраний параметр (0..kBandCount - 1 = смуги EQ, kBandCount = баланс) і момент
 // останньої дії в екрані (таймаут eq_screen_cfg::kTimeoutMs). Осмислені, лише поки eqOpen().
@@ -365,6 +383,12 @@ bool s_usbHoldRelease = false;     // після зупинки радіо зн�
 bool s_usbPrevRadioPaused = false; // радіо до входу стояло на паузі
 uint8_t s_usbPrevInput = 0;
 uint16_t s_usbPrevStation = 0;
+// [USB14] Відновлення (папка / трек / позиція) запитується ОДИН раз за сеанс режиму — після першого Mounted; повторна
+// вставка носія стару позицію НЕ відновлює (задача usb_nav просто перечитає корінь). Спроби — з паузою (queue_full / task_create).
+bool s_usbResumeIssued = false;
+uint8_t s_usbResumeTries = 0;
+uint32_t s_usbResumeTryMs = 0;
+PlayerSource s_playerSource = PlayerSource::Usb;  // [USB14] єдина точка «джерело плеєра» (поки лише USB)
 inline bool usbModeOn() { return s_usbMode; }
 // [USB11] LEFT / RIGHT / OK заблоковані не лише в режимі, а й під час Entering: прапорець s_usbMode ставить задача usb_mode
 // трохи пізніше за requestEnter() (десятки мс), і радіо за цей час не має перезапускатись зі станції / паузи.
@@ -415,6 +439,13 @@ constexpr bool usbKeysLocked() { return false; }
 constexpr bool navPending() { return false; }
 constexpr UsbUiState usbUiNow() { return UsbUiState::Off; }
 #endif
+
+// [USB14] Індекс ПРОФІЛЮ активного звуку: у режимі «USB» — слот «Player» (kInputCount), інакше логічний вхід s_input
+// (у режимі s_input лишається входом ДО режиму — на нього профіль більше не пишеться). Усі читання / записи гучності, балансу,
+// чутливості VU і пресету EQ «активного входу» йдуть через цю функцію.
+inline uint8_t profileIdx() { return usbModeOn() ? player_mode_cfg::kProfileIndex : s_input; }
+// Профіль звучить через DSP радіо (радіо або файл у режимі «USB»).
+inline bool profileIsRadioDsp(uint8_t idx) { return idx == 0 || idx == player_mode_cfg::kProfileIndex; }
 
 uint32_t s_lastSyncMs = 0;
 
@@ -546,6 +577,8 @@ const char* actionName(Action a) {
         case Action::GAIN_UP:      return "GAIN_UP";
         case Action::GAIN_DOWN:    return "GAIN_DOWN";
         case Action::USB_MODE:     return "USB_MODE";  // [USB11]
+        case Action::USB_SHUFFLE:  return "USB_SHUFFLE";  // [USB14]
+        case Action::USB_REPEAT:   return "USB_REPEAT";   // [USB14]
     }
     return "?";
 }
@@ -740,10 +773,11 @@ bool targetSupported(AdjustTarget t) {
 // --- [Prompt 21b/46a] Профілі входів -------------------------------------------
 // Робоча гучність поточного входу -> s_volumes[s_input].
 void captureActiveProfile() {
-    if (s_input >= defaults::kInputCount) {
+    const uint8_t idx = profileIdx();  // [USB14] у режимі «USB» — профіль «Player»
+    if (idx >= player_mode_cfg::kProfileCount) {
         return;
     }
-    s_volumes[s_input] = s_volume;
+    s_volumes[idx] = s_volume;
 }
 
 // [Prompt 47a] Цільова гучність -> цифрове послаблення радіо. У мʼюті (Settle, standby, ...) слух не
@@ -827,13 +861,13 @@ void applyVuSens() {
 // s_volumes[idx] -> робоча гучність, обрізана за audio_cfg::kVolumeUiMin..Max ([P48a] capabilities чипа немає).
 // Реле входу не торкається й AppState не публікує (це робить викликач). [P47a] Оновлює цифрову гучність радіо.
 void loadActiveFromProfile(uint8_t idx) {
-    if (idx >= defaults::kInputCount) {
+    if (idx >= player_mode_cfg::kProfileCount) {  // [USB14] 0..kInputCount-1 — входи, kInputCount — «Player»
         idx = 0;
     }
     s_volume = static_cast<int8_t>(clampInt(s_volumes[idx], audio_cfg::kVolumeUiMin, audio_cfg::kVolumeUiMax));
     // [Prompt 47c] Радіо — цифрова гучність одразу; для зовнішнього входу значення піде в LinePath разом з вибором
     // входу чіпа (lineApplyParams()), щоб не міняти звук старого входу, поки він ще згасає.
-    if (idx == 0) {
+    if (profileIsRadioDsp(idx)) {  // [USB14] «Player» звучить через DSP радіо
         applyRadioVolume();
     }
     // [Prompt 48b] Баланс входу — з профілю в Settings (його пише контролер при зміні, веб — для неактивних входів).
@@ -843,10 +877,15 @@ void loadActiveFromProfile(uint8_t idx) {
         s_balance = balance_cfg::sanitizeDb(st.profiles[idx].balanceDb);
         // [V1] Чутливість VU входу — з профілю; застосовується одразу (лише показ VU, звуку не чіпає).
         s_vuSens = vu_sens_cfg::sanitizeDb(st.profiles[idx].vuSensDb);
+        // [USB14] Пресет EQ профілю «Player» -> екземпляр EQ радіо (файл звучить через нього). Повернення пресету входу 0
+        // робить applyRadioEq() (usbModeLeaveLocked). Інші входи свій EQ застосовують власними шляхами (як і раніше).
+        if (idx == player_mode_cfg::kProfileIndex) {
+            eq::setAllDb(st.profiles[idx].eqGainsDb);
+        }
     }
     applyVuSens();
     logVuSens(idx, s_vuSens);
-    if (idx == 0) {
+    if (profileIsRadioDsp(idx)) {
         applyRadioBalance();
     }
 }
@@ -1082,9 +1121,9 @@ void publishState() {
     // джерело правди, тож зміна з вебу теж видна); інакше нулі.
     if (eqOpen()) {
         p.eqSelected = s_eqSel;
-        if (s_input < defaults::kInputCount) {
+        if (profileIdx() < player_mode_cfg::kProfileCount) {  // [USB14] у режимі «USB» — профіль «Player»
             const Settings st = SettingsStore::snapshot();
-            memcpy(p.eqGainsDb, st.profiles[s_input].eqGainsDb, sizeof(p.eqGainsDb));
+            memcpy(p.eqGainsDb, st.profiles[profileIdx()].eqGainsDb, sizeof(p.eqGainsDb));
         }
     }
     AppState::modify(applyPub, &p);
@@ -1109,7 +1148,7 @@ void applyPersist(Settings& s, void* c) {
     s.lastInput = p->input;
     s.lastStation = p->station;
     s.lastMute = p->mute;
-    for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+    for (uint8_t i = 0; i < player_mode_cfg::kProfileCount; ++i) {  // [USB14] + слот «Player»
         s.profiles[i].volume = p->volumes[i];  // eqGainsDb профілів не чіпаємо
     }
 }
@@ -1278,7 +1317,7 @@ struct BalancePersistCtx {
 
 void applyBalancePersist(Settings& st, void* c) {
     const BalancePersistCtx* p = static_cast<const BalancePersistCtx*>(c);
-    if (p->input < defaults::kInputCount) {
+    if (p->input < player_mode_cfg::kProfileCount) {  // [USB14] input = індекс ПРОФІЛЮ (profileIdx())
         st.profiles[p->input].balanceDb = balance_cfg::sanitizeDb(p->db);
     }
 }
@@ -1292,9 +1331,9 @@ bool setBalanceTarget(int v) {
     }
     s_balance = static_cast<int8_t>(v);
     applyActiveBalance();
-    BalancePersistCtx ctx = {s_input, s_balance};
+    BalancePersistCtx ctx = {profileIdx(), s_balance};  // [USB14]
     SettingsStore::modify(applyBalancePersist, &ctx);
-    logBalance(s_input, s_balance);
+    logBalance(profileIdx(), s_balance);
     return true;
 }
 
@@ -1308,7 +1347,7 @@ struct VuSensPersistCtx {
 
 void applyVuSensPersist(Settings& st, void* c) {
     const VuSensPersistCtx* p = static_cast<const VuSensPersistCtx*>(c);
-    if (p->input < defaults::kInputCount) {
+    if (p->input < player_mode_cfg::kProfileCount) {  // [USB14] input = індекс ПРОФІЛЮ
         st.profiles[p->input].vuSensDb = vu_sens_cfg::sanitizeDb(p->db);
     }
 }
@@ -1322,9 +1361,9 @@ bool setVuSensTarget(int v) {
     }
     s_vuSens = static_cast<int8_t>(v);
     applyVuSens();
-    VuSensPersistCtx ctx = {s_input, s_vuSens};
+    VuSensPersistCtx ctx = {profileIdx(), s_vuSens};  // [USB14]
     SettingsStore::modify(applyVuSensPersist, &ctx);
-    logVuSens(s_input, s_vuSens);
+    logVuSens(profileIdx(), s_vuSens);
     return true;
 }
 
@@ -1346,7 +1385,7 @@ struct EqStoreCtx {
 
 void applyEqStore(Settings& st, void* c) {
     const EqStoreCtx* p = static_cast<const EqStoreCtx*>(c);
-    if (p->input < defaults::kInputCount) {
+    if (p->input < player_mode_cfg::kProfileCount) {  // [USB14] input = індекс ПРОФІЛЮ
         memcpy(st.profiles[p->input].eqGainsDb, p->gains, sizeof(p->gains));
     }
 }
@@ -1354,7 +1393,7 @@ void applyEqStore(Settings& st, void* c) {
 // Пресет АКТИВНОГО входу -> екземпляр DSP (як веб /api/eq): радіо — екземпляр g_radio, зовнішні входи — власний
 // EQ проходу (діє й до старту проходу; решту входів застосує lineApplyEq() при перемиканні).
 void applyEqToDsp(uint8_t input, const int8_t gains[eq_cfg::kBandCount]) {
-    if (input == 0) {
+    if (profileIsRadioDsp(input)) {  // [USB14] радіо або «Player» (файл звучить через EQ радіо)
         eq::setAllDb(gains);
         return;
     }
@@ -1368,20 +1407,21 @@ void applyEqToDsp(uint8_t input, const int8_t gains[eq_cfg::kBandCount]) {
 // Значення смуги band пресету активного входу -> value (обрізається до eq_cfg::kGainMinDb..kGainMaxDb). Читає свіжий
 // Settings (веб міг змінити інші смуги), міняє лише одну смугу. true — значення змінилось.
 bool eqSetBand(uint8_t band, int value) {
-    if (band >= eq_cfg::kBandCount || s_input >= defaults::kInputCount) {
+    const uint8_t prof = profileIdx();  // [USB14] у режимі «USB» — профіль «Player»
+    if (band >= eq_cfg::kBandCount || prof >= player_mode_cfg::kProfileCount) {
         return false;
     }
     value = clampInt(value, eq_cfg::kGainMinDb, eq_cfg::kGainMaxDb);
     const Settings st = SettingsStore::snapshot();
     EqStoreCtx ctx;
-    ctx.input = s_input;
-    memcpy(ctx.gains, st.profiles[s_input].eqGainsDb, sizeof(ctx.gains));
+    ctx.input = prof;
+    memcpy(ctx.gains, st.profiles[prof].eqGainsDb, sizeof(ctx.gains));
     if (ctx.gains[band] == value) {
         return false;
     }
     ctx.gains[band] = static_cast<int8_t>(value);
     SettingsStore::modify(applyEqStore, &ctx);  // профіль входу; NVS — з дебаунсом
-    applyEqToDsp(s_input, ctx.gains);           // звук міняється одразу
+    applyEqToDsp(prof, ctx.gains);              // звук міняється одразу
     return true;
 }
 
@@ -1390,11 +1430,11 @@ int eqSelectedValue() {
     if (s_eqSel == kEqBalanceIdx) {
         return s_balance;
     }
-    if (s_eqSel >= eq_cfg::kBandCount || s_input >= defaults::kInputCount) {
+    if (s_eqSel >= eq_cfg::kBandCount || profileIdx() >= player_mode_cfg::kProfileCount) {  // [USB14]
         return 0;
     }
     const Settings st = SettingsStore::snapshot();
-    return st.profiles[s_input].eqGainsDb[s_eqSel];
+    return st.profiles[profileIdx()].eqGainsDb[s_eqSel];
 }
 
 // Встановлює вибраний параметр (з обрізанням до меж). Повертає true, якщо значення змінилось; лог — лише при зміні.
@@ -1835,6 +1875,7 @@ void enterStandby() {
 #if FEATURE_USB_MODE
     s_navWant = kNavNone;  // [USB11] standby скасовує невиконану ціль навігації (вихід із режиму — нижче, у фоні)
     if (s_usbMode) {
+        usb_queue::commitResume();  // [USB14] останній трек / позиція -> Settings (кеш) ДО flush() нижче
         usb_mode::requestExit(usb_mode::ExitCause::Standby);  // [USB9] файл зупинено вище; end() — у фоні
     }
 #endif
@@ -2234,9 +2275,101 @@ void handleEqEvent(const Event& e) {
     }
 }
 
+#if FEATURE_USB_MODE
+// --- [USB14] Керування відтворенням у режимі «USB» --------------------------------------------------------------------------
+// OK = пауза / продовження (або запуск підготовленого треку), LEFT / RIGHT = попередній / наступний трек, довге OK =
+// перемикання джерела плеєра (зараз єдине джерело — USB: лише лог), USB_SHUFFLE / USB_REPEAT = перемикачі (NVS через
+// SettingsStore::modify). Усе неблокуюче: команди лише ставляться в чергу usb_nav. Поза режимом ці дії не викликаються.
+struct PlayerFlagsCtx {
+    bool shuffle;
+    bool repeat;
+};
+void applyPlayerFlags(Settings& s, void* c) {
+    const PlayerFlagsCtx* p = static_cast<const PlayerFlagsCtx*>(c);
+    s.playerShuffle = p->shuffle;
+    s.playerRepeat = p->repeat;
+}
+void persistPlayerFlags() {
+    PlayerFlagsCtx ctx = {usb_queue::shuffle(), usb_queue::repeatAll()};
+    SettingsStore::modify(applyPlayerFlags, &ctx);
+}
+
+void usbCycleSource() {
+    const uint8_t cur = static_cast<uint8_t>(s_playerSource);
+    const uint8_t next = static_cast<uint8_t>((cur + 1u) % kPlayerSourceCount);
+    if (next == cur) {
+        Serial.printf("[USBN] source: only one source (USB), nothing to switch\n");
+        return;
+    }
+    s_playerSource = static_cast<PlayerSource>(next);  // недосяжно, поки kPlayerSourceCount == 1
+}
+
+void usbPlayerKey(const Event& e) {
+    const bool plain = !e.repeat && !e.longPress;
+    const char* why = nullptr;
+    uint32_t id = 0;
+    switch (e.action) {
+        case Action::OK:
+            if (e.longPress) {
+                usbCycleSource();
+            } else if (!e.repeat) {
+                const usb_queue::PlayPause r = usb_queue::requestPlayPause(&why);
+                switch (r) {
+                    case usb_queue::PlayPause::Paused:  Serial.printf("[USBN] OK -> pause\n"); break;
+                    case usb_queue::PlayPause::Resumed: Serial.printf("[USBN] OK -> resume\n"); break;
+                    case usb_queue::PlayPause::Started: Serial.printf("[USBN] OK -> start prepared track\n"); break;
+                    case usb_queue::PlayPause::Refused:
+                        Serial.printf("[USBN] OK refused (%s)\n", why != nullptr ? why : "?");
+                        break;
+                }
+            }
+            break;
+        case Action::LEFT:
+            if (plain) {
+                if (!usb_queue::requestPrev(&id, &why)) {
+                    Serial.printf("[USBN] LEFT (prev) refused (%s)\n", why != nullptr ? why : "?");
+                }
+            }
+            break;
+        case Action::RIGHT:
+            if (plain) {
+                if (!usb_queue::requestNext(&id, &why)) {
+                    Serial.printf("[USBN] RIGHT (next) refused (%s)\n", why != nullptr ? why : "?");
+                }
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+void usbToggleShuffle() {
+    usb_queue::setShuffle(!usb_queue::shuffle());
+    persistPlayerFlags();
+    Serial.printf("[USBN] shuffle -> %s\n", usb_queue::shuffle() ? "ON" : "OFF");
+}
+
+void usbToggleRepeat() {
+    usb_queue::setRepeatAll(!usb_queue::repeatAll());
+    persistPlayerFlags();
+    Serial.printf("[USBN] repeat -> %s\n", usb_queue::repeatAll() ? "ON" : "OFF");
+}
+#endif  // FEATURE_USB_MODE
+
 void handleMainEvent(const Event& e) {
     const int step = (e.delta > 0) ? e.delta : 1;
     const bool plain = !e.repeat && !e.longPress;
+#if FEATURE_USB_MODE
+    // [USB14] У режимі «USB» (на головному екрані) LEFT / RIGHT / OK керують відтворенням. Під час Entering клавіші
+    // заблоковані (usbKeysLocked), у Exiting команди відхиляє usb_queue («mode_not_ready»). Поза режимом — без змін.
+    if (usbModeOn() && (s_mode == Mode::Radio || s_mode == Mode::ExternalInput) &&
+        (e.action == Action::LEFT || e.action == Action::RIGHT || e.action == Action::OK)) {
+        if (usb_mode::state() != usb_mode::State::Entering) {
+            usbPlayerKey(e);
+        }
+        return;
+    }
+#endif
     switch (e.action) {
         case Action::UP:
             if (plain) stepInput(cfg::kInputUpStep);
@@ -2507,6 +2640,11 @@ void beginRestart(bool external = false) {
     }
     ampRequestOff();  // ПІСЛЯ applyHardwareMute(), як у enterStandby()
     lineRelease();    // [Prompt 47c] прохід замʼючено (restarting() у desiredMute()), звільняємо ресурси
+#if FEATURE_USB_MODE
+    if (s_usbMode) {
+        usb_queue::commitResume();  // [USB14] останній трек / позиція -> Settings (кеш) ДО flush() нижче
+    }
+#endif
     // Остання зміна гучності/входу могла не дійти до NVS (запис із дебаунсом) — скидаємо зараз.
     persist();
     SettingsStore::flush();
@@ -2655,6 +2793,13 @@ void handleLocked(const Event& e) {
                 case Action::USB_MODE:
                     if (!e.repeat && !e.longPress) navToggle();
                     break;
+                // [USB14] Перемикачі режиму «USB»: діють лише в режимі (поза ним — без дії й без шуму), без repeat / long.
+                case Action::USB_SHUFFLE:
+                    if (!e.repeat && !e.longPress && usbModeOn()) usbToggleShuffle();
+                    break;
+                case Action::USB_REPEAT:
+                    if (!e.repeat && !e.longPress && usbModeOn()) usbToggleRepeat();
+                    break;
 #endif
                 case Action::ENC_PRESS:
                     // [Prompt 49a] Головний екран (Radio / ExternalInput): коротке натискання = мʼют, довге утримання =
@@ -2746,6 +2891,25 @@ void usbModeService() {
     }
     if (desiredMute() && !radio_volume::muted()) {
         radio_volume::setMute(true);
+    }
+    // [USB14] Відновлення: один раз за сеанс, коли носій уперше змонтовано й режим готовий. Недоступна задача usb_nav / черга
+    // команд — повтор не частіше ніж раз на 500 мс, не більше 20 спроб (далі — без відновлення, лог).
+    if (!s_usbResumeIssued && usb_mode::media() == usb_mode::Media::Mounted &&
+        (usb_mode::state() == usb_mode::State::Ready || usb_mode::state() == usb_mode::State::Playing)) {
+        const uint32_t now = millis();
+        if (s_usbResumeTries == 0 || static_cast<uint32_t>(now - s_usbResumeTryMs) >= 500) {
+            s_usbResumeTryMs = now;
+            ++s_usbResumeTries;
+            const char* why = nullptr;
+            if (usb_queue::requestResume(&why)) {
+                s_usbResumeIssued = true;
+                Serial.printf("[USBN] resume requested (try %u)\n", static_cast<unsigned>(s_usbResumeTries));
+            } else if (s_usbResumeTries >= 20) {
+                s_usbResumeIssued = true;
+                Serial.printf("[USBN] resume gave up after %u tries (%s)\n", static_cast<unsigned>(s_usbResumeTries),
+                              why != nullptr ? why : "?");
+            }
+        }
     }
 }
 
@@ -3118,9 +3282,18 @@ bool usbModeEnterLocked(const char*& why) {
     if (s_mode == Mode::IrLearn)         { why = "ir_learn_active"; return false; }
     if (s_mode == Mode::WifiSetup)       { why = "wifi_setup"; return false; }
     closeAnyMenu("usb_mode");  // список станцій / екран «EQ + баланс»
+    captureActiveProfile();    // [USB14] гучність попереднього входу -> його профіль ДО того, як профіль стане «Player»
     s_usbPrevInput = s_input;
     s_usbPrevStation = s_station;
     s_usbMode = true;
+    s_usbResumeIssued = false;  // [USB14]
+    s_usbResumeTries = 0;
+    s_usbResumeTryMs = 0;
+    {   // [USB14] shuffle / repeat — з Settings (спільні для джерел); черга бере їх з атомарних прапорців
+        const Settings ps = SettingsStore::snapshot();
+        usb_queue::setShuffle(ps.playerShuffle);
+        usb_queue::setRepeatAll(ps.playerRepeat);
+    }
     if (s_input == 0) {
         s_usbPrevRadioPaused = !playerActive();
         pauseRadio();  // плавний мʼют -> stop(); s_stopHold знімає usbModeService(), коли плеєр Idle
@@ -3130,8 +3303,9 @@ bool usbModeEnterLocked(const char*& why) {
         s_usbHoldRelease = false;
         lineRelease();  // прохід замʼючено (lineMuteWanted()), returnToRadio(); lineReleaseDone() у режимі «USB» нічого не стартує
     }
-    applyRadioVolume();   // файл звучить через DSP радіо: гучність / баланс активного профілю
-    applyRadioBalance();
+    // [USB14] Профіль «Player» (гучність, баланс, чутливість VU, пресет EQ) замість профілю попереднього входу; радіо вже
+    // гасне / зупинене (див. вище), тож зміна цілі DSP чутна не більше, ніж раніше applyRadioVolume().
+    loadActiveFromProfile(player_mode_cfg::kProfileIndex);
     APP_LOG("usb mode: enter (prev input=%u station=%u radio_paused=%d)\n", static_cast<unsigned>(s_usbPrevInput),
             static_cast<unsigned>(s_usbPrevStation), s_usbPrevRadioPaused ? 1 : 0);
     publishState();
@@ -3143,9 +3317,16 @@ void usbModeLeaveLocked() {
     if (!s_usbMode) {
         return;
     }
+    // [USB14] Профіль «Player»: поточна гучність -> s_volumes[kInputCount] (поки profileIdx() ще «Player»), далі повертаємо
+    // профіль попереднього входу (гучність, баланс, VU) і пресет EQ радіо (вхід 0) — ДО будь-яких шляхів нижче.
+    captureActiveProfile();
     s_usbMode = false;
     s_usbHoldRelease = false;
+    s_usbResumeIssued = false;
     s_navExitRetries = 0;  // [USB11] вихід вдався
+    loadActiveFromProfile(s_input);
+    applyRadioEq();
+    persist();  // гучність «Player» (і решта профілів) -> Settings (дебаунс); lastInput лишається входом ДО режиму
     APP_LOG("usb mode: leave (mode=%s)\n", modeName(s_mode));
     // [USB11] Відкладена ціль входу (UP / DOWN / INPUT_* / USB_MODE, натиснуті в режимі «USB»): ціль-вхід застосовується тут,
     // замість відновлення попереднього входу (щоб не піднімати радіо / прохід, який одразу доведеться зупиняти). Ціль «USB»
@@ -3723,7 +3904,7 @@ bool AppController::begin() {
     // [Prompt 21b/46a] Гучності профілів усіх входів — у таблицю контролера, робоча гучність — з профілю
     // останнього активного входу. Пресети EQ профілів лишаються в Settings (контролер їх не копіює).
     const Settings st = SettingsStore::snapshot();
-    for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+    for (uint8_t i = 0; i < player_mode_cfg::kProfileCount; ++i) {  // [USB14] + профіль «Player»
         s_volumes[i] = st.profiles[i].volume;
     }
     // [Prompt 39] Маска входів — ДО вибору s_input: lastInput, вимкнений (або апаратно відсутній),
@@ -3776,3 +3957,4 @@ bool AppController::begin() {
             static_cast<int>(s_volume), s_userMute ? 1 : 0, static_cast<unsigned>(s_inputMask));
     return true;
 }
+

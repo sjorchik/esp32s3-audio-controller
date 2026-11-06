@@ -30,6 +30,7 @@
 #include "usb/usb_msc_mount.h"
 #if USB_HOST_DIAG
 #include "usb/usb_browser.h"  // [USB13] статус usb_nav при виході
+#include "usb/usb_queue.h"    // [USB14] usb_queue::printPlayerStat() у usb.mode stat
 #include "usb/usb_fs.h"       // [USB13] лічильники дескрипторів
 #include "usb/usb_memdiag.h"  // [USB13] знімки пам'яті (DEF-5)
 #endif
@@ -692,6 +693,7 @@ void cmdStat() {
                   kTag, navOk ? "" : " (controller busy)", static_cast<int>(nav.pendingTarget),
                   static_cast<unsigned>(nav.requests), static_cast<unsigned>(nav.replaced),
                   static_cast<unsigned>(nav.exitFailures), static_cast<unsigned>(nav.restarts));
+    usb_queue::printPlayerStat();  // [USB14] пауза, збережені shuffle / repeat / папка / трек / позиція, записи в NVS
     printRam("now", ramNow());
     printRam("before enter", i.ramBeforeEnter);
     printRam("quiet (before begin)", i.ramQuiet);
@@ -828,3 +830,4 @@ void handleConsoleLine(const char* line) {
 }  // namespace usb_mode
 
 #endif  // FEATURE_USB_MODE
+

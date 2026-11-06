@@ -59,6 +59,9 @@
 //             «диригента» режиму «USB» (src/usb/usb_mode.*). Режим «USB» не є новим Mode: AppController лишається в Radio /
 //             ExternalInput, але поки режим активний (s_usbMode) нічого не запускає на радіо / проході й відхиляє зміну входу.
 //             Решту публічного інтерфейсу не змінено.
+// [USB14] Публічний інтерфейс AppController НЕ змінено. Усередині: профіль «Player» (4-й слот Settings::profiles) для режиму
+//             «USB», керування відтворенням кнопками / RC5 (OK, LEFT, RIGHT, довге OK, USB_SHUFFLE, USB_REPEAT), запит відновлення
+//             після монтування, передача позиції в Settings перед standby / перезапуском. Див. шапку app_controller.cpp.
 // [USB11] ДОДАНО (лише під FEATURE_USB_MODE): повсякденне керування режимом «USB». Публічних СИГНАТУР чужих модулів не
 //             змінено; додано лише usbNavStats() (діагностика usb.mode stat). Решта — всередині контролера:
 //             • коло входів Радіо -> TV Box -> Computer -> USB (UP / DOWN; «USB» = позиція після останнього входу;
@@ -264,3 +267,4 @@ public:
     static bool usbNavStats(UsbNavStats* out);
 #endif
 };
+

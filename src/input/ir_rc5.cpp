@@ -29,11 +29,14 @@ constexpr uint8_t kFrameBits     = 14;              // S1 S2 T A4..A0 C5..C0
 constexpr uint8_t kFrameHalfBits = kFrameBits * 2;  // 28
 constexpr uint8_t kRc5xCmdBit    = 0x40;            // 7-й біт команди
 
-// Усі дії до останньої (USB_MODE, [USB11]) включно: BASS_UP..GAIN_DOWN ідуть у enum Action одразу після DIGIT_9,
-// USB_MODE — одразу після GAIN_DOWN. [USB11] Було GAIN_DOWN + 1: формат NVS мапи не змінювався (записи зберігають
+// Усі дії до останньої (USB_REPEAT, [USB14]) включно: BASS_UP..GAIN_DOWN ідуть у enum Action одразу після DIGIT_9,
+// USB_MODE — одразу після GAIN_DOWN, USB_SHUFFLE і USB_REPEAT — одразу після USB_MODE. [USB14] Було USB_MODE + 1: формат NVS
+// мапи не змінювався (записи зберігають числове значення Action; старі мапи без нових дій валідні), але прошивка з вузьким
+// kActionCount відхилила б мапу, у якій навчено USB_SHUFFLE / USB_REPEAT (id >= kActionCount -> «invalid entry»).
+// [USB11 історично] Було GAIN_DOWN + 1 до додавання USB_MODE. [USB11] Було GAIN_DOWN + 1: формат NVS мапи не змінювався (записи зберігають
 // числове значення Action; старі мапи без USB_MODE валідні), але прошивка з вузьким kActionCount відхилила б мапу,
 // у якій навчено USB_MODE (action id >= kActionCount -> «invalid entry»).
-constexpr uint8_t kActionCount = static_cast<uint8_t>(Action::USB_MODE) + 1;
+constexpr uint8_t kActionCount = static_cast<uint8_t>(Action::USB_REPEAT) + 1;
 
 constexpr size_t kEntryBytes   = 3;  // action, addr, cmd
 constexpr size_t kBlobMaxBytes = 2 + ir_cfg::kMaxMapEntries * kEntryBytes + 4;
@@ -84,6 +87,8 @@ const ActionName kActionNames[] = {
     {Action::GAIN_UP, "GAIN_UP"},
     {Action::GAIN_DOWN, "GAIN_DOWN"},
     {Action::USB_MODE, "USB_MODE"},  // [USB11]
+    {Action::USB_SHUFFLE, "USB_SHUFFLE"},  // [USB14]
+    {Action::USB_REPEAT, "USB_REPEAT"},    // [USB14]
 };
 static_assert(sizeof(kActionNames) / sizeof(kActionNames[0]) == kActionCount,
               "kActionNames must list every Action");
@@ -865,3 +870,4 @@ bool IrRc5::importJson(const JsonDocument& doc) {
     gMapCount = count;
     return saveLocked();
 }
+

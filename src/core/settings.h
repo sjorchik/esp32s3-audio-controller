@@ -20,6 +20,13 @@
 // [Prompt 48a] NVS blob v7 (БЕЗ міграції): ВИДАЛЕНО processorType (аудіочіпи TDA7318 / PT2313L вирізано);
 // 3 логічні входи (inputNames[3], profiles[3]: 0 радіо, 1 TV Box, 2 Computer); профіль входу +balanceDb
 // (баланс ±20 дБ, крок 1 дБ, діапазон — config/balance_config.h; у P48a лише зберігається, DSP — P48b).
+// [USB14] NVS blob (БЕЗ міграції): profiles[] має player_mode_cfg::kProfileCount = kInputCount + 1 = 4 елементи: 4-й слот —
+// профіль входу «Player» (режим «USB» і майбутні джерела SD / BT). defaults::kInputCount (3) НЕ змінено: веб, коло входів
+// і маска входів працюють з 0..2; слот 3 бачить лише AppController. У КІНЕЦЬ структури додано playerShuffle / playerRepeat.
+// Розкладка: Settings 138 Б, blob 142 Б (було 128 / 132): blob v8 старої довжини відхиляється з логом, діють дефолти.
+// Окремо від blob-а (ключі NVS `pl_usb_dir` / `pl_usb_trk` / `pl_usb_pos`, namespace «audioctl») зберігається ПОЗИЦІЯ
+// відтворення джерела (SettingsStore::getPlayerResume / setPlayerResume): шляхи на 2 × 256 Б не роздувають blob
+// і не копіюються в кожен snapshot().
 // [Prompt 39] У КІНЕЦЬ структури додано inputEnabledMask (маска дозволених входів, відключення
 // входів 1..3 з вебу). Формат blob-а v4; blobs v3, v2 і v1 мігруються в load() (усі входи дозволені).
 
@@ -29,6 +36,7 @@
 #include "config/balance_config.h"
 #include "config/defaults.h"
 #include "config/eq_config.h"
+#include "config/player_mode_config.h"  // [USB14] PlayerSource, player_mode_cfg::kProfileCount
 #include "config/vu_sens_config.h"  // [V1] діапазон чутливості VU
 
 // [Prompt 46a] Профіль одного логічного входу: гучність (шкала UI 0..100, діапазон обрізає
@@ -70,13 +78,26 @@ struct Settings {
     // (разом з lastInput); пресет EQ входу пише веб-обробник /api/eq (SettingsStore::modify); balanceDb
     // у P48a не пише ніхто (P48b). На екземпляр радіо (eq::*) застосовується лише пресет входу 0
     // (profiles[0].eqGainsDb): load(), resetToDefaults(), /api/eq, повернення на вхід 0 (AppController).
-    InputProfile profiles[defaults::kInputCount];
+    // [USB14] Масив має kInputCount + 1 елементів: індекс kInputCount (player_mode_cfg::kProfileIndex) — профіль «Player».
+    InputProfile profiles[player_mode_cfg::kProfileCount];
 
     // [Prompt 39] Маска дозволених логічних входів: біт i = вхід i (0 = радіо, 1 = TV Box, 2 = Computer),
     // 1 = дозволено. [P48a] За замовчуванням 0x07 (settings_cfg::kInputMaskDefault). Біт 0 ЗАВЖДИ 1:
     // нормалізується в load()/sanitize() і в AppController (settings_cfg::normalizeInputMask). Пише лише
     // AppController (команда вебу WebCmdType::InputsEnabledSet). Поле стоїть ПІСЛЯ profiles.
     uint8_t inputEnabledMask;
+
+    // [USB14] Режим «Плеєр»: перемішування й повтор усього (спільні для джерел). Пише AppController (дії USB_SHUFFLE /
+    // USB_REPEAT, SettingsStore::modify), читає при вході в режим. Поля стоять ПІСЛЯ inputEnabledMask (лише в кінець).
+    bool playerShuffle;
+    bool playerRepeat;
+};
+
+// [USB14] Збережена позиція відтворення одного джерела плеєра (папка + імʼя треку в ній + секунда). Живе окремо від Settings
+// (див. шапку). dir — шлях папки від кореня флешки («/» — корінь), track — ІМʼЯ файлу в цій папці (без шляху).
+struct PlayerResume {
+    bool valid;      // true — є що відновлювати
+    uint32_t posSec; // абсолютна секунда (для AudioPlayer::playFile)
 };
 
 // Потокобезпечність: усі методи беруть внутрішній мʼютекс, КРІМ get() —
@@ -136,6 +157,23 @@ public:
     // «першого запуску» після перезавантаження). Скасовує відкладений запис.
     static bool eraseStored();
 
-    // [Prompt 6] ДОДАНО: скільки разів реально писали в NVS з моменту старту.
+    // [Prompt 6] ДОДАНО: скільки разів реально писали в NVS з моменту старту (лише blob; ключі позиції плеєра рахує
+    // playerResumeWriteCount()).
     static uint32_t writeCount();
+
+    // [USB14] ДОДАНО: позиція відтворення джерела плеєра (кеш у RAM; запис у NVS — відкладений, як requestSave()).
+    //  - getPlayerResume: копіює збережені папку й імʼя треку в буфери викликача (обрізання НЕ робиться: false при малому
+    //    буфері) і позицію. false — немає збереженого, або малий буфер. Буфери викликача краще мати статичними:
+    //    стек задачі usb_nav малий.
+    //  - setPlayerResume: оновлює кеш і ПОЗНАЧАЄ «брудним», ЛИШЕ якщо значення відрізняються від збережених (повтор тієї
+    //    ж паузи / позиції не пише). Запис виконує фонова задача з тим самим дебаунсом, що й blob (kSaveDebounceMs /
+    //    kSaveMaxDelayMs); flush() дописує негайно (перед standby / перезапуском).
+    //  - clearPlayerResume: забути позицію (кеш + видалення ключів NVS при наступному записі).
+    //  - playerResumeWriteCount: скільки разів реально писали ключі позиції в NVS з моменту старту (діагностика).
+    static bool getPlayerResume(PlayerSource src, char* dirOut, size_t dirCap, char* trackOut, size_t trackCap,
+                                PlayerResume* info);
+    static void setPlayerResume(PlayerSource src, const char* dir, const char* track, uint32_t posSec);
+    static void clearPlayerResume(PlayerSource src);
+    static uint32_t playerResumeWriteCount();
 };
+
