@@ -23,6 +23,7 @@
 #include "audio/line_path.h"
 #include "config/usb_mode_config.h"
 #include "core/app_controller.h"
+#include "core/ssl_workaround.h"  // [USB13b] WORKAROUND DEF-5
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -281,6 +282,7 @@ void runExit(ExitCause cause) {
     }
 
     // 4. Відновлення попереднього входу штатним шляхом (RAM для TLS / line_path уже вільна).
+    ssl_workaround::noteUsbExit();  // [USB13b] ПЕРЕД стартом радіо: озброює вікно, якщо в сеансі грав файл
     const uint32_t tRestore = millis();
     AppController::UsbModeSnapshot restored = {};
     const bool leftOk = appLeave(&restored);

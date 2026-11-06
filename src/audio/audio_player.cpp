@@ -11,6 +11,7 @@
 //   стиль 2: Audio::audio_info_callback, Audio::msg_t, Audio::evt_info,
 //            evt_bitrate, evt_eof, evt_name, evt_streamtitle, evt_id3data;
 
+// [USB13b] ДОДАНО виклики ssl_workaround:: (noteFilePlayed / onRadioConnect / noteLibSslAllocText): обхідне рішення DEF-5.
 // [USB7] ДОДАНО файлове джерело (AudioPlayer::playFile, Audio::connecttoFS(usb_fs::volume(), ...)): окремі гілки
 // doPlayFile / failFile / finishFile / monitorFile; радіо-логіка (reconnect, backoff, буфер, недовантаження) для
 // файлу НЕ виконується (s_source == Source::File). Решта файлу для радіо — без змін.
@@ -37,6 +38,7 @@
 #include "config/line_path_config.h"  // [Prompt 48d] LINE_PATH_ENABLE (раніше ADC_VU_ENABLE через adc_vu_config.h)
 #include "config/pins.h"
 #include "config/xsmt_config.h"          // [Prompt X1]
+#include "core/ssl_workaround.h"         // [USB13b] WORKAROUND DEF-5: облік невдач підключення радіо після файлу
 #if FEATURE_USB_HOST
 #include "usb/usb_fs.h"         // [USB7] usb_fs::volume() для connecttoFS
 #include "usb/usb_msc_mount.h"  // [USB7] isMounted()
@@ -565,6 +567,9 @@ void handleInfo(const char* text) {
     Serial.printf("[PLAYER][lib] %s\n", text);
 #endif
     parseHttpCode(text);
+    if (strstr(text, "32512") != nullptr || strstr(text, "Memory allocation failed") != nullptr) {
+        ssl_workaround::noteLibSslAllocText();  // [USB13b] лише лічильник / лог (рішення не залежить)
+    }
     if (strstr(text, player_cfg::kStreamReadyText) != nullptr) {
         s_evtStreamReady = true;
     }
@@ -685,6 +690,7 @@ void connectNow(bool isReconnect) {
     const bool ok = s_audio->connecttohost(s_url);
     s_connectedAtMs = millis();
     XSMT_EVT("player connecttohost end ok=%d", ok ? 1 : 0);
+    ssl_workaround::onRadioConnect(ok, s_url);  // [USB13b] WORKAROUND DEF-5 (рішення — у модулі; інакше нічого не змінює)
     if (!ok) {
         failStream("connecttohost failed");
         return;
@@ -902,6 +908,7 @@ void doPlayFile(const char* path, int32_t startSec) {
         return;
     }
     s_fileActive = true;
+    ssl_workaround::noteFilePlayed();  // [USB13b] «файл грав у сеансі» (усі збірки)
 #if FEATURE_USB_HOST && USB_HOST_DIAG
     s_dbgFileSeen = true;  // [USB13]
 #endif

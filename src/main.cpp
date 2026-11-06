@@ -53,6 +53,7 @@
 #include "config/station_store_config.h"  // [Prompt 11] ДОДАНО
 #include "core/app_controller.h"  // [Prompt 8] ДОДАНО
 #include "core/events.h"
+#include "core/ssl_workaround.h"  // [USB13b] WORKAROUND DEF-5
 #include "core/settings.h"       // [Prompt 6] ДОДАНО
 #include "core/settings_test.h"  // [Prompt 6] ДОДАНО
 #include "input/buttons.h"
@@ -350,6 +351,7 @@ void setup() {
 
     Serial.println("[MAIN] ESP32-S3 Audio Controller skeleton");
     Serial.println("[MAIN] Build: " __DATE__ " " __TIME__);
+    ssl_workaround::onBoot();  // [USB13b] читає й стирає RTC-прапорець попереднього запуску (захист від петлі)
 #if FEATURE_AMP_STANDBY
     Serial.printf("[MAIN] Amp standby pin GPIO%d: %s\n", pins::kAmpStby,
                   ampPinOk ? "standby level set" : "init failed");

@@ -1,3 +1,4 @@
+// [USB13b] ДОДАНО команду usb.sslfail [dry | expired | stat] (імітація події -32512 після виходу; обхідне рішення DEF-5).
 // [USB10] ДОДАНО диспетчеризацію usb.dir / usb.cd / usb.pwd (usb_browser) і usb.q (usb_queue) — як usb.mode у USB9.
 // [USB7] Консоль відтворення файлу з /usb: usb.play / usb.pstat / usb.seek / usb.stopf / usb.ended.
 // Стиль — як у usb_msc_mount.cpp / usb_fs.cpp (тег «[USB]», відлуння «got:» друкує usb_msc_mount::handleLine).
@@ -12,6 +13,7 @@
 
 #include "audio/audio_player.h"
 #include "config/file_player_config.h"
+#include "core/ssl_workaround.h"  // [USB13b] usb.sslfail
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -43,7 +45,7 @@ bool matchWord(const char* s, const char* word, const char** rest) {
     return true;
 }
 
-const char* const kWords[] = {"usb.play", "usb.pstat", "usb.seek", "usb.stopf", "usb.ended", "usb.fx"
+const char* const kWords[] = {"usb.play", "usb.pstat", "usb.seek", "usb.stopf", "usb.ended", "usb.fx", "usb.sslfail"
 #if FEATURE_USB_MODE
                                  ,
                                  "usb.mode"  // [USB9]
@@ -243,6 +245,8 @@ void handleConsoleLine(const char* line) {
         cmdEnded(rest);
     } else if (matchWord(line, "usb.fx", &rest)) {
         cmdFx(rest);
+    } else if (matchWord(line, "usb.sslfail", &rest)) {
+        ssl_workaround::handleConsole(rest);  // [USB13b]
 #if FEATURE_USB_MODE
     } else if (matchWord(line, "usb.mode", &rest)) {
         usb_mode::handleConsoleLine(line);  // [USB9]
