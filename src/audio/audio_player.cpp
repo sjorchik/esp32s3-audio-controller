@@ -40,6 +40,9 @@
 #if FEATURE_USB_HOST
 #include "usb/usb_fs.h"         // [USB7] usb_fs::volume() для connecttoFS
 #include "usb/usb_msc_mount.h"  // [USB7] isMounted()
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+#include "usb/usb_memdiag.h"  // [USB13] знімки пам'яті навколо підключення радіо (DEF-5)
+#endif
 #endif
 
 #if AUDIO_PLAYER_DEBUG
@@ -421,6 +424,9 @@ volatile int32_t s_seekSec = 0;
 const char* volatile s_fileError = nullptr;  // статичний рядок
 // Під мʼютексом: запит playFile і шлях активного / останнього файлу.
 char s_pendingFile[file_player_cfg::kPathMax];
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+volatile bool s_dbgFileSeen = false;  // [USB13] true після першого успішного connecttoFS (знімки пам'яті навколо радіо)
+#endif
 int32_t s_pendingStartSec = -1;
 char s_filePath[file_player_cfg::kPathMax];
 // Лише задача плеєра. [USB7] Цифровий мʼют radio_volume: після паузи радіо AppController тримає його (s_stopHold до
@@ -627,6 +633,13 @@ void handleId3(const char* text) {
 
 // Планує наступну спробу з exponential backoff, мʼютить ЦАП, зупиняє потік.
 void failStream(const char* reason) {
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+    if (s_dbgFileSeen) {  // [USB13] стан пам'яті в момент збою радіо ПІСЛЯ файла (разом з хуком невдалих виділень)
+        Serial.printf("[PLAYER] DIAG failStream reason='%s'\n", reason != nullptr ? reason : "?");
+        usb_memdiag::print("player:failure", true);
+        usb_memdiag::printFailStats();
+    }
+#endif
     muteDacWithLead("failure");  // [X1] спочатку мʼют (+пауза), потім stopSong()
     if (s_audio != nullptr) {
         s_audio->stopSong();
@@ -663,6 +676,11 @@ void connectNow(bool isReconnect) {
     s_evtSampleRate = false;  // [X1d]
     s_bufPercent = 0;
 
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+    if (s_dbgFileSeen) {  // [USB13]
+        usb_memdiag::print("player:connect begin (file played before)");
+    }
+#endif
     XSMT_EVT("player connecttohost begin");
     const bool ok = s_audio->connecttohost(s_url);
     s_connectedAtMs = millis();
@@ -884,6 +902,9 @@ void doPlayFile(const char* path, int32_t startSec) {
         return;
     }
     s_fileActive = true;
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+    s_dbgFileSeen = true;  // [USB13]
+#endif
     if (s_fxDigDelayMs < 0) {  // usb.fx dig -1: радіо-DSP розмʼючується одразу (поведінка до виправлення)
         fileUnmuteRadioVolume();
     }

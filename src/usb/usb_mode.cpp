@@ -27,6 +27,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "usb/usb_msc_mount.h"
+#if USB_HOST_DIAG
+#include "usb/usb_browser.h"  // [USB13] статус usb_nav при виході
+#include "usb/usb_fs.h"       // [USB13] лічильники дескрипторів
+#include "usb/usb_memdiag.h"  // [USB13] знімки пам'яті (DEF-5)
+#endif
 
 namespace usb_mode {
 
@@ -47,6 +52,12 @@ portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 Info s_info = {};  // під s_mux (поле state тут НЕ використовується — береться з s_state)
 
 constexpr int16_t kNoPrev = -1;
+
+#if USB_HOST_DIAG
+// [USB13] Знімок пам'яті ДО входу (для різниці при виході; у т.ч. PSRAM).
+usb_memdiag::Snap s_memEnter = {};
+bool s_memEnterValid = false;
+#endif
 
 inline State rawState() { return static_cast<State>(s_state.load()); }
 
@@ -190,6 +201,18 @@ void runExit(ExitCause cause) {
                       static_cast<unsigned>(fileStopMs), AudioPlayer::stateName(AudioPlayer::state()));
     }
 
+#if USB_HOST_DIAG
+    {  // [USB13] стан ПІСЛЯ зупинки файла, ДО end(): дескриптори й usb_nav
+        usb_memdiag::print("exit:file stopped", true);
+        const usb_fs::HandleStats h = usb_fs::handleStats();
+        usb_browser::Status nb = {};
+        const bool nbOk = usb_browser::status(&nb);
+        Serial.printf("%s exit: fs handles open=%u closed_at_unmount=%u deferred_total=%u leaked_total=%u | usb_nav active=%d%s\n",
+                      kTag, (unsigned)h.open, (unsigned)h.closedAtUnmount, (unsigned)h.deferredTotal,
+                      (unsigned)h.leakedTotal, nbOk ? (int)nb.active : -1, nbOk ? "" : " (status busy)");
+    }
+#endif
+
     // 2. Зняття USB-host (0,6 – 1,25 с, до kEndWaitMs) — у цій фоновій задачі, не з UI.
     const RamSample ramPreEnd = ramNow();
     printRam("exit: before end()", ramPreEnd);
@@ -239,6 +262,17 @@ void runExit(ExitCause cause) {
     snap = s_info;
     portEXIT_CRITICAL(&s_mux);
     printRam("exit: after end()", ramAfter);
+#if USB_HOST_DIAG
+    {  // [USB13] знімок ПІСЛЯ end(), ДО старту радіо: порівняння з «enter:before» за ВСІМА класами (PSRAM теж)
+        const usb_memdiag::Snap after = usb_memdiag::print("exit:after end() (before radio restore)", true);
+        if (s_memEnterValid) {
+            usb_memdiag::printDelta("exit vs enter:before", s_memEnter, after);
+        }
+        usb_browser::Status nb = {};
+        const bool nbOk = usb_browser::status(&nb);
+        Serial.printf("%s exit: usb_nav active=%d%s\n", kTag, nbOk ? (int)nb.active : -1, nbOk ? "" : " (status busy)");
+    }
+#endif
     if (snap.ramQuiet.freeBytes != 0) {
         Serial.printf("%s ram vs before begin(): d_free=%ld d_largest=%ld d_min=%ld (expect 0; first begin/end after boot: -128 B)\n",
                       kTag, static_cast<long>(ramAfter.freeBytes) - static_cast<long>(snap.ramQuiet.freeBytes),
@@ -325,6 +359,11 @@ void runEnter() {
     const RamSample ram0 = ramNow();
     infoWrite([&](Info& i) { i.ramBeforeEnter = ram0; });
     printRam("enter: before", ram0);
+#if USB_HOST_DIAG
+    usb_memdiag::installFailHook();  // [USB13] хук невдалих виділень діє на весь сеанс (і на старт радіо після виходу)
+    s_memEnter = usb_memdiag::print("enter:before", true);
+    s_memEnterValid = true;
+#endif
 
     // 1. Тиха зупинка радіо / звільнення проходу штатними шляхами AppController (запамʼятовує попередній стан).
     AppController::UsbModeSnapshot prev = {};
@@ -366,6 +405,9 @@ void runEnter() {
         i.ramQuiet = ramQuiet;
     });
     printRam("enter: quiet (before begin)", ramQuiet);
+#if USB_HOST_DIAG
+    usb_memdiag::print("enter:quiet");  // [USB13]
+#endif
     // Поріг не вигадується: друкуємо виміряну різницю; «не зросла» при працювавшому радіо / проході — підозра.
     Serial.printf("%s ram freed by stopping the source: d_free=%ld d_largest=%ld (quiet in %u ms)\n", kTag,
                   static_cast<long>(ramQuiet.freeBytes) - static_cast<long>(ram0.freeBytes),
@@ -422,6 +464,9 @@ void runEnter() {
         i.detail = nullptr;
     });
     printRam("enter: ready", ramReady);
+#if USB_HOST_DIAG
+    usb_memdiag::print("enter:ready");  // [USB13]
+#endif
     Serial.printf("%s enter: ready in %u ms (quiet=%u begin=%u mount_wait=%u) media=%s; host cost d_free=%ld d_largest=%ld\n",
                   kTag, static_cast<unsigned>(since(tEnter)), static_cast<unsigned>(quietMs),
                   static_cast<unsigned>(beginMs), static_cast<unsigned>(mountMs), mediaName(media),

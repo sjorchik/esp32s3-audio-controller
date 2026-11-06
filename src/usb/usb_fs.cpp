@@ -1,3 +1,9 @@
+// [USB13] DEF-9: відкриті файли / каталоги обгортки тепер ЗАКРИВАЮТЬСЯ ДО розмонтування VFS. Раніше при вийманні флешки
+// (або end()) під час відкритого файла обгортка не могла викликати fclose() «на знятому томі» і навмисно витікала
+// shared_ptr: FILE, його буфер, VFSFileImpl і динамічний буфер сектора FatFs (fp->buf, див. f_close в ff.c) лишались
+// до перезавантаження (≈ 4,7–5,1 КБ внутрішньої RAM за кожне вийняття під час файла). Тепер: реєстр живих обгорток +
+// closeAllForUnmountLocked() (викликає usb_msc_mount::unmountLocked() під volumeLock, ДО msc_host_vfs_unregister);
+// закриття, що не вдалось через таймаут блокування тому, відкладається (kFsDeferredMax), а не витікає.
 // [USB7] ДОДАНО лічильники читань у UsbFileImpl::read (readStats / resetReadStats, лише USB_HOST_DIAG); логіка
 // блокувань і поколінь без змін.
 // [USB6] fs::FS-обгортка над VFS-монтуванням USB-флешки (/usb) + діагностика читання (usb.fs.*).
@@ -23,11 +29,14 @@
 #include <stdlib.h>
 #include <atomic>
 #include <memory>
+#include <utility>
 
 #include "config/usb_host_config.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"  // [USB7] esp_timer_get_time() для лічильників читань
 #include "usb/usb_msc_mount.h"
+#include "freertos/FreeRTOS.h"  // [USB13] мьютекс реєстру
+#include "freertos/semphr.h"
 #include "vfs_api.h"  // VFSImpl / VFSFileImpl з бібліотеки FS (ядро Arduino-ESP32 3.3.7)
 
 namespace usb_fs {
@@ -70,6 +79,63 @@ bool isReadMode(const char* mode) {
     return mode == nullptr || mode[0] == 'r';
 }
 
+// --- [USB13] Реєстр живих обгорток і відкладені закриття -------------------------------------------------------------
+// Мьютекс реєстру ЗАВЖДИ внутрішній: його беруть, маючи (або не маючи) блокування тому, але під ним НІКОЛИ не беруть
+// блокування тому. Під ним виконуються лише: зміна списку, закриття дескрипторів (fclose / closedir — вони не беруть
+// блокування тому), робота з масивом відкладених закриттів.
+class UsbFileImpl;
+
+StaticSemaphore_t s_regMtxCb;
+SemaphoreHandle_t s_regMtx = nullptr;
+portMUX_TYPE s_regInitMux = portMUX_INITIALIZER_UNLOCKED;
+
+SemaphoreHandle_t regMtx() {
+    if (s_regMtx == nullptr) {
+        portENTER_CRITICAL(&s_regInitMux);
+        if (s_regMtx == nullptr) {
+            s_regMtx = xSemaphoreCreateMutexStatic(&s_regMtxCb);
+        }
+        portEXIT_CRITICAL(&s_regInitMux);
+    }
+    return s_regMtx;
+}
+
+class RegLock {
+public:
+    RegLock() { xSemaphoreTake(regMtx(), portMAX_DELAY); }
+    ~RegLock() { xSemaphoreGive(regMtx()); }
+    RegLock(const RegLock&) = delete;
+    RegLock& operator=(const RegLock&) = delete;
+};
+
+UsbFileImpl* s_head = nullptr;  // двозвʼязний список живих обгорток (під RegLock)
+
+struct Deferred {
+    fs::FileImplPtr inner;
+    uint32_t gen = 0;
+};
+Deferred s_deferred[usb_host_cfg::kFsDeferredMax];  // під RegLock
+std::atomic<uint32_t> s_deferredCount{0};           // скільки слотів зайнято (швидка перевірка без мьютекса)
+
+std::atomic<uint32_t> s_stOpen{0};
+std::atomic<uint32_t> s_stClosedAtUnmount{0};
+std::atomic<uint32_t> s_stDeferredTotal{0};
+std::atomic<uint32_t> s_stLeakedTotal{0};
+
+// Останній запасний шлях: навмисний витік (закрити небезпечно / нема куди відкласти). Лічильник має лишатись 0.
+void leakForever(fs::FileImplPtr& p) {
+    if (p) {
+        new fs::FileImplPtr(p);
+        p.reset();
+        s_stLeakedTotal.fetch_add(1);
+    }
+}
+
+void regLink(UsbFileImpl* f);
+void regUnlink(UsbFileImpl* f);
+bool deferAndUnlink(UsbFileImpl* f, fs::FileImplPtr& inner, uint32_t gen);
+void reapDeferredLocked(uint32_t gen);
+
 // Блокування тому на одну операцію. Конструктор бере блокування (не довше kFsLockWaitMs),
 // деструктор знімає. ready() — том змонтовано й блокування взято; sameMount(gen) — це те саме монтування.
 class VolumeGuard {
@@ -87,6 +153,7 @@ public:
     VolumeGuard(const VolumeGuard&) = delete;
     VolumeGuard& operator=(const VolumeGuard&) = delete;
 
+    bool locked() const { return _locked; }  // [USB13]
     bool ready() const { return _gen != 0; }
     bool sameMount(uint32_t gen) const { return _gen != 0 && _gen == gen; }
     uint32_t generation() const { return _gen; }
@@ -99,8 +166,25 @@ private:
 // Обгортка над файлом VFS. Усі методи, крім деструктора, беруть блокування тому й перевіряють покоління.
 class UsbFileImpl : public fs::FileImpl {
 public:
-    UsbFileImpl(fs::FileImplPtr inner, uint32_t gen) : _inner(inner), _gen(gen) {}
+    UsbFileImpl(fs::FileImplPtr inner, uint32_t gen) : _inner(inner), _gen(gen) { regLink(this); }
     ~UsbFileImpl() override { close(); }
+
+    // [USB13] Поля реєстру (під RegLock) і закриття при розмонтуванні. Викликати closeForUnmount() ЛИШЕ з
+    // closeAllForUnmountLocked(): тримає й блокування тому (unmountLocked), і RegLock.
+    UsbFileImpl* regPrev = nullptr;
+    UsbFileImpl* regNext = nullptr;
+    bool regLinked = false;
+
+    // true — був відкритий дескриптор і його закрито. *wasDir — це був каталог.
+    bool closeForUnmount(bool* wasDir) {
+        if (!_inner) {
+            return false;
+        }
+        *wasDir = _inner->isDirectory();
+        _inner->close();  // VFSFileImpl::close(): fclose() / closedir() — том ще змонтовано, VFS ще зареєстровано
+        _inner.reset();
+        return true;
+    }
 
     // Лише читання: запис відхилено.
     size_t write(const uint8_t* buf, size_t size) override {
@@ -149,20 +233,26 @@ public:
     }
 
     void close() override {
-        if (!_inner) {
-            return;
+        if (_inner) {
+            VolumeGuard g;
+            if (g.sameMount(_gen)) {
+                // Нормальний шлях: те саме монтування, блокування тримаємо. ~VFSFileImpl / close() → fclose().
+                _inner->close();
+                _inner.reset();
+                reapDeferredLocked(_gen);  // заодно закриваємо відкладені (без їхнього власника)
+            } else if (g.locked()) {
+                // Блокування взято, але монтування вже інше / знято. closeAllForUnmountLocked() мав закрити _inner
+                // раніше (тоді сюди не потрапляємо). Якщо потрапили — реєстр не охопив обгортку: запасний витік.
+                leakForever(_inner);
+            } else {
+                // Блокування тому не взято за kFsLockWaitMs: торкатись VFS-обʼєкта небезпечно. Відкладаємо закриття
+                // (його виконає наступне закриття в тому самому монтуванні або unmountLocked); нема місця — витік.
+                if (!deferAndUnlink(this, _inner, _gen)) {
+                    leakForever(_inner);
+                }
+            }
         }
-        VolumeGuard g;
-        if (g.sameMount(_gen)) {
-            _inner->close();
-            _inner.reset();  // ~VFSFileImpl → fclose(), поки том змонтовано (блокування тримаємо)
-        } else {
-            // Том знято або змінено після відкриття, або блокування не взято за kFsLockWaitMs.
-            // VFS-обʼєкт торкати не можна: fclose() на знятому томі небезпечний. Навмисний витік:
-            // тримаємо копію shared_ptr назавжди. Див. «Відомі обмеження».
-            new fs::FileImplPtr(_inner);
-            _inner.reset();
-        }
+        regUnlink(this);  // ідемпотентно
     }
 
     time_t getLastWrite() override {
@@ -239,6 +329,76 @@ private:
     uint32_t _gen;
 };
 
+// --- [USB13] Реалізація реєстру ---------------------------------------------------------------------------------------
+void regLink(UsbFileImpl* f) {
+    RegLock l;
+    f->regPrev = nullptr;
+    f->regNext = s_head;
+    if (s_head != nullptr) {
+        s_head->regPrev = f;
+    }
+    s_head = f;
+    f->regLinked = true;
+    s_stOpen.fetch_add(1);
+}
+
+// Викликати під RegLock.
+void unlinkLocked(UsbFileImpl* f) {
+    if (!f->regLinked) {
+        return;
+    }
+    if (f->regPrev != nullptr) {
+        f->regPrev->regNext = f->regNext;
+    } else {
+        s_head = f->regNext;
+    }
+    if (f->regNext != nullptr) {
+        f->regNext->regPrev = f->regPrev;
+    }
+    f->regPrev = nullptr;
+    f->regNext = nullptr;
+    f->regLinked = false;
+    s_stOpen.fetch_sub(1);
+}
+
+void regUnlink(UsbFileImpl* f) {
+    RegLock l;
+    unlinkLocked(f);
+}
+
+// Віддає _inner у слот відкладених і ОДНОЧАСНО виймає обгортку з реєстру (під одним RegLock): після цього
+// closeAllForUnmountLocked() не бачить обгортку, а _inner лишається лише в слоті.
+bool deferAndUnlink(UsbFileImpl* f, fs::FileImplPtr& inner, uint32_t gen) {
+    RegLock l;
+    for (size_t i = 0; i < usb_host_cfg::kFsDeferredMax; ++i) {
+        if (!s_deferred[i].inner) {
+            s_deferred[i].inner = std::move(inner);
+            s_deferred[i].gen = gen;
+            s_deferredCount.fetch_add(1);
+            s_stDeferredTotal.fetch_add(1);
+            unlinkLocked(f);
+            return true;
+        }
+    }
+    unlinkLocked(f);  // місця нема: обгортку виймаємо, _inner лишається в неї → запасний витік у викликача
+    return false;
+}
+
+// Виклик під блокуванням тому (VolumeGuard, sameMount(gen)).
+void reapDeferredLocked(uint32_t gen) {
+    if (s_deferredCount.load() == 0) {
+        return;
+    }
+    RegLock l;
+    for (size_t i = 0; i < usb_host_cfg::kFsDeferredMax; ++i) {
+        if (s_deferred[i].inner && s_deferred[i].gen == gen) {
+            s_deferred[i].inner->close();
+            s_deferred[i].inner.reset();
+            s_deferredCount.fetch_sub(1);
+        }
+    }
+}
+
 // Том /usb. Наслідує VFSImpl (його open / exists працюють з _mountpoint), але кожен виклик спершу бере
 // блокування тому й відмовляє, коли том не змонтовано. Лише читання.
 class UsbVolumeImpl : public VFSImpl {
@@ -295,6 +455,46 @@ public:
 fs::FS& volume() {
     static fs::FS s_volume(std::make_shared<UsbVolumeImpl>());
     return s_volume;
+}
+
+UnmountClosed closeAllForUnmountLocked(uint32_t closingGen) {
+    UnmountClosed r = {};
+    RegLock l;
+    for (UsbFileImpl* f = s_head; f != nullptr; f = f->regNext) {
+        bool wasDir = false;
+        if (f->closeForUnmount(&wasDir)) {
+            if (wasDir) {
+                ++r.dirs;
+            } else {
+                ++r.files;
+            }
+        }
+    }
+    for (size_t i = 0; i < usb_host_cfg::kFsDeferredMax; ++i) {
+        if (!s_deferred[i].inner) {
+            continue;
+        }
+        if (closingGen != 0 && s_deferred[i].gen == closingGen) {
+            s_deferred[i].inner->close();  // те саме монтування, що знімається: закрити безпечно
+            s_deferred[i].inner.reset();
+            ++r.deferred;
+        } else {
+            leakForever(s_deferred[i].inner);  // зі старого монтування: VFS уже знято, fd міг бути перевиділений
+            ++r.leaked;
+        }
+    }
+    s_deferredCount.store(0);
+    s_stClosedAtUnmount.fetch_add(static_cast<uint32_t>(r.files) + r.dirs + r.deferred);
+    return r;
+}
+
+HandleStats handleStats() {
+    HandleStats h;
+    h.open = s_stOpen.load();
+    h.closedAtUnmount = s_stClosedAtUnmount.load();
+    h.deferredTotal = s_stDeferredTotal.load();
+    h.leakedTotal = s_stLeakedTotal.load();
+    return h;
 }
 
 #if USB_HOST_DIAG
@@ -408,8 +608,16 @@ bool reportIfNotMounted(const char* cmd) {
 void printHelp() {
     Serial.printf("%s fs (read-only, / = volume root): usb.fs.ls [path] | usb.fs.exists <path> | "
                   "usb.fs.read <path> [bytes] | usb.fs.selftest <path> | usb.fs.cycle <path> <N> | "
-                  "usb.fs.multi <path> <N> | usb.fs.help\n",
+                  "usb.fs.multi <path> <N> | usb.fs.handles | usb.fs.help\n",
                   kTag);
+}
+
+// [USB13] usb.fs.handles: лічильники дескрипторів обгортки. open = відкрито зараз; leaked_total має лишатись 0.
+void cmdFsHandles() {
+    const HandleStats h = handleStats();
+    Serial.printf("%s fs.handles: open=%lu closed_at_unmount=%lu deferred_total=%lu leaked_total=%lu\n", kTag,
+                  (unsigned long)h.open, (unsigned long)h.closedAtUnmount, (unsigned long)h.deferredTotal,
+                  (unsigned long)h.leakedTotal);
 }
 
 void cmdFsLs(const char* rest) {
@@ -743,6 +951,8 @@ void handleConsoleLine(const char* line) {
         cmdFsCycle(rest);
     } else if (matchWord(line, "usb.fs.multi", &rest)) {
         cmdFsMulti(rest);
+    } else if (matchWord(line, "usb.fs.handles", &rest)) {
+        cmdFsHandles();  // [USB13]
     } else if (matchWord(line, "usb.fs.help", &rest)) {
         printHelp();
     } else {

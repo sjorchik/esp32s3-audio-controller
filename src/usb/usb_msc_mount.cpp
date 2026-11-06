@@ -1,3 +1,5 @@
+// [USB13] DEF-9: unmountLocked() ПЕРЕД msc_host_vfs_unregister закриває всі відкриті файли / каталоги обгортки
+// (usb_fs::closeAllForUnmountLocked); `usb.heap` розширено (класи пам'яті, невдалі виділення, дескриптори).
 // [USB2] Постійний модуль монтування USB-флешки (USB-host MSC). Замінює src/usb_host_test.*.
 // [USB7] ДОДАНО лише диспетчеризацію консольних команд відтворення (usb.play / usb.pstat / usb.seek / usb.stopf /
 // usb.ended -> usb/usb_play_diag.*) і рядок usb.help; логіка монтування / зняття без змін.
@@ -50,9 +52,10 @@
 #include <atomic>
 
 #include "config/usb_host_config.h"
+#include "usb/usb_fs.h"  // [USB6] usb.fs.*; [USB13] closeAllForUnmountLocked() потрібен і в релізі (DIAG = 0)
 #if USB_HOST_DIAG
-#include "usb/usb_fs.h"  // [USB6] usb.fs.* (диспетчеризація в handleLine)
 #include "usb/usb_play_diag.h"  // [USB7] usb.play / usb.pstat / usb.seek / usb.stopf / usb.ended
+#include "usb/usb_memdiag.h"     // [USB13] usb.heap: класи пам'яті, невдалі виділення
 #endif
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -513,8 +516,19 @@ esp_err_t doMount(uint8_t addr) {
 // Порядок: спершу VFS, потім пристрій. Тримає s_ioMutex: чекає завершення usb.ls (яке перериває s_abortIo).
 void unmountLocked() {
     xSemaphoreTake(s_ioMutex, portMAX_DELAY);
+    const uint32_t closingGen = s_volReady.load() ? s_volGen.load() : 0;  // [USB13] монтування, що знімається
     s_volReady.store(false);  // [USB6] до розмонтування: обгортка більше не звертається до VFS
     s_volGen.fetch_add(1);    // [USB6]
+    // [USB13] DEF-9: закриваємо ВСІ відкриті файли / каталоги, поки VFS ще зареєстровано, а FatFs змонтовано
+    // (для читання f_close не звертається до диска, тож це безпечно й після вийняття носія). Інакше fclose() пізніше,
+    // на знятому томі, неможливий, а FILE + його буфер + буфер сектора FatFs (fp->buf) лишаються до перезавантаження.
+    {
+        const usb_fs::UnmountClosed uc = usb_fs::closeAllForUnmountLocked(closingGen);
+        if (uc.files + uc.dirs + uc.deferred + uc.leaked != 0) {
+            Serial.printf("%s unmount: closed %u file(s), %u dir(s), %u deferred; leaked=%u (before vfs_unregister)\n",
+                          kTag, (unsigned)uc.files, (unsigned)uc.dirs, (unsigned)uc.deferred, (unsigned)uc.leaked);
+        }
+    }
     if (s_vfs != nullptr) {
         const esp_err_t err = msc_host_vfs_unregister(s_vfs);
         Serial.printf("%s msc_host_vfs_unregister: %s\n", kTag, errorName(err));
@@ -1762,6 +1776,14 @@ void handleLine(const char* line) {
         cmdStat();
     } else if (isCmd(line, "usb.heap")) {
         printHeap("manual");
+        usb_memdiag::print("usb.heap", true);  // [USB13] класи пам'яті + перевірка цілісності куп
+        usb_memdiag::printFailStats();
+        {
+            const usb_fs::HandleStats h = usb_fs::handleStats();
+            Serial.printf("%s fs handles: open=%lu closed_at_unmount=%lu deferred_total=%lu leaked_total=%lu\n", kTag,
+                          (unsigned long)h.open, (unsigned long)h.closedAtUnmount, (unsigned long)h.deferredTotal,
+                          (unsigned long)h.leakedTotal);
+        }
     } else if (isCmd(line, "usb.ls")) {
         cmdLs(skipSpaces(line + strlen("usb.ls")));
     } else if (isCmd(line, "usb.cycle")) {
