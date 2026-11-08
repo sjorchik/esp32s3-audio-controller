@@ -10,7 +10,7 @@
 //   POST /api/power            {"state":"on"|"off"|"toggle"}
 //   POST /api/mute             {"mute":true|false|"toggle"}
 //   POST /api/volume           {"value":N}  або  {"step":N}
-//   POST /api/input            {"index":N}
+//   POST /api/input            {"index":N}  [USB15] у режимі «USB» -> 202 pending (вихід із режиму й перехід на вхід)
 //   POST /api/player/{play|pause|stop|toggle|next|prev}
 //   POST /api/player/station   {"index":N[,"switchInput":true]}
 //   GET  /api/balance          (P50a) [?input=N] -> {"input":N,"balance":V}
@@ -23,6 +23,8 @@
 //   GET  /api/inputs           (P39) входи: назва, апаратна доступність, дозвіл (маска)
 //   POST /api/inputs           (P39) {"enabled":[b|null x3]} або {"index":N,"enabled":bool}; йде через
 //                              AppController::runWebCommand(InputsEnabledSet)
+
+// [USB15] registerPlayerRoutes() заодно реєструє /api/usb/* (net/web_api_usb.*).
 
 #include <ESPAsyncWebServer.h>
 

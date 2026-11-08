@@ -36,6 +36,7 @@
 #include <atomic>
 
 #include "config/usb_queue_config.h"
+#include "config/web_api_usb_config.h"  // [USB15] kResultRingLen
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -174,6 +175,20 @@ uint32_t s_lastReqId = 0;
 bool s_lastOk = false;
 const char* s_lastWhy = nullptr;
 const char* s_lastError = nullptr;
+
+// [USB15] Кільце останніх результатів команд (за reqId). Команди завершуються по черзі, тож запис = найновіший завершений.
+// id == 0 — порожній слот (reqId починаються з 1). s_lostUpTo — усі номери ≤ цього, яких нема в кільці й які не завершені,
+// втрачені (задача usb_nav зупинилась / черга скинута до їх виконання): result() не показує їх як «Pending» вічно.
+struct ResultRec {
+    uint32_t id;
+    bool ok;
+    const char* why;
+};
+ResultRec s_ring[web_api_usb_cfg::kResultRingLen];
+uint8_t s_ringNext = 0;
+uint32_t s_lostUpTo = 0;
+static_assert(web_api_usb_cfg::kResultRingLen >= 2 * usb_browser_cfg::kCmdQueueLen,
+              "result ring must hold at least two full command queues");
 
 void initOnce() {
     if (s_initReady.load()) {
@@ -425,6 +440,7 @@ void workerMain(void*) {
     q::onWorkerStop();
     lock(UINT32_MAX);
     s_active = false;
+    s_lostUpTo = s_reqCounter.load();  // [USB15] невиконані команди (чергу не обробили до виходу) втрачено
     freeListing(s_live);
     freeListing(s_stage);
     unlock();
@@ -439,6 +455,10 @@ bool ensureWorker(const char** why) {
     if (s_worker.compare_exchange_strong(expected, 1)) {
         xQueueReset(s_cmdQ);
         s_inProgress.store(false);
+        if (lock(UINT32_MAX)) {  // [USB15] команди, що стояли в черзі до скидання, не виконаються: їх номери втрачено
+            s_lostUpTo = s_reqCounter.load();
+            unlock();
+        }
         const BaseType_t ok = xTaskCreatePinnedToCore(workerMain, usb_browser_cfg::kTaskName, usb_browser_cfg::kTaskStack, nullptr,
                                                       usb_browser_cfg::kTaskPriority, nullptr, usb_browser_cfg::kTaskCore);
         if (ok != pdPASS) {
@@ -568,6 +588,8 @@ void finish(uint32_t reqId, bool ok, const char* why) {
     s_lastReqId = reqId;
     s_lastOk = ok;
     s_lastWhy = why;
+    s_ring[s_ringNext] = ResultRec{reqId, ok, why};  // [USB15]
+    s_ringNext = static_cast<uint8_t>((s_ringNext + 1u) % web_api_usb_cfg::kResultRingLen);
     unlock();
 }
 
@@ -774,6 +796,77 @@ bool entry(uint16_t index, char* nameOut, size_t nameCap, EntryInfo* info) {
     }
     usb_nav::unlock();
     return ok;
+}
+
+// [USB15] Результат команди за reqId (див. usb_browser.h).
+bool result(uint32_t reqId, ReqResult* out) {
+    if (out == nullptr || !usb_nav::lock(usb_browser_cfg::kApiLockWaitMs)) {
+        return false;
+    }
+    *out = ReqResult{ReqResult::State::Unknown, false, nullptr};
+    if (reqId != 0) {
+        bool found = false;
+        for (uint8_t i = 0; i < web_api_usb_cfg::kResultRingLen; ++i) {
+            const usb_nav::ResultRec& r = usb_nav::s_ring[i];
+            if (r.id == reqId) {
+                *out = ReqResult{ReqResult::State::Done, r.ok, r.why};
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            const uint32_t floorId = usb_nav::s_lastReqId > usb_nav::s_lostUpTo ? usb_nav::s_lastReqId : usb_nav::s_lostUpTo;
+            if (reqId > floorId && reqId <= usb_nav::s_reqCounter.load()) {
+                out->state = ReqResult::State::Pending;
+            }
+        }
+    }
+    usb_nav::unlock();
+    return true;
+}
+
+// [USB15] Сторінка списку одним утриманням мьютекса (див. usb_browser.h).
+bool readPage(uint16_t offset, uint16_t maxItems, uint32_t expectVersion, char* buf, size_t cap, char* cwdOut, size_t cwdCap,
+              PageInfo* out) {
+    if (out == nullptr || buf == nullptr || cap < 258 || !usb_nav::lock(usb_browser_cfg::kApiLockWaitMs)) {
+        return false;
+    }
+    *out = PageInfo{};
+    if (cwdOut != nullptr && cwdCap > 0) {
+        cwdOut[0] = '\0';
+    }
+    const usb_nav::Listing& l = usb_nav::s_live;
+    if (usb_nav::s_active && l.valid && l.e != nullptr) {
+        out->valid = true;
+        out->truncated = l.truncated;
+        out->version = l.version;
+        out->count = l.count;
+        out->dirs = l.dirs;
+        out->depth = l.depth;
+        if (cwdOut != nullptr && strlen(l.cwd) < cwdCap) {
+            strcpy(cwdOut, l.cwd);
+        }
+        if (expectVersion != 0 && expectVersion != l.version) {
+            out->stale = true;
+        } else {
+            size_t used = 0;
+            uint16_t n = 0;
+            for (uint16_t i = offset; i < l.count && n < maxItems; ++i) {
+                const usb_nav::Entry& en = l.e[i];
+                const size_t need = 1u + en.nameLen + 1u;
+                if (used + need > cap) {
+                    break;  // імʼя НЕ обрізаємо: лишається на наступну сторінку
+                }
+                buf[used++] = en.isDir ? 1 : 0;
+                memcpy(buf + used, l.pool + en.nameOff, en.nameLen + 1u);
+                used += en.nameLen + 1u;
+                ++n;
+            }
+            out->returned = n;
+        }
+    }
+    usb_nav::unlock();
+    return true;
 }
 
 bool requestRefresh(uint32_t* reqId, const char** why) {

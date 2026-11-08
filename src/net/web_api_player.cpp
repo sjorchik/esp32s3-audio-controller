@@ -30,6 +30,7 @@
 //       Radio, немає станцій) | 503 контролер зайнятий або немає аудіопроцесора.
 
 #include "net/web_api_player.h"
+#include "net/web_api_usb.h"  // [USB15] registerUsbRoutes()
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
@@ -56,10 +57,17 @@ using namespace web_api;
 // стан у AppState). streamStatus свідомо не віддаємо: він оновлюється періодично
 // (app_controller_cfg::kSyncPeriodMs) і одразу після команди міг би бути застарілим —
 // клієнт бере його з GET /api/status.
-void sendOkState(AsyncWebServerRequest* req) {
+// [USB15] pendingTarget >= 0: команда прийнята, але ще виконується (зміна входу з режиму «USB»: вихід із режиму ≈ 1 с) ->
+// HTTP 202 і поля pending / reason / target; state — знімок на момент відповіді (вхід ще старий).
+void sendOkState(AsyncWebServerRequest* req, int pendingTarget = -1) {
     const AppStateData st = AppState::snapshot();
     JsonDocument doc;
     doc["ok"] = true;
+    if (pendingTarget >= 0) {
+        doc["pending"] = true;
+        doc["reason"] = "usb_exit";
+        doc["target"] = pendingTarget;
+    }
     JsonObject s = doc["state"].to<JsonObject>();
     s["mode"] = modeName(st.mode);
     s["standby"] = (st.mode == Mode::Standby);
@@ -67,7 +75,7 @@ void sendOkState(AsyncWebServerRequest* req) {
     s["volume"] = st.volume;
     s["mute"] = st.mute;
     s["stationIndex"] = st.stationIndex;
-    sendJson(req, 200, doc);
+    sendJson(req, pendingTarget >= 0 ? 202 : 200, doc);
 }
 
 void sendResult(AsyncWebServerRequest* req, WebCmdResult r, const char* why) {
@@ -221,7 +229,16 @@ void handleInput(AsyncWebServerRequest* req) {
         sendRangeError(req, "index", 0, logicalCount - 1);
         return;
     }
-    runCommand(req, {WebCmdType::InputSet, x, false});
+    // [USB15] У режимі «USB» команда не відхиляється, а ставить відкладену ціль (вихід із режиму й перехід на вхід x, як UP / DOWN
+    // на пристрої): Ok + reason "usb_exit_pending" -> 202 {"ok":true,"pending":true,"reason":"usb_exit","target":x,"state":{...}}.
+    const char* why = nullptr;
+    const WebCmdResult r = AppController::runWebCommand({WebCmdType::InputSet, x, false}, &why);
+    WEB_API_LOG("cmd InputSet -> result %d (%s)", static_cast<int>(r), why != nullptr ? why : "-");
+    if (r == WebCmdResult::Ok && why != nullptr && strcmp(why, "usb_exit_pending") == 0) {
+        sendOkState(req, x);
+        return;
+    }
+    sendResult(req, r, why);
 }
 
 // ---------------------------------------------------------------------------
@@ -894,4 +911,7 @@ void registerPlayerRoutes(AsyncWebServer& server) {  // [P48a] без AudioProce
     // ESPAsyncWebServer зіставляє "/x" лише з "/x" і "/x/...", а не з "/xs".
     server.on("/api/inputs", HTTP_GET, handleInputsGet);
     server.on("/api/inputs", HTTP_POST, handleInputsPost, nullptr, web_api::jsonBodyCallback);
+
+    // [USB15] Плеєр USB (/api/usb/*): реєструється тут, щоб web_server.cpp лишився без змін. При FEATURE_USB_MODE = 0 — порожня.
+    registerUsbRoutes(server);
 }

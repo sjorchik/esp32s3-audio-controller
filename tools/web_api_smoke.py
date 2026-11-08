@@ -24,6 +24,11 @@
 Оновлено у V2: GET /api/vu, status.vuSens; з --write — чутливість VU активного й неактивного входу (зміна й повернення),
 негативні випадки POST /api/vu (value поза діапазоном, невідомий ключ, input = 3).
 
+Оновлено в USB15: GET /api/usb/status|list|result (форма відповідей; за режиму «USB» вимкненому — 409 usb_mode_off на list); з --write — негативні
+перевірки POST /api/usb/* (400 за тілом; 409 usb_mode_off, лише коли режим вимкнений). Нічого не змінює: POST /api/usb/mode з коректною дією
+(вхід у режим) НЕ викликається — це перевіряється вручну за hwcheck_USB15.md. Якщо /api/usb/status повертає 404 (збірка з
+FEATURE_USB_MODE = 0), усі USB-перевірки позначаються SKIP.
+
 Код виходу: 0 — немає FAIL; 1 — є хоча б один FAIL; 2 — пристрій недоступний.
 """
 
@@ -224,6 +229,96 @@ def read_checks(d):
            ["firmware", "chip", "uptimeMs", "resetReason", "heap", "psram", "fs", "ota", "wifi", "settings"])
     expect("GET /api/nonexistent -> 404", d.get("/api/nonexistent"), 404, ["error"], "not_found")
     return st if ok else None
+
+
+# --------------------------------------------------------------------------
+# [USB15] Плеєр USB: GET-перевірки (/api/usb/*). Нічого не змінюють.
+# --------------------------------------------------------------------------
+USB_STATUS_KEYS = ["active", "mode", "media", "cwd", "list", "queue", "nowPlaying", "lastReq", "pending"]
+USB_MODE_STATES = ("Off", "Entering", "Ready", "Playing", "Exiting", "Error")
+USB_MEDIA = ("none", "mounting", "mounted", "fault")  # usb_mode::mediaName(): малі літери
+USB_QUEUE_STATES = ("Idle", "Starting", "Playing")
+USB_LIST_MAX = 100
+
+
+def usb_read_checks(d):
+    """-> (usb_present, active). usb_present=False, якщо маршрутів нема (FEATURE_USB_MODE = 0)."""
+    status, body = d.get("/api/usb/status")
+    if status == 404:
+        record("usb.*", False, "/api/usb/status -> 404: збірка без FEATURE_USB_MODE", skip=True)
+        return False, False
+    ok, st = expect("GET /api/usb/status", (status, body), 200, USB_STATUS_KEYS)
+    if not ok:
+        return True, False
+    record("usb.status.mode.state / media допустимі",
+           st["mode"].get("state") in USB_MODE_STATES and st["media"] in USB_MEDIA,
+           "state=%r media=%r" % (st["mode"].get("state"), st["media"]))
+    record("usb.status.list має valid/version/count/dirs/depth/truncated",
+           has_keys(st["list"], ["valid", "version", "count", "dirs", "depth", "truncated"]))
+    record("usb.status.queue має state/index/count/position/shuffle/repeat/paused/prepared/reason",
+           has_keys(st["queue"], ["state", "index", "count", "position", "shuffle", "repeat", "paused", "prepared", "reason"])
+           and st["queue"]["state"] in USB_QUEUE_STATES)
+    record("usb.status.active == (state ∈ Ready/Playing)",
+           st["active"] == (st["mode"].get("state") in ("Ready", "Playing")),
+           "active=%r state=%r" % (st["active"], st["mode"].get("state")))
+    if st["nowPlaying"] is not None:
+        record("usb.status.nowPlaying має name/posSec/durSec/paused",
+               has_keys(st["nowPlaying"], ["name", "posSec", "durSec", "paused"]))
+    if st["lastReq"] is not None:
+        record("usb.status.lastReq має id/ok/why", has_keys(st["lastReq"], ["id", "ok", "why"]))
+
+    # Параметри перевіряються ДО стану режиму: 400 однаково і з активним режимом, і без нього.
+    expect("GET /api/usb/list?limit=0 -> 400", d.get("/api/usb/list?limit=0"), 400, ["error", "min", "max"], "out_of_range")
+    expect("GET /api/usb/list?limit=%d -> 400" % (USB_LIST_MAX + 1), d.get("/api/usb/list?limit=%d" % (USB_LIST_MAX + 1)),
+           400, ["error", "min", "max"], "out_of_range")
+    expect("GET /api/usb/list?offset=abc -> 400", d.get("/api/usb/list?offset=abc"), 400, ["error", "field"], "invalid_value")
+    expect("GET /api/usb/list?offset=-1 -> 400", d.get("/api/usb/list?offset=-1"), 400, ["error", "field"], "invalid_value")
+    expect("GET /api/usb/result (без id) -> 400", d.get("/api/usb/result"), 400, ["error", "field"], "missing_field")
+    expect("GET /api/usb/result?id=abc -> 400", d.get("/api/usb/result?id=abc"), 400, ["error", "field"], "invalid_value")
+    expect("GET /api/usb/result?id=4000000000 -> 404", d.get("/api/usb/result?id=4000000000"), 404, ["error"], "unknown_req")
+    expect("GET /api/usb/result?id=0 -> 404", d.get("/api/usb/result?id=0"), 404, ["error"], "unknown_req")
+    expect("GET /api/usb/nonexistent -> 404", d.get("/api/usb/nonexistent"), 404, ["error"], "not_found")
+
+    if not st["active"]:
+        expect("GET /api/usb/list поза режимом -> 409 usb_mode_off", d.get("/api/usb/list"), 409, ["error", "state"],
+               "usb_mode_off")
+        return True, False
+
+    # Режим активний: форма сторінки й повний обхід за nextOffset (нічого не змінює).
+    if st["media"] != "mounted":
+        expect("GET /api/usb/list без носія -> 409 no_media", d.get("/api/usb/list"), 409, ["error", "media"], "no_media")
+        return True, True
+    ok, pg = expect("GET /api/usb/list", d.get("/api/usb/list"), 200,
+                    ["version", "cwd", "depth", "count", "dirs", "truncated", "offset", "limit", "items", "nextOffset"])
+    if not ok:
+        return True, True
+    record("usb.list.items[] має i/name/dir",
+           all(has_keys(it, ["i", "name", "dir"]) for it in pg["items"]))
+    total, off, pages, bad_order, seen_dirs_after_file = 0, 0, 0, False, False
+    cur = pg
+    while True:
+        pages += 1
+        for k, it in enumerate(cur["items"]):
+            if it["i"] != off + k:
+                bad_order = True
+            if it["dir"] and total + k >= cur["dirs"]:
+                seen_dirs_after_file = True
+        total += len(cur["items"])
+        nxt = cur["nextOffset"]
+        if nxt is None or pages > 200:
+            break
+        if nxt != off + len(cur["items"]):
+            bad_order = True
+            break
+        off = nxt
+        st2, cur = d.get("/api/usb/list?offset=%d&limit=%d&version=%d" % (off, USB_LIST_MAX, pg["version"]))
+        if st2 != 200 or not isinstance(cur, dict):
+            record("usb.list пагінація", st2 == 409, "HTTP %s (409 stale допустимий, якщо список змінився)" % st2)
+            return True, True
+    record("usb.list пагінація: сума записів == count (%d сторінок)" % pages, total == pg["count"] and not bad_order,
+           "total=%d count=%d" % (total, pg["count"]))
+    record("usb.list: папки перед файлами (dirs)", not seen_dirs_after_file)
+    return True, True
 
 
 # --------------------------------------------------------------------------
@@ -446,6 +541,56 @@ def write_checks(d, st, args):
         record("confirm-перевірки reset", False, "додайте --confirm-checks", skip=True)
 
 
+def usb_write_checks(d, st, active):
+    """[USB15] Негативні POST /api/usb/* без побічних ефектів. 400 перевіряються завжди (валідація йде до перевірки режиму);
+    409 usb_mode_off — лише коли режим вимкнений. Коректних команд, що змінюють стан, тут НЕМАЄ (див. hwcheck_USB15.md)."""
+    if st and st.get("mode") in ("OtaUpdate", "IrLearn"):
+        record("usb POST-перевірки", False, "mode=%s: спершу завершіть OTA/навчання IR" % st.get("mode"), skip=True)
+        return
+    expect("POST /api/usb/mode {} -> 400", d.post("/api/usb/mode", {}), 400, ["error", "field"], "missing_field")
+    expect("POST /api/usb/mode {action:x} -> 400", d.post("/api/usb/mode", {"action": "x"}), 400, ["error", "field"], "invalid_value")
+    expect("POST /api/usb/mode {action:1} -> 400", d.post("/api/usb/mode", {"action": 1}), 400, ["error", "field"], "invalid_value")
+    expect("POST /api/usb/mode unknown field -> 400", d.post("/api/usb/mode", {"action": "enter", "x": 1}), 400, ["error"],
+           "unknown_field")
+    expect("POST /api/usb/mode (без тіла) -> 400", d.post("/api/usb/mode"), 400, ["error"], "no_body")
+    expect("POST /api/usb/control {} -> 400", d.post("/api/usb/control", {}), 400, ["error", "field"], "missing_field")
+    expect("POST /api/usb/control {action:bogus} -> 400", d.post("/api/usb/control", {"action": "bogus"}), 400, ["error", "field"],
+           "invalid_value")
+    expect("POST /api/usb/seek {} -> 400", d.post("/api/usb/seek", {}), 400, ["error", "field"], "missing_field")
+    expect("POST /api/usb/seek {deltaSec:1.5} -> 400", d.post("/api/usb/seek", {"deltaSec": 1.5}), 400, ["error", "field"],
+           "invalid_value")
+    expect("POST /api/usb/seek {deltaSec:99999} -> 400", d.post("/api/usb/seek", {"deltaSec": 99999}), 400,
+           ["error", "field", "min", "max"], "out_of_range")
+    expect("POST /api/usb/options {} -> 400", d.post("/api/usb/options", {}), 400, ["error"], "missing_field")
+    expect("POST /api/usb/options {shuffle:x} -> 400", d.post("/api/usb/options", {"shuffle": "x"}), 400, ["error", "field"],
+           "invalid_value")
+    expect("POST /api/usb/options unknown field -> 400", d.post("/api/usb/options", {"shuffle": True, "x": 1}), 400, ["error"],
+           "unknown_field")
+    expect("POST /api/usb/cd {} -> 400", d.post("/api/usb/cd", {}), 400, ["error", "field"], "missing_field")
+    expect("POST /api/usb/cd {up:true,index:1} -> 400", d.post("/api/usb/cd", {"up": True, "index": 1}), 400, ["error", "field"],
+           "conflicting_fields")
+    expect("POST /api/usb/cd {up:false} -> 400", d.post("/api/usb/cd", {"up": False}), 400, ["error", "field"], "invalid_value")
+    expect("POST /api/usb/cd {index:-1} -> 400", d.post("/api/usb/cd", {"index": -1}), 400, ["error", "field", "min", "max"],
+           "out_of_range")
+    expect("POST /api/usb/cd {index:x} -> 400", d.post("/api/usb/cd", {"index": "x"}), 400, ["error", "field"], "invalid_value")
+    expect("POST /api/usb/play {version:1} -> 400", d.post("/api/usb/play", {"version": 1}), 400, ["error", "field"], "missing_field")
+    expect("POST /api/usb/play {index:0,up:true} -> 400", d.post("/api/usb/play", {"index": 0, "up": True}), 400, ["error"],
+           "unknown_field")
+    if active:
+        record("usb 409 usb_mode_off", False, "режим «USB» активний: перевірки станів «вимкнено» пропущено", skip=True)
+        return
+    expect("POST /api/usb/control pause поза режимом -> 409", d.post("/api/usb/control", {"action": "pause"}), 409,
+           ["error", "state"], "usb_mode_off")
+    expect("POST /api/usb/control next поза режимом -> 409", d.post("/api/usb/control", {"action": "next"}), 409,
+           ["error"], "usb_mode_off")
+    expect("POST /api/usb/seek поза режимом -> 409", d.post("/api/usb/seek", {"deltaSec": 5}), 409, ["error"], "usb_mode_off")
+    expect("POST /api/usb/options поза режимом -> 409", d.post("/api/usb/options", {"shuffle": True}), 409, ["error"],
+           "usb_mode_off")
+    expect("POST /api/usb/cd поза режимом -> 409", d.post("/api/usb/cd", {"index": 0}), 409, ["error"], "usb_mode_off")
+    expect("POST /api/usb/cd up поза режимом -> 409", d.post("/api/usb/cd", {"up": True}), 409, ["error"], "usb_mode_off")
+    expect("POST /api/usb/play поза режимом -> 409", d.post("/api/usb/play", {"index": 0}), 409, ["error"], "usb_mode_off")
+
+
 def player_checks(d, st):
     if not st or st.get("standby") or st.get("input") != 0 or st.get("mode") not in ("Radio", "Menu"):
         record("player.*", False, "потрібен увімкнений пристрій на вході 0 (Radio)", skip=True)
@@ -486,8 +631,16 @@ def main():
         return 2
 
     st = read_checks(d)
+    usb_present, usb_active = usb_read_checks(d)  # [USB15]
     if args.write:
-        write_checks(d, st, args)
+        if usb_present and usb_active:
+            # [USB15] У режимі «USB» POST /api/input -> 202 (вихід із режиму), тож старі write-перевірки (очікують 200) й сам режим зламались би.
+            record("write-перевірки (звук / станції / входи)", False,
+                   "режим USB активний: пропущено; вийдіть з режиму (POST /api/usb/mode exit) і запустіть --write ще раз", skip=True)
+        else:
+            write_checks(d, st, args)
+        if usb_present:
+            usb_write_checks(d, st, usb_active)
     else:
         record("POST/PUT/DELETE перевірки", False, "додайте --write", skip=True)
 

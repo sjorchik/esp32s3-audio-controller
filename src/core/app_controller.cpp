@@ -3418,13 +3418,10 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
     }
 
 #if FEATURE_USB_MODE
-    // [USB9] Зміна входу й станційні / плеєрні команди в режимі «USB» відхиляються (g2 дасть їм сенс). Причини — наявні рядки.
+    // [USB9] Станційні / плеєрні команди радіо в режимі «USB» відхиляються. Причини — наявні рядки.
+    // [USB15] InputSet більше НЕ відхиляється: у режимі «USB» він виконується як UP / DOWN на пристрої (див. case InputSet).
     if (s_usbMode) {
         switch (c.type) {
-            case WebCmdType::InputSet:
-                APP_LOG("usb mode active: web input change rejected\n");
-                why = "input_unavailable";
-                return WebCmdResult::NotAllowed;
             case WebCmdType::PlayerPlay:
             case WebCmdType::PlayerPause:
             case WebCmdType::PlayerToggle:
@@ -3517,6 +3514,16 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
                 why = "input_unavailable";
                 return WebCmdResult::OutOfRange;
             }
+#if FEATURE_USB_MODE
+            if (usbIntentActive()) {
+                // [USB15] Режим «USB» є / піднімається: вихід із режиму й перехід до цілі так само, як UP / DOWN на пристрої
+                // (відкладена ціль s_navWant; «остання виграє»; ціль застосує usbModeLeaveLocked()). Не блокує: вихід із режиму
+                // (≈ 1 с) виконує фонова задача usb_mode. Ознака для обробника: Ok + why = "usb_exit_pending".
+                navRequest(static_cast<int8_t>(c.value));
+                why = "usb_exit_pending";
+                break;
+            }
+#endif
             if (s_mode == Mode::Menu && s_menuCtx == MenuContext::StationList) closeStationList();  // [P49a] EQ закриє changeInput()
             changeInput(static_cast<uint8_t>(c.value));
             break;
@@ -3625,6 +3632,70 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
             stepStation(c.type == WebCmdType::StationNext ? cfg::kStationRightStep
                                                           : cfg::kStationLeftStep);
             break;
+
+        case WebCmdType::UsbModeSet:  // [USB15] вхід / вихід / перемикання режиму «USB» з вебу (як RC5 USB_MODE)
+#if FEATURE_USB_MODE
+        {
+            if (s_mode == Mode::WifiSetup) {
+                why = "wifi_setup";  // навігація тут скасовується (navReconcile): не обіцяємо того, чого не буде
+                return WebCmdResult::NotAllowed;
+            }
+            const bool inMode = (navPosition() == kNavUsb);  // режим є / піднімається й ціль виходу ще не поставлена
+            if (c.value == 1) {
+                if (!inMode) {
+                    if (!usbNavAvailable()) {
+                        why = "usb_unavailable";
+                        return WebCmdResult::NotAllowed;
+                    }
+                    navRequest(kNavUsb);
+                }
+            } else if (c.value == 0) {
+                if (inMode) {
+                    navRequest(kNavPrev);
+                }
+            } else if (c.value == 2) {
+                if (!inMode && !usbNavAvailable()) {
+                    why = "usb_unavailable";
+                    return WebCmdResult::NotAllowed;
+                }
+                navToggle();
+            } else {
+                why = "usb_action_out_of_range";
+                return WebCmdResult::OutOfRange;
+            }
+            break;
+        }
+#else
+            why = "usb_unavailable";
+            return WebCmdResult::NotAllowed;
+#endif
+
+        case WebCmdType::UsbOptionsSet:  // [USB15] shuffle / repeat режиму «USB» з вебу (як RC5 USB_SHUFFLE / USB_REPEAT)
+#if FEATURE_USB_MODE
+        {
+            if (!s_usbMode) {
+                why = "usb_mode_off";
+                return WebCmdResult::NotAllowed;
+            }
+            const bool oldShuffle = usb_queue::shuffle();
+            const bool oldRepeat = usb_queue::repeatAll();
+            if ((c.value & 0x1) != 0) {
+                usb_queue::setShuffle((c.value & 0x2) != 0);
+            }
+            if ((c.value & 0x4) != 0) {
+                usb_queue::setRepeatAll((c.value & 0x8) != 0);
+            }
+            if (oldShuffle != usb_queue::shuffle() || oldRepeat != usb_queue::repeatAll()) {
+                persistPlayerFlags();  // той самий шлях NVS, що RC5; без зміни значень — без запису
+                Serial.printf("[USBN] options (WEB): shuffle=%d repeat=%d\n", usb_queue::shuffle() ? 1 : 0,
+                              usb_queue::repeatAll() ? 1 : 0);
+            }
+            break;
+        }
+#else
+            why = "usb_unavailable";
+            return WebCmdResult::NotAllowed;
+#endif
     }
 
     publishState();

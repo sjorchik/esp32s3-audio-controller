@@ -20,6 +20,12 @@
 // [USB14] ДОДАНО requestGoto(): перехід у папку за ПОВНИМ шляхом (для відновлення останньої папки при вході в режим). Решта
 // API без змін.
 //
+// [USB15] ДОДАНО (лише нові функції / типи; наявні сигнатури й поля Status НЕ змінено):
+//  - result(reqId): результат команди за її номером з кільця останніх web_api_usb_cfg::kResultRingLen (16) результатів. Одного
+//    «останнього результату» (Status::lastReqId) недостатньо, коли команди ставлять кілька клієнтів. Status::lastReqId / lastOk /
+//    lastWhy лишились і збігаються з найновішим записом кільця.
+//  - readPage(): сторінка списку папки ОДНИМ утриманням мьютекса (узгоджені версія й імена; для веб-API GET /api/usb/list).
+//
 // Заголовок не підключає заголовки IDF, AppController, AudioPlayer.
 
 #include <stddef.h>
@@ -79,6 +85,40 @@ bool requestUp(uint32_t* reqId = nullptr, const char** why = nullptr);
 // Реалізація: окремої команди в usb_nav_internal.h немає — шлях кладеться в статичний буфер, а виконує його команда Refresh
 // (перша з черги, що знайде «відкладений» шлях).
 bool requestGoto(const char* path, uint32_t* reqId = nullptr, const char** why = nullptr);
+
+// [USB15] ДОДАНО: результат команди за reqId.
+//  Done    — команда завершена; ok / why дійсні (why — статичний рядок або nullptr; як Status::lastWhy);
+//  Pending — номер видано, команда ще в черзі або виконується;
+//  Unknown — номер не видавався, застарів (виштовхнутий з кільця) або команда втрачена (задача usb_nav зупинилась до її виконання).
+struct ReqResult {
+    enum class State : uint8_t { Unknown, Pending, Done };
+    State state;
+    bool ok;
+    const char* why;
+};
+// false — мьютекс зайнятий довше kApiLockWaitMs (out не змінено). Неблокуюча.
+bool result(uint32_t reqId, ReqResult* out);
+
+// [USB15] ДОДАНО: сторінка списку поточної папки. Записи від offset (до maxItems штук, поки вміщаються в buf) копіюються в
+// buf у упакованому вигляді: для кожного запису байт 0 / 1 (1 — папка), далі імʼя UTF-8 з '\0'; імена НЕ обрізаються (запис, що
+// не вміщається, і всі наступні лишаються на наступну сторінку). cwdOut (якщо не nullptr) — шлях папки. Усе під одним
+// утриманням мьютекса (kApiLockWaitMs), читання флешки не виконується.
+//  true  — out заповнено (out->valid = false: списку нема, записів нема). Якщо expectVersion != 0 і версія списку інша —
+//          out->stale = true, записи не копіюються (список змінився між сторінками).
+//  false — мьютекс зайнятий, buf замалий (< 258 Б) або null.
+// out->returned — скільки записів скопійовано; наступна сторінка починається з offset + returned.
+struct PageInfo {
+    bool valid;
+    bool stale;
+    bool truncated;
+    uint32_t version;
+    uint16_t count;
+    uint16_t dirs;
+    uint8_t depth;
+    uint16_t returned;
+};
+bool readPage(uint16_t offset, uint16_t maxItems, uint32_t expectVersion, char* buf, size_t cap, char* cwdOut, size_t cwdCap,
+              PageInfo* out);
 
 #if USB_HOST_DIAG
 // Консоль: usb.dir [сторінка | refresh] | usb.cd <індекс | .. | /шлях> | usb.pwd. Викликається з loopTask; БЛОКУЄ її до завершення

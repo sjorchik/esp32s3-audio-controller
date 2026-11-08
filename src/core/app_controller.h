@@ -123,6 +123,18 @@ enum class WebCmdType : uint8_t {
     InputsEnabledSet,  // [Prompt 39] ДОДАНО (лише в кінець enum)
     BalanceSet,        // [Prompt 48b] ДОДАНО (лише в кінець enum)
     VuSensSet,         // [V1] ДОДАНО (лише в кінець enum)
+    // [USB15] ДОДАНО (лише в кінець enum): керування режимом «USB» з вебу (POST /api/usb/mode, /api/usb/options).
+    //  UsbModeSet    — value: 0 = вийти на попередній вхід, 1 = увійти, 2 = перемкнути (як RC5 USB_MODE: ціль s_navWant,
+    //                  виконується автоматом навігації, не блокує). Відмови: standby / wifi_setup / ota_in_progress /
+    //                  ir_learn_active, "usb_unavailable" (стек USB потребує перезавантаження або FEATURE_USB_MODE = 0).
+    //  UsbOptionsSet — value: біт 0 — змінювати shuffle, біт 1 — значення shuffle, біт 2 — змінювати repeat, біт 3 — значення
+    //                  repeat; той самий шлях збереження в NVS, що й RC5 USB_SHUFFLE / USB_REPEAT (запис лише при зміні).
+    //                  Відмова "usb_mode_off", якщо режиму «USB» немає.
+    // ЗМІНЕНО ПОВЕДІНКУ: InputSet у режимі «USB» більше не відхиляється ("input_unavailable"): виконується як натискання
+    // UP / DOWN на пристрої — вихід із режиму й перехід до цілі (відкладена ціль); runWebCommand() повертає Ok, а *reasonOut =
+    // "usb_exit_pending" (ознака «прийнято, ще виконується»; для всіх інших Ok — nullptr).
+    UsbModeSet,
+    UsbOptionsSet,
 };
 
 struct WebCommand {

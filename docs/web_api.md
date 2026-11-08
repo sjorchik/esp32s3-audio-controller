@@ -9,6 +9,7 @@ Prompt 39: відключення входів `GET` / `POST /api/inputs` (§12)
 **P50a: з контракту прибрано застарілі поля й заглушки (§14), додано `GET /api/balance` (§13) і `menuContext`
 у `GET /api/status` (§2).** V2: чутливість VU по входах — `GET` / `POST /api/vu` (§15) і поле `vuSens` у
 `GET /api/status` (§2); профіль входу доповнено чутливістю VU (§1.3). V3 (веб-інтерфейс «Налаштування → Входи», перевірено на залізі 2026-10-22): фронтенд використовує `GET` / `POST /api/vu` (§15); сам контракт не змінювався.
+**USB15: веб-API плеєра USB (режим «USB», `/api/usb/*`, §16; лише при збірці з `FEATURE_USB_MODE = 1`), HTTP `202` для команд, що виконуються асинхронно (§1.1), і `POST /api/input` у режимі «USB» (§4.5).**
 
 ## 1. Загальні правила
 
@@ -43,6 +44,7 @@ Prompt 39: відключення входів `GET` / `POST /api/inputs` (§12)
 |---:|---|
 | 200 | успіх |
 | 201 | створено (`POST /api/stations`) |
+| 202 | **(USB15)** прийнято, виконується асинхронно: `POST /api/usb/cd`, `/play` і `/control` (`next` / `prev` / `stop`) -> `{"ok":true,"reqId":N}` (результат — §16.3), `POST /api/usb/mode` (перехід триває ≈ 1-2 с), `POST /api/input` у режимі «USB» (§4.5). Це НЕ помилка й НЕ готовий результат: `ok:true` означає лише «команду прийнято» |
 | 400 | помилка клієнта: невалідне значення, поза межами, `no_body`, `invalid_json`, `unknown_field` |
 | 404 | немає такого шляху / станції / запису |
 | 409 | операція зараз недопустима (стан пристрою, зайнято, список заповнений) |
@@ -267,6 +269,13 @@ Prompt 39: відключення входів `GET` / `POST /api/inputs` (§12)
 Зміна входу з/на Radio зупиняє/запускає потік; мʼют і плавний підйом — як на пристрої. Під мʼютом застосовується
 профіль нового входу (гучність, EQ, баланс; §1.3), тож `GET /api/status` одразу показує його `volume` і `balance`.
 Якщо на пристрої відкрито список станцій або екран «EQ + баланс», він закривається. `409 standby` у standby.
+
+**У режимі «USB» (USB15):** запит НЕ відхиляється (раніше був `409 input_unavailable`), а виконується так само, як UP / DOWN на пристрої:
+режим «USB» закривається (≈ 1 с, у фоні) і пристрій переходить на вказаний вхід; радіо повертається на ту саму станцію.
+Відповідь — `202 {"ok":true,"pending":true,"reason":"usb_exit","target":N,"state":{...}}`; у `state` вхід іще СТАРИЙ — стежте за
+`GET /api/status` (`input`) і `GET /api/usb/status` (`active:false`). Швидкі запити: остання ціль виграє. Валідація (`400 out_of_range`,
+`409 input_disabled`, `409 standby` …) — як поза режимом. Поза режимом «USB» поведінка й відповідь `200` без змін.
+Станційні команди (`/api/player/*`, `/api/player/station`) у режимі «USB» і далі дають `409 not_radio_input`.
 
 ### 4.6. `POST /api/player/{play|pause|stop|toggle|next|prev}`
 
@@ -664,6 +673,8 @@ curl -X POST --data-binary @firmware.bin -H "Content-Type: application/octet-str
 | DELETE | `/api/wifi/networks/{index}` | §7 |
 | GET | `/api/system` | §8 |
 | POST | `/api/system/reboot`, `/api/system/factory-reset`, `/api/ota` | §8 |
+| GET | `/api/usb/status`, `/api/usb/list`, `/api/usb/result` | §16 (USB15; лише `FEATURE_USB_MODE = 1`) |
+| POST | `/api/usb/mode`, `/api/usb/cd`, `/api/usb/play`, `/api/usb/control`, `/api/usb/seek`, `/api/usb/options` | §16 (USB15) |
 
 Видалені маршрути (`POST /api/gain`) — §14.
 
@@ -984,3 +995,209 @@ POST /api/vu {"value":1,"x":2}            -> 400 {"ok":false,"error":"unknown_fi
 
 Примітка: код `vu_sens_out_of_range` (відмова контролера) на практиці не виникає — межі `value` перевіряються ще до
 команди, тож клієнт бачить `400 out_of_range` із `min` / `max`.
+
+---
+
+## 16. Плеєр USB (USB15; режим «USB», `/api/usb/*`)
+
+Керування відтворенням MP3 з USB-флешки: режим, навігація по папках, черга, пауза, перемотування, shuffle / repeat.
+Маршрути існують лише в прошивці, зібраній з `FEATURE_USB_MODE = 1`; в іншій збірці всі `/api/usb/*` → `404 not_found`.
+Фронтенд (сторінка) і екран пристрою цього кроку не стосуються.
+
+**Модель.** «Режим USB» — це стан пристрою, у якому звук веде файловий плеєр, а радіо / TV / PC зупинені. Увійти в режим можна на
+пристрої (RC5 `USB_MODE`, коло входів) або `POST /api/usb/mode`. Каталоги читає окрема фонова задача; HTTP-обробники лише ставлять
+команди в чергу й читають знімки, тому **жоден запит не чекає флешку**. Команда, що торкається флешки або черги, повертає
+`202 {"ok":true,"reqId":N}`, а її результат (успіх чи причина відмови) видно за номером `N` (§16.3).
+
+### 16.1. Коли що доступно
+
+| Маршрут | Поза режимом «USB» | У режимі, носія нема | У режимі, носій є |
+|---|---|---|---|
+| `GET /api/usb/status` | `200`, `active:false` | `200` | `200` |
+| `GET /api/usb/result` | `200` / `404 unknown_req` | як поза | як поза |
+| `POST /api/usb/mode` | працює (це вхід у режим) | працює | працює |
+| `GET /api/usb/list`, `POST /api/usb/cd`, `POST /api/usb/play` | `409 usb_mode_off` | `409 no_media` | працює |
+| `POST /api/usb/control`, `/seek`, `/options` | `409 usb_mode_off` | працює за станом черги | працює |
+
+Спільні відмови (тіло `{"ok":false,"error":"<код>"[,...]}`):
+
+| HTTP | `error` | Коли |
+|---:|---|---|
+| 409 | `usb_mode_off` (+ `state`: стан режиму) | режим не в `Ready` / `Playing` (вимкнений, `Entering`, `Exiting`, `Error`) |
+| 409 | `no_media` (+ `media`: `none` \| `mounting` \| `fault`) | флешки нема, ще монтується або не змонтувалась |
+| 409 | `ota_in_progress` / `ir_learn_active` | усі POST: як у §1.2 (GET дозволені) |
+| 409 | `standby` / `wifi_setup` | лише `POST /api/usb/mode` (§1.2) |
+| 503 | `busy` | мьютекс списку / контролера зайнятий довше 20 мс або іде перезапуск — повторіть |
+| 400 | `no_body` / `invalid_json` / `unknown_field` / `missing_field` / `invalid_value` / `out_of_range` | як у решті API (§1) |
+| 413 | `body_too_large` | тіло > 1024 байт |
+
+Порядок перевірок POST: тіло (400) → стан пристрою (OTA / IR) → режим (`usb_mode_off`) → носій (`no_media`) → список / індекс.
+
+### 16.2. `GET /api/usb/status`
+
+Дешевий, для опитування ≈ 2 Гц (як `/api/status`). Доступний завжди (також поза режимом, у standby, під час OTA).
+
+```json
+{
+  "active": true,
+  "mode": {"state": "Playing", "reason": null},
+  "media": "mounted",
+  "cwd": "/Музика/Rock",
+  "list": {"valid": true, "version": 12, "count": 120, "dirs": 8, "depth": 2, "truncated": false},
+  "queue": {"state": "Playing", "index": 4, "count": 112, "position": 4, "shuffle": false, "repeat": false,
+            "paused": false, "prepared": false, "reason": null},
+  "nowPlaying": {"name": "Track 05.mp3", "posSec": 73, "durSec": 201, "paused": false},
+  "lastReq": {"id": 41, "ok": true, "why": null},
+  "pending": 0
+}
+```
+
+- `active` — режим у `Ready` / `Playing`. `mode.state`: `Off` \| `Entering` \| `Ready` \| `Playing` \| `Exiting` \| `Error`; `mode.reason` — причина
+  останнього збою входу / виходу (рядок) або `null`. `media`: `none` \| `mounting` \| `mounted` \| `fault` (малими літерами).
+- `cwd` — шлях поточної папки від кореня флешки (`"/"` — корінь) або `null`, якщо списку нема. `list.valid=false` — список недійсний
+  (вийняття / перемонтування; після повторної вставки корінь перечитується сам).
+- `list.version` змінюється при кожній публікації й інвалідації списку (це «ключ свіжості» для `cd` / `play` / `list`).
+  `list.dirs` — перші `dirs` індексів це папки, далі файли. `list.truncated=true` — папку обрізано до 1000 записів
+  (перших у порядку FAT, не за алфавітом).
+- `queue.state`: `Idle` \| `Starting` \| `Playing`. `queue.index` — номер файла в черзі (папка, з якої запущено відтворення; може
+  відрізнятись від поточної папки браузера), `-1` — нема. `queue.reason` — причина останньої зупинки: `end_of_queue`, `user_stop`, `media_removed`,
+  `mode_exit`, `too_many_skips` тощо (стабільні рядки) або `null`. `queue.prepared=true` — черга стоїть, але є підготовлений трек
+  (після відновлення без автостарту / після кінця черги): `control resume` / `toggle` запускає його.
+  `queue.shuffle` / `queue.repeat` відображають поточні налаштування режиму; поза режимом значення не мають сенсу.
+- `nowPlaying` — `null`, якщо трек не стартує й не грає. `posSec` / `durSec` — кеш плеєра, роздільність 1 с, `0` = невідомо
+  (VBR / ще не відомо). На паузі `posSec` не змінюється, `paused:true`.
+- `lastReq` — результат НАЙНОВІШОЇ завершеної команди (усіх клієнтів разом), `null`, якщо команд ще не було. Для власної команди
+  користуйтеся `reqId` і `GET /api/usb/result` (§16.3), а не `lastReq`. `pending` — команд у черзі + виконується.
+
+**Вийняття й вставлення флешки (перевірено на залізі).** Поля `status` збираються з різних джерел (режим, браузер, черга) не атомарно, тож у момент
+вийняття / вставлення впродовж ≈ 1 с можливі неузгоджені комбінації (напр. `media:"none"` при ще `list.valid:true` і `queue.state:"Playing"`). Клієнт має
+спиратися на останню відповідь, а не на одну. Після вийняття: `media:"none"`, `list.valid:false`, `queue.state:"Idle"`, `queue.reason:"media_removed"`, режим лишається
+`Ready` (автовиходу немає). Після повторної вставки: `media:"mounting"` → `"mounted"`, перечитується КОРІНЬ (`cwd:"/"`), позиція НЕ відновлюється, `queue` лишається `Idle`.
+Виняток: перше монтування після ВХОДУ в режим (флешка вставлена до входу або під час нього) відновлює останню папку й трек (автостарт).
+
+### 16.3. `GET /api/usb/result?id=N` і `reqId`
+
+Кожна команда, що ставиться в чергу фонової задачі, отримує `reqId`. Команди виконуються по черзі; результати останніх **16**
+зберігаються (запас над чергою в 8 команд + 1 виконувана; клієнт, який опитує ≈ 2 Гц, їх не втрачає).
+
+```
+GET /api/usb/result?id=41   -> 200 {"ok":true,"req":{"id":41,"done":true,"ok":true,"why":null}}
+GET /api/usb/result?id=42   -> 200 {"ok":true,"req":{"id":42,"done":true,"ok":false,"why":"stale"}}
+GET /api/usb/result?id=43   -> 200 {"ok":true,"req":{"id":43,"done":false}}          (ще в черзі / виконується)
+GET /api/usb/result?id=9999 -> 404 {"ok":false,"error":"unknown_req"}                  (не видавався, застарів або втрачений)
+```
+
+`unknown_req` також означає «номер виштовхнуто з кільця» і «режим закрився до виконання команди». Параметр `id` обовʼязковий й має бути
+невідʼємним цілим (`400 missing_field` / `invalid_value`). Доступний завжди.
+
+`why` для невдалої команди (стабільні рядки): `stale` (список змінився), `bad_index`, `not_dir`, `not_file`, `list_invalid`, `at_root`,
+`too_deep`, `path_too_long`, `open_failed` (папку не відкрито), `media_changed` (флешку вийнято під час читання), `queue_idle` (черги нема —
+`next` / `prev`), `end_of_queue` (`next` на останньому треку без repeat — відтворення триває), `queue_overflow`, а також причини старту
+треку від плеєра (напр. `player_refused`, `open_failed`). `ok:true` для `play` означає «трек запитано в плеєра»; що він справді заграв, видно
+в `status` (`queue.state` / `nowPlaying`).
+
+### 16.4. `GET /api/usb/list?offset=&limit=[&version=]`
+
+Сторінка записів поточної папки: СПОЧАТКУ ПАПКИ, ПОТІМ ФАЙЛИ (`.mp3`), нечутливе до регістру впорядкування (укр. абетка за порядком).
+
+```json
+{
+  "version": 12, "cwd": "/Музика", "depth": 1, "count": 120, "dirs": 8, "truncated": false,
+  "offset": 0, "limit": 40,
+  "items": [{"i": 0, "name": "Rock", "dir": true}, {"i": 8, "name": "Івано - Пісня.mp3", "dir": false}],
+  "nextOffset": 40
+}
+```
+
+- `offset` (за замовчуванням 0, `0..65535`; `offset > count` → `400 out_of_range` з `max:count`), `limit` (за замовчуванням **40**, максимум **100**;
+  `400 out_of_range` з `min:1`,`max:100`), `version` (необовʼязково: версія з попередньої сторінки; якщо список змінився —
+  `409 stale`, тоді почніть з `offset=0` знову). Усі параметри — невідʼємні цілі (`400 invalid_value`).
+- `items[].i` — індекс запису в списку: саме його приймають `cd` / `play`. Імена — UTF-8 (кирилиця, пробіли); байти, що не є коректним UTF-8,
+  замінюються на U+FFFD; керуючі символи екрануються `\u00XX`. Імена НЕ обрізаються.
+- **Розмір відповіді обмежений за БАЙТАМИ** (≈ 4 КБ записів, у сумі ≤ ≈ 4,5 КБ), а не лише за `limit`: якщо записи не влізли, їх повертається менше
+  за `limit`, а `nextOffset` вказує, звідки читати далі. Завжди ходіть за `nextOffset`, не за `offset + limit`. `nextOffset:null` — кінець списку.
+- `409 list_invalid` — списку нема (щойно вийнято флешку / режим піднімається): повторіть пізніше.
+- Список обрізається на 1000 записів (`truncated:true`); розмір файла не надається (в API його нема).
+
+### 16.5. `POST /api/usb/mode`
+
+`{"action":"enter"|"exit"|"toggle"}` — те саме, що RC5 `USB_MODE` (`toggle`) і коло входів: `enter` піднімає режим, `exit` повертає попередній
+вхід. Не блокує: вхід ≈ 1 с з носієм, ≈ 1,7 с без (чекайте `status.active`); вихід ≈ 1 с.
+
+```
+POST /api/usb/mode {"action":"enter"}   -> 202 {"ok":true,"changed":true,"state":"Entering"}
+POST /api/usb/mode {"action":"enter"}   -> 200 {"ok":true,"changed":false,"state":"Ready"}      (вже в режимі; нічого не змінено)
+POST /api/usb/mode {"action":"exit"}    -> 202 {"ok":true,"changed":true,"state":"Exiting"}
+POST /api/usb/mode {"action":"exit"}    -> 200 {"ok":true,"changed":false,"state":"Off"}        (режиму й так нема)
+```
+
+Відмови: `400 missing_field` / `invalid_value` (`field:"action"`), `409 standby`, `409 wifi_setup`, `409 ota_in_progress`, `409 ir_learn_active`,
+`409 usb_unavailable` (стек USB потребує перезавантаження), `503 busy`. Команда лише ставить ціль: коли вхід не вдасться (напр. помилка носія),
+це видно зі `status.mode.state` / `mode.reason`, а не з відповіді.
+
+### 16.6. `POST /api/usb/cd`, `POST /api/usb/play`
+
+- `cd`: `{"index":N[,"version":V]}` — зайти в папку з індексом `N` (`N < list.dirs`); або `{"up":true}` — на рівень вище. Дозволені поля `index`,
+  `version`, `up`; `up` несумісне з `index` / `version` (`400 conflicting_fields`).
+- `play`: `{"index":N[,"version":V]}` — запустити файл `N` (`N >= list.dirs`). Черга = усі файли ЦІЄЇ папки (без рекурсії) на момент запиту; далі
+  автоперехід на наступний трек, shuffle / repeat за `options`.
+- `version` — версія списку, з якої взято `N` (з `list.version` / `status.list.version`); пропущена — перевіряється лише проти поточної. Застарілий —
+  `409 stale` (синхронно, команда не ставиться); навіть якщо список зміниться між перевіркою й виконанням, команда відхилиться з `why:"stale"`.
+
+Успіх: `202 {"ok":true,"reqId":N}`. Синхронні відмови: `409 list_invalid` (списку нема), `409 stale`, `409 at_root` (`up` у корені),
+`400 out_of_range` (`field:"index"`, `min`, `max`), `400 not_dir` / `400 not_file` (`field:"index"`: `cd` на файл / `play` на папку),
+`400 missing_field` / `invalid_value` / `conflicting_fields`, `409 queue_full` (черга команд заповнена, повторіть), `503 task_create_failed`.
+Після `cd` / `up` оновіть `list` (версія змінюється), `play` не змінює поточну папку.
+
+### 16.7. `POST /api/usb/control`
+
+`{"action":"pause"|"resume"|"toggle"|"next"|"prev"|"stop"}` — ті самі шляхи, що кнопки (OK = пауза / продовження / запуск підготовленого,
+LEFT / RIGHT = попередній / наступний).
+
+| `action` | Відповідь | Примітки |
+|---|---|---|
+| `next`, `prev`, `stop` | `202 {"ok":true,"reqId":N}` | правила черги (shuffle / repeat / історія), результат за `reqId`: `end_of_queue`, `queue_idle` … |
+| `pause` | `200 {"ok":true,"result":"paused","changed":true\|false}` | лише коли трек грає (`409 not_playing` інакше); на паузі — ідемпотентно (`changed:false`) |
+| `resume` | `200 {"ok":true,"result":"resumed"\|"started"\|"playing","changed":...}` | `resumed` — продовжено з паузи; `started` — запущено підготовлений трек (`queue.prepared`); `playing` — і так грає (`changed:false`) |
+| `toggle` | `200 {"ok":true,"result":"paused"\|"resumed"\|"started","changed":true}` | як OK на пульті |
+
+Пауза/продовження виконує задача плеєра: `status.queue.paused` / `nowPlaying.paused` змінюється за ≈ 1-2 с (мʼют ЦАП, плавно). Пауза НЕ є збоєм: `queue.state`
+лишається `Playing`, позиція зберігається. Відмови плеєра/черги — `409 {"error":"<why>"}`: `starting` (трек ще стартує), `nothing_to_play`
+(черга порожня й нічого не підготовлено), `not_active`, `player_refused`, `busy`, `queue_full`. `400 invalid_value` (`field:"action"`) — невідома дія.
+
+### 16.8. `POST /api/usb/seek`
+
+`{"deltaSec":N}` — ВІДНОСНИЙ зсув позиції, секунди, знак — напрям; `N` ціле `−3600..3600` (`400 out_of_range`, `field:"deltaSec"`, `min`, `max`).
+Точність ≈ 1-2 с (розділ 11 MASTER SPEC; для VBR не вимірювалась). `200 {"ok":true,"deltaSec":N}` — запит прийнято плеєром; нову позицію
+видно в `nowPlaying.posSec` за ≈ 1-2 с. `deltaSec:0` — нічого не робить. Відмови: `409 not_playing` (файл не грає), `409 paused` (на паузі
+перемотування не підтримується — спершу `resume`), `409 seek_refused`. Перемотування за межі треку — на розсуд плеєра: за кінець = природний кінець треку.
+
+### 16.9. `POST /api/usb/options`
+
+`{"shuffle":bool,"repeat":bool}` — одне або обидва поля (`400 missing_field`, якщо жодного). `shuffle` — перемішування (кожен трек раз за прохід),
+`repeat` — повтор усього. Те саме, що RC5 `USB_SHUFFLE` / `USB_REPEAT`: значення зберігаються в налаштуваннях (NVS з дебаунсом, лише при зміні) і
+переживають перезавантаження. Діє лише в режимі «USB» (`409 usb_mode_off` поза ним). Зміна shuffle під час відтворення поточний трек не
+перериває (порядок перебудовується). Успіх: `200 {"ok":true,"shuffle":true,"repeat":false}` (поточні значення).
+
+### 16.10. Приклади
+
+```
+GET  /api/usb/status                                  -> 200 {"active":false,"mode":{"state":"Off","reason":null},"media":"none","cwd":null,...,"nowPlaying":null,"lastReq":null,"pending":0}
+GET  /api/usb/list                                    -> 409 {"ok":false,"error":"usb_mode_off","state":"Off"}
+POST /api/usb/mode    {"action":"enter"}              -> 202 {"ok":true,"changed":true,"state":"Entering"}
+GET  /api/usb/list?offset=0&limit=40                  -> 200 {"version":3,"cwd":"/","depth":0,"count":57,"dirs":4,"truncated":false,"offset":0,"limit":40,"items":[...],"nextOffset":40}
+POST /api/usb/cd      {"index":2,"version":3}         -> 202 {"ok":true,"reqId":7}
+POST /api/usb/cd      {"index":2,"version":3}         -> 409 {"ok":false,"error":"stale"}            (список уже інший: version змінилась після cd)
+POST /api/usb/cd      {"index":99}                    -> 400 {"ok":false,"error":"out_of_range","field":"index","min":0,"max":56}
+POST /api/usb/play    {"index":2}                     -> 400 {"ok":false,"error":"not_file","field":"index"}   (індекс 2 < dirs = 4: це папка)
+POST /api/usb/play    {"index":20,"version":4}        -> 202 {"ok":true,"reqId":8}
+GET  /api/usb/result?id=8                             -> 200 {"ok":true,"req":{"id":8,"done":true,"ok":true,"why":null}}
+POST /api/usb/control {"action":"pause"}              -> 200 {"ok":true,"result":"paused","changed":true}
+POST /api/usb/control {"action":"next"}               -> 202 {"ok":true,"reqId":9}
+POST /api/usb/seek    {"deltaSec":30}                 -> 200 {"ok":true,"deltaSec":30}
+POST /api/usb/options {"shuffle":true}                -> 200 {"ok":true,"shuffle":true,"repeat":false}
+POST /api/input       {"index":1}                     -> 202 {"ok":true,"pending":true,"reason":"usb_exit","target":1,"state":{...}}   (у режимі «USB»)
+```
+
+Порада клієнту: під час відтворення опитуйте лише `GET /api/usb/status` (≈ 2 Гц); `list` запитуйте після зміни `list.version`. Не відправляйте паралельно
+багато `cd` / `play` (сервер однозадачний, черга команд — 8).
