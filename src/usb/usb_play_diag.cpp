@@ -1,3 +1,4 @@
+// [DEF5a] ДОДАНО диспетчеризацію usb.hm (лише USB_HEAPMAP = 1) -> usb_heapmap::handleConsoleLine.
 // [USB13b] ДОДАНО команду usb.sslfail [dry | expired | stat] (імітація події -32512 після виходу; обхідне рішення DEF-5).
 // [USB10] ДОДАНО диспетчеризацію usb.dir / usb.cd / usb.pwd (usb_browser) і usb.q (usb_queue) — як usb.mode у USB9.
 // [USB7] Консоль відтворення файлу з /usb: usb.play / usb.pstat / usb.seek / usb.stopf / usb.ended.
@@ -19,6 +20,9 @@
 #include "freertos/task.h"
 #include "usb/usb_fs.h"
 #include "usb/usb_msc_mount.h"
+#if USB_HEAPMAP
+#include "usb/usb_heapmap.h"  // [DEF5a] usb.hm …
+#endif
 #if FEATURE_USB_MODE
 #include "usb/usb_mode.h"  // [USB9] usb.mode … (диспетчеризація тут: usb_msc_mount.cpp не змінюється)
 #include "usb/usb_browser.h"  // [USB10] usb.dir / usb.cd / usb.pwd
@@ -46,6 +50,10 @@ bool matchWord(const char* s, const char* word, const char** rest) {
 }
 
 const char* const kWords[] = {"usb.play", "usb.pstat", "usb.seek", "usb.stopf", "usb.ended", "usb.fx", "usb.sslfail"
+#if USB_HEAPMAP
+                                 ,
+                                 "usb.hm"  // [DEF5a]
+#endif
 #if FEATURE_USB_MODE
                                  ,
                                  "usb.mode"  // [USB9]
@@ -247,6 +255,10 @@ void handleConsoleLine(const char* line) {
         cmdFx(rest);
     } else if (matchWord(line, "usb.sslfail", &rest)) {
         ssl_workaround::handleConsole(rest);  // [USB13b]
+#if USB_HEAPMAP
+    } else if (matchWord(line, "usb.hm", &rest)) {
+        usb_heapmap::handleConsoleLine(line);  // [DEF5a]
+#endif
 #if FEATURE_USB_MODE
     } else if (matchWord(line, "usb.mode", &rest)) {
         usb_mode::handleConsoleLine(line);  // [USB9]

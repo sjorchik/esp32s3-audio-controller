@@ -1,3 +1,4 @@
+// [DEF5a] При USB_HEAPMAP = 1 trigger() НЕ перезапускає плату (лише лог «would restart»), щоб збій не стирав стан кучі.
 // [USB13b] WORKAROUND для відкритого DEF-5 (див. ssl_workaround.h). Усі збірки (захист для користувача, не діагностика);
 // вимикається usb_host_cfg::kRestartOnSslAllocFail = false. Для інших помилок радіо поведінка не змінюється.
 
@@ -82,6 +83,14 @@ bool trigger(uint32_t failCount, uint32_t sinceMs, bool simulated, bool dry) {
                       kTag);
         return false;
     }
+#if USB_HEAPMAP
+    // [DEF5a] kRestartOnSslAllocFail ПРИМУСОВО «false» для самого перезапуску: стан кучі після збою потрібен для знімка.
+    if (!dry) {
+        Serial.printf("%s would restart now (fails=%u since_exit=%u ms%s) - SUPPRESSED by USB_HEAPMAP=1: take `usb.hm dump full`, then reboot manually\n",
+                      kTag, static_cast<unsigned>(failCount), static_cast<unsigned>(sinceMs), simulated ? ", simulated" : "");
+        return false;
+    }
+#endif
     if (dry) {
         Serial.printf("%s DRY RUN: would restart now (fails=%u since_exit=%u ms%s) - nothing done\n", kTag,
                       static_cast<unsigned>(failCount), static_cast<unsigned>(sinceMs), simulated ? ", simulated" : "");
@@ -243,7 +252,7 @@ void handleConsole(const char* arg) {
     s_expiredLogged.store(false);
     Serial.printf("%s simulate: %s%s\n", kTag, dry ? "DRY " : "", expired ? "window already expired" : "event -32512 after USB exit with a file");
     registerFailure("https://simulated.invalid/", true, dry);
-    if (dry || expired || s_blocked.load()) {  // нічого не ініційовано: повернути попередній стан
+    if (dry || expired || s_blocked.load() || USB_HEAPMAP) {  // нічого не ініційовано: повернути попередній стан
         s_armed.store(oldArmed);
         s_armedAtMs.store(oldAt);
         s_fails.store(oldFails);

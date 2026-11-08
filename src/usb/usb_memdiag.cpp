@@ -1,3 +1,5 @@
+// [DEF5a] ДОДАНО (лише USB_HEAPMAP = 1): запис невдалих виділень у кільце БЕЗ друку з хука; failSeq / failCopySince /
+// capsToText. Друк esp_rom_printf з хука при USB_HEAPMAP = 1 вимкнено (спека DEF5a: з хука не друкувати).
 // [USB13] Діагностика пам'яті (див. usb_memdiag.h). Лише USB_HOST_DIAG = 1.
 
 #include "usb/usb_memdiag.h"
@@ -64,6 +66,10 @@ std::atomic<uint32_t> s_failTotal{0};
 std::atomic<uint32_t> s_failInternal{0};
 std::atomic<uint32_t> s_failPsram{0};
 std::atomic<bool> s_hookInstalled{false};
+#if USB_HEAPMAP
+usb_memdiag::FailEntry s_hmRing[usb_heapmap_cfg::kFailRing];  // [DEF5a] static .bss (internal): kFailRing × 40 Б
+std::atomic<uint32_t> s_hmSeq{0};
+#endif
 
 void onAllocFailed(size_t size, uint32_t caps, const char* functionName) {
     const uint32_t n = s_failTotal.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -74,16 +80,38 @@ void onAllocFailed(size_t size, uint32_t caps, const char* functionName) {
         s_failInternal.fetch_add(1, std::memory_order_relaxed);
     }
     const uint32_t tMs = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+#if USB_HEAPMAP
+    {  // [DEF5a] лише запис: без друку, без виділень, без блокувань
+        const uint32_t seq = s_hmSeq.fetch_add(1, std::memory_order_relaxed) + 1;
+        FailEntry& e = s_hmRing[(seq - 1) % usb_heapmap_cfg::kFailRing];
+        e.seq = 0;  // слот «у записі»
+        std::atomic_thread_fence(std::memory_order_release);
+        e.size = static_cast<uint32_t>(size);
+        e.caps = caps;
+        e.tMs = tMs;
+        size_t k = 0;
+        if (functionName != nullptr) {
+            for (; k + 1 < usb_heapmap_cfg::kFailFnChars && functionName[k] != '\0'; ++k) {
+                e.fn[k] = functionName[k];
+            }
+        }
+        e.fn[k] = '\0';
+        std::atomic_thread_fence(std::memory_order_release);
+        e.seq = seq;
+    }
+#endif
     FailRec& r = s_ring[(n - 1) % kRing];
     r.size = static_cast<uint32_t>(size);
     r.caps = caps;
     r.fn = functionName;
     r.tMs = tMs;
+#if !USB_HEAPMAP  // [DEF5a] під USB_HEAPMAP з хука не друкуємо (друкує usb_heapmap пізніше)
     if (n <= usb_host_cfg::kMemFailPrintMax) {
         esp_rom_printf("[MEM] ALLOC FAILED #%u t=%u size=%u caps=0x%x fn=%s\n", static_cast<unsigned>(n),
                        static_cast<unsigned>(tMs), static_cast<unsigned>(size), static_cast<unsigned>(caps),
                        functionName != nullptr ? functionName : "?");
     }
+#endif
 }
 
 // Розшифровка caps (лише у printFailStats, у звичайній задачі).
@@ -193,6 +221,28 @@ void printFailStats() {
                       r.fn != nullptr ? r.fn : "?");
     }
 }
+
+#if USB_HEAPMAP
+uint32_t failSeq() { return s_hmSeq.load(std::memory_order_acquire); }
+
+uint32_t failCopySince(uint32_t afterSeq, FailEntry* out, uint32_t max) {
+    const uint32_t total = s_hmSeq.load(std::memory_order_acquire);
+    uint32_t first = afterSeq + 1;
+    if (total > afterSeq && total - afterSeq > usb_heapmap_cfg::kFailRing) {
+        first = total - usb_heapmap_cfg::kFailRing + 1;  // старіші вже перезаписано
+    }
+    uint32_t n = 0;
+    for (uint32_t q = first; q <= total && n < max; ++q) {
+        const FailEntry src = s_hmRing[(q - 1) % usb_heapmap_cfg::kFailRing];  // копія; перевіряємо seq після копіювання
+        if (src.seq == q && s_hmRing[(q - 1) % usb_heapmap_cfg::kFailRing].seq == q) {
+            out[n++] = src;
+        }
+    }
+    return n;
+}
+
+void capsToText(uint32_t caps, char* out, size_t cap) { capsText(caps, out, cap); }
+#endif
 
 }  // namespace usb_memdiag
 

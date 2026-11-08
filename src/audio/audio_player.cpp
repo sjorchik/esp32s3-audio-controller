@@ -11,6 +11,7 @@
 //   стиль 2: Audio::audio_info_callback, Audio::msg_t, Audio::evt_info,
 //            evt_bitrate, evt_eof, evt_name, evt_streamtitle, evt_id3data;
 
+// [DEF5a] ДОДАНО лише HEAPMAP_POINT(C6) і HEAPMAP_CONNECT_RESULT(ok) у connectNow() (порожні при USB_HEAPMAP = 0).
 // [USB13b] ДОДАНО виклики ssl_workaround:: (noteFilePlayed / onRadioConnect / noteLibSslAllocText): обхідне рішення DEF-5.
 // [USB7] ДОДАНО файлове джерело (AudioPlayer::playFile, Audio::connecttoFS(usb_fs::volume(), ...)): окремі гілки
 // doPlayFile / failFile / finishFile / monitorFile; радіо-логіка (reconnect, backoff, буфер, недовантаження) для
@@ -40,6 +41,7 @@
 #include "config/xsmt_config.h"          // [Prompt X1]
 #include "config/player_mode_config.h"   // [USB14] kPauseFadeMs
 #include "core/ssl_workaround.h"         // [USB13b] WORKAROUND DEF-5: облік невдач підключення радіо після файлу
+#include "usb/usb_heapmap.h"            // [DEF5a] HEAPMAP_POINT / HEAPMAP_CONNECT_RESULT (порожні при USB_HEAPMAP = 0)
 #if FEATURE_USB_HOST
 #include "usb/usb_fs.h"         // [USB7] usb_fs::volume() для connecttoFS
 #include "usb/usb_msc_mount.h"  // [USB7] isMounted()
@@ -691,9 +693,11 @@ void connectNow(bool isReconnect) {
         usb_memdiag::print("player:connect begin (file played before)");
     }
 #endif
+    HEAPMAP_POINT(C6);  // [DEF5a] безпосередньо перед connecttohost (знімається лише в вікні після виходу з USB)
     XSMT_EVT("player connecttohost begin");
     const bool ok = s_audio->connecttohost(s_url);
     s_connectedAtMs = millis();
+    HEAPMAP_CONNECT_RESULT(ok);  // [DEF5a] C7: результат підключення (мс від кінця C6); при збої — блок [HM] FAIL
     XSMT_EVT("player connecttohost end ok=%d", ok ? 1 : 0);
     ssl_workaround::onRadioConnect(ok, s_url);  // [USB13b] WORKAROUND DEF-5 (рішення — у модулі; інакше нічого не змінює)
     if (!ok) {

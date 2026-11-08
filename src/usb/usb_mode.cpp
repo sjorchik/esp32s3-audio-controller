@@ -1,3 +1,4 @@
+// [DEF5a] ДОДАНО лише виклики HEAPMAP_POINT(C0..C5) (порожні при USB_HEAPMAP = 0); логіка й порядок операцій без змін.
 // [USB9] Режим «USB» — бекенд (крок g1). Див. usb_mode.h і config/usb_mode_config.h.
 //
 // Послідовності (виконує одноразова задача usb_mode, ядро 0, пріоритет 1):
@@ -28,6 +29,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "usb/usb_msc_mount.h"
+#include "usb/usb_heapmap.h"  // [DEF5a] HEAPMAP_POINT (порожній при USB_HEAPMAP = 0)
 #if USB_HOST_DIAG
 #include "usb/usb_browser.h"  // [USB13] статус usb_nav при виході
 #include "usb/usb_queue.h"    // [USB14] usb_queue::printPlayerStat() у usb.mode stat
@@ -183,6 +185,11 @@ void runExit(ExitCause cause) {
     setState(State::Exiting);
     Serial.printf("%s exit: begin (cause=%s)\n", kTag, cause == ExitCause::Standby ? "standby" : "user");
 
+#if USB_HEAPMAP
+    if (AudioPlayer::fileActive()) {
+        HEAPMAP_POINT(C3);  // [DEF5a] файл грає (початок виходу, ДО зупинки)
+    }
+#endif
     // 1. Зупинка файлу (штатно: мʼют ЦАП із паузою, stopSong; радіо-DSP повертає сам плеєр).
     const uint32_t tStop = millis();
     bool accepted = false;
@@ -214,6 +221,8 @@ void runExit(ExitCause cause) {
                       (unsigned)h.leakedTotal, nbOk ? (int)nb.active : -1, nbOk ? "" : " (status busy)");
     }
 #endif
+
+    HEAPMAP_POINT(C4);  // [DEF5a] файл зупинено, перед end()
 
     // 2. Зняття USB-host (0,6 – 1,25 с, до kEndWaitMs) — у цій фоновій задачі, не з UI.
     const RamSample ramPreEnd = ramNow();
@@ -275,6 +284,7 @@ void runExit(ExitCause cause) {
         Serial.printf("%s exit: usb_nav active=%d%s\n", kTag, nbOk ? (int)nb.active : -1, nbOk ? "" : " (status busy)");
     }
 #endif
+    HEAPMAP_POINT(C5);  // [DEF5a] після end(): host знято, радіо ще не стартувало
     if (snap.ramQuiet.freeBytes != 0) {
         Serial.printf("%s ram vs before begin(): d_free=%ld d_largest=%ld d_min=%ld (expect 0; first begin/end after boot: -128 B)\n",
                       kTag, static_cast<long>(ramAfter.freeBytes) - static_cast<long>(snap.ramQuiet.freeBytes),
@@ -367,6 +377,7 @@ void runEnter() {
     s_memEnter = usb_memdiag::print("enter:before", true);
     s_memEnterValid = true;
 #endif
+    HEAPMAP_POINT(C0);  // [DEF5a] радіо (або інший вхід) ще працює, перед входом
 
     // 1. Тиха зупинка радіо / звільнення проходу штатними шляхами AppController (запамʼятовує попередній стан).
     AppController::UsbModeSnapshot prev = {};
@@ -411,6 +422,7 @@ void runEnter() {
 #if USB_HOST_DIAG
     usb_memdiag::print("enter:quiet");  // [USB13]
 #endif
+    HEAPMAP_POINT(C1);  // [DEF5a] джерело зупинено, перед begin()
     // Поріг не вигадується: друкуємо виміряну різницю; «не зросла» при працювавшому радіо / проході — підозра.
     Serial.printf("%s ram freed by stopping the source: d_free=%ld d_largest=%ld (quiet in %u ms)\n", kTag,
                   static_cast<long>(ramQuiet.freeBytes) - static_cast<long>(ram0.freeBytes),
@@ -470,6 +482,7 @@ void runEnter() {
 #if USB_HOST_DIAG
     usb_memdiag::print("enter:ready");  // [USB13]
 #endif
+    HEAPMAP_POINT(C2);  // [DEF5a] змонтовано / «флешки нема» (стан після очікування носія)
     Serial.printf("%s enter: ready in %u ms (quiet=%u begin=%u mount_wait=%u) media=%s; host cost d_free=%ld d_largest=%ld\n",
                   kTag, static_cast<unsigned>(since(tEnter)), static_cast<unsigned>(quietMs),
                   static_cast<unsigned>(beginMs), static_cast<unsigned>(mountMs), mediaName(media),
