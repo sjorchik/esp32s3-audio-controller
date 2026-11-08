@@ -1,3 +1,4 @@
+// [DEF5b] ДОДАНО команду usb.preflight [test | force on | force off | stat] -> ssl_preflight::handleConsole (запобіжна перевірка DEF-5).
 // [DEF5a] ДОДАНО диспетчеризацію usb.hm (лише USB_HEAPMAP = 1) -> usb_heapmap::handleConsoleLine.
 // [USB13b] ДОДАНО команду usb.sslfail [dry | expired | stat] (імітація події -32512 після виходу; обхідне рішення DEF-5).
 // [USB10] ДОДАНО диспетчеризацію usb.dir / usb.cd / usb.pwd (usb_browser) і usb.q (usb_queue) — як usb.mode у USB9.
@@ -14,6 +15,7 @@
 
 #include "audio/audio_player.h"
 #include "config/file_player_config.h"
+#include "core/ssl_preflight.h"   // [DEF5b] usb.preflight
 #include "core/ssl_workaround.h"  // [USB13b] usb.sslfail
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -50,6 +52,10 @@ bool matchWord(const char* s, const char* word, const char** rest) {
 }
 
 const char* const kWords[] = {"usb.play", "usb.pstat", "usb.seek", "usb.stopf", "usb.ended", "usb.fx", "usb.sslfail"
+#if SSL_PREFLIGHT
+                                 ,
+                                 "usb.preflight"  // [DEF5b]
+#endif
 #if USB_HEAPMAP
                                  ,
                                  "usb.hm"  // [DEF5a]
@@ -255,6 +261,10 @@ void handleConsoleLine(const char* line) {
         cmdFx(rest);
     } else if (matchWord(line, "usb.sslfail", &rest)) {
         ssl_workaround::handleConsole(rest);  // [USB13b]
+#if SSL_PREFLIGHT
+    } else if (matchWord(line, "usb.preflight", &rest)) {
+        ssl_preflight::handleConsole(rest);  // [DEF5b]
+#endif
 #if USB_HEAPMAP
     } else if (matchWord(line, "usb.hm", &rest)) {
         usb_heapmap::handleConsoleLine(line);  // [DEF5a]

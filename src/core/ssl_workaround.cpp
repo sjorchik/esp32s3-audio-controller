@@ -1,3 +1,5 @@
+// [DEF5b] ДОДАНО лише виклик ssl_preflight::noteUsbSession() на початку noteUsbExit() (прапорець «була USB-сесія» для
+// запобіжної перевірки); поведінка обходу DEF-5 не змінена.
 // [DEF5a] При USB_HEAPMAP = 1 trigger() НЕ перезапускає плату (лише лог «would restart»), щоб збій не стирав стан кучі.
 // [USB13b] WORKAROUND для відкритого DEF-5 (див. ssl_workaround.h). Усі збірки (захист для користувача, не діагностика);
 // вимикається usb_host_cfg::kRestartOnSslAllocFail = false. Для інших помилок радіо поведінка не змінюється.
@@ -17,6 +19,7 @@
 #include <atomic>
 
 #include "core/app_controller.h"
+#include "core/ssl_preflight.h"  // [DEF5b] noteUsbSession()
 #include "esp_attr.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -190,6 +193,7 @@ void onBoot() {
 void noteFilePlayed() { s_filePlayed.store(true); }
 
 void noteUsbExit() {
+    ssl_preflight::noteUsbSession();  // [DEF5b] будь-яка USB-сесія (з файлом чи без) -> https-підключення радіо перевіряються
     const bool played = s_filePlayed.exchange(false);
     s_fails.store(0);
     s_expiredLogged.store(false);

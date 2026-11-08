@@ -11,6 +11,8 @@
 //   стиль 2: Audio::audio_info_callback, Audio::msg_t, Audio::evt_info,
 //            evt_bitrate, evt_eof, evt_name, evt_streamtitle, evt_id3data;
 
+// [DEF5b] ДОДАНО в connectNow() виклик ssl_preflight::beforeConnect() ПЕРЕД HEAPMAP_POINT(C6) / connecttohost() (запобіжна
+// перевірка буферів TLS після USB-сесії; RestartRequested -> failStream + довга пауза замість підключення).
 // [DEF5a] ДОДАНО лише HEAPMAP_POINT(C6) і HEAPMAP_CONNECT_RESULT(ok) у connectNow() (порожні при USB_HEAPMAP = 0).
 // [USB13b] ДОДАНО виклики ssl_workaround:: (noteFilePlayed / onRadioConnect / noteLibSslAllocText): обхідне рішення DEF-5.
 // [USB7] ДОДАНО файлове джерело (AudioPlayer::playFile, Audio::connecttoFS(usb_fs::volume(), ...)): окремі гілки
@@ -38,8 +40,10 @@
 #include "config/file_player_config.h"  // [USB7]
 #include "config/line_path_config.h"  // [Prompt 48d] LINE_PATH_ENABLE (раніше ADC_VU_ENABLE через adc_vu_config.h)
 #include "config/pins.h"
+#include "config/ssl_preflight_config.h"  // [DEF5b] kRetryHoldMs
 #include "config/xsmt_config.h"          // [Prompt X1]
 #include "config/player_mode_config.h"   // [USB14] kPauseFadeMs
+#include "core/ssl_preflight.h"          // [DEF5b] запобіжна перевірка буферів TLS перед https-підключенням
 #include "core/ssl_workaround.h"         // [USB13b] WORKAROUND DEF-5: облік невдач підключення радіо після файлу
 #include "usb/usb_heapmap.h"            // [DEF5a] HEAPMAP_POINT / HEAPMAP_CONNECT_RESULT (порожні при USB_HEAPMAP = 0)
 #if FEATURE_USB_HOST
@@ -693,6 +697,16 @@ void connectNow(bool isReconnect) {
         usb_memdiag::print("player:connect begin (file played before)");
     }
 #endif
+    // [DEF5b] Перевірка ДО C6 (пробні виділення звільняються до знімка). Може заблокувати цю задачу до kMaxWaitMs (як і сам
+    // connecttohost() блокує на секунди). RestartRequested: тихий перезапуск замовлено, підключатись НЕ можна — failStream()
+    // (мʼют, stopSong, Error); довга пауза, щоб backoff 1 / 2 / 4 с не викликав повторних спроб до перезапуску. Stop від
+    // beginRestart() обробить цикл задачі (processCommands) одразу після повернення звідси. ssl_workaround тут не бачить
+    // невдачі (підключення не робилось) — лічильник його https-невдач не чіпається.
+    if (ssl_preflight::beforeConnect(s_url) == ssl_preflight::Verdict::RestartRequested) {
+        failStream("ssl preflight: no fit for TLS buffers, quiet restart");
+        s_nextRetryMs = millis() + ssl_preflight_cfg::kRetryHoldMs;
+        return;
+    }
     HEAPMAP_POINT(C6);  // [DEF5a] безпосередньо перед connecttohost (знімається лише в вікні після виходу з USB)
     XSMT_EVT("player connecttohost begin");
     const bool ok = s_audio->connecttohost(s_url);
@@ -1677,4 +1691,3 @@ void AudioPlayer::getFileTune(uint32_t* extraMs, int32_t* digMs, int* levelDb) {
         *levelDb = static_cast<int>(s_fxLevelDb);
     }
 }
-

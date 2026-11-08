@@ -60,10 +60,18 @@
 // й між циклами, хук невдалих виділень без друку з контексту хука, консоль `usb.hm …`. ЛИШЕ діагностика (нічого не
 // виправляє). 0 — нуль коду й RAM, поведінка збірок не змінюється; 1 — потребує USB_HOST_DIAG = 1 і FEATURE_USB_MODE = 1.
 // Під 1 обхід DEF-5 (ssl_workaround) НЕ перезапускає плату (лише лог «would restart»), щоб збій не стирав стан.
-#define USB_HEAPMAP 1
+#define USB_HEAPMAP 0
 #if USB_HEAPMAP && !USB_HOST_DIAG
 #error "USB_HEAPMAP = 1 requires USB_HOST_DIAG = 1 (config/features.h)"
 #endif
 #if USB_HEAPMAP && !FEATURE_USB_MODE
 #error "USB_HEAPMAP = 1 requires FEATURE_USB_MODE = 1 (config/features.h)"
 #endif
+
+// [DEF5b] Запобіжна перевірка перед https-підключенням радіо після USB-сесії (src/core/ssl_preflight.*, константи —
+// config/ssl_preflight_config.h): два пробні виділення по 16 717 Б (буфери TLS) INTERNAL|8BIT; не вмістились (навіть після
+// очікування ≤ 600 мс) — підключення НЕ починається, замовляється ОДИН тихий перезапуск у ту саму станцію. WORKAROUND для
+// DEF-5 (причину не усуває). Діє лише при FEATURE_USB_HOST = 1 (без USB-сесій перевіряти нічого); 0 — перевірка, її
+// консольна команда `usb.preflight` і виклик у AudioPlayer::connectNow() повністю прибрані (inline-заглушки). Під
+// USB_HEAPMAP = 1 перевірка логується, але перезапуск НЕ робиться (діагностика DEF-5 бачить збій).
+#define SSL_PREFLIGHT 1
