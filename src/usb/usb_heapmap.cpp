@@ -4,6 +4,16 @@
 // виділяє: він виконується під блокуванням кучі), далі сортування за адресою й порівняння двох відсортованих знімків
 // злиттям. Усі буфери — одна арена в PSRAM, що виділяється ОДИН раз (внутрішня RAM не займається). Друк — через
 // статичний буфер і Serial.println(const char*) (без malloc, на відміну від довгого Serial.printf).
+//
+// [DEF5c] ДОДАНО «власник блока» (лише діагностика, нічого не виправляє):
+//   - історія знімків поточного циклу C1 … C6 у PSRAM (s_hist) -> для кожного «постійного» блока обчислюється first_seen
+//     (найраніша точка C1 … C5, у знімку якої є блок з тією ж адресою й розміром);
+//   - на C5 (після end(), перед підключенням радіо): кандидати = використані блоки з «PERSISTENT-NEW vs C1 цього циклу»
+//     БУДЬ-ЯКОГО розміру; INSIDE (усередині найбільшого вільного блока еталона C1) першими, далі за розміром спадання;
+//     рядок `blk` (first_seen, сусіди), hex-дамп перших 96 Б і останніх 16 Б, рядок класифікації слів (code / iram / rodata /
+//     ptr) і текстові послідовності. Знімок спершу, друк після (читання памʼяті блока — 32-бітними читаннями, IRAM-безпечно);
+//   - на C6: чи кандидати ще виділені (still-allocated);
+//   - консоль `usb.hm mem <hex-адреса> [байт <= 256]`: той самий формат для довільної адреси ВСЕРЕДИНІ внутрішньої кучі.
 
 #include "usb/usb_heapmap.h"
 
@@ -85,6 +95,20 @@ struct Cand {
     uint32_t size;
 };
 
+// [DEF5c] Область внутрішньої кучі (start / end із heap_caps_walk).
+struct Region {
+    uint32_t start;
+    uint32_t end;
+};
+
+// [DEF5c] Кандидат «власника блока».
+struct Pick {
+    uint32_t addr;
+    uint32_t size;
+    uint32_t idx;  // індекс запису у знімку, з якого вибрано (C5)
+    bool inside;   // лежить усередині найбільшого вільного блока еталона C1
+};
+
 // --- Стан (під s_mtx, окрім атомарних) ----------------------------------------------------------------------------
 StaticSemaphore_t s_mtxBuf;
 SemaphoreHandle_t s_mtx = nullptr;
@@ -100,6 +124,14 @@ bool s_prevValid = false;
 bool s_olderValid = false;  // у s_cur лежить знімок, що передував s_prev (для `usb.hm diff`)
 bool s_refValid = false;
 uint32_t s_refCycle = 0;
+Slot s_hist[kHistoryPoints];  // [DEF5c] знімки C1 … C6 ПОТОЧНОГО циклу (індекс = точка − 1); recs — в арені
+Pick s_picks[kDumpMaxBlocks];  // [DEF5c] кандидати, вибрані на C5 цього циклу
+uint32_t s_pickN = 0;
+uint32_t s_pickCycle = 0;
+Region s_regions[kRegionMax];  // [DEF5c] області внутрішньої кучі з останнього обходу
+uint32_t s_regionN = 0;
+uint32_t* s_memBuf = nullptr;  // [DEF5c] kMemMaxBytes / 4 слів (арена, PSRAM)
+char* s_text = nullptr;        // [DEF5c] kTextBufBytes (арена, PSRAM)
 Cand* s_cand = nullptr;
 TaskRec* s_tasks = nullptr;
 TaskStatus_t* s_scan = nullptr;
@@ -167,7 +199,10 @@ bool ensureArena() {
     const size_t candBytes = static_cast<size_t>(kCandidateMax) * sizeof(Cand);
     const size_t taskBytes = static_cast<size_t>(kTaskRegistryMax) * sizeof(TaskRec);
     const size_t scanBytes = static_cast<size_t>(kTaskScanMax) * sizeof(TaskStatus_t);
-    const size_t total = 3 * recBytes + candBytes + taskBytes + scanBytes + 64;
+    const size_t histBytes = static_cast<size_t>(kHistoryPoints) * recBytes;  // [DEF5c]
+    const size_t memBytes = kMemMaxBytes;                                      // [DEF5c]
+    const size_t textBytes = kTextBufBytes;                                    // [DEF5c]
+    const size_t total = 3 * recBytes + histBytes + memBytes + textBytes + candBytes + taskBytes + scanBytes + 64;
     uint8_t* a = static_cast<uint8_t*>(heap_caps_calloc(1, total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (a == nullptr) {
         s_arenaFailed = true;
@@ -181,13 +216,21 @@ bool ensureArena() {
         s_slots[i].recs = reinterpret_cast<Rec*>(p);
         p += recBytes;
     }
+    for (uint32_t i = 0; i < kHistoryPoints; ++i) {  // [DEF5c]
+        s_hist[i].recs = reinterpret_cast<Rec*>(p);
+        p += recBytes;
+    }
+    s_memBuf = reinterpret_cast<uint32_t*>(p);  // [DEF5c]
+    p += memBytes;
+    s_text = reinterpret_cast<char*>(p);  // [DEF5c]
+    p += textBytes;
     s_cand = reinterpret_cast<Cand*>(p);
     p += candBytes;
     s_tasks = reinterpret_cast<TaskRec*>(p);
     p += taskBytes;
     s_scan = reinterpret_cast<TaskStatus_t*>(p);
-    Serial.printf("%s arena in PSRAM: %u B (3 x %u records of 8 B); internal RAM is not used by the snapshots\n", kTag,
-                  static_cast<unsigned>(total), static_cast<unsigned>(kHeapMapMaxBlocks));
+    Serial.printf("%s arena in PSRAM: %u B (%u x %u records of 8 B: 3 slots + C1..C6 history); internal RAM is not used by the snapshots\n", kTag,
+                  static_cast<unsigned>(total), static_cast<unsigned>(3 + kHistoryPoints), static_cast<unsigned>(kHeapMapMaxBlocks));
     return true;
 }
 
@@ -203,11 +246,21 @@ struct WalkCtx {
     uint32_t usedBlk;
     uint32_t freeBlk;
     uint32_t usedBytes;
+    Region reg[kRegionMax];  // [DEF5c] області кучі (повторюються по блоках; порівнюємо з останньою записаною)
+    uint32_t regN;
 };
 
 // ВИКОНУЄТЬСЯ ПІД БЛОКУВАННЯМ КУПИ: лише арифметика й запис у PSRAM; без друку, виділень і мʼютексів.
-bool walkCb(walker_heap_into_t /*heapInfo*/, walker_block_info_t b, void* user) {
+bool walkCb(walker_heap_into_t heapInfo, walker_block_info_t b, void* user) {
     WalkCtx* c = static_cast<WalkCtx*>(user);
+    const uint32_t rs = static_cast<uint32_t>(heapInfo.start);  // [DEF5c]
+    if (c->regN == 0 || c->reg[c->regN - 1].start != rs) {
+        if (c->regN < kRegionMax) {
+            c->reg[c->regN].start = rs;
+            c->reg[c->regN].end = static_cast<uint32_t>(heapInfo.end);
+            c->regN++;
+        }
+    }
     const uint32_t addr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(b.ptr));
     const uint32_t size = static_cast<uint32_t>(b.size);
     c->total++;
@@ -236,11 +289,28 @@ int cmpRec(const void* a, const void* b) {
     return (x < y) ? -1 : (x > y) ? 1 : 0;
 }
 
+void storeRegions(const WalkCtx& c) {  // [DEF5c]
+    for (uint32_t i = 0; i < c.regN; ++i) {
+        s_regions[i] = c.reg[i];
+    }
+    s_regionN = c.regN;
+}
+
+// [DEF5c] Обхід БЕЗ запису блоків (лише області кучі) — для перевірки адреси в `usb.hm mem`; слоти не чіпає.
+void refreshRegions() {
+    WalkCtx c = {};
+    heap_caps_walk(MALLOC_CAP_INTERNAL, walkCb, &c);
+    storeRegions(c);
+}
+
 void walkInto(Slot& s, int8_t point, const char* tag) {
-    WalkCtx c = {s.recs, kHeapMapMaxBlocks, 0, 0, 0, 0, 0, 0, 0, 0};
+    WalkCtx c = {};
+    c.recs = s.recs;
+    c.cap = kHeapMapMaxBlocks;
     const int64_t t0 = esp_timer_get_time();
     heap_caps_walk(MALLOC_CAP_INTERNAL, walkCb, &c);
     const int64_t t1 = esp_timer_get_time();
+    storeRegions(c);  // [DEF5c]
     qsort(s.recs, c.n, sizeof(Rec), cmpRec);
     const int64_t t2 = esp_timer_get_time();
     s.n = c.n;
@@ -469,11 +539,16 @@ void printHeader(const Slot& s, const char* extra) {
     Serial.println(s_line);
 }
 
-void saveRef(const Slot& from) {
-    Rec* keep = s_ref->recs;
-    *s_ref = from;
-    s_ref->recs = keep;
+// Копія знімка з власним буфером recs призначення (метадані + записи).
+void copySlot(Slot& to, const Slot& from) {
+    Rec* keep = to.recs;
+    to = from;
+    to.recs = keep;
     memcpy(keep, from.recs, static_cast<size_t>(from.n) * sizeof(Rec));
+}
+
+void saveRef(const Slot& from) {
+    copySlot(*s_ref, from);
     s_refValid = true;
     s_refCycle = from.cycle;
 }
@@ -484,6 +559,10 @@ void newCycle() {
     s_c6Open = false;
     s_retry = 0;
     s_failSeqAtCycle = usb_memdiag::failSeq();
+    for (uint32_t i = 0; i < kHistoryPoints; ++i) {  // [DEF5c] історія попереднього циклу недійсна
+        s_hist[i].valid = false;
+    }
+    s_pickN = 0;
 }
 
 // Блок «FAIL» (перед знімком C7 при збої): записи хука за цикл + знімок за класами (largest по INTERNAL / I8 / DMA / PSRAM).
@@ -504,6 +583,379 @@ void printFailBlock(uint32_t connMs) {
              ent[k].fn);
     }
     usb_memdiag::print("hm:FAIL classes", usb_memdiag::take());
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// [DEF5c] Власник блока: first_seen, кандидати, вміст блока, still-allocated
+// ---------------------------------------------------------------------------------------------------------------------
+
+// Пошук у відсортованому знімку: індекс запису з точною адресою або -1.
+int32_t findRec(const Slot& s, uint32_t addr) {
+    int32_t lo = 0;
+    int32_t hi = static_cast<int32_t>(s.n) - 1;
+    while (lo <= hi) {
+        const int32_t mid = (lo + hi) / 2;
+        const uint32_t a = s.recs[mid].addr;
+        if (a == addr) {
+            return mid;
+        }
+        if (a < addr) {
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return -1;
+}
+
+// Індекс останнього запису з адресою <= addr або -1.
+int32_t findFloor(const Slot& s, uint32_t addr) {
+    int32_t lo = 0;
+    int32_t hi = static_cast<int32_t>(s.n) - 1;
+    int32_t best = -1;
+    while (lo <= hi) {
+        const int32_t mid = (lo + hi) / 2;
+        if (s.recs[mid].addr <= addr) {
+            best = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return best;
+}
+
+bool isUsed(const Rec& r) { return (r.szUsed & kUsedBit) != 0; }
+uint32_t recSize(const Rec& r) { return r.szUsed & ~kUsedBit; }
+
+// Складання тексту в буфер (s_text) без malloc.
+struct Out {
+    char* buf;
+    size_t cap;
+    size_t off;
+};
+void oapp(Out& o, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+void oapp(Out& o, const char* fmt, ...) {
+    if (o.off >= o.cap) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    const int w = vsnprintf(o.buf + o.off, o.cap - o.off, fmt, ap);
+    va_end(ap);
+    if (w > 0) {
+        o.off += static_cast<size_t>(w);
+        if (o.off >= o.cap) {
+            o.off = o.cap - 1;
+        }
+    }
+}
+
+// Читає nWords 32-бітних слів з addr (вирівняно по 4). Лише 32-бітні читання: безпечно й для IRAM (0x4037xxxx).
+// Адреса береться з обходу кучі або перевіряється проти областей кучі (usb.hm mem). Вміст міг змінитися після знімка.
+void readWords(uint32_t addr, uint32_t nWords, uint32_t* out) {
+    const volatile uint32_t* src = reinterpret_cast<const volatile uint32_t*>(static_cast<uintptr_t>(addr));
+    for (uint32_t i = 0; i < nWords; ++i) {
+        out[i] = src[i];
+    }
+}
+
+enum class Cls : uint8_t { None, Code, Iram, Rodata, Ptr };
+
+Cls classify(uint32_t v) {
+    if (v >= kCodeLow && v < kCodeHigh) {
+        return Cls::Code;
+    }
+    if (v >= kIramLow && v < kIramHigh) {
+        return Cls::Iram;
+    }
+    if (v >= kRodataLow && v < kRodataHigh) {
+        return Cls::Rodata;
+    }
+    if ((v >= kPtrLowA && v < kPtrHighA) || (v >= kPtrLowB && v < kPtrHighB)) {
+        return Cls::Ptr;
+    }
+    return Cls::None;
+}
+
+char byteAt(const uint32_t* w, uint32_t b) { return static_cast<char>((w[b >> 2] >> ((b & 3u) * 8u)) & 0xFFu); }
+bool printable(char c) { return c >= 0x20 && c <= 0x7E; }
+
+// Дописує текстові послідовності (>= kStrMinLen друкованих ASCII) з w[0..nWords); повертає, скільки їх уже показано.
+uint32_t appendStrings(Out& o, const uint32_t* w, uint32_t nWords, uint32_t shown) {
+    const uint32_t nB = nWords * 4u;
+    uint32_t runStart = 0;
+    uint32_t runLen = 0;
+    for (uint32_t b = 0; b <= nB && shown < kStrMaxCount; ++b) {
+        if (b < nB && printable(byteAt(w, b))) {
+            if (runLen == 0) {
+                runStart = b;
+            }
+            ++runLen;
+            continue;
+        }
+        if (runLen >= kStrMinLen) {
+            oapp(o, " str:\"");
+            const uint32_t lim = runLen < kStrMaxChars ? runLen : kStrMaxChars;
+            for (uint32_t k = 0; k < lim; ++k) {
+                const char c = byteAt(w, runStart + k);
+                oapp(o, "%c", c == '"' ? '\'' : c);
+            }
+            oapp(o, "%s\"", runLen > lim ? "..." : "");
+            ++shown;
+        }
+        runLen = 0;
+    }
+    return shown;
+}
+
+// Рядок класифікації слів w[0..nHead+nTail): code / iram / rodata / ptr (унікальні, у порядку появи) + текст.
+// Текст шукається окремо в голові й у хвості (рядок не переходить через розрив).
+void printClass(const uint32_t* w, uint32_t nHead, uint32_t nTail) {
+    const uint32_t n = nHead + nTail;
+    Out o = {s_text, kTextBufBytes, 0};
+    o.buf[0] = '\0';
+    oapp(o, "%s     class:", kTag);
+    struct Cat {
+        Cls c;
+        const char* name;
+    };
+    static const Cat kCats[] = {{Cls::Code, "code:"}, {Cls::Iram, "iram:"}, {Cls::Rodata, "rodata:"}, {Cls::Ptr, "ptr:"}};
+    bool any = false;
+    for (const Cat& cat : kCats) {
+        bool first = true;
+        for (uint32_t i = 0; i < n; ++i) {
+            if (classify(w[i]) != cat.c) {
+                continue;
+            }
+            bool dup = false;
+            for (uint32_t j = 0; j < i; ++j) {
+                if (w[j] == w[i]) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                continue;
+            }
+            if (first) {
+                oapp(o, " %s", cat.name);
+                first = false;
+            }
+            oapp(o, " 0x%08x", static_cast<unsigned>(w[i]));
+            any = true;
+        }
+    }
+    uint32_t shown = appendStrings(o, w, nHead, 0);
+    if (nTail != 0) {
+        shown = appendStrings(o, w + nHead, nTail, shown);
+    }
+    if (!any && shown == 0) {
+        oapp(o, " -");
+    }
+    Serial.println(o.buf);
+}
+
+// Hex-слова, kDumpWordsPerLine у рядку. label — "" або "tail ".
+void printHex(uint32_t addr, const uint32_t* w, uint32_t nWords, const char* label) {
+    for (uint32_t i = 0; i < nWords; i += kDumpWordsPerLine) {
+        int off = snprintf(s_line, sizeof(s_line), "%s     %s0x%08x:", kTag, label, static_cast<unsigned>(addr + i * 4u));
+        for (uint32_t k = 0; k < kDumpWordsPerLine && i + k < nWords && off > 0 && static_cast<size_t>(off) < sizeof(s_line); ++k) {
+            off += snprintf(s_line + off, sizeof(s_line) - static_cast<size_t>(off), " %08x", static_cast<unsigned>(w[i + k]));
+        }
+        Serial.println(s_line);
+    }
+}
+
+// Вміст блока: перші kDumpHeadBytes (hex-слова) + останні kDumpTailBytes (окремий рядок, якщо блок довший за голову)
+// + рядок класифікації. Читання — ПІСЛЯ обходу кучі (знімок уже знято), блокування кучі не тримається.
+void dumpBlock(const Pick& p) {
+    const uint32_t size = p.size & ~3u;
+    const uint32_t nHead = (size < kDumpHeadBytes ? size : kDumpHeadBytes) / 4u;
+    uint32_t nTail = 0;
+    uint32_t tailAddr = 0;
+    if (size > kDumpHeadBytes) {
+        uint32_t tb = kDumpTailBytes;
+        if (size - kDumpHeadBytes < tb) {
+            tb = size - kDumpHeadBytes;
+        }
+        nTail = tb / 4u;
+        tailAddr = p.addr + size - tb;
+    }
+    readWords(p.addr, nHead, s_memBuf);
+    if (nTail != 0) {
+        readWords(tailAddr, nTail, s_memBuf + nHead);
+    }
+    printHex(p.addr, s_memBuf, nHead, "");
+    if (nTail != 0) {
+        printHex(tailAddr, s_memBuf + nHead, nTail, "tail ");
+    }
+    printClass(s_memBuf, nHead, nTail);
+}
+
+// Кандидат a «кращий» за b: INSIDE першими, далі більший розмір, далі менша адреса.
+bool betterPick(const Pick& a, const Pick& b) {
+    if (a.inside != b.inside) {
+        return a.inside;
+    }
+    if (a.size != b.size) {
+        return a.size > b.size;
+    }
+    return a.addr < b.addr;
+}
+
+// «PERSISTENT-NEW vs ref» БУДЬ-ЯКОГО розміру (та сама умова, що в computeDiff: використаний у cur, а в ref немає запису з тією ж
+// адресою й розміром). Повертає до maxOut найкращих (betterPick), впорядкованих; totalNew / totalInside — скільки всього.
+uint32_t pickCandidates(const Slot& cur, const Slot& ref, Pick* out, uint32_t maxOut, uint32_t* totalNew, uint32_t* totalInside) {
+    uint32_t nOut = 0;
+    uint32_t j = 0;
+    *totalNew = 0;
+    *totalInside = 0;
+    for (uint32_t i = 0; i < cur.n; ++i) {
+        const Rec& r = cur.recs[i];
+        if (!isUsed(r)) {
+            continue;
+        }
+        while (j < ref.n && ref.recs[j].addr < r.addr) {
+            ++j;
+        }
+        if (j < ref.n && ref.recs[j].addr == r.addr && ref.recs[j].szUsed == r.szUsed) {
+            continue;
+        }
+        const bool inside = ref.largest != 0 && r.addr >= ref.largestAddr && r.addr < ref.largestAddr + ref.largest;
+        ++*totalNew;
+        if (inside) {
+            ++*totalInside;
+        }
+        const Pick cand = {r.addr, recSize(r), i, inside};
+        uint32_t pos;
+        if (nOut < maxOut) {
+            pos = nOut++;
+        } else if (betterPick(cand, out[nOut - 1])) {
+            pos = nOut - 1;
+        } else {
+            continue;
+        }
+        out[pos] = cand;
+        while (pos > 0 && betterPick(out[pos], out[pos - 1])) {
+            std::swap(out[pos], out[pos - 1]);
+            --pos;
+        }
+    }
+    return nOut;
+}
+
+// first_seen: найраніша точка C1 … C5 ПОТОЧНОГО циклу, у знімку якої є використаний блок з тією ж адресою й розміром.
+// gap — блок зникав і зʼявлявся знову між first_seen і C5 (тоді це не безперервна присутність); partial — частину знімків
+// C2 … C4 не збережено (точка не викликалась).
+int firstSeen(uint32_t addr, uint32_t szUsed, bool* gap, bool* partial) {
+    int first = -1;
+    *gap = false;
+    *partial = false;
+    for (uint32_t k = 0; k < 5; ++k) {  // C1 … C5 -> s_hist[0..4]
+        const Slot& h = s_hist[k];
+        if (!h.valid || h.cycle != s_cycle) {
+            if (k >= 1 && k <= 3) {
+                *partial = true;
+            }
+            continue;
+        }
+        const int32_t idx = findRec(h, addr);
+        const bool present = idx >= 0 && h.recs[idx].szUsed == szUsed;
+        if (present) {
+            if (first < 0) {
+                first = static_cast<int>(k) + 1;
+            }
+        } else if (first >= 0) {
+            *gap = true;
+        }
+    }
+    return first;
+}
+
+void printBlockLine(const Slot& cur, const Pick& p) {
+    const int32_t n = static_cast<int32_t>(cur.n);
+    const int32_t idx = static_cast<int32_t>(p.idx);
+    int32_t l = idx - 1;
+    while (l >= 0 && !isUsed(cur.recs[l])) {
+        --l;
+    }
+    int32_t r = idx + 1;
+    while (r < n && !isUsed(cur.recs[r])) {
+        ++r;
+    }
+    const uint32_t freeL = (idx > 0 && !isUsed(cur.recs[idx - 1])) ? recSize(cur.recs[idx - 1]) : 0;
+    const uint32_t freeR = (idx + 1 < n && !isUsed(cur.recs[idx + 1])) ? recSize(cur.recs[idx + 1]) : 0;
+    char ps[28];
+    char ns[28];
+    if (l >= 0) {
+        snprintf(ps, sizeof(ps), "0x%08x/%u", static_cast<unsigned>(cur.recs[l].addr), static_cast<unsigned>(recSize(cur.recs[l])));
+    } else {
+        snprintf(ps, sizeof(ps), "-");
+    }
+    if (r < n) {
+        snprintf(ns, sizeof(ns), "0x%08x/%u", static_cast<unsigned>(cur.recs[r].addr), static_cast<unsigned>(recSize(cur.recs[r])));
+    } else {
+        snprintf(ns, sizeof(ns), "-");
+    }
+    bool gap = false;
+    bool partial = false;
+    const int fs = firstSeen(p.addr, p.size | kUsedBit, &gap, &partial);
+    char fss[16];
+    if (fs > 0) {
+        snprintf(fss, sizeof(fss), "C%d", fs);
+    } else {
+        snprintf(fss, sizeof(fss), "?");
+    }
+    emit("%s   blk 0x%08x size=%u first_seen=%s prev=%s next=%s freeL=%u freeR=%u%s%s%s", kTag, static_cast<unsigned>(p.addr),
+         static_cast<unsigned>(p.size), fss, ps, ns, static_cast<unsigned>(freeL), static_cast<unsigned>(freeR),
+         p.inside ? " INSIDE" : "", gap ? " (not continuous)" : "", partial ? " (history incomplete)" : "");
+}
+
+// C5: вибір кандидатів і вивід (підсумок + для кожного `blk`; повний вміст — для перших kDumpDetailBlocks).
+void reportBlockOwners(const Slot& cur, const Slot& ref) {
+    uint32_t totalNew = 0;
+    uint32_t totalIn = 0;
+    s_pickN = pickCandidates(cur, ref, s_picks, kDumpMaxBlocks, &totalNew, &totalIn);
+    s_pickCycle = s_cycle;
+    emit("%s c%u C5 block-owner candidates: %u persistent-new block(s) of any size, %u INSIDE largest free of C1 0x%08x/%u; "
+         "showing %u, full content for %u%s",
+         kTag, static_cast<unsigned>(s_cycle), static_cast<unsigned>(totalNew), static_cast<unsigned>(totalIn),
+         static_cast<unsigned>(ref.largestAddr), static_cast<unsigned>(ref.largest), static_cast<unsigned>(s_pickN),
+         static_cast<unsigned>(s_pickN < kDumpDetailBlocks ? s_pickN : kDumpDetailBlocks),
+         (cur.trunc || ref.trunc) ? " [INCOMPLETE: snapshot truncated]" : "");
+    for (uint32_t i = 0; i < s_pickN; ++i) {
+        printBlockLine(cur, s_picks[i]);
+        if (i < kDumpDetailBlocks) {
+            dumpBlock(s_picks[i]);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));  // не переповнювати буфер Serial
+    }
+}
+
+// C6: чи кандидати цього циклу ще виділені (за свіжим знімком). realloc:N — за тією ж адресою вже блок іншого розміру.
+void reportStillAllocated(const Slot& cur) {
+    if (s_pickN == 0 || s_pickCycle != s_cycle) {
+        return;
+    }
+    Out o = {s_text, kTextBufBytes, 0};
+    o.buf[0] = '\0';
+    oapp(o, "%s c%u C6 try=%u still-allocated:", kTag, static_cast<unsigned>(s_cycle), static_cast<unsigned>(s_retry + 1));
+    for (uint32_t i = 0; i < s_pickN; ++i) {
+        const int32_t idx = findRec(cur, s_picks[i].addr);
+        char st[20];
+        if (idx >= 0 && isUsed(cur.recs[idx])) {
+            if (recSize(cur.recs[idx]) == s_picks[i].size) {
+                snprintf(st, sizeof(st), "yes");
+            } else {
+                snprintf(st, sizeof(st), "realloc:%u", static_cast<unsigned>(recSize(cur.recs[idx])));
+            }
+        } else {
+            snprintf(st, sizeof(st), "no");
+        }
+        oapp(o, " 0x%08x/%u=%s", static_cast<unsigned>(s_picks[i].addr), static_cast<unsigned>(s_picks[i].size), st);
+    }
+    Serial.println(o.buf);
 }
 
 struct PointInfo {
@@ -553,6 +1005,9 @@ void takePoint(const PointInfo& pi) {
     walkInto(*s_cur, pi.manual ? -1 : pi.p, tag);
     scanTasks();
     ++s_pointsTaken;
+    if (!pi.manual && pi.p >= 1 && pi.p <= 6) {  // [DEF5c] історія C1 … C6 поточного циклу (для first_seen)
+        copySlot(s_hist[pi.p - 1], *s_cur);
+    }
 
     char extra[40] = {0};
     if (pi.hasResult) {
@@ -582,6 +1037,10 @@ void takePoint(const PointInfo& pi) {
         saveRef(*s_cur);
     } else if (!pi.manual && pi.p == 5 && s_refValid && s_refCycle == s_cycle) {  // після end(): що пережило C1 цього ж циклу
         printDiff(*s_cur, *s_ref, "C1 of THIS cycle", kPersistentLines, true);
+        reportBlockOwners(*s_cur, *s_ref);  // [DEF5c]
+    }
+    if (!pi.manual && pi.p == 6) {  // [DEF5c] чи кандидати C5 пережили відкладене звільнення
+        reportStillAllocated(*s_cur);
     }
 
     std::swap(s_cur, s_prev);  // тепер s_prev = щойно знята точка, s_cur = попередня (для `usb.hm diff`)
@@ -673,6 +1132,14 @@ void cmdStat() {
                   static_cast<unsigned>(s_resultSeq.load()),
                   s_lastResultOk.load() < 0 ? "-" : (s_lastResultOk.load() ? "OK" : "FAIL"),
                   static_cast<unsigned>(s_lastResultMs.load()));
+    unsigned mask = 0;  // [DEF5c]
+    for (uint32_t i = 0; i < kHistoryPoints; ++i) {
+        if (s_hist[i].valid && s_hist[i].cycle == s_cycle) {
+            mask |= 1u << i;
+        }
+    }
+    Serial.printf("%s stat: cycle history (C1..C6 bit0..5) mask=0x%02x | picks=%u (cycle %u) | heap regions known=%u\n", kTag, mask,
+                  static_cast<unsigned>(s_pickN), static_cast<unsigned>(s_pickCycle), static_cast<unsigned>(s_regionN));
 }
 
 void cmdSnap(const char* tagArg) {
@@ -758,6 +1225,85 @@ void cmdDump(bool full) {
     emit("%s dump end: %u lines, used < %u B aggregated: %u blk/%u B%s", kTag, static_cast<unsigned>(lines),
          static_cast<unsigned>(usedMin), static_cast<unsigned>(smallN), static_cast<unsigned>(smallB),
          skipped != 0 ? " (line limit hit: use `usb.hm dump full`)" : "");
+    unlock();
+}
+
+
+// [DEF5c] usb.hm mem <hex-адреса> [байт <= kMemMaxBytes]: вміст довільної адреси ВСЕРЕДИНІ внутрішньої кучі (області —
+// з heap_caps_walk). Слоти знімків не чіпає (окремий обхід лише областей). Інформація про блок — за останньою збереженою точкою.
+void cmdMem(const char* arg) {
+    if (*arg == '\0') {
+        Serial.printf("%s usage: usb.hm mem <hex address> [bytes 1..%u, default %u]\n", kTag, static_cast<unsigned>(kMemMaxBytes),
+                      static_cast<unsigned>(kMemDefaultBytes));
+        return;
+    }
+    char* end = nullptr;
+    const unsigned long long a64 = strtoull(arg, &end, 16);  // base 16: префікс 0x необовʼязковий
+    if (end == arg || a64 > 0xFFFFFFFFull) {
+        Serial.printf("%s mem: bad hex address '%s'\n", kTag, arg);
+        return;
+    }
+    const char* p = skipWs(end);
+    long n = (*p != '\0') ? atol(p) : static_cast<long>(kMemDefaultBytes);
+    if (n < 1) {
+        Serial.printf("%s mem: bad byte count '%s'\n", kTag, p);
+        return;
+    }
+    bool clamped = false;
+    if (n > static_cast<long>(kMemMaxBytes)) {
+        n = static_cast<long>(kMemMaxBytes);
+        clamped = true;
+    }
+    const uint32_t req = static_cast<uint32_t>(a64);
+    const uint32_t addr = req & ~3u;
+    uint32_t nWords = (static_cast<uint32_t>(n) + (req - addr) + 3u) / 4u;
+    if (nWords > kMemMaxBytes / 4u) {
+        nWords = kMemMaxBytes / 4u;
+    }
+    if (!lock()) {
+        Serial.printf("%s busy\n", kTag);
+        return;
+    }
+    if (!ensureArena()) {
+        unlock();
+        return;
+    }
+    refreshRegions();
+    bool ok = false;
+    for (uint32_t i = 0; i < s_regionN; ++i) {
+        if (addr >= s_regions[i].start && addr + nWords * 4u <= s_regions[i].end) {
+            ok = true;
+            break;
+        }
+    }
+    if (!ok) {
+        Serial.printf("%s mem: refused - 0x%08x..0x%08x is not inside one region of the internal heap (reading elsewhere may fault). Regions:\n",
+                      kTag, static_cast<unsigned>(addr), static_cast<unsigned>(addr + nWords * 4u));
+        for (uint32_t i = 0; i < s_regionN; ++i) {
+            Serial.printf("%s   0x%08x..0x%08x\n", kTag, static_cast<unsigned>(s_regions[i].start), static_cast<unsigned>(s_regions[i].end));
+        }
+        unlock();
+        return;
+    }
+    char where[96];
+    snprintf(where, sizeof(where), "no stored point yet");
+    if (s_prevValid) {
+        const int32_t idx = findFloor(*s_prev, addr);
+        if (idx >= 0 && addr < s_prev->recs[idx].addr + recSize(s_prev->recs[idx])) {
+            snprintf(where, sizeof(where), "%s block 0x%08x/%u +%u (as of c%u C%d t=%u)", isUsed(s_prev->recs[idx]) ? "used" : "free",
+                     static_cast<unsigned>(s_prev->recs[idx].addr), static_cast<unsigned>(recSize(s_prev->recs[idx])),
+                     static_cast<unsigned>(addr - s_prev->recs[idx].addr), static_cast<unsigned>(s_prev->cycle),
+                     static_cast<int>(s_prev->point), static_cast<unsigned>(s_prev->tMs));
+        } else {
+            snprintf(where, sizeof(where), "not in any block payload of c%u C%d (heap metadata or allocated later)",
+                     static_cast<unsigned>(s_prev->cycle), static_cast<int>(s_prev->point));
+        }
+    }
+    emit("%s mem 0x%08x len=%u%s%s: %s", kTag, static_cast<unsigned>(addr), static_cast<unsigned>(nWords * 4u),
+         clamped ? " (clamped to max)" : "", req != addr ? " (address aligned down to 4)" : "", where);
+    readWords(addr, nWords, s_memBuf);
+    printHex(addr, s_memBuf, nWords, "");
+    printClass(s_memBuf, nWords, 0);
     unlock();
 }
 
@@ -917,11 +1463,14 @@ void handleConsoleLine(const char* line) {
         Serial.printf("%s auto=%s\n", kTag, s_autoOn.load() ? "on" : "off");
     } else if (word(rest, "cycle", &arg)) {
         cmdCycle(arg);
+    } else if (word(rest, "mem", &arg)) {  // [DEF5c]
+        cmdMem(arg);
     } else {
-        Serial.printf("%s usage: usb.hm stat | snap <tag> | diff | dump [full] | auto on|off | cycle <N> [<file sec>]\n", kTag);
+        Serial.printf("%s usage: usb.hm stat | snap <tag> | diff | dump [full] | mem <hex addr> [bytes] | auto on|off | cycle <N> [<file sec>]\n", kTag);
     }
 }
 
 }  // namespace usb_heapmap
 
 #endif  // USB_HEAPMAP
+

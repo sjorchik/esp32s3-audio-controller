@@ -13,7 +13,11 @@
 //   C2 змонтовано (enter: ready)           C6 безпосередньо перед connecttohost радіо (лише після C5 того ж циклу)
 //   C3 файл грає (початок виходу)          C7 результат підключення радіо (HEAPMAP_CONNECT_RESULT(ok))
 // Потоки: точки викликаються із задач usb_mode (C0 – C5) і плеєра (C6, C7); виклики серіалізує мʼютекс модуля.
-// Консоль (диспетчеризація — usb_play_diag): usb.hm stat | snap <tag> | diff | dump [full] | auto on|off | cycle <N> [<сек>].
+// Консоль (диспетчеризація — usb_play_diag): usb.hm stat | snap <tag> | diff | dump [full] | mem <hex-адреса> [байт] | auto on|off |
+// cycle <N> [<сек>].
+// [DEF5c] ДОДАНО: на C5 — кандидати «власника блока» (рядки `[HM]   blk …`, hex-дамп, класифікація слів), на C6 — рядок
+// `still-allocated`, консоль `usb.hm mem <hex-адреса> [байт <= 256]`. Публічний API (point / connectResult / handleConsoleLine)
+// і макроси HEAPMAP_POINT / HEAPMAP_CONNECT_RESULT НЕ змінено.
 
 #include <stdint.h>
 
@@ -49,3 +53,4 @@ void handleConsoleLine(const char* line);
     } while (0)
 
 #endif  // USB_HEAPMAP
+
