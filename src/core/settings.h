@@ -27,6 +27,9 @@
 // Окремо від blob-а (ключі NVS `pl_usb_dir` / `pl_usb_trk` / `pl_usb_pos`, namespace «audioctl») зберігається ПОЗИЦІЯ
 // відтворення джерела (SettingsStore::getPlayerResume / setPlayerResume): шляхи на 2 × 256 Б не роздувають blob
 // і не копіюються в кожен snapshot().
+// [INP4a-1] NVS blob v9 (БЕЗ міграції): inputNames[defaults::kInputSlotCount = 4][32] (слот 3 = вхід «USB», дефолт «Player»),
+// inputEnabledMask 4-бітна (біт 3 = USB). Розкладка: Settings 170 Б, blob 174 Б (було 138 / 142). defaults::kInputCount (3)
+// НЕ змінено; lastInput допускає 0..defaults::kUsbInputIndex (у цьому кроці його ніхто не ставить у 3).
 // [Prompt 39] У КІНЕЦЬ структури додано inputEnabledMask (маска дозволених входів, відключення
 // входів 1..3 з вебу). Формат blob-а v4; blobs v3, v2 і v1 мігруються в load() (усі входи дозволені).
 
@@ -59,8 +62,8 @@ struct InputProfile {
 struct Settings {
     // [Prompt 48a] Поле processorType ВИДАЛЕНО (аудіочіпи вирізано).
 
-    // Назви входів (кількість = defaults::kInputCount = 3: 0 радіо, 1 TV Box, 2 Computer) [Prompt 48a].
-    char inputNames[defaults::kInputCount][32];
+    // Назви входів (кількість = defaults::kInputSlotCount = 4: 0 радіо, 1 TV Box, 2 Computer, 3 USB) [Prompt 48a, INP4a-1].
+    char inputNames[defaults::kInputSlotCount][32];
 
     // Яскравість підсвітки дисплея (та сама шкала, що defaults::kDefaultBrightness).
     uint8_t brightness;
@@ -68,7 +71,7 @@ struct Settings {
     // Орієнтація дисплея: true = display_cfg::kRotationFlipped.
     bool displayFlipped;
 
-    // Останній стан для відновлення.
+    // Останній стан для відновлення. [INP4a-1] lastInput: 0..defaults::kUsbInputIndex (3 = «USB»; пише INP4a-2).
     uint8_t lastInput;
     uint16_t lastStation;
     bool lastMute;
@@ -82,7 +85,7 @@ struct Settings {
     InputProfile profiles[player_mode_cfg::kProfileCount];
 
     // [Prompt 39] Маска дозволених логічних входів: біт i = вхід i (0 = радіо, 1 = TV Box, 2 = Computer),
-    // 1 = дозволено. [P48a] За замовчуванням 0x07 (settings_cfg::kInputMaskDefault). Біт 0 ЗАВЖДИ 1:
+    // 1 = дозволено. [INP4a-1] 4 біти (біт 3 = USB), за замовчуванням 0x0F (settings_cfg::kInputMaskDefault). Біт 0 ЗАВЖДИ 1:
     // нормалізується в load()/sanitize() і в AppController (settings_cfg::normalizeInputMask). Пише лише
     // AppController (команда вебу WebCmdType::InputsEnabledSet). Поле стоїть ПІСЛЯ profiles.
     uint8_t inputEnabledMask;
@@ -176,4 +179,5 @@ public:
     static void clearPlayerResume(PlayerSource src);
     static uint32_t playerResumeWriteCount();
 };
+
 

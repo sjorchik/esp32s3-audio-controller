@@ -7,7 +7,8 @@
 
 #include <stdint.h>
 
-#include "config/defaults.h"  // [Prompt 39] defaults::kInputCount (маска входів)
+#include "config/defaults.h"  // [Prompt 39] defaults::kInputCount (маска входів); [INP4a-1] kInputSlotCount, kUsbInputIndex
+#include "config/features.h"  // [INP4a-1] FEATURE_USB_HOST / FEATURE_USB_MODE (біт 3 маски = вхід «USB»)
 
 // ---------------------------------------------------------------------------
 // Прапорці умовної компіляції
@@ -46,23 +47,42 @@ constexpr const char* kNvsBlobKey   = "settings";
 // [V1] 7 -> 8: профіль входу + int8_t vuSensDb (чутливість VU, дБ) = 8 Б; Settings 126 -> 128 Б, blob 130 -> 132 Б.
 // БЕЗ МІГРАЦІЇ з v7 (власник: «міграція не потрібна, контролер буде стиратися»): валідний лише blob версії 8 з
 // точним розміром; прошивка — на СТЕРТИЙ flash (`pio run -t erase`). Blob v7 (130 Б) буде відхилено з логом.
-constexpr uint8_t kFormatVersion = 8;
+// [INP4a-1] 8 -> 9: слотів налаштувань входів 4 (defaults::kInputSlotCount): inputNames[4][32] (слот 3 = «USB» / «Player»),
+// маска входів 4-бітна. Settings 138 -> 170 Б, blob 142 -> 174 Б. БЕЗ МІГРАЦІЇ: валідний лише blob версії 9 з точним
+// розміром; прошивка — на СТЕРТИЙ flash (`pio run -t erase`). Blob v8 (142 Б) буде відхилено з логом.
+constexpr uint8_t kFormatVersion = 9;
 
 // [Prompt 39] Маска дозволених логічних входів (Settings::inputEnabledMask): біт i = вхід i.
-// [Prompt 48a] 3 логічні входи (0 радіо, 1 TV Box, 2 Computer): маска = 3 біти, за замовчуванням усі
-// дозволені (kInputMaskDefault = 0x07). Біт 0 (радіо) завжди 1 — вимкнути можна лише входи 1..2.
-// Апаратної недоступності входів більше немає (чипів нема): вхід «доступний» = дозволений маскою.
-static_assert(defaults::kInputCount <= 8, "inputEnabledMask is a single byte");
-constexpr uint8_t kInputMaskAll = static_cast<uint8_t>((1u << defaults::kInputCount) - 1u);
+// [INP4a-1] 4 слоти (0 радіо, 1 TV Box, 2 Computer, 3 USB): маска = 4 біти, за замовчуванням усі дозволені (0x0F).
+// Біт 0 (радіо) завжди 1 — вимкнути можна лише входи 1..3. Біт 3 (USB) примусово 0, якщо збірка без USB-входу
+// (FEATURE_USB_HOST = 0 або FEATURE_USB_MODE = 0). Апаратної недоступності входів немає: «доступний» = дозволений маскою.
+static_assert(defaults::kInputSlotCount <= 8, "inputEnabledMask is a single byte");
+constexpr uint8_t kInputMaskAll = static_cast<uint8_t>((1u << defaults::kInputSlotCount) - 1u);
 constexpr uint8_t kInputMaskRadioBit = 0x01;
-// [Prompt 48a] Маска за замовчуванням: усі три входи дозволені (0x07).
-constexpr uint8_t kInputMaskDefault = kInputMaskAll;
-static_assert(kInputMaskDefault == 0x07, "default input mask = radio + TV Box + Computer");
+constexpr uint8_t kInputMaskUsbBit = static_cast<uint8_t>(1u << defaults::kUsbInputIndex);
+// [INP4a-1] Біти, які бачить веб (логічні входи 0..kInputCount-1 = 0x07): відповіді /api/inputs лишаються 3-бітними.
+constexpr uint8_t kInputMaskWebVisible = static_cast<uint8_t>((1u << defaults::kInputCount) - 1u);
 
-// Єдине місце нормалізації маски: зайві біти (≥ kInputCount) скидаються, біт радіо = 1.
+#if FEATURE_USB_HOST && FEATURE_USB_MODE
+constexpr uint8_t kInputMaskBuilt = kInputMaskAll;  // вхід «USB» зібрано
+#else
+constexpr uint8_t kInputMaskBuilt = static_cast<uint8_t>(kInputMaskAll & ~kInputMaskUsbBit);  // USB не зібрано: біт 3 = 0
+#endif
+
+// Єдине місце нормалізації маски: зайві біти (≥ kInputSlotCount) скидаються, незібраний USB (біт 3) = 0, біт радіо = 1.
 constexpr uint8_t normalizeInputMask(uint8_t m) {
-    return static_cast<uint8_t>((m & kInputMaskAll) | kInputMaskRadioBit);
+    return static_cast<uint8_t>((m & kInputMaskBuilt) | kInputMaskRadioBit);
 }
+
+// [INP4a-1] Маска за замовчуванням: усі входи дозволені (0x0F; без USB-збірки — 0x07 через нормалізацію).
+constexpr uint8_t kInputMaskDefault = normalizeInputMask(kInputMaskAll);
+#if FEATURE_USB_HOST && FEATURE_USB_MODE
+static_assert(kInputMaskDefault == 0x0F, "default input mask = radio + TV Box + Computer + USB");
+#else
+static_assert(kInputMaskDefault == 0x07, "no USB input in this build: default mask = radio + TV Box + Computer");
+#endif
+static_assert(normalizeInputMask(0x00) == 0x01, "radio bit is always set");
+static_assert(normalizeInputMask(0xF0) == 0x01, "bits >= kInputSlotCount are cleared");
 
 // ---------------------------------------------------------------------------
 // Відкладений запис (дебаунс)

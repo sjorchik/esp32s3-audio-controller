@@ -69,9 +69,12 @@
 
 namespace {
 
+// [INP4a-1] Settings::inputNames має слоти налаштувань (kInputSlotCount = 4, слот 3 = USB); веб працює лише з
+// першими defaults::kInputCount (3) іменами — усі цикли нижче йдуть за kInputCount.
 static_assert(sizeof(Settings::inputNames) / sizeof(Settings::inputNames[0]) ==
-                  defaults::kInputCount,
-              "Settings::inputNames must have defaults::kInputCount entries");
+                  defaults::kInputSlotCount,
+              "Settings::inputNames must have defaults::kInputSlotCount entries");
+static_assert(defaults::kInputCount <= defaults::kInputSlotCount, "web inputs are a prefix of the settings slots");
 static_assert(sizeof(Settings::inputNames[0]) == web_cfg::kInputNameMaxBytes + 1,
               "web_cfg::kInputNameMaxBytes must match Settings::inputNames[i] size - 1");
 

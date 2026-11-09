@@ -1,5 +1,7 @@
 // Реалізація SettingsStore: один blob у NVS з версією формату, кеш у RAM,
 // відкладений запис з дебаунсом у власній легкій задачі.
+// [INP4a-1] Формат v9: inputNames[4][32] (слот 3 = USB), маска входів 4-бітна; Settings 170 Б, blob 174 Б (було 138 / 142).
+// БЕЗ МІГРАЦІЇ: blob v8 (142 Б) відхиляється за версією й розміром, діють дефолти.
 // [USB14] Розкладка після кроку USB14: profiles[4] (4-й слот — профіль «Player»), + playerShuffle / playerRepeat: Settings 138 Б,
 // blob 142 Б. БЕЗ МІГРАЦІЇ: blob v8 старої довжини (132 Б) не збігається з sizeof(StoredBlob) і відхиляється з логом (діють
 // дефолти, одразу записуються). Номер версії (settings_cfg::kFormatVersion, config/settings_config.h) цим кроком НЕ змінено
@@ -45,20 +47,21 @@ struct StoredBlob {
 static_assert(std::is_trivially_copyable<Settings>::value,
               "Settings is stored as raw bytes");
 static_assert(sizeof(Settings::inputNames) / sizeof(Settings::inputNames[0]) ==
-                  defaults::kInputCount,
-              "Settings::inputNames must have defaults::kInputCount rows");
+                  defaults::kInputSlotCount,
+              "Settings::inputNames must have defaults::kInputSlotCount rows");
 static_assert(sizeof(StoredBlob) <= 1024, "keep the blob small");
 
 // ---------------------------------------------------------------------------
-// Перевірки розкладки (формат v8)
+// Перевірки розкладки (формат v9)
 // ---------------------------------------------------------------------------
-static_assert(defaults::kInputCount == 3, "format v8 is laid out for 3 logical inputs (radio + TV Box + Computer)");
+static_assert(defaults::kInputCount == 3, "format v9 is laid out for 3 logical inputs (radio + TV Box + Computer) + USB slot");
+static_assert(defaults::kInputSlotCount == 4, "format v9 is laid out for 4 input slots (radio + TV Box + Computer + USB)");
 static_assert(sizeof(InputProfile) == 1 + eq_cfg::kBandCount + 1 + 1,
               "InputProfile = volume + EQ bands + balanceDb + vuSensDb, no padding");
 static_assert(sizeof(Settings::profiles) / sizeof(Settings::profiles[0]) == player_mode_cfg::kProfileCount,
               "[USB14] profiles[]: one per logical input + the Player slot");
-static_assert(sizeof(Settings) == 138, "[USB14] Settings is 138 bytes (was 128: +1 Player profile (8) + playerShuffle + playerRepeat)");
-static_assert(sizeof(StoredBlob) == 142, "[USB14] blob is 142 bytes (was 132; differs from every earlier format: 130/132/144/164/168/170/202)");
+static_assert(sizeof(Settings) == 170, "[INP4a-1] Settings is 170 bytes (was 138: +1 input name slot (32))");
+static_assert(sizeof(StoredBlob) == 174, "[INP4a-1] blob is 174 bytes (was 142; v8 blob of 142 bytes is rejected by version and size)");
 static_assert(defaults::kInputCount >= 1, "profiles[0] (radio) must exist");
 
 
@@ -114,7 +117,7 @@ private:
 // ---------------------------------------------------------------------------
 void fillDefaults(Settings& s) {
     memset(&s, 0, sizeof(s));
-    for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+    for (uint8_t i = 0; i < defaults::kInputSlotCount; ++i) {  // [INP4a-1] 4 слоти (слот 3 = USB, «Player»)
         snprintf(s.inputNames[i], sizeof(s.inputNames[i]), "%s", defaults::kInputNames[i]);
     }
     s.brightness = defaults::kDefaultBrightness;
@@ -135,7 +138,7 @@ void fillDefaults(Settings& s) {
         p.balanceDb = balance_cfg::kDefaultDb;
         p.vuSensDb = vu_sens_cfg::kDefaultDb;  // [V1]
     }
-    // [Prompt 48a] Усі три входи дозволені (0x07).
+    // [INP4a-1] Усі входи дозволені (0x0F; біт USB = 0, якщо збірка без USB-входу — див. settings_cfg::normalizeInputMask).
     s.inputEnabledMask = settings_cfg::kInputMaskDefault;
     s.playerShuffle = false;  // [USB14]
     s.playerRepeat = false;
@@ -154,10 +157,10 @@ void normalizeBool(bool& b) {
 // [P48a] balanceDb поза діапазоном (balance_cfg::kMinDb..kMaxDb) -> 0; [V1] vuSensDb поза діапазоном
 // (vu_sens_cfg::kMinDb..kMaxDb) -> 0.
 void sanitize(Settings& s) {
-    for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+    for (uint8_t i = 0; i < defaults::kInputSlotCount; ++i) {  // [INP4a-1]
         s.inputNames[i][sizeof(s.inputNames[i]) - 1] = '\0';
     }
-    if (s.lastInput >= defaults::kInputCount) {
+    if (s.lastInput > defaults::kUsbInputIndex) {  // [INP4a-1] допустимо 0..3 (3 = «USB»)
         s.lastInput = defaults::kDefaultInput;
     }
     normalizeBool(s.displayFlipped);
@@ -175,7 +178,7 @@ void sanitize(Settings& s) {
         s.profiles[i].balanceDb = balance_cfg::sanitizeDb(s.profiles[i].balanceDb);  // [Prompt 48a]
         s.profiles[i].vuSensDb = vu_sens_cfg::sanitizeDb(s.profiles[i].vuSensDb);    // [V1] поза діапазоном -> 0
     }
-    // [Prompt 39] Маска входів: зайві біти скидаємо, радіо (біт 0) завжди дозволене.
+    // [Prompt 39] Маска входів: зайві біти скидаємо, радіо (біт 0) завжди дозволене; [INP4a-1] біт 3 (USB) — лише в збірці з USB.
     s.inputEnabledMask = settings_cfg::normalizeInputMask(s.inputEnabledMask);
 }
 
@@ -385,8 +388,8 @@ bool SettingsStore::load() {
             Serial.printf("[SET] stored size %u unsupported, using defaults\n",
                           static_cast<unsigned>(len));
         } else {
-            // [Prompt 48a / V1] Приймаємо ЛИШЕ поточний формат v8 (версія + довжина + payload). Будь-який інший
-            // blob (старі версії v1..v7, чужа довжина) не мігрується: значення за замовчуванням.
+            // [Prompt 48a / V1] Приймаємо ЛИШЕ поточний формат v9 (версія + довжина + payload). Будь-який інший
+            // blob (старі версії v1..v8, чужа довжина) не мігрується: значення за замовчуванням.
             alignas(4) uint8_t raw[sizeof(StoredBlob)];
             memset(raw, 0, sizeof(raw));
             const size_t got = prefs.getBytes(settings_cfg::kNvsBlobKey, raw, len);
@@ -612,4 +615,5 @@ void SettingsStore::clearPlayerResume(PlayerSource src) {
 uint32_t SettingsStore::playerResumeWriteCount() {
     return s_resWrites;
 }
+
 

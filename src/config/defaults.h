@@ -22,10 +22,20 @@ constexpr bool   kDefaultMute    = false;
 // дозволені за замовчуванням (settings_cfg::kInputMaskDefault = 0x07).
 constexpr uint8_t kDefaultInput = 0;
 constexpr uint8_t kInputCount = 3;
-constexpr const char* kInputNames[kInputCount] = {
+// [INP4a-1] Слоти НАЛАШТУВАНЬ входів (Settings::inputNames, біти Settings::inputEnabledMask) = логічні входи + «USB»:
+// kInputSlotCount = 4, слот kUsbInputIndex = 3. kInputCount (3) НЕ змінено: веб-JSON, AppController (s_input 0..2) і
+// player_mode_cfg (kProfileCount = kInputCount + 1 = 4) працюють як раніше. Профіль слота 3 («Player») уже існує.
+constexpr uint8_t kInputSlotCount = 4;
+constexpr uint8_t kUsbInputIndex = 3;
+static_assert(kInputCount < kInputSlotCount && kUsbInputIndex == kInputSlotCount - 1,
+              "USB input is the last settings slot, right after the logical inputs");
+// Імена за замовчуванням: перші kInputCount елементів — як раніше (читачі, що індексують за kInputCount, не змінились);
+// слот 3 — за вказівкою власника «Player» (НЕ «USB Player»).
+constexpr const char* kInputNames[kInputSlotCount] = {
     "WiFi Radio",
     "TV Box",
     "Computer",
+    "Player",
 };
 
 // --- Дисплей ---

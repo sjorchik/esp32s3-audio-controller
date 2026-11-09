@@ -773,7 +773,8 @@ void handleVuPost(AsyncWebServerRequest* req) {
 // ВАЖЛИВО: імена в doc (char-масиви Settings) ArduinoJson може лише ПОСИЛАТИ, а не копіювати, тож
 // Settings `st` мусить жити в викликача, поки doc не серіалізовано (sendJson() — синхронний).
 void fillInputsState(JsonDocument& doc, const Settings& st) {
-    const uint8_t mask = settings_cfg::normalizeInputMask(st.inputEnabledMask);
+    // [INP4a-1] Маска Settings тепер 4-бітна (біт 3 = USB): веб бачить лише логічні входи 0..2 (відповідь як раніше).
+    const uint8_t mask = settings_cfg::normalizeInputMask(st.inputEnabledMask) & settings_cfg::kInputMaskWebVisible;
     const uint8_t hw = defaults::kInputCount;  // [P48a] апаратно доступні всі 3 логічні входи
     JsonArray arr = doc["inputs"].to<JsonArray>();
     for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
@@ -915,3 +916,4 @@ void registerPlayerRoutes(AsyncWebServer& server) {  // [P48a] без AudioProce
     // [USB15] Плеєр USB (/api/usb/*): реєструється тут, щоб web_server.cpp лишився без змін. При FEATURE_USB_MODE = 0 — порожня.
     registerUsbRoutes(server);
 }
+
