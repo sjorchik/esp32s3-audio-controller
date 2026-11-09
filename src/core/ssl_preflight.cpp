@@ -1,5 +1,7 @@
 // [DEF5b] Запобіжна перевірка перед https-підключенням радіо після USB-сесії (опис, інваріанти й захист від петлі —
 // у core/ssl_preflight.h). Лише WORKAROUND для DEF-5: причину (власник блока 448 Б) не усуває.
+// [DEF5d] ЗМІНЕНО: пробні виділення повторюють політику tls_psram (>= kMinBytes — спершу PSRAM, потім internal; див.
+// tls_psram::probeAlloc), у логу показано область. Логіка очікування, перезапуску, обмежувача й force НЕ змінена.
 
 #include "core/ssl_preflight.h"
 
@@ -15,6 +17,7 @@
 #include <atomic>
 
 #include "core/app_controller.h"
+#include "core/tls_psram.h"  // [DEF5d] probeAlloc / areaName
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -24,7 +27,6 @@ namespace ssl_preflight {
 namespace {
 
 constexpr const char* kTag = "[PREFLIGHT]";
-constexpr uint32_t kCaps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;  // ті самі caps, що й у збійному виділенні DEF-5 (0x804)
 
 std::atomic<bool> s_usbSession{false};       // у цьому запуску була хоч одна USB-сесія (скидається перезапуском)
 std::atomic<bool> s_restartRequested{false}; // перезапуск за перевіркою уже замовлено (один за запуск)
@@ -36,6 +38,7 @@ struct Result {
     uint32_t tries = 0;     // скільки спроб (1-based)
     uint32_t waitedMs = 0;  // від першої спроби до кінця
     bool forced = false;
+    tls_psram::Area area[ssl_preflight_cfg::kProbeCount] = {};  // [DEF5d] звідки пройшла кожна проба останньої спроби
 };
 
 bool httpsUrl(const char* url) { return url != nullptr && strncasecmp(url, "https://", 8) == 0; }
@@ -44,13 +47,17 @@ uint32_t freeInternal() { return static_cast<uint32_t>(heap_caps_get_free_size(M
 uint32_t largestInternal() { return static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)); }
 
 // Одна проба: kProbeCount послідовних виділень по kTlsBufBytes (перше невдале зупиняє серію), потім звільнення ВСІХ
-// успішних. Повертає, скільки виділень вдалось.
-uint8_t probeOnce() {
+// успішних. Повертає, скільки виділень вдалось. [DEF5d] Виділення — за політикою tls_psram (PSRAM, потім internal);
+// areas[i] — область i-ї проби (None — не вмістилось або не пробувалась).
+uint8_t probeOnce(tls_psram::Area* areas) {
     void* blk[ssl_preflight_cfg::kProbeCount] = {};
     uint8_t n = 0;
     for (uint8_t i = 0; i < ssl_preflight_cfg::kProbeCount; ++i) {
-        blk[i] = heap_caps_malloc(ssl_preflight_cfg::kTlsBufBytes, kCaps);
-        if (blk[i] == nullptr) {
+        areas[i] = tls_psram::Area::None;
+    }
+    for (uint8_t i = 0; i < ssl_preflight_cfg::kProbeCount; ++i) {
+        areas[i] = tls_psram::probeAlloc(ssl_preflight_cfg::kTlsBufBytes, &blk[i]);
+        if (areas[i] == tls_psram::Area::None) {
             break;
         }
         ++n;
@@ -69,7 +76,7 @@ Result evaluate() {
     const uint32_t t0 = millis();
     for (;;) {
         ++r.tries;
-        r.okCount = r.forced ? 0 : probeOnce();
+        r.okCount = r.forced ? 0 : probeOnce(r.area);
         if (r.okCount == ssl_preflight_cfg::kProbeCount) {
             r.ok = true;
             break;
@@ -83,13 +90,16 @@ Result evaluate() {
     return r;
 }
 
-// «alloc#1 ok, alloc#2 FAIL» (після першої невдачі решта — «skipped»; при force — «FORCED»).
+// «alloc#1 ok(psram), alloc#2 FAIL» (після першої невдачі решта — «skipped»; при force — «FORCED»). [DEF5d] у дужках — область.
 void describeAllocs(const Result& r, char* out, size_t cap) {
     size_t pos = 0;
     out[0] = '\0';
     for (uint8_t i = 0; i < ssl_preflight_cfg::kProbeCount; ++i) {
-        const char* s = r.forced ? "FORCED" : (i < r.okCount ? "ok" : (i == r.okCount ? "FAIL" : "skipped"));
-        const int w = snprintf(out + pos, cap - pos, "%salloc#%u %s", i == 0 ? "" : ", ", static_cast<unsigned>(i + 1), s);
+        const bool good = !r.forced && i < r.okCount;
+        const char* s = r.forced ? "FORCED" : (good ? "ok" : (i == r.okCount ? "FAIL" : "skipped"));
+        const int w = snprintf(out + pos, cap - pos, "%salloc#%u %s%s%s%s", i == 0 ? "" : ", ",
+                               static_cast<unsigned>(i + 1), s, good ? "(" : "", good ? tls_psram::areaName(r.area[i]) : "",
+                               good ? ")" : "");
         if (w < 0) {
             break;
         }
@@ -229,17 +239,18 @@ void handleConsole(const char* arg) {
         return;
     }
     Serial.printf("%s stat: usb_session=%d restart_requested=%d force=%d uptime=%u ms min_uptime=%u ms free=%u largest=%u "
-                  "probe=%ux%u B wait<=%u ms step=%u ms heapmap=%d\n",
+                  "probe=%ux%u B wait<=%u ms step=%u ms heapmap=%d tls_psram=%d\n",
                   kTag, s_usbSession.load() ? 1 : 0, s_restartRequested.load() ? 1 : 0, s_force.load() ? 1 : 0,
                   static_cast<unsigned>(millis()), static_cast<unsigned>(ssl_preflight_cfg::kMinUptimeMs),
                   static_cast<unsigned>(freeInternal()), static_cast<unsigned>(largestInternal()),
                   static_cast<unsigned>(ssl_preflight_cfg::kProbeCount),
                   static_cast<unsigned>(ssl_preflight_cfg::kTlsBufBytes),
                   static_cast<unsigned>(ssl_preflight_cfg::kMaxWaitMs), static_cast<unsigned>(ssl_preflight_cfg::kStepMs),
-                  USB_HEAPMAP ? 1 : 0);
+                  USB_HEAPMAP ? 1 : 0, TLS_PSRAM ? 1 : 0);
 }
 #endif  // USB_HOST_DIAG
 
 }  // namespace ssl_preflight
 
 #endif  // SSL_PREFLIGHT && FEATURE_USB_HOST
+

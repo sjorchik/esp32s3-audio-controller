@@ -60,7 +60,7 @@
 // й між циклами, хук невдалих виділень без друку з контексту хука, консоль `usb.hm …`. ЛИШЕ діагностика (нічого не
 // виправляє). 0 — нуль коду й RAM, поведінка збірок не змінюється; 1 — потребує USB_HOST_DIAG = 1 і FEATURE_USB_MODE = 1.
 // Під 1 обхід DEF-5 (ssl_workaround) НЕ перезапускає плату (лише лог «would restart»), щоб збій не стирав стан.
-#define USB_HEAPMAP 1
+#define USB_HEAPMAP 0
 #if USB_HEAPMAP && !USB_HOST_DIAG
 #error "USB_HEAPMAP = 1 requires USB_HOST_DIAG = 1 (config/features.h)"
 #endif
@@ -75,3 +75,10 @@
 // консольна команда `usb.preflight` і виклик у AudioPlayer::connectNow() повністю прибрані (inline-заглушки). Під
 // USB_HEAPMAP = 1 перевірка логується, але перезапуск НЕ робиться (діагностика DEF-5 бачить збій).
 #define SSL_PREFLIGHT 1
+
+// [DEF5d] Великі буфери mbedtls (>= tls_psram_cfg::kMinBytes = 16 384 Б, тобто два буфери запису TLS по 16 717 Б) — у PSRAM
+// через mbedtls_platform_set_calloc_free() (src/core/tls_psram.*, константи — config/tls_psram_config.h); дрібні — як і досі в
+// internal. Тоді DEF-5 (`(-32512)` після USB-сесії) не залежить від розкладки внутрішньої купи. tls_psram::install() — на
+// початку setup(). 0 — install() порожній, виділення TLS як раніше (internal), проби ssl_preflight — лише internal.
+// Не залежить від FEATURE_USB_HOST. Консоль `tls.mem stat` (і псевдонім `usb.tls stat`) — лише при USB_HOST_DIAG = 1.
+#define TLS_PSRAM 1

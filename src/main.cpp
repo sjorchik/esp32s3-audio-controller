@@ -29,6 +29,8 @@
 // - [USB2] Тестовий код usb_host_test.* замінено модулем usb/usb_msc_mount (USB-host MSC, монтування
 //   флешки в /usb); старт — в кінці setup() за FEATURE_USB_HOST && USB_HOST_AUTOSTART; діагностична
 //   консоль usb.* (USB_HOST_DIAG) опитується в loop().
+// - [DEF5d] tls_psram::install() — на самому початку setup() (одразу після банера, до WiFi і будь-якого TLS): великі буфери
+//   mbedtls (>= 16 384 Б) виділяються в PSRAM (TLS_PSRAM = 1).
 
 #include <Arduino.h>
 #include <LittleFS.h>
@@ -54,6 +56,7 @@
 #include "core/app_controller.h"  // [Prompt 8] ДОДАНО
 #include "core/events.h"
 #include "core/ssl_workaround.h"  // [USB13b] WORKAROUND DEF-5
+#include "core/tls_psram.h"       // [DEF5d] ДОДАНО
 #include "core/settings.h"       // [Prompt 6] ДОДАНО
 #include "core/settings_test.h"  // [Prompt 6] ДОДАНО
 #include "input/buttons.h"
@@ -352,6 +355,7 @@ void setup() {
     Serial.println("[MAIN] ESP32-S3 Audio Controller skeleton");
     Serial.println("[MAIN] Build: " __DATE__ " " __TIME__);
     ssl_workaround::onBoot();  // [USB13b] читає й стирає RTC-прапорець попереднього запуску (захист від петлі)
+    tls_psram::install();      // [DEF5d] ДО WiFi і будь-якого TLS: буфери mbedtls >= 16 384 Б -> PSRAM
 #if FEATURE_AMP_STANDBY
     Serial.printf("[MAIN] Amp standby pin GPIO%d: %s\n", pins::kAmpStby,
                   ampPinOk ? "standby level set" : "init failed");
@@ -458,3 +462,4 @@ void loop() {
     vTaskDelay(pdMS_TO_TICKS(1000));
 #endif
 }
+
