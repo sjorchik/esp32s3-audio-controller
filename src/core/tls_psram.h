@@ -36,8 +36,10 @@ void install();
 Area probeAlloc(size_t bytes, void** keep);
 
 #if FEATURE_USB_HOST && USB_HOST_DIAG
-// Консоль: `tls.mem [stat]` (псевдонім `usb.tls [stat]`) — див. usb_play_diag.cpp.
+// Консоль: `usb.tls [stat]` — див. usb_play_diag.cpp. [CLEAN1] Псевдонім `tls.mem` прибрано: консольний диспетчер пропускає
+// лише рядки, що починаються на «u», тож `tls.mem` ніколи не доходив до обробника.
 void handleConsole(const char* arg);
 #endif
 
 }  // namespace tls_psram
+

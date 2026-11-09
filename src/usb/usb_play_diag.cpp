@@ -1,4 +1,5 @@
-// [DEF5d] ДОДАНО команду tls.mem [stat] (і псевдонім usb.tls [stat]) -> tls_psram::handleConsole (лічильники виділень буферів TLS).
+// [CLEAN1] ПРИБРАНО неробочий псевдонім tls.mem (диспетчер консолі пропускає лише рядки на «u»); лишилась usb.tls [stat].
+// [DEF5d] ДОДАНО команду usb.tls [stat] -> tls_psram::handleConsole (лічильники виділень буферів TLS).
 // [DEF5b] ДОДАНО команду usb.preflight [test | force on | force off | stat] -> ssl_preflight::handleConsole (запобіжна перевірка DEF-5).
 // [DEF5a] ДОДАНО диспетчеризацію usb.hm (лише USB_HEAPMAP = 1) -> usb_heapmap::handleConsoleLine.
 // [USB13b] ДОДАНО команду usb.sslfail [dry | expired | stat] (імітація події -32512 після виходу; обхідне рішення DEF-5).
@@ -18,7 +19,7 @@
 #include "config/file_player_config.h"
 #include "core/ssl_preflight.h"   // [DEF5b] usb.preflight
 #include "core/ssl_workaround.h"  // [USB13b] usb.sslfail
-#include "core/tls_psram.h"       // [DEF5d] tls.mem
+#include "core/tls_psram.h"       // [DEF5d] usb.tls
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -54,7 +55,7 @@ bool matchWord(const char* s, const char* word, const char** rest) {
 }
 
 const char* const kWords[] = {"usb.play", "usb.pstat", "usb.seek", "usb.stopf", "usb.ended", "usb.fx", "usb.sslfail",
-                                 "tls.mem", "usb.tls"  // [DEF5d]
+                                 "usb.tls"  // [DEF5d]
 #if SSL_PREFLIGHT
                                  ,
                                  "usb.preflight"  // [DEF5b]
@@ -264,7 +265,7 @@ void handleConsoleLine(const char* line) {
         cmdFx(rest);
     } else if (matchWord(line, "usb.sslfail", &rest)) {
         ssl_workaround::handleConsole(rest);  // [USB13b]
-    } else if (matchWord(line, "tls.mem", &rest) || matchWord(line, "usb.tls", &rest)) {
+    } else if (matchWord(line, "usb.tls", &rest)) {
         tls_psram::handleConsole(rest);  // [DEF5d]
 #if SSL_PREFLIGHT
     } else if (matchWord(line, "usb.preflight", &rest)) {
@@ -290,4 +291,5 @@ void handleConsoleLine(const char* line) {
 }  // namespace usb_play_diag
 
 #endif  // FEATURE_USB_HOST && USB_HOST_DIAG
+
 

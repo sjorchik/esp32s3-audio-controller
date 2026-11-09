@@ -80,5 +80,6 @@
 // через mbedtls_platform_set_calloc_free() (src/core/tls_psram.*, константи — config/tls_psram_config.h); дрібні — як і досі в
 // internal. Тоді DEF-5 (`(-32512)` після USB-сесії) не залежить від розкладки внутрішньої купи. tls_psram::install() — на
 // початку setup(). 0 — install() порожній, виділення TLS як раніше (internal), проби ssl_preflight — лише internal.
-// Не залежить від FEATURE_USB_HOST. Консоль `tls.mem stat` (і псевдонім `usb.tls stat`) — лише при USB_HOST_DIAG = 1.
+// Не залежить від FEATURE_USB_HOST. Консоль `usb.tls [stat]` — лише при USB_HOST_DIAG = 1.
 #define TLS_PSRAM 1
+

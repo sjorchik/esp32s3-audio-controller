@@ -1,5 +1,6 @@
 #pragma once
 
+// [CLEAN1] ДОДАНО kCycleAutostartWaitMs (usb.hm cycle чекає автостарт відновлення замість прямого playFile).
 // [DEF5a] Константи діагностики «карта внутрішньої кучі» (src/usb/usb_heapmap.*). Діють лише при USB_HEAPMAP = 1
 // [DEF5c] ДОДАНО розділ «власник блока» (історія знімків циклу, дамп вмісту кандидатів, usb.hm mem): див. кінець namespace.
 // (config/features.h); значення тут НЕ змінюють поведінку збірок з USB_HEAPMAP = 0.
@@ -60,8 +61,11 @@ constexpr uint32_t kCycleFileMaxSec = 120;
 constexpr uint32_t kCycleDefaultFileSec = 10;
 // Скільки чекати результат підключення радіо (C7) після виходу. ПРИПУЩЕННЯ: TLS-підключення + backoff 1/2/4 с.
 constexpr uint32_t kCycleResultWaitMs = 30000;
-// Скільки чекати старт відтворення файлу після playFile().
+// Скільки чекати старт відтворення файлу після playFile() (ЗАПАСНИЙ шлях, коли автостарту не було).
 constexpr uint32_t kCycleFileStartWaitMs = 8000;
+// [CLEAN1] Скільки чекати автостарт відновлення (стан плеєра Playing після `resume autostart` у usb_nav) після Ready, перш ніж
+// перейти на запасний шлях (перший аудіофайл у корені). ПРИПУЩЕННЯ: 5000 мс (за промптом; вимірювань часу автостарту нема).
+constexpr uint32_t kCycleAutostartWaitMs = 5000;
 constexpr uint32_t kCyclePollMs = 50;
 // Розширення, які шукає «перший трек» у корені тому (регістр ігнорується).
 constexpr const char* const kAudioExt[] = {".mp3", ".flac", ".wav", ".aac", ".m4a", ".ogg", ".opus"};
@@ -129,6 +133,8 @@ constexpr uint32_t kPtrHighB = 0x40000000u;
 static_assert(kHeapMapMaxBlocks >= 256 && kHeapMapMaxBlocks <= 20000, "usb_heapmap: sane block limit");
 static_assert(kTaskScanMax >= 16 && kTaskRegistryMax >= 16, "usb_heapmap: sane task tables");
 static_assert(kCycleMaxCount >= 1 && kCycleMaxCount <= 100, "usb_heapmap: sane cycle limit");
+static_assert(kCycleDefaultFileSec >= 1 && kCycleDefaultFileSec <= kCycleFileMaxSec, "usb_heapmap: sane default file seconds");
+static_assert(kCycleAutostartWaitMs >= 1000 && kCycleAutostartWaitMs <= 30000, "usb_heapmap: sane autostart wait");
 static_assert(kHistoryPoints == 6, "usb_heapmap: history holds C1..C6");
 static_assert(kDumpMaxBlocks >= 1 && kDumpMaxBlocks <= 16, "usb_heapmap: sane candidate limit");
 static_assert(kDumpDetailBlocks <= kDumpMaxBlocks, "usb_heapmap: detail blocks <= candidates");
@@ -139,4 +145,5 @@ static_assert(kDumpWordsPerLine >= 1 && kDumpWordsPerLine <= 8, "usb_heapmap: he
 static_assert(kRegionMax >= 2 && kTextBufBytes >= 256, "usb_heapmap: sane region / text buffers");
 
 }  // namespace usb_heapmap_cfg
+
 

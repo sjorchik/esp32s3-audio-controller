@@ -1,3 +1,5 @@
+// [CLEAN1] ЗМІНЕНО `usb.hm cycle` (cmdCycle): імітація реального сценарію (чекати автостарт відновлення, відлік від першого Playing,
+// C3 знімається, поки файл грає); нові поля підсумку src / play_ms / tracks_played. Інше (точки, діфи, DEF5c) не чіпалось.
 // [DEF5a] Карта внутрішньої кучі (див. usb_heapmap.h і config/usb_heapmap_config.h). Лише USB_HEAPMAP = 1.
 //
 // Знімок: heap_caps_walk(MALLOC_CAP_INTERNAL) -> Rec{addr, size | used-біт} у PSRAM (callback нічого не друкує й не
@@ -1357,8 +1359,11 @@ bool isReady() {
 bool isOff() { return usb_mode::state() == usb_mode::State::Off || usb_mode::state() == usb_mode::State::Error; }
 bool isFilePlaying() { return AudioPlayer::fileActive() && AudioPlayer::state() == PlayerState::Playing; }
 
-// usb.hm cycle <N> [<сек файла>]: «вхід -> (перший трек -> пауза <сек>) -> вихід -> чекати результат радіо».
-// Без <сек> трек не відтворюється (БАЗА). Зупиняється на першому збої підключення радіо, щоб стан не стерся.
+// usb.hm cycle <N> [<сек>]: «вхід -> (автостарт відновлення -> грає <сек> від першого Playing) -> вихід -> чекати результат радіо».
+// [CLEAN1] <сек> типово kCycleDefaultFileSec (10); 0 — цикл БЕЗ файла (БАЗА). Прямий playFile одразу після Ready більше НЕ
+// викликається: він конфліктував з автостартом відновлення (`resume autostart` у usb_nav), вихід починався за ≈ 1,5 с і C3 не
+// знімалась. Тепер: чекаємо Playing до kCycleAutostartWaitMs; не було (немає збереженої позиції) — запасно перший аудіофайл
+// у корені (як раніше). Відлік <сек> не скидається при зміні треків. Зупиняється на першому збої підключення радіо.
 void cmdCycle(const char* arg) {
     const long n = atol(arg);
     const char* p = arg;
@@ -1366,10 +1371,11 @@ void cmdCycle(const char* arg) {
         ++p;
     }
     p = skipWs(p);
-    const long sec = (*p != '\0') ? atol(p) : 0;
+    const long sec = (*p != '\0') ? atol(p) : static_cast<long>(kCycleDefaultFileSec);
     if (n < 1 || n > static_cast<long>(kCycleMaxCount) || sec < 0 || sec > static_cast<long>(kCycleFileMaxSec)) {
-        Serial.printf("%s usage: usb.hm cycle <N 1..%u> [<file sec 1..%u>]  (no seconds = no file, BASE cycles)\n", kTag,
-                      static_cast<unsigned>(kCycleMaxCount), static_cast<unsigned>(kCycleFileMaxSec));
+        Serial.printf("%s usage: usb.hm cycle <N 1..%u> [<play sec 0..%u>]  (default %u s; 0 = no file, BASE cycles)\n", kTag,
+                      static_cast<unsigned>(kCycleMaxCount), static_cast<unsigned>(kCycleFileMaxSec),
+                      static_cast<unsigned>(kCycleDefaultFileSec));
         return;
     }
     if (usb_mode::state() != usb_mode::State::Off) {
@@ -1380,8 +1386,11 @@ void cmdCycle(const char* arg) {
         s_autoOn.store(true);
         Serial.printf("%s cycle: auto points switched ON\n", kTag);
     }
-    Serial.printf("%s cycle: N=%ld file=%lds (loopTask is blocked until the cycles end; radio must be the current input)\n",
+    Serial.printf("%s cycle: N=%ld play=%lds (loopTask is blocked until the cycles end; radio must be the current input)\n",
                   kTag, n, sec);
+    // Буфери імен треків — статичні (не збільшувати стек loopTask).
+    static char s_curTrack[file_player_cfg::kPathMax];
+    static char s_lastTrack[file_player_cfg::kPathMax];
     for (long c = 1; c <= n; ++c) {
         const uint32_t seq0 = s_resultSeq.load();
         const char* why = nullptr;
@@ -1394,21 +1403,55 @@ void cmdCycle(const char* arg) {
             return;
         }
         bool filePlayed = false;
+        const char* src = "none";  // autostart | fallback | none
+        uint32_t playMs = 0;
+        uint32_t tracksPlayed = 0;
         if (sec > 0) {
-            char path[file_player_cfg::kPathMax];
             if (usb_mode::media() != usb_mode::Media::Mounted) {
                 Serial.printf("%s cycle %ld/%ld: media=%s - cycle without a file\n", kTag, c, n, usb_mode::mediaName(usb_mode::media()));
-            } else if (!findFirstTrack(path, sizeof(path))) {
-                Serial.printf("%s cycle %ld/%ld: no audio file in the volume root - cycle without a file\n", kTag, c, n);
-            } else if (!AudioPlayer::playFile(path, -1)) {
-                Serial.printf("%s cycle %ld/%ld: playFile('%s') refused - cycle without a file\n", kTag, c, n, path);
-            } else if (!waitFor(isFilePlaying, kCycleFileStartWaitMs)) {
-                Serial.printf("%s cycle %ld/%ld: file did not start in %u ms\n", kTag, c, n, static_cast<unsigned>(kCycleFileStartWaitMs));
             } else {
-                filePlayed = true;
-                const uint32_t t0 = millis();
-                while (millis() - t0 < static_cast<uint32_t>(sec) * 1000u && AudioPlayer::fileActive()) {
-                    vTaskDelay(pdMS_TO_TICKS(kCyclePollMs));
+                // 1) Автостарт відновлення (стан плеєра Playing без нашого playFile).
+                const uint32_t wa0 = millis();
+                bool playing = waitFor(isFilePlaying, kCycleAutostartWaitMs);
+                if (playing) {
+                    src = "autostart";
+                    Serial.printf("%s cycle %ld/%ld: resume autostart is playing (%u ms after Ready)\n", kTag, c, n,
+                                  static_cast<unsigned>(millis() - wa0));
+                } else {
+                    // 2) Запасний шлях: автостарту не було (немає збереженої позиції) — перший аудіофайл у корені.
+                    char path[file_player_cfg::kPathMax];
+                    Serial.printf("%s cycle %ld/%ld: no autostart in %u ms - fallback to the first file in the volume root\n", kTag, c, n,
+                                  static_cast<unsigned>(kCycleAutostartWaitMs));
+                    if (!findFirstTrack(path, sizeof(path))) {
+                        Serial.printf("%s cycle %ld/%ld: no audio file in the volume root - cycle without a file\n", kTag, c, n);
+                    } else if (!AudioPlayer::playFile(path, -1)) {
+                        Serial.printf("%s cycle %ld/%ld: playFile('%s') refused - cycle without a file\n", kTag, c, n, path);
+                    } else if (!waitFor(isFilePlaying, kCycleFileStartWaitMs)) {
+                        Serial.printf("%s cycle %ld/%ld: file did not start in %u ms\n", kTag, c, n, static_cast<unsigned>(kCycleFileStartWaitMs));
+                    } else {
+                        playing = true;
+                        src = "fallback";
+                    }
+                }
+                if (playing) {
+                    filePlayed = true;
+                    // Відлік від першого Playing; НЕ скидається при зміні треків (між треками fileActive() на мить false — це нормально).
+                    const uint32_t t0 = millis();
+                    s_lastTrack[0] = '\0';
+                    const uint32_t holdMs = static_cast<uint32_t>(sec) * 1000u;
+                    while (true) {
+                        if (AudioPlayer::currentFilePath(s_curTrack, sizeof(s_curTrack)) && strcmp(s_curTrack, s_lastTrack) != 0) {
+                            strcpy(s_lastTrack, s_curTrack);  // той самий розмір буфера
+                            ++tracksPlayed;
+                            Serial.printf("%s cycle %ld/%ld: track #%u '%s' at +%u ms\n", kTag, c, n, static_cast<unsigned>(tracksPlayed),
+                                          s_curTrack, static_cast<unsigned>(millis() - t0));
+                        }
+                        if (millis() - t0 >= holdMs || usb_mode::state() == usb_mode::State::Error) {
+                            break;
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(kCyclePollMs));
+                    }
+                    playMs = millis() - t0;  // до початку виходу: C3 знімається вже всередині requestExit, поки файл грає
                 }
             }
         }
@@ -1423,7 +1466,8 @@ void cmdCycle(const char* arg) {
         }
         const bool got = s_resultSeq.load() != seq0;
         const int ok = s_lastResultOk.load();
-        Serial.printf("%s cycle %ld/%ld done: file=%d radio_connect=%s (%u ms)\n", kTag, c, n, filePlayed ? 1 : 0,
+        Serial.printf("%s cycle %ld/%ld done: file=%d src=%s play_ms=%u tracks_played=%u radio_connect=%s (%u ms)\n", kTag, c, n,
+                      filePlayed ? 1 : 0, src, static_cast<unsigned>(playMs), static_cast<unsigned>(tracksPlayed),
                       !got ? "NO RESULT (timeout; is the radio the current input?)" : (ok ? "OK" : "FAIL"),
                       static_cast<unsigned>(s_lastResultMs.load()));
         if (got && ok == 0) {
@@ -1466,11 +1510,12 @@ void handleConsoleLine(const char* line) {
     } else if (word(rest, "mem", &arg)) {  // [DEF5c]
         cmdMem(arg);
     } else {
-        Serial.printf("%s usage: usb.hm stat | snap <tag> | diff | dump [full] | mem <hex addr> [bytes] | auto on|off | cycle <N> [<file sec>]\n", kTag);
+        Serial.printf("%s usage: usb.hm stat | snap <tag> | diff | dump [full] | mem <hex addr> [bytes] | auto on|off | cycle <N> [<play sec>]\n", kTag);
     }
 }
 
 }  // namespace usb_heapmap
 
 #endif  // USB_HEAPMAP
+
 

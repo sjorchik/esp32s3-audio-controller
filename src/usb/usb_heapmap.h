@@ -15,6 +15,8 @@
 // Потоки: точки викликаються із задач usb_mode (C0 – C5) і плеєра (C6, C7); виклики серіалізує мʼютекс модуля.
 // Консоль (диспетчеризація — usb_play_diag): usb.hm stat | snap <tag> | diff | dump [full] | mem <hex-адреса> [байт] | auto on|off |
 // cycle <N> [<сек>].
+// [CLEAN1] `cycle` імітує реальний сценарій: чекає автостарт відновлення (запасно — перший файл у корені), відлік <сек> (типово 10;
+// 0 = цикл без файла) — від першого Playing; підсумок циклу містить src / play_ms / tracks_played. Публічний API не змінено.
 // [DEF5c] ДОДАНО: на C5 — кандидати «власника блока» (рядки `[HM]   blk …`, hex-дамп, класифікація слів), на C6 — рядок
 // `still-allocated`, консоль `usb.hm mem <hex-адреса> [байт <= 256]`. Публічний API (point / connectResult / handleConsoleLine)
 // і макроси HEAPMAP_POINT / HEAPMAP_CONNECT_RESULT НЕ змінено.
@@ -53,4 +55,5 @@ void handleConsoleLine(const char* line);
     } while (0)
 
 #endif  // USB_HEAPMAP
+
 
