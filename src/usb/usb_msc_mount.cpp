@@ -1,3 +1,4 @@
+// [CLEAN1b] ДОДАНО другий рядок usb.help (`[USB] commands (more):`) для usb.hm / usb.preflight / usb.tls; логіка без змін.
 // [USB13] DEF-9: unmountLocked() ПЕРЕД msc_host_vfs_unregister закриває всі відкриті файли / каталоги обгортки
 // (usb_fs::closeAllForUnmountLocked); `usb.heap` розширено (класи пам'яті, невдалі виділення, дескриптори).
 // [USB2] Постійний модуль монтування USB-флешки (USB-host MSC). Замінює src/usb_host_test.*.
@@ -1807,6 +1808,19 @@ void handleLine(const char* line) {
                       "usb.begin [nowait] | usb.beginend <ms> | usb.sweep <from> <to> <step> [runs] | usb.end | usb.prio [<lib> <msc> <mgr> | default] | usb.trace | "
                       "usb.play <path> [start_sec] | usb.pstat | usb.seek <sec> | usb.stopf | usb.ended [take] | usb.fx [extra <ms> | dig <ms|-1> | level <dB>]\n",
                       kTag);
+#if USB_HOST_DIAG
+        // [CLEAN1b] Другий рядок довідки: команди, що диспетчеризуються в usb_play_diag.cpp (ті самі умови збірки).
+        // usb.tls зареєстровано без умови TLS_PSRAM (при TLS_PSRAM = 0 друкує stat із TLS_PSRAM=0), тому тут теж без неї.
+        Serial.printf("%s commands (more): "
+#if USB_HEAPMAP
+                      "usb.hm stat | snap <tag> | diff | dump [full] | mem <hex> [bytes] | auto on|off | cycle <N> [<sec>] | "
+#endif
+#if SSL_PREFLIGHT
+                      "usb.preflight test | force on|off | stat | "
+#endif
+                      "usb.tls [stat]\n",
+                      kTag);
+#endif
 #if USB_HOST_DIAG
     } else if (usb_play_diag::isPlayCommand(line)) {
         usb_play_diag::handleConsoleLine(line);  // [USB7]

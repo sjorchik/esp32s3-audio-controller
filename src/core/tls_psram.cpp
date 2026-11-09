@@ -1,3 +1,4 @@
+// [CLEAN1b] Прибрано згадку неробочого псевдоніма tls.mem (текст usage команди usb.tls); логіка без змін.
 // [DEF5d] Буфери mbedtls >= tls_psram_cfg::kMinBytes — у PSRAM (опис, політика й інваріанти — у core/tls_psram.h).
 
 #include "core/tls_psram.h"
@@ -144,7 +145,7 @@ Area probeAlloc(size_t bytes, void** keep) {
 void handleConsole(const char* arg) {
     const char* a = (arg != nullptr) ? arg : "";
     if (a[0] != '\0' && strcmp(a, "stat") != 0) {
-        Serial.printf("%s usage: tls.mem [stat]   (alias: usb.tls [stat])\n", kTag);
+        Serial.printf("%s usage: usb.tls [stat]\n", kTag);
         return;
     }
     Serial.printf("%s mem stat: TLS_PSRAM=%d installed=%d rc=%d kMinBytes=%u bigPsram=%lu fallback=%lu bigFailed=%lu "
