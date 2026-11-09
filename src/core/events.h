@@ -49,15 +49,17 @@ enum class Action : uint8_t {
     BALANCE_DOWN,
     GAIN_UP,
     GAIN_DOWN,
-    // [USB11] ДОДАНО (лише в кінець): перемикач режиму «USB» (RC5; фізичної кнопки немає). Увійти в режим, якщо його
-    // нема; інакше вийти на попередній вхід. Дія існує в enum і в таблиці ir_rc5 ЗАВЖДИ (щоб мапа IR в NVS лишалась
-    // валідною при зміні FEATURE_USB_MODE), але AppController її обробляє, а action_names пропонує для навчання
-    // лише при FEATURE_USB_MODE = 1. УВАГА: ir_rc5::kActionCount тепер = USB_MODE + 1 (раніше GAIN_DOWN + 1).
-    USB_MODE,
+    // [USB11] ДОДАНО (лише в кінець): дія режиму «USB» (RC5; фізичної кнопки немає). [INP4a-2] ПЕРЕЙМЕНОВАНА з USB_MODE на
+    // INPUT_USB НА ТОМУ САМОМУ місці enum (числове значення в NVS-мапі IR те саме, наступні значення не зсунулись): тепер це
+    // прямий вибір входу «USB» (як INPUT_RADIO / INPUT_TV / INPUT_PC): входить у режим; у режимі «USB» нічого не робить
+    // (вихід — вибір іншого входу). Дія існує в enum і в таблиці ir_rc5 ЗАВЖДИ (щоб мапа IR в NVS лишалась валідною при
+    // зміні FEATURE_USB_MODE), але AppController її обробляє, а action_names пропонує для навчання лише при
+    // FEATURE_USB_MODE = 1. УВАГА: ir_rc5::kActionCount = USB_REPEAT + 1 (раніше GAIN_DOWN + 1, далі USB_MODE + 1).
+    INPUT_USB,
     // [USB14] ДОДАНО (лише в кінець): перемикачі режиму «USB» (RC5; фізичних кнопок немає). USB_SHUFFLE — перемішування,
-    // USB_REPEAT — повтор усього; діють ЛИШЕ в режимі «USB» (поза ним AppController їх ігнорує). Як і USB_MODE, існують в
+    // USB_REPEAT — повтор усього; діють ЛИШЕ в режимі «USB» (поза ним AppController їх ігнорує). Як і INPUT_USB, існують в
     // enum і в таблиці ir_rc5 ЗАВЖДИ (мапа IR в NVS валідна при будь-якому FEATURE_USB_MODE), а action_names пропонує їх для
-    // навчання лише при FEATURE_USB_MODE = 1. УВАГА: ir_rc5::kActionCount тепер = USB_REPEAT + 1 (раніше USB_MODE + 1).
+    // навчання лише при FEATURE_USB_MODE = 1. УВАГА: ir_rc5::kActionCount тепер = USB_REPEAT + 1 (раніше INPUT_USB, тоді ще USB_MODE, + 1).
     USB_SHUFFLE,
     USB_REPEAT,
 };

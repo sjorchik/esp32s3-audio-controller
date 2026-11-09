@@ -28,7 +28,9 @@ const Info kTable[] = {
     {Action::INPUT_PC, "INPUT_PC", true},
     {Action::INPUT_AUX, "INPUT_AUX", false},  // [P49e] вхід AUX видалено
 #if FEATURE_USB_MODE
-    {Action::USB_MODE, "USB_MODE", true},  // [USB11] перемикач режиму «USB»: увійти / вийти на попередній вхід
+    // [INP4a-2] Було USB_MODE. Прямий вибір входу «USB» (підпис для UI / вебу: «Вхід USB»; сама таблиця підписів не має -
+    // українські підписи живуть у webui, див. USB16a): входить у режим; у режимі «USB» нічого не робить.
+    {Action::INPUT_USB, "INPUT_USB", true},
     {Action::USB_SHUFFLE, "USB_SHUFFLE", true},  // [USB14] перемішування (лише в режимі «USB»)
     {Action::USB_REPEAT, "USB_REPEAT", true},    // [USB14] повтор усього (лише в режимі «USB»)
 #endif
@@ -96,4 +98,3 @@ bool isLearnable(Action action) {
 }
 
 }  // namespace action_names
-

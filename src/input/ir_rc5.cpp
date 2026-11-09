@@ -33,6 +33,7 @@ constexpr uint8_t kRc5xCmdBit    = 0x40;            // 7-й біт команд�
 // USB_MODE — одразу після GAIN_DOWN, USB_SHUFFLE і USB_REPEAT — одразу після USB_MODE. [USB14] Було USB_MODE + 1: формат NVS
 // мапи не змінювався (записи зберігають числове значення Action; старі мапи без нових дій валідні), але прошивка з вузьким
 // kActionCount відхилила б мапу, у якій навчено USB_SHUFFLE / USB_REPEAT (id >= kActionCount -> «invalid entry»).
+// [INP4a-2] Дія USB_MODE перейменована на INPUT_USB на тому самому місці enum: числове значення в записах NVS не змінилось.
 // [USB11 історично] Було GAIN_DOWN + 1 до додавання USB_MODE. [USB11] Було GAIN_DOWN + 1: формат NVS мапи не змінювався (записи зберігають
 // числове значення Action; старі мапи без USB_MODE валідні), але прошивка з вузьким kActionCount відхилила б мапу,
 // у якій навчено USB_MODE (action id >= kActionCount -> «invalid entry»).
@@ -86,7 +87,7 @@ const ActionName kActionNames[] = {
     {Action::BALANCE_DOWN, "BALANCE_DOWN"},
     {Action::GAIN_UP, "GAIN_UP"},
     {Action::GAIN_DOWN, "GAIN_DOWN"},
-    {Action::USB_MODE, "USB_MODE"},  // [USB11]
+    {Action::INPUT_USB, "INPUT_USB"},  // [USB11] було USB_MODE; [INP4a-2] перейменовано, id той самий
     {Action::USB_SHUFFLE, "USB_SHUFFLE"},  // [USB14]
     {Action::USB_REPEAT, "USB_REPEAT"},    // [USB14]
 };
@@ -102,6 +103,9 @@ const char* nameOf(uint8_t action) {
 
 bool actionFromName(const char* name, uint8_t& out) {
     if (name == nullptr) return false;
+    // [INP4a-2] Застарілий псевдонім: дія USB_MODE перейменована на INPUT_USB (те саме числове значення). Лише для імпорту
+    // старих бекапів мапи; exportJson() (через nameOf) завжди пише "INPUT_USB".
+    if (strcmp(name, "USB_MODE") == 0) name = "INPUT_USB";
     for (const ActionName& n : kActionNames) {
         if (strcmp(n.name, name) == 0) {
             out = static_cast<uint8_t>(n.action);
@@ -870,4 +874,3 @@ bool IrRc5::importJson(const JsonDocument& doc) {
     gMapCount = count;
     return saveLocked();
 }
-
