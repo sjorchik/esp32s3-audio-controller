@@ -5,7 +5,7 @@
 // йде через AppController::runWebCommand(): це чисто програмний фільтр у хуку PCM (audio/eq.*),
 // без заліза й без стану контролера; обробник кладе значення в eq::* і в Settings (NVS, дебаунс).
 // [Prompt 48a] Аудіочіпи вирізано: 3 логічні входи (0 радіо, 1 TV Box, 2 Computer), `requireProc()` і
-// capabilities() прибрано; діапазон гучності — audio_cfg::kVolumeUiMin..kVolumeUiMax; /api/inputs і /api/eq працюють по kInputCount (3). registerPlayerRoutes() без параметра AudioProcessor*: параметр прибрано разом із AudioProcessor.
+// capabilities() прибрано; діапазон гучності — audio_cfg::kVolumeUiMin..kVolumeUiMax; /api/inputs і /api/eq працюють по kInputCount (3; [INP4b] тепер по kInputSlotCount = 4). registerPlayerRoutes() без параметра AudioProcessor*: параметр прибрано разом із AudioProcessor.
 // [Prompt 48b] + POST /api/balance {"value":N[,"input":M]}: цифровий баланс ±20 дБ (balance_cfg), індивідуальний для кожного
 // входу. Активний вхід (без `input` або input == поточний) — через AppController::runWebCommand(BalanceSet): DSP
 // радіо / проходу + профіль; НЕАКТИВНИЙ вхід — лише запис у Settings (як /api/eq), застосується при перемиканні.
@@ -13,6 +13,11 @@
 // входу. Зразок — /api/balance: активний вхід (без `input` або input == поточний) — через
 // AppController::runWebCommand(VuSensSet) (VU реагує одразу + профіль); НЕАКТИВНИЙ вхід — лише запис у Settings
 // (застосується при перемиканні на вхід). Чутливість VU — лише зсув показу, на звук не впливає.
+// [INP4b] USB = ЧЕТВЕРТИЙ вхід (індекс defaults::kUsbInputIndex = 3, профіль «Player» = Settings::profiles[3]). Усі «для входу N»
+// ендпоїнти (/api/inputs, /api/input, /api/eq, /api/balance, /api/vu) працюють по defaults::kInputSlotCount (4). «Веб-активний
+// вхід» (webActiveInput()) = 3, поки опублікований стан режиму «USB» (AppStateData::usbUi) != Off, інакше AppStateData::inputIndex
+// (у режимі він лишається входом ДО режиму). POST /api/input {"index":3} -> 202 pending reason "usb_enter"; масиви enabled у
+// POST /api/inputs — 3 (ЗАСТАРІЛО, лише слоти 0..2) або 4 елементи; вимкнення USB у режимі «USB» -> 409 input_active.
 // [Prompt 46a] Пресет EQ тепер ПО ВХОДАХ (Settings::profiles[i].eqGainsDb): /api/eq читає й пише профіль
 // ПОТОЧНОГО входу (AppState.inputIndex); на екземпляр радіо (eq::setAllDb) значення потрапляє лише коли
 // поточний вхід 0. Форма запиту/відповіді не змінилась (поле `input` — у P46b).
@@ -41,6 +46,7 @@
 #include "config/eq_config.h"
 #include "config/audio_config.h"     // [P48a] kVolumeUiMin / kVolumeUiMax
 #include "config/balance_config.h"   // [Prompt 48b] isValidDb / kMinDb / kMaxDb
+#include "config/player_mode_config.h"  // [INP4b] player_mode_cfg::kProfileIndex / kProfileCount (static_assert)
 #include "config/settings_config.h"  // [Prompt 39] normalizeInputMask
 #include "config/vu_sens_config.h"    // [V2] isValidDb / sanitizeDb / kMinDb / kMaxDb / kStepDb
 #include "core/app_controller.h"
@@ -53,25 +59,36 @@ namespace {
 
 using namespace web_api;
 
+// [INP4b] Слоти входів веб-API = слоти налаштувань (0..2 логічні входи, 3 = «USB» / профіль «Player»).
+constexpr uint8_t kSlots = defaults::kInputSlotCount;
+static_assert(player_mode_cfg::kProfileIndex == defaults::kUsbInputIndex,
+              "web input slot 3 must be the Player profile slot");
+static_assert(player_mode_cfg::kProfileCount >= defaults::kInputSlotCount,
+              "Settings::profiles must cover every web input slot");
+static_assert(sizeof(Settings::inputNames) / sizeof(Settings::inputNames[0]) == defaults::kInputSlotCount,
+              "Settings::inputNames must cover every web input slot");
+
 // {"ok":true,"state":{...}} — компактний знімок ПІСЛЯ команди (контролер уже опублікував
 // стан у AppState). streamStatus свідомо не віддаємо: він оновлюється періодично
 // (app_controller_cfg::kSyncPeriodMs) і одразу після команди міг би бути застарілим —
 // клієнт бере його з GET /api/status.
 // [USB15] pendingTarget >= 0: команда прийнята, але ще виконується (зміна входу з режиму «USB»: вихід із режиму ≈ 1 с) ->
 // HTTP 202 і поля pending / reason / target; state — знімок на момент відповіді (вхід ще старий).
-void sendOkState(AsyncWebServerRequest* req, int pendingTarget = -1) {
+// [INP4b] pendingReason: "usb_exit" (вихід із режиму «USB» до входу target) або "usb_enter" (вхід у режим «USB», target = 3);
+// state.input = webActiveInput() (у режимі «USB» = 3, тобто СТАРИЙ вхід для usb_exit і ще НЕ новий для usb_enter).
+void sendOkState(AsyncWebServerRequest* req, int pendingTarget = -1, const char* pendingReason = "usb_exit") {
     const AppStateData st = AppState::snapshot();
     JsonDocument doc;
     doc["ok"] = true;
     if (pendingTarget >= 0) {
         doc["pending"] = true;
-        doc["reason"] = "usb_exit";
+        doc["reason"] = pendingReason;
         doc["target"] = pendingTarget;
     }
     JsonObject s = doc["state"].to<JsonObject>();
     s["mode"] = modeName(st.mode);
     s["standby"] = (st.mode == Mode::Standby);
-    s["input"] = st.inputIndex;
+    s["input"] = webActiveInput(st);
     s["volume"] = st.volume;
     s["mute"] = st.mute;
     s["stationIndex"] = st.stationIndex;
@@ -207,7 +224,7 @@ void handleVolume(AsyncWebServerRequest* req) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /api/input {"index":N}   [Prompt 48a] логічний вхід 0..2 (радіо, TV Box, Computer)
+// POST /api/input {"index":N}   [Prompt 48a] логічний вхід 0..2 (радіо, TV Box, Computer); [INP4b] + 3 = «USB»
 // ---------------------------------------------------------------------------
 void handleInput(AsyncWebServerRequest* req) {
     if (!exactUrl(req, "/api/input")) return;
@@ -223,10 +240,9 @@ void handleInput(AsyncWebServerRequest* req) {
         sendFieldError(req, 400, "invalid_value", "index");
         return;
     }
-    const int logicalCount = defaults::kInputCount;
     const int x = v.as<int>();
-    if (x < 0 || x >= logicalCount) {
-        sendRangeError(req, "index", 0, logicalCount - 1);
+    if (x < 0 || x >= kSlots) {  // [INP4b] 0..3 (max = 3)
+        sendRangeError(req, "index", 0, kSlots - 1);
         return;
     }
     // [USB15] У режимі «USB» команда не відхиляється, а ставить відкладену ціль (вихід із режиму й перехід на вхід x, як UP / DOWN
@@ -235,7 +251,13 @@ void handleInput(AsyncWebServerRequest* req) {
     const WebCmdResult r = AppController::runWebCommand({WebCmdType::InputSet, x, false}, &why);
     WEB_API_LOG("cmd InputSet -> result %d (%s)", static_cast<int>(r), why != nullptr ? why : "-");
     if (r == WebCmdResult::Ok && why != nullptr && strcmp(why, "usb_exit_pending") == 0) {
-        sendOkState(req, x);
+        sendOkState(req, x, "usb_exit");
+        return;
+    }
+    // [INP4b] Вхід 3 (контролер: navRequest(3)): вхід у режим «USB» триває ≈ 1 с -> 202 pending usb_enter. Якщо режим уже є й
+    // виходу не заплановано — Ok без причини -> 200 (ідемпотентно, як вибір поточного входу). Вимкнений / недоступний -> 409 input_disabled.
+    if (r == WebCmdResult::Ok && why != nullptr && strcmp(why, "usb_enter_pending") == 0) {
+        sendOkState(req, x, "usb_enter");
         return;
     }
     sendResult(req, r, why);
@@ -322,15 +344,39 @@ void handlePlayerStation(AsyncWebServerRequest* req) {
 //         -> 200 {"ok":true, ...те саме, що GET}
 // [Prompt 46b] Необовʼязковий вхід: GET /api/eq?input=N, POST {"input":N,...}; N = 0..2 (P48a; профіль цього входу,
 // незалежно від апаратної доступності); без поля — ПОТОЧНИЙ вхід. Відповідь (GET і POST) містить "input".
+// [INP4b] N = 0..3: слот 3 = профіль «Player» (режим «USB»). Живе застосування (applyEqLive): слот 3 — коли режим «USB» активний,
+// через екземпляр EQ радіо (eq::setAllDb; через нього звучить файл); вхід 0 — коли режим НЕ активний; 1 / 2 — як раніше
+// (applyLineEq); решта випадків — лише профіль (застосується при перемиканні).
 // [Prompt 46a] Пресет — ПОТОЧНОГО входу (профіль у Settings). Зберігається для будь-якого входу;
 // на екземпляр радіо діє лише пресет входу 0. [Prompt 47c] Пресет ПОТОЧНОГО зовнішнього входу застосовується
 // живцем через AppController::applyLineEq() (екземпляр EQ проходу); решти входів — лише профіль.
 // ---------------------------------------------------------------------------
 
-// Поточний вхід — з AppState (публікує AppController); поза межами профілів -> 0.
+// Поточний («веб-активний») вхід — webActiveInput() над знімком AppState: 3, поки режим «USB» активний, інакше inputIndex.
+// [INP4b] Назву eqInputIndex() збережено (її викликають усі обробники нижче).
 uint8_t eqInputIndex() {
-    const uint8_t i = AppState::snapshot().inputIndex;
-    return i < defaults::kInputCount ? i : 0;
+    return webActiveInput(AppState::snapshot());
+}
+
+// [INP4b] Живе застосування пресету EQ входу `input` (профіль у Settings уже записано). `active` = eqInputIndex() ДО запису.
+void applyEqLive(uint8_t input, uint8_t active, const int8_t gains[eq_cfg::kBandCount]) {
+    const bool usbActive = (active == defaults::kUsbInputIndex);
+    if (input == defaults::kUsbInputIndex) {
+        if (usbActive) {
+            eq::setAllDb(gains);  // екземпляр радіо: файл у режимі «USB» звучить через нього
+        }
+        return;  // режим не активний: лише профіль
+    }
+    if (usbActive) {
+        return;  // екземпляр радіо зайнятий пресетом «Player» (при виході режиму контролер перезавантажить пресет входу 0)
+    }
+    if (input == 0) {
+        eq::setAllDb(gains);  // екземпляр радіо: лише пресет входу 0, звук змінюється одразу
+    } else {
+        // [Prompt 47c] Зовнішній вхід: якщо він ПОТОЧНИЙ — пресет одразу на екземпляр проходу
+        // (логіка в AppController); інакше лише профіль, застосується при перемиканні на вхід.
+        AppController::applyLineEq(input, gains);
+    }
 }
 
 void readEqPreset(uint8_t input, int8_t out[eq_cfg::kBandCount]) {
@@ -381,8 +427,8 @@ void handleEqGet(AsyncWebServerRequest* req) {
             sendFieldError(req, 400, "invalid_value", "input");
             return;
         }
-        if (x < 0 || x >= defaults::kInputCount) {
-            sendRangeError(req, "input", 0, defaults::kInputCount - 1);
+        if (x < 0 || x >= kSlots) {  // [INP4b]
+            sendRangeError(req, "input", 0, kSlots - 1);
             return;
         }
         input = static_cast<uint8_t>(x);
@@ -414,8 +460,9 @@ void handleEqPost(AsyncWebServerRequest* req) {
         }
     }
 
-    // [Prompt 46b] Вхід — з тіла (0..kInputCount-1), інакше поточний; один раз: читання й запис того самого входу.
-    uint8_t input = eqInputIndex();
+    // [Prompt 46b] Вхід — з тіла (0..kSlots-1; [INP4b] 0..3), інакше поточний; один раз: читання й запис того самого входу.
+    const uint8_t active = eqInputIndex();
+    uint8_t input = active;
     JsonVariantConst vInput = root["input"];
     if (!vInput.isNull()) {
         if (!vInput.is<int>()) {
@@ -423,8 +470,8 @@ void handleEqPost(AsyncWebServerRequest* req) {
             return;
         }
         const int x = vInput.as<int>();
-        if (x < 0 || x >= defaults::kInputCount) {
-            sendRangeError(req, "input", 0, defaults::kInputCount - 1);
+        if (x < 0 || x >= kSlots) {  // [INP4b]
+            sendRangeError(req, "input", 0, kSlots - 1);
             return;
         }
         input = static_cast<uint8_t>(x);
@@ -504,13 +551,7 @@ void handleEqPost(AsyncWebServerRequest* req) {
         ctx.input = input;
         memcpy(ctx.gains, next, sizeof(ctx.gains));
         SettingsStore::modify(storeEqPreset, &ctx);  // профіль входу в Settings; NVS — з дебаунсом
-        if (input == 0) {
-            eq::setAllDb(next);  // екземпляр радіо: лише пресет входу 0, звук змінюється одразу
-        } else {
-            // [Prompt 47c] Зовнішній вхід: якщо він ПОТОЧНИЙ — пресет одразу на екземпляр проходу
-            // (логіка в AppController); інакше лише профіль, застосується при перемиканні на вхід.
-            AppController::applyLineEq(input, next);
-        }
+        applyEqLive(input, active, next);            // [INP4b] живе застосування (див. заголовок розділу)
     }
     JsonDocument doc;
     doc["ok"] = true;
@@ -522,7 +563,7 @@ void handleEqPost(AsyncWebServerRequest* req) {
 // [Prompt 48b] POST /api/balance {"value":N[,"input":M]}
 //   value — баланс, дБ: balance_cfg::kMinDb..kMaxDb (−20..+20); додатне = вправо (лівий канал послаблюється),
 //           від'ємне = вліво, 0 = без змін. Ціле число.
-//   input — необовʼязково, 0..kInputCount−1; без поля — ПОТОЧНИЙ вхід (як у /api/eq).
+//   input — необовʼязково, 0..kSlots−1 ([INP4b] 0..3; 3 = профіль «Player»); без поля — ПОТОЧНИЙ («веб-активний») вхід.
 //   Поточний вхід (або input == поточний): AppController::runWebCommand(BalanceSet) — DSP + профіль; помилки
 //     як у /api/volume (409 standby | ota_in_progress | ir_learn_active, 400 balance_out_of_range, 503 busy).
 //   Неактивний вхід: лише профіль у Settings (NVS з дебаунсом), без DSP — застосується при перемиканні на вхід.
@@ -537,7 +578,7 @@ struct BalanceStoreCtx {
 
 void storeBalance(Settings& s, void* ctx) {
     const BalanceStoreCtx* c = static_cast<const BalanceStoreCtx*>(ctx);
-    if (c->input < defaults::kInputCount) {
+    if (c->input < kSlots) {  // [INP4b]
         s.profiles[c->input].balanceDb = balance_cfg::sanitizeDb(c->db);
     }
 }
@@ -550,7 +591,7 @@ void handleBalanceGet(AsyncWebServerRequest* req) {
     if (!exactUrl(req, "/api/balance")) return;
     WEB_API_LOG("%s %s", req->methodToString(), req->url().c_str());
     const AppStateData st = AppState::snapshot();
-    const uint8_t active = (st.inputIndex < defaults::kInputCount) ? st.inputIndex : 0;
+    const uint8_t active = webActiveInput(st);  // [INP4b] у режимі «USB» = 3 (st.balanceDb — баланс профілю «Player»)
     uint8_t input = active;
     if (req->hasParam("input")) {
         int x = 0;
@@ -558,8 +599,8 @@ void handleBalanceGet(AsyncWebServerRequest* req) {
             sendFieldError(req, 400, "invalid_value", "input");
             return;
         }
-        if (x < 0 || x >= defaults::kInputCount) {
-            sendRangeError(req, "input", 0, defaults::kInputCount - 1);
+        if (x < 0 || x >= kSlots) {  // [INP4b]
+            sendRangeError(req, "input", 0, kSlots - 1);
             return;
         }
         input = static_cast<uint8_t>(x);
@@ -610,8 +651,8 @@ void handleBalance(AsyncWebServerRequest* req) {
             return;
         }
         const int n = vi.as<int>();
-        if (n < 0 || n >= defaults::kInputCount) {
-            sendRangeError(req, "input", 0, defaults::kInputCount - 1);
+        if (n < 0 || n >= kSlots) {  // [INP4b]
+            sendRangeError(req, "input", 0, kSlots - 1);
             return;
         }
         input = static_cast<uint8_t>(n);
@@ -646,7 +687,8 @@ void handleBalance(AsyncWebServerRequest* req) {
 // ---------------------------------------------------------------------------
 // [V2] GET /api/vu, POST /api/vu — чутливість VU по входах (vu_sens_cfg: −20..+20 дБ, крок 1, 0 = нейтрально)
 //   Чутливість — зсув рівня показу VU в дБ; на звук (гучність, EQ, баланс, ЦАП) НЕ впливає. Додатне = VU реагує
-//   сильніше, відʼємне = слабше. Індивідуальна для кожного входу (Settings::profiles[i].vuSensDb, NVS v8).
+//   сильніше, відʼємне = слабше. Індивідуальна для кожного входу (Settings::profiles[i].vuSensDb, NVS v9).
+//   [INP4b] Входів 4 (0..3; 3 = профіль «Player»): GET віддає 4 елементи inputs[]; input = 0..3, без поля — ПОТОЧНИЙ («веб-активний»).
 //   GET : {"input":A,"minDb":-20,"maxDb":20,"stepDb":1,
 //          "inputs":[{"index":0,"sensitivityDb":V0},{"index":1,"sensitivityDb":V1},{"index":2,"sensitivityDb":V2}]}
 //         A = активний вхід; значення — з профілів входів (Settings), без запису й обчислень; параметрів запиту немає.
@@ -667,7 +709,7 @@ struct VuSensStoreCtx {
 
 void storeVuSens(Settings& s, void* ctx) {
     const VuSensStoreCtx* c = static_cast<const VuSensStoreCtx*>(ctx);
-    if (c->input < defaults::kInputCount) {
+    if (c->input < kSlots) {  // [INP4b]
         s.profiles[c->input].vuSensDb = vu_sens_cfg::sanitizeDb(c->db);
     }
 }
@@ -682,7 +724,7 @@ void handleVuGet(AsyncWebServerRequest* req) {
     doc["maxDb"] = static_cast<int>(vu_sens_cfg::kMaxDb);
     doc["stepDb"] = static_cast<int>(vu_sens_cfg::kStepDb);
     JsonArray arr = doc["inputs"].to<JsonArray>();
-    for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+    for (uint8_t i = 0; i < kSlots; ++i) {  // [INP4b] 4 елементи
         JsonObject o = arr.add<JsonObject>();
         o["index"] = static_cast<int>(i);
         o["sensitivityDb"] = static_cast<int>(s.profiles[i].vuSensDb);
@@ -723,8 +765,8 @@ void handleVuPost(AsyncWebServerRequest* req) {
             return;
         }
         const int n = vi.as<int>();
-        if (n < 0 || n >= defaults::kInputCount) {
-            sendRangeError(req, "input", 0, defaults::kInputCount - 1);
+        if (n < 0 || n >= kSlots) {  // [INP4b]
+            sendRangeError(req, "input", 0, kSlots - 1);
             return;
         }
         input = static_cast<uint8_t>(n);
@@ -759,26 +801,31 @@ void handleVuPost(AsyncWebServerRequest* req) {
 // ---------------------------------------------------------------------------
 // [Prompt 39] GET /api/inputs, POST /api/inputs — доступність і відключення входів
 //   GET : {"inputs":[{"index":0,"name":"WiFi Radio","available":true,"enabled":true,
-//                     "selectable":true,"canDisable":false}, ... 3 входи (P48a) ...],
-//          "enabledMask":7,"input":0}
-//         available  = завжди true (P48a: чипів немає, усі 3 входи апаратно є);
-//         enabled    = дозволено користувачем (маска); selectable = available && enabled;
-//         canDisable = false лише для радіо (вхід 0).
-//   POST: {"enabled":[a,b,c]}        рівно 3 елементи (P48a): true | false | null (= не змінювати);
+//                     "selectable":true,"canDisable":false}, ... [INP4b] 4 входи (слот 3 = «Player», USB) ...],
+//          "enabledMask":15,"input":0}
+//         available  = для входів 0..2 завжди true (P48a); для слота 3 — true, якщо USB-вхід зібрано (settings_cfg::kInputMaskBuilt),
+//                      інакше false (тоді й enabled = false). Динамічну недоступність (перезапуск, стек USB) веб не бачить:
+//                      вибір такого входу дає 409 input_disabled від контролера;
+//         enabled    = дозволено користувачем (маска, 4 біти); selectable = available && enabled;
+//         canDisable = false лише для радіо (вхід 0);
+//         input      = веб-активний вхід (webActiveInput(): 3, поки активний режим «USB»).
+//   POST: {"enabled":[a,b,c,d]}      [INP4b] 4 елементи (усі слоти) АБО 3 елементи (ЗАСТАРІЛО, лише для сумісності зі старим
+//                                    webui/: оновлює слоти 0..2, слот 3 лишається як є): true | false | null (= не змінювати);
 //                                    елемент 0 (радіо) ігнорується: радіо завжди дозволене
-//         або {"index":N,"enabled":true|false}   (одне поле, N = 0..2)
-//         -> 200 {"ok":true, ...те саме, що GET}; 409 ota_in_progress | ir_learn_active; 503 busy.
+//         або {"index":N,"enabled":true|false}   (одне поле, N = 0..3)
+//         -> 200 {"ok":true, ...те саме, що GET}; 409 ota_in_progress | ir_learn_active | input_active (вимкнення слота 3,
+//         поки активний режим «USB»); 400 input_unavailable (увімкнення слота 3 у збірці без USB-входу); 503 busy.
 // Дозволено і в Standby. Зберігається в NVS (з дебаунсом, лише при зміні) і діє після перезапуску.
 // ---------------------------------------------------------------------------
 // ВАЖЛИВО: імена в doc (char-масиви Settings) ArduinoJson може лише ПОСИЛАТИ, а не копіювати, тож
 // Settings `st` мусить жити в викликача, поки doc не серіалізовано (sendJson() — синхронний).
 void fillInputsState(JsonDocument& doc, const Settings& st) {
-    // [INP4a-1] Маска Settings тепер 4-бітна (біт 3 = USB): веб бачить лише логічні входи 0..2 (відповідь як раніше).
-    const uint8_t mask = settings_cfg::normalizeInputMask(st.inputEnabledMask) & settings_cfg::kInputMaskWebVisible;
-    const uint8_t hw = defaults::kInputCount;  // [P48a] апаратно доступні всі 3 логічні входи
+    // [INP4b] Маска Settings 4-бітна (біт 3 = USB): віддаємо повністю (0x0F; 0x07, якщо USB вимкнено або не зібрано).
+    const uint8_t mask = settings_cfg::normalizeInputMask(st.inputEnabledMask);
+    const uint8_t hw = defaults::kInputCount;  // [P48a] апаратно доступні всі 3 логічні входи; слот 3 — якщо USB зібрано
     JsonArray arr = doc["inputs"].to<JsonArray>();
-    for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
-        const bool available = (i < hw);
+    for (uint8_t i = 0; i < kSlots; ++i) {
+        const bool available = (i < hw) || webUsbInputBuilt();
         const bool enabled = ((mask >> i) & 1u) != 0;
         JsonObject o = arr.add<JsonObject>();
         o["index"] = i;
@@ -789,7 +836,7 @@ void fillInputsState(JsonDocument& doc, const Settings& st) {
         o["canDisable"] = (i != 0);
     }
     doc["enabledMask"] = mask;
-    doc["input"] = AppState::snapshot().inputIndex;  // активний вхід (міг змінитись після вимкнення)
+    doc["input"] = eqInputIndex();  // [INP4b] веб-активний вхід (міг змінитись після вимкнення); у режимі «USB» = 3
 }
 
 void handleInputsGet(AsyncWebServerRequest* req) {
@@ -827,11 +874,16 @@ void handleInputsPost(AsyncWebServerRequest* req) {
             return;
         }
         JsonArrayConst a = vEn.as<JsonArrayConst>();
-        if (a.size() != defaults::kInputCount) {
+        // [INP4b] 4 елементи — усі слоти; 3 елементи — ЗАСТАРІЛО (сумісність зі старим webui/): слоти 0..2, слот 3 лишається.
+        const size_t n = a.size();
+        if (n != kSlots && n != defaults::kInputCount) {
             sendFieldError(req, 400, "invalid_value", "enabled");
             return;
         }
-        for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+        if (n == defaults::kInputCount) {
+            WEB_API_LOG("inputs: enabled[%u] is deprecated, slot 3 left unchanged", static_cast<unsigned>(n));
+        }
+        for (uint8_t i = 0; i < n; ++i) {
             JsonVariantConst v = a[i];
             if (v.isNull()) continue;  // null = лишити без змін
             if (!v.is<bool>()) {
@@ -854,8 +906,8 @@ void handleInputsPost(AsyncWebServerRequest* req) {
             return;
         }
         const int idx = vIdx.as<int>();
-        if (idx < 0 || idx >= defaults::kInputCount) {
-            sendRangeError(req, "index", 0, defaults::kInputCount - 1);
+        if (idx < 0 || idx >= kSlots) {  // [INP4b]
+            sendRangeError(req, "index", 0, kSlots - 1);
             return;
         }
         if (vEn.as<bool>()) {
@@ -865,6 +917,12 @@ void handleInputsPost(AsyncWebServerRequest* req) {
         }
     } else {
         sendFieldError(req, 400, "invalid_value", "enabled");
+        return;
+    }
+    // [INP4b] Збірка без USB-входу: слот 3 увімкнути не можна (normalizeInputMask() мовчки скинув би біт — краще явна відмова).
+    if (!webUsbInputBuilt() && (next & settings_cfg::kInputMaskUsbBit) != 0 &&
+        (cur & settings_cfg::kInputMaskUsbBit) == 0) {
+        sendFieldError(req, 400, "input_unavailable", "enabled");
         return;
     }
     next = settings_cfg::normalizeInputMask(next);  // радіо (біт 0) лишається дозволеним
@@ -887,6 +945,14 @@ void handleInputsPost(AsyncWebServerRequest* req) {
 }
 
 }  // namespace
+
+// [INP4b] Веб-активний вхід: див. web_api_player.h.
+uint8_t webActiveInput(const AppStateData& st) {
+    if (st.usbUi != UsbUiState::Off) {
+        return defaults::kUsbInputIndex;  // режим «USB» є / піднімається / виходить (inputIndex — вхід ДО режиму)
+    }
+    return st.inputIndex < defaults::kInputCount ? st.inputIndex : 0;
+}
 
 void registerPlayerRoutes(AsyncWebServer& server) {  // [P48a] без AudioProcessor*
 
@@ -916,4 +982,5 @@ void registerPlayerRoutes(AsyncWebServer& server) {  // [P48a] без AudioProce
     // [USB15] Плеєр USB (/api/usb/*): реєструється тут, щоб web_server.cpp лишився без змін. При FEATURE_USB_MODE = 0 — порожня.
     registerUsbRoutes(server);
 }
+
 

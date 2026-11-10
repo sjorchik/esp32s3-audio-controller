@@ -200,7 +200,8 @@
 //     вибору профілю для captureActiveProfile / persist / баланс / VU / EQ. Вхід у режим: captureActiveProfile() (профіль
 //     попереднього входу) -> s_usbMode = true -> loadActiveFromProfile(kProfileIndex) (+ eq::setAllDb пресету «Player»);
 //     вихід: captureActiveProfile() («Player») -> s_usbMode = false -> loadActiveFromProfile(s_input) + applyRadioEq() -> persist().
-//     Коло входів, маска, веб (defaults::kInputCount = 3) профіль «Player» не бачать.
+//     Коло входів і маска бачать слот 3 (kUsbInputIndex); [INP4b] веб теж працює з 4 входами (слот 3 = профіль «Player»),
+//     логічні входи s_input лишаються 0..2 (defaults::kInputCount = 3).
 //   • Кнопки / RC5 у режимі (головний екран): OK = пауза / продовження (або запуск підготовленого треку), LEFT = попередній,
 //     RIGHT = наступний (usb_queue::requestPrev / requestNext; їхні правила — розділ 11), довге OK = перемикання джерела
 //     плеєра (зараз єдине — лише лог «only one source»), USB_SHUFFLE / USB_REPEAT = перемикачі (Settings::playerShuffle /
@@ -3735,6 +3736,26 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
             break;
 
         case WebCmdType::InputSet:
+            // [INP4b] Вхід 3 = «USB» (defaults::kUsbInputIndex): вхід у режим тією ж відкладеною ціллю навігації, що й UP / DOWN і
+            // UsbModeSet (navRequest; «остання виграє»). Вимкнений маскою / стек недоступний -> input_disabled (409). Режим уже є й
+            // виходу не заплановано — нічого не робимо (Ok без причини). Ознака для обробника: Ok + why = "usb_enter_pending".
+            if (c.value == defaults::kUsbInputIndex) {
+#if FEATURE_USB_MODE
+                if (!navPosAvailable(kNavUsb)) {
+                    why = "input_disabled";
+                    return WebCmdResult::NotAllowed;
+                }
+                if (navPosition() == kNavUsb) {
+                    break;
+                }
+                navRequest(kNavUsb);
+                why = "usb_enter_pending";
+                break;
+#else
+                why = "input_disabled";  // USB-вхід не зібрано
+                return WebCmdResult::NotAllowed;
+#endif
+            }
             if (c.value < 0 || c.value >= defaults::kInputCount) {
                 why = "input_unavailable";  // поза 0..2
                 return WebCmdResult::OutOfRange;
@@ -3771,6 +3792,14 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
             if (want == s_inputMask) {
                 break;  // нічого не змінилось: ні запису в NVS, ні перемикань
             }
+#if FEATURE_USB_MODE
+            // [INP4b] Не вимикаємо USB-вхід, поки активний режим «USB» (є / піднімається й виходу не заплановано). У Standby
+            // режим усе одно виходить, тож відмови немає. Маска не змінюється; leaveStandby() сам обробить вимкнений біт 3.
+            if (s_mode != Mode::Standby && navPosition() == kNavUsb && (want & settings_cfg::kInputMaskUsbBit) == 0) {
+                why = "input_active";
+                return WebCmdResult::NotAllowed;
+            }
+#endif
             APP_LOG("inputs enabled mask 0x%02X -> 0x%02X (WEB)\n",
                     static_cast<unsigned>(s_inputMask), static_cast<unsigned>(want));
             s_inputMask = want;

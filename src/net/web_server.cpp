@@ -26,6 +26,10 @@
 // lastVolume з профілю lastInput.
 // [Prompt 19] ДОДАНО: один рядок registerStaticRoutes() наприкінці registerRoutes() —
 // вбудовані веб-сторінки (net/web_static.*); API-маршрути лишаються першими.
+// [INP4b] USB = ЧЕТВЕРТИЙ вхід (слот 3). GET /api/status: input / inputName = «веб-активний» вхід (webActiveInput(): 3, поки
+// AppStateData::usbUi != Off), inputs[] — 4 елементи (слот 3: available = USB-вхід зібрано). GET /api/settings: inputNames — 4
+// елементи, lastVolume — з профілю lastInput (у тому числі 3). POST /api/settings: inputNames — 4 елементи АБО 3 (ЗАСТАРІЛО, лише
+// слоти 0..2, слот 3 не змінюється); помилка довжини -> inputNames / expected_array_of_4.
 
 #include "net/web_server.h"
 
@@ -46,6 +50,7 @@
 #include <new>
 
 #include "config/defaults.h"
+#include "config/settings_config.h"  // [INP4b]
 #include "config/web_server_config.h"
 #include "core/action_names.h"   // [Prompt 15]
 #include "core/app_controller.h"
@@ -69,8 +74,8 @@
 
 namespace {
 
-// [INP4a-1] Settings::inputNames має слоти налаштувань (kInputSlotCount = 4, слот 3 = USB); веб працює лише з
-// першими defaults::kInputCount (3) іменами — усі цикли нижче йдуть за kInputCount.
+// [INP4a-1] Settings::inputNames має слоти налаштувань (kInputSlotCount = 4, слот 3 = USB). [INP4b] Веб працює з усіма
+// чотирма слотами (цикли нижче йдуть за kInputSlotCount); логічні входи 0..2 (kInputCount) — префікс слотів.
 static_assert(sizeof(Settings::inputNames) / sizeof(Settings::inputNames[0]) ==
                   defaults::kInputSlotCount,
               "Settings::inputNames must have defaults::kInputSlotCount entries");
@@ -154,19 +159,18 @@ void handleStatus(AsyncWebServerRequest* req) {
     char ip[16];
     WifiManager::copyInfo(ssid, sizeof(ssid), ip, sizeof(ip));
 
-    // Назва входу: користувацька з Settings, якщо задана, інакше типова.
-    const char* inputName = "";
-    if (st.inputIndex < defaults::kInputCount) {
-        inputName = cfg.inputNames[st.inputIndex];
-        if (inputName[0] == '\0') inputName = defaults::kInputNames[st.inputIndex];
-    }
+    // Назва входу: користувацька з Settings, якщо задана, інакше типова. [INP4b] Вхід — «веб-активний»: у режимі «USB» = 3
+    // (назва слота 3, типово «Player»), інакше inputIndex.
+    const uint8_t activeInput = webActiveInput(st);
+    const char* inputName = cfg.inputNames[activeInput];
+    if (inputName[0] == '\0') inputName = defaults::kInputNames[activeInput];
 
     JsonDocument doc;
     doc["mode"] = modeName(st.mode);
     // [P50a] Підрежим меню: "None" | "StationList" | "EqBalance". mode лишається "Menu" для будь-якого контексту;
     // поза Mode::Menu контекст завжди "None".
     doc["menuContext"] = (st.mode == Mode::Menu) ? menuContextName(st.menuContext) : "None";
-    doc["input"] = st.inputIndex;
+    doc["input"] = activeInput;  // [INP4b] 3, поки активний режим «USB» (st.inputIndex — вхід ДО режиму)
     doc["inputName"] = inputName;
     doc["volume"] = st.volume;
     doc["balance"] = st.balanceDb;  // дБ активного входу (−20..+20; додатне = вправо)
@@ -187,13 +191,14 @@ void handleStatus(AsyncWebServerRequest* req) {
 
     // [Prompt 18] ДОДАНО: перелік входів для вибору. [Prompt 48a] 3 логічні входи (0 радіо, 1 TV Box,
     // 2 Computer): апаратно доступні всі (available = true), вимкнення — маскою (/api/inputs).
+    // [INP4b] Слотів 4: слот 3 = «USB» (available = USB-вхід зібрано; чи дозволений маскою — GET /api/inputs).
     JsonArray inputs = doc["inputs"].to<JsonArray>();
-    for (uint8_t i = 0; i < defaults::kInputCount; ++i) {
+    for (uint8_t i = 0; i < defaults::kInputSlotCount; ++i) {
         JsonObject o = inputs.add<JsonObject>();
         o["index"] = i;
         const char* nm = cfg.inputNames[i];
         o["name"] = (nm[0] != '\0') ? nm : defaults::kInputNames[i];
-        o["available"] = true;
+        o["available"] = (i < defaults::kInputCount) || webUsbInputBuilt();
     }
 
     JsonObject wifi = doc["wifi"].to<JsonObject>();
@@ -222,12 +227,13 @@ void handleSettingsGet(AsyncWebServerRequest* req) {
 
     JsonDocument doc;
     JsonArray names = doc["inputNames"].to<JsonArray>();
-    for (uint8_t i = 0; i < defaults::kInputCount; ++i) names.add(s.inputNames[i]);
+    for (uint8_t i = 0; i < defaults::kInputSlotCount; ++i) names.add(s.inputNames[i]);  // [INP4b] завжди 4
     doc["brightness"] = s.brightness;
     doc["displayFlipped"] = s.displayFlipped;
     // [Prompt 21b] Звукові значення — з ЗБЕРЕЖЕНОГО профілю входу lastInput (той самий вхід, що
     // відновиться після перезапуску); ключі й типи без змін.
-    const InputProfile& pf = s.profiles[s.lastInput < defaults::kInputCount ? s.lastInput : 0];
+    // [INP4b] lastInput = 3 («USB») -> профіль слота 3 («Player»), а не 0.
+    const InputProfile& pf = s.profiles[s.lastInput < defaults::kInputSlotCount ? s.lastInput : 0];
     doc["lastInput"] = s.lastInput;
     doc["lastStation"] = s.lastStation;
     doc["lastVolume"] = pf.volume;
@@ -257,7 +263,7 @@ void handleJsonBody(AsyncWebServerRequest* req, uint8_t* data, size_t len, size_
 // ---------------------------------------------------------------------------
 // POST /api/settings — розбір і валідація
 // ---------------------------------------------------------------------------
-constexpr uint8_t kNames = defaults::kInputCount;
+constexpr uint8_t kNames = defaults::kInputSlotCount;  // [INP4b] 4 слоти назв (приймається й 3 — ЗАСТАРІЛО)
 
 // Перевірений план змін. Нічого не застосовується, поки не пройшла ВСЯ валідація.
 struct Plan {
@@ -356,14 +362,17 @@ void parsePlan(JsonObjectConst root, Plan& plan, JsonArray errs, ParseFlags& f) 
                 ++f.fields;
             }
         } else if (strcmp(key, "inputNames") == 0) {
-            if (!v.is<JsonArrayConst>() || v.as<JsonArrayConst>().size() != kNames) {
-                addErr(errs, "inputNames", "expected_array_of_3");
+            // [INP4b] 4 елементи — усі слоти; 3 елементи — ЗАСТАРІЛО (сумісність зі старим webui/): слоти 0..2, слот 3 лишається.
+            if (!v.is<JsonArrayConst>() ||
+                (v.as<JsonArrayConst>().size() != kNames && v.as<JsonArrayConst>().size() != defaults::kInputCount)) {
+                addErr(errs, "inputNames", "expected_array_of_4");
                 f.invalid = true;
                 continue;
             }
             JsonArrayConst arr = v.as<JsonArrayConst>();
+            const size_t cnt = arr.size();
             bool any = false;
-            for (uint8_t i = 0; i < kNames; ++i) {
+            for (size_t i = 0; i < cnt; ++i) {
                 JsonVariantConst e = arr[i];
                 if (e.isNull()) continue;  // null = «не змінювати»
                 const char* s = e.is<const char*>() ? e.as<const char*>() : nullptr;
