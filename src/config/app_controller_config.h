@@ -189,5 +189,32 @@ static_assert((kInputUpStep == 1 || kInputUpStep == -1) &&
                   (kStationRightStep == 1 || kStationRightStep == -1),
               "direction steps must be +1 or -1");
 
+// ---------------------------------------------------------------------------
+// [INP4a-3] Відновлення входу «USB» (lastInput = 3)
+// ---------------------------------------------------------------------------
+// Скільки відновлень USB поспіль без досягнення Ready (лічильник у RTC_NOINIT) допускається; далі — запасний вхід.
+constexpr uint8_t kUsbRestoreMaxAttempts = 2;
+// Пауза між початком відновлення (begin() / вихід зі standby) і navRequest(3), мс. ПРИПУЩЕННЯ: Wi-Fi й веб-сервер встигають
+// піднятись, щоб вхід у USB не збігався з піком ініціалізації; не вимірювалось.
+constexpr uint32_t kUsbRestoreDelayMs = 2000;
+// Магічне число RTC-структури лічильника спроб / ознаки фатальної помилки USB (контрольна сума — у app_controller.cpp).
+constexpr uint32_t kUsbRestoreMagic = 0x55B4A303u;
+
+// Аварійні скидання: після них вхід «USB» НЕ відновлюється (старт на першому доступному вході, lastInput перезаписується).
+constexpr esp_reset_reason_t kAbnormalResetReasons[] = {
+    ESP_RST_PANIC, ESP_RST_INT_WDT, ESP_RST_TASK_WDT, ESP_RST_WDT, ESP_RST_BROWNOUT,
+};
+
+inline bool isAbnormalResetReason(esp_reset_reason_t reason) {
+    for (const esp_reset_reason_t r : kAbnormalResetReasons) {
+        if (r == reason) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static_assert(kUsbRestoreMaxAttempts >= 1 && kUsbRestoreDelayMs >= 500, "usb restore limits");
+
 }  // namespace app_controller_cfg
 

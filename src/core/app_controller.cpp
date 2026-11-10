@@ -226,7 +226,17 @@
 //     встигає відновитись — свідоме спрощення);
 //   • Error із піднятим прапорцем режиму (end() не вдався / вхід не відкотився): повтор requestExit() (лише якщо стек справний,
 //     <= kNavExitRetries), далі «тихий» перезапуск beginRestart() із логом причини (usb_mode_cfg::kNavRestartOnError).
-// Остання команда ЗАМІНЮЄ ціль. Страховка — kNavPendingTimeoutMs. Нові лог-рядки мають тег [USBN]; режим не зберігається в NVS.
+// Остання команда ЗАМІНЮЄ ціль. Страховка — kNavPendingTimeoutMs. Нові лог-рядки мають тег [USBN].
+// [INP4a-3] ЗБЕРЕЖЕННЯ Й ВІДНОВЛЕННЯ ВХОДУ «USB» (lastInput = 3). Логічний вхід для запису — persistInputIndex():
+//   s_usbNoRestore -> s_input; s_usbStandbyKeep / s_usbRestoreHold / s_usbMode -> 3; інакше ціль s_navWant (якщо висить) або s_input.
+// Відновлення (радіо / прохід НЕ стартують): begin() для не-холодних причин скидання (usbBootDecide) і leaveStandby() (lastInput == 3)
+//   викликають usbRestoreBegin(): s_input = запасний вхід, профіль застосовано, звук замʼючено, s_usbRestoreHold = true (startStream() заблоковано);
+//   через cfg::kUsbRestoreDelayMs usbRestoreService() робить navRequest(3) — той самий шлях, що вибір входу 3. Успіх = usb_mode дійшов до
+//   Ready / Playing (з носієм чи без). Збій входу (Off без s_usbMode) -> usbRestoreAbandon(): запасний вхід стартує звичайно.
+// Захист від циклів: (а) аварійні скидання (cfg::isAbnormalResetReason) вхід 3 не відновлюють; (б) лічильник спроб у RTC_NOINIT
+//   (s_usbRtc, magic + контрольна сума), +1 при кожному відновленні в begin(), скидається по Ready й після пропуску; >= kUsbRestoreMaxAttempts
+//   -> пропуск; (в) ознака «фатальна помилка USB» (navErrorService -> beginRestart) у тій самій RTC-структурі: наступний старт USB не відновлює.
+// Standby із USB: s_usbStandbyKeep тримає lastInput = 3 (інакше usbModeLeaveLocked() у фоні записав би вхід ДО режиму).
 #include "core/app_controller.h"
 
 #include <Arduino.h>
@@ -391,6 +401,32 @@ uint8_t s_usbResumeTries = 0;
 uint32_t s_usbResumeTryMs = 0;
 PlayerSource s_playerSource = PlayerSource::Usb;  // [USB14] єдина точка «джерело плеєра» (поки лише USB)
 inline bool usbModeOn() { return s_usbMode; }
+// [INP4a-3] Відновлення входу «USB». Прапорці лише в RAM; лічильник спроб і ознака фатальної помилки — RTC_NOINIT (переживають
+// ESP.restart(), після подачі живлення — сміття, тому чинні лише за magic + контрольною сумою).
+struct UsbRestoreRtc {
+    uint32_t magic;
+    uint32_t attempts;  // відновлень USB від останнього успіху (Ready)
+    uint32_t fatal;     // 1 = попередній перезапуск спричинила фатальна помилка USB
+    uint32_t check;
+};
+RTC_NOINIT_ATTR UsbRestoreRtc s_usbRtc;
+inline uint32_t usbRtcCheck(uint32_t attempts, uint32_t fatal) {
+    return cfg::kUsbRestoreMagic ^ (attempts * 0x9E3779B1u) ^ (fatal * 0x85EBCA6Bu) ^ 0xA5A5A5A5u;
+}
+inline bool usbRtcValid() {
+    return s_usbRtc.magic == cfg::kUsbRestoreMagic && s_usbRtc.check == usbRtcCheck(s_usbRtc.attempts, s_usbRtc.fatal);
+}
+inline void usbRtcStore(uint32_t attempts, uint32_t fatal) {
+    s_usbRtc.magic = cfg::kUsbRestoreMagic;
+    s_usbRtc.attempts = attempts;
+    s_usbRtc.fatal = fatal;
+    s_usbRtc.check = usbRtcCheck(attempts, fatal);
+}
+bool s_usbStandbyKeep = false;        // standby із USB (або холодний старт з lastInput == 3): lastInput лишається 3
+bool s_usbNoRestore = false;          // фатальна помилка USB: persist() пише вхід ДО режиму
+bool s_usbRestoreHold = false;        // відновлення USB триває: радіо / прохід не стартують (startStream() заблоковано)
+bool s_usbRestoreRequested = false;   // navRequest(3) для відновлення вже зроблено
+uint32_t s_usbRestoreAtMs = 0;        // коли робити navRequest(3)
 // [USB11] LEFT / RIGHT / OK заблоковані не лише в режимі, а й під час Entering: прапорець s_usbMode ставить задача usb_mode
 // трохи пізніше за requestEnter() (десятки мс), і радіо за цей час не має перезапускатись зі станції / паузи.
 inline bool usbKeysLocked() { return s_usbMode || usb_mode::state() == usb_mode::State::Entering; }
@@ -709,7 +745,8 @@ void applyStationLevel(int8_t db, uint16_t idx, const char* why) {
 void startStream() {
 #if FEATURE_USB_MODE
     // [USB9] У режимі «USB» радіо не запускається ніякими шляхами (єдина точка запуску потоку).
-    if (s_usbMode) {
+    // [INP4a-3] Так само, поки триває відновлення входу «USB» (s_usbRestoreHold): радіо не має стартувати перед входом.
+    if (s_usbMode || s_usbRestoreHold) {
         s_playPending = false;
         APP_LOG("stream start blocked (usb mode active)\n");
         return;
@@ -1167,9 +1204,29 @@ void applyPersist(Settings& s, void* c) {
 
 // SettingsStore::modify() сама позначає кеш «брудним» (як requestSave()):
 // фактичний запис відбудеться з дебаунсом (не на кожен крок енкодера).
+// [INP4a-3] Логічний вхід для lastInput (0..2 = s_input, 3 = «USB»). У режимі USB s_input = вхід ДО режиму, тому 3 виводиться з
+// прапорців; висяча ціль s_navWant (явний вибір користувача) має пріоритет над s_usbMode.
+uint8_t persistInputIndex() {
+#if FEATURE_USB_MODE
+    if (s_usbNoRestore) {
+        return s_input;
+    }
+    if (s_usbStandbyKeep || s_usbRestoreHold) {
+        return defaults::kUsbInputIndex;
+    }
+    if (s_navWant >= 0 && s_navWant <= kNavUsb) {
+        return static_cast<uint8_t>(s_navWant);
+    }
+    if (s_usbMode) {
+        return defaults::kUsbInputIndex;
+    }
+#endif
+    return s_input;
+}
+
 void persist() {
     captureActiveProfile();
-    PersistCtx p = {s_input, s_station, s_userMute, s_volumes};
+    PersistCtx p = {persistInputIndex(), s_station, s_userMute, s_volumes};
     SettingsStore::modify(applyPersist, &p);
 }
 
@@ -1871,6 +1928,82 @@ void powerOnTransition() {
     publishStationName();  // [Prompt 20b]
 }
 
+#if FEATURE_USB_MODE
+// [INP4a-3] Початок відновлення входу «USB» (begin() / leaveStandby()). Те саме, що powerOnTransition(), але БЕЗ routeInput():
+// звук замʼючено, радіо / прохід не стартують (s_usbRestoreHold блокує startStream()); s_input = запасний вхід. Через
+// cfg::kUsbRestoreDelayMs usbRestoreService() робить navRequest(3). Викликати під s_lock (або в begin() до старту задачі).
+void usbRestoreBegin() {
+    s_mode = (s_input == 0) ? Mode::Radio : Mode::ExternalInput;
+    s_target = AdjustTarget::Volume;
+    s_menuCtx = MenuContext::None;
+    s_menuSel = 0;
+    s_usbRestoreHold = true;
+    s_usbRestoreRequested = false;
+    s_usbRestoreAtMs = millis() + cfg::kUsbRestoreDelayMs;
+    startTransition();
+    ampRequestOn();
+    loadActiveFromProfile(s_input);
+    Serial.printf("[APP] boot input restore: USB (fallback input %u, request in %u ms)\n", static_cast<unsigned>(s_input),
+                  static_cast<unsigned>(cfg::kUsbRestoreDelayMs));
+}
+
+// Відновлення скасовано (вхід у USB не вдався / користувач обрав інше / режим пристрою змінився): запасний вхід стартує звичайно.
+void usbRestoreAbandon(const char* why) {
+    if (!s_usbRestoreHold) {
+        return;
+    }
+    s_usbRestoreHold = false;
+    s_usbRestoreRequested = false;
+    s_persistNeeded = true;  // lastInput -> фактичний вхід
+    Serial.printf("[APP] USB restore abandoned (%s) -> input %u\n", why != nullptr ? why : "?", static_cast<unsigned>(s_input));
+    if (s_mode == Mode::Radio || s_mode == Mode::ExternalInput) {
+        routeInput();
+        publishStationName();
+    }
+}
+
+// Рішення begin(): відновлювати USB чи ні. true = відновлювати (begin() викличе usbRestoreBegin()). Побічно: оновлює RTC,
+// при пропуску перезаписує lastInput (persist()), при холодному старті з lastInput == 3 ставить s_usbStandbyKeep.
+bool usbBootDecide(uint8_t lastInput, esp_reset_reason_t rr, bool standbyBoot) {
+    const bool coldPower = (rr == ESP_RST_POWERON || rr == ESP_RST_BROWNOUT);
+    const bool valid = usbRtcValid() && !coldPower;
+    const uint32_t attempts = valid ? s_usbRtc.attempts : 0;
+    const bool fatal = valid && s_usbRtc.fatal != 0;
+    if (lastInput == defaults::kUsbInputIndex || valid) {
+        Serial.printf("[APP] usb restore rtc: valid=%d attempts=%u fatal=%d lastInput=%u reset reason %d\n", valid ? 1 : 0,
+                      static_cast<unsigned>(attempts), fatal ? 1 : 0, static_cast<unsigned>(lastInput), static_cast<int>(rr));
+    }
+    usbRtcStore(0, 0);  // ознака діє на ОДИН запуск; лічильник нижче виставляється лише при реальному відновленні
+    if (lastInput != defaults::kUsbInputIndex) {
+        return false;
+    }
+    const char* skip = nullptr;
+    char buf[40];
+    if (cfg::isAbnormalResetReason(rr)) {
+        snprintf(buf, sizeof(buf), "reset reason %d", static_cast<int>(rr));
+        skip = buf;
+    } else if (fatal) {
+        skip = "fatal USB error";
+    } else if (!standbyBoot && attempts >= cfg::kUsbRestoreMaxAttempts) {
+        snprintf(buf, sizeof(buf), "attempts %u", static_cast<unsigned>(attempts));
+        skip = buf;
+    } else if (!navPosAvailable(kNavUsb)) {
+        skip = "USB input unavailable";
+    }
+    if (skip != nullptr) {
+        Serial.printf("[APP] boot input restore: USB skipped (%s)\n", skip);
+        persist();  // lastInput <- запасний вхід (s_input)
+        return false;
+    }
+    if (standbyBoot) {
+        s_usbStandbyKeep = true;  // холодний старт: у standby lastInput лишається 3, POWER відновить USB (leaveStandby())
+        return false;
+    }
+    usbRtcStore(attempts + 1, 0);
+    return true;
+}
+#endif  // FEATURE_USB_MODE
+
 // --- Дії -------------------------------------------------------------------
 void enterStandby() {
     APP_LOG("standby on\n");
@@ -1886,6 +2019,11 @@ void enterStandby() {
     lineRelease();        // [Prompt 47c]: прохід замʼючено (desiredMute()), returnToRadio() через kExtMuteSettleMs
 #if FEATURE_USB_MODE
     s_navWant = kNavNone;  // [USB11] standby скасовує невиконану ціль навігації (вихід із режиму — нижче, у фоні)
+    // [INP4a-3] Standby із USB (або під час відновлення USB): lastInput лишається 3 — usbModeLeaveLocked() у фоні інакше записав би
+    // вхід ДО режиму. Прапорець скидає leaveStandby().
+    s_usbStandbyKeep = s_usbMode || s_usbRestoreHold;
+    s_usbRestoreHold = false;
+    s_usbRestoreRequested = false;
     if (s_usbMode) {
         usb_queue::commitResume();  // [USB14] останній трек / позиція -> Settings (кеш) ДО flush() нижче
         usb_mode::requestExit(usb_mode::ExitCause::Standby);  // [USB9] файл зупинено вище; end() — у фоні
@@ -1954,13 +2092,32 @@ void leaveStandby() {
 #endif
     captureActiveProfile();  // [Prompt 21b] профіль «старого» входу, поки s_input ще його
     const Settings st = SettingsStore::snapshot();
+    // [INP4a-3] lastInput == 3 («USB»): відновлюємо, якщо вхід дозволено маскою й стек придатний; інакше — запасний вхід і
+    // перезапис lastInput.
+    bool restoreUsb = false;
+#if FEATURE_USB_MODE
+    s_usbStandbyKeep = false;
+    if (st.lastInput == defaults::kUsbInputIndex) {
+        restoreUsb = navPosAvailable(kNavUsb);
+        if (!restoreUsb) {
+            Serial.printf("[APP] standby off: USB input unavailable -> fallback\n");
+            s_persistNeeded = true;
+        }
+    }
+#endif
     s_input = (st.lastInput < defaults::kInputCount) ? st.lastInput : 0;
     if (!inputAvailable(s_input)) {  // [Prompt 28] офлайн: lastInput = радіо -> перший не-радіо вхід
         s_input = firstAvailableInput();
     }
     s_station = (st.lastStation < stationCount()) ? st.lastStation : 0;
-    APP_LOG("standby off: input=%u station=%u\n", static_cast<unsigned>(s_input),
-            static_cast<unsigned>(s_station));
+    APP_LOG("standby off: input=%u station=%u%s\n", static_cast<unsigned>(s_input),
+            static_cast<unsigned>(s_station), restoreUsb ? " (restoring USB)" : "");
+#if FEATURE_USB_MODE
+    if (restoreUsb) {
+        usbRestoreBegin();
+        return;
+    }
+#endif
     powerOnTransition();
 }
 
@@ -2988,6 +3145,7 @@ int8_t navPosition() {
 void navClear(const char* note) {
     if (s_navWant != kNavNone) {
         Serial.printf("[USBN] target %s cleared: %s\n", navPosName(s_navWant), note);
+        s_persistNeeded = true;  // [INP4a-3] lastInput більше не повинен бути цілью, що зникла
         s_navWant = kNavNone;
     }
 }
@@ -3026,7 +3184,11 @@ void navErrorService(uint32_t now) {
         Serial.printf("[USBN] FATAL: usb exit failed (reason=%s detail=%s need_reboot=%d) -> quiet restart\n",
                       inf.reason != nullptr ? inf.reason : "-", inf.detail != nullptr ? inf.detail : "-",
                       inf.needsReboot ? 1 : 0);
-        beginRestart();  // мʼют -> підсилювач STBY -> пауза -> ESP.restart(); режим «USB» після перезапуску не відновлюється
+        // [INP4a-3] Фатальна помилка USB: persist() у beginRestart() пише вхід ДО режиму (s_usbNoRestore), а ознака в RTC
+        // змушує begin() пропустити відновлення (захист від циклу «відновили -> Error -> перезапуск»).
+        s_usbNoRestore = true;
+        usbRtcStore(0, 1);
+        beginRestart();  // мʼют -> підсилювач STBY -> пауза -> ESP.restart(); після цього перезапуску режим «USB» не відновлюється
     } else if (s_navErrT0 != 0) {
         Serial.printf("[USBN] usb mode stays in Error (kNavRestartOnError = false): hold POWER to restart\n");
         s_navErrT0 = 0;  // повідомлення один раз за епізод
@@ -3102,6 +3264,16 @@ void navReconcile() {
 
 // Новий намір користувача (UP / DOWN / INPUT_*, [INP4a-2] у т.ч. INPUT_USB): ЗАМІНЮЄ ціль, що ще не виконалась.
 void navRequest(int8_t pos) {
+    // [INP4a-3] Користувач обрав інший вхід під час відновлення USB: скасувати відновлення (запасний вхід стартує звичайно);
+    // обрав USB — відновлення вважається запитаним. Вибір входу записується в lastInput (persistInputIndex()).
+    if (s_usbRestoreHold && !s_usbMode) {
+        if (pos == kNavUsb) {
+            s_usbRestoreRequested = true;
+        } else {
+            usbRestoreAbandon("user input");
+        }
+    }
+    s_persistNeeded = true;
     ++s_navRequests;
     if (s_navWant != kNavNone && s_navWant != pos) {
         ++s_navReplaced;
@@ -3148,7 +3320,46 @@ void navStep(int dir) {
 }
 
 // Щотакту з tickLocked(): Error із прапорцем режиму, страховка цілі, виконання цілі, що чекала.
+// [INP4a-3] Щотакту: (1) лічильник спроб відновлення скидається, коли режим дійшов до Ready / Playing (з носієм чи без);
+// (2) відновлення входу «USB»: через kUsbRestoreDelayMs — navRequest(3); якщо вхід не вдався (Off без s_usbMode) — скасування.
+void usbRestoreService(uint32_t now) {
+    if (s_usbMode) {
+        const usb_mode::State us = usb_mode::state();
+        if ((us == usb_mode::State::Ready || us == usb_mode::State::Playing) && usbRtcValid() && s_usbRtc.attempts != 0) {
+            Serial.printf("[APP] usb restore: Ready reached, attempts %u -> 0\n", static_cast<unsigned>(s_usbRtc.attempts));
+            usbRtcStore(0, s_usbRtc.fatal);
+        }
+        s_usbRestoreHold = false;
+        return;
+    }
+    if (!s_usbRestoreHold) {
+        return;
+    }
+    if (restarting() || (s_mode != Mode::Radio && s_mode != Mode::ExternalInput)) {
+        usbRestoreAbandon("device mode");
+        return;
+    }
+    if (!s_usbRestoreRequested) {
+        if (!reached(now, s_usbRestoreAtMs)) {
+            return;
+        }
+        if (!navPosAvailable(kNavUsb)) {
+            usbRestoreAbandon("USB unavailable");
+            return;
+        }
+        s_usbRestoreRequested = true;
+        Serial.printf("[APP] boot input restore: entering USB\n");
+        navRequest(kNavUsb);
+        return;
+    }
+    const usb_mode::State us = usb_mode::state();
+    if (s_navWant == kNavNone && (us == usb_mode::State::Off || us == usb_mode::State::Error)) {
+        usbRestoreAbandon("enter failed");
+    }
+}
+
 void navService(uint32_t now) {
+    usbRestoreService(now);
     if (s_usbMode && usb_mode::state() == usb_mode::State::Error) {
         navErrorService(now);
     } else {
@@ -3307,7 +3518,10 @@ bool usbModeEnterLocked(const char*& why) {
     captureActiveProfile();    // [USB14] гучність попереднього входу -> його профіль ДО того, як профіль стане «Player»
     s_usbPrevInput = s_input;
     s_usbPrevStation = s_station;
+    const bool bootRestore = s_usbRestoreHold;  // [INP4a-3] радіо не стартувало: «на паузі» не вважати
     s_usbMode = true;
+    s_usbRestoreHold = false;
+    s_usbRestoreRequested = false;
     s_usbResumeIssued = false;  // [USB14]
     s_usbResumeTries = 0;
     s_usbResumeTryMs = 0;
@@ -3317,7 +3531,7 @@ bool usbModeEnterLocked(const char*& why) {
         usb_queue::setRepeatAll(ps.playerRepeat);
     }
     if (s_input == 0) {
-        s_usbPrevRadioPaused = !playerActive();
+        s_usbPrevRadioPaused = !bootRestore && !playerActive();
         pauseRadio();  // плавний мʼют -> stop(); s_stopHold знімає usbModeService(), коли плеєр Idle
         s_usbHoldRelease = s_stopHold;
     } else {
@@ -3330,6 +3544,7 @@ bool usbModeEnterLocked(const char*& why) {
     loadActiveFromProfile(player_mode_cfg::kProfileIndex);
     APP_LOG("usb mode: enter (prev input=%u station=%u radio_paused=%d)\n", static_cast<unsigned>(s_usbPrevInput),
             static_cast<unsigned>(s_usbPrevStation), s_usbPrevRadioPaused ? 1 : 0);
+    persist();  // [INP4a-3] lastInput = 3 (persistInputIndex(): s_usbMode), гучність «Player»
     publishState();
     return true;
 }
@@ -3348,7 +3563,7 @@ void usbModeLeaveLocked() {
     s_navExitRetries = 0;  // [USB11] вихід вдався
     loadActiveFromProfile(s_input);
     applyRadioEq();
-    persist();  // гучність «Player» (і решта профілів) -> Settings (дебаунс); lastInput лишається входом ДО режиму
+    persist();  // гучність «Player» (і решта профілів) -> Settings (дебаунс); [INP4a-3] lastInput: s_usbStandbyKeep -> 3, інакше вхід, на який вийшли
     APP_LOG("usb mode: leave (mode=%s)\n", modeName(s_mode));
     // [USB11] Відкладена ціль входу (UP / DOWN / INPUT_*, натиснуті в режимі «USB»): ціль-вхід застосовується тут,
     // замість відновлення попереднього входу (щоб не піднімати радіо / прохід, який одразу доведеться зупиняти). Ціль «USB»
@@ -4030,7 +4245,17 @@ bool AppController::begin() {
         APP_LOG("reset reason %d (not a cold start)\n", static_cast<int>(resetReason));
     }
 
-    if (cfg::kBootInStandby || coldStart) {
+#if FEATURE_USB_MODE
+    // [INP4a-3] lastInput == 3: відновити USB (радіо не стартує), лишити для POWER (холодний старт) або пропустити (захист).
+    const bool restoreUsb = usbBootDecide(st.lastInput, resetReason, cfg::kBootInStandby || coldStart);
+#else
+    const bool restoreUsb = false;
+#endif
+    if (restoreUsb) {
+#if FEATURE_USB_MODE
+        usbRestoreBegin();
+#endif
+    } else if (cfg::kBootInStandby || coldStart) {
         APP_LOG("boot in standby\n");
         // [Prompt 48a] Реле не чіпаємо (лишається в TV Box після input_selector::begin()), тиша: профіль
         // входу застосується повністю при виході зі standby.
