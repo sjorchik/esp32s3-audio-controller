@@ -271,3 +271,15 @@ fieldset.group-bare{border:0;padding:0;margin:0}
 .in-row .btn-zero{flex:none}
 .in-row>.hint{margin-top:var(--sp-1)}
 
+/* --- Головна: плеєр USB (USB16b-1) --- */
+.usb-title{font-size:clamp(1.25rem,5vw,1.6rem);font-weight:700;line-height:1.25;min-height:2.5em;overflow-wrap:anywhere;
+  display:-webkit-box;-webkit-line-clamp:3;line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.usb-note{margin-bottom:var(--sp-2)}
+.usb-prog{display:flex;align-items:center;gap:var(--sp-2);margin-top:var(--sp-3)}
+.usb-prog .slider{flex:1;min-width:0}
+.usb-prog .slider:disabled{opacity:.5}
+.usb-time{flex:none;min-width:3.6em;font-size:.85rem;color:var(--muted);font-variant-numeric:tabular-nums}
+.usb-time:last-child{text-align:right}
+.usb-transport{gap:var(--sp-3)}
+.usb-opts{display:flex;flex-wrap:wrap;gap:var(--sp-2);margin-top:var(--sp-4)}
+.usb-opts .btn{flex:1 1 auto;padding:0 var(--sp-3);font-size:.9rem}

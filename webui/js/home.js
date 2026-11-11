@@ -1,6 +1,7 @@
 'use strict';
 /* Сторінка «Головна» (Prompt 19; P51a: без аудіочіпа / тембру; USB16a-1: 4 входи, слот 3 = USB із заглушкою замість
-   блоків радіо й станцій). Залежить від common.js і nav.js. */
+   блоків радіо й станцій; USB16b-1: на місці блоку радіо — блок плеєра USB із usb_player.js). Залежить від common.js, nav.js
+   і (необовʼязково) usb_player.js. */
 (() => {
   const STREAM = {
     Idle: ['Зупинено', ''], Connecting: ['Підключення…', 'badge-warn'],
@@ -13,7 +14,7 @@
   const ui = {
     wifi: g('wifi'), power: g('btn-power'), wake: g('btn-wake'), standby: g('standby'), live: g('live'),
     grpPlayer: g('grp-player'), grpVolume: g('grp-volume'), grpInput: g('grp-input'), grpStations: g('grp-stations'),
-    grpUsb: g('grp-usb'), usbName: g('usb-name'),
+    grpUsb: g('grp-usb'), usbName: g('usb-name'), grpUsbPlayer: g('grp-usb-player'),
     badge: g('badge'), inputName: g('input-name'), menuNote: g('menu-note'), name: g('station-name'), track: g('track'),
     dial: g('dial'), needle: g('dial-needle'), dialCaption: g('dial-caption'), hint: g('player-hint'),
     prev: g('btn-prev'), play: g('btn-play'), next: g('btn-next'),
@@ -35,6 +36,8 @@
   let inputsSig = '';
   let lastUsb = false;           // попередній render був у режимі USB (для перемірювання біжучих рядків)
   const pending = createInputPending();   // очікування 202 pending (вхід у USB / вихід з нього)
+  // USB16b-1: якщо usb_player.js не завантажився, Головна працює як у USB16a (лише заглушка)
+  const usbPlayer = typeof createUsbPlayer === 'function' ? createUsbPlayer(ui.grpUsbPlayer) : null;
   let pendTimer = null;
 
   /* ---------- Стан ---------- */
@@ -124,7 +127,7 @@
 
   function render() {
     if (!st) {
-      [ui.grpPlayer, ui.grpVolume, ui.grpInput, ui.grpStations, ui.power].forEach((n) => { n.disabled = true; });
+      [ui.grpPlayer, ui.grpUsbPlayer, ui.grpVolume, ui.grpInput, ui.grpStations, ui.power].forEach((n) => { n.disabled = true; });
       return;
     }
     const lock = lockKind();
@@ -143,11 +146,17 @@
     setAttr(ui.power, 'aria-pressed', !standby);
     ui.wake.disabled = ui.power.disabled;
 
-    // USB (INP4b): блоки радіо й станцій ховаємо, на місці станцій — тимчасова заглушка (USB16b замінить її плеєром).
+    // USB (INP4b): блоки радіо й станцій ховаємо; на місці радіо — плеєр USB (16b-1), на місці станцій — заглушка (16b-2).
     // status.mode / station / playing у цей час належать ПОПЕРЕДНЬОМУ входу й не використовуються.
     ui.grpPlayer.hidden = usb;
     ui.grpStations.hidden = usb;
     ui.grpUsb.hidden = !usb;
+    ui.grpUsbPlayer.hidden = !usb || !usbPlayer;
+    ui.grpUsbPlayer.disabled = locked;
+    if (usbPlayer) {
+      usbPlayer.setTitle(st.inputName || inputName(CONFIG.usbInputIndex, st.inputs));
+      usbPlayer.setActive(usb && !standby);       // опитування /api/usb/status лише в режимі USB і не в standby
+    }
     if (usb) setText(ui.usbName, st.inputName || inputName(CONFIG.usbInputIndex, st.inputs));
     if (lastUsb && !usb) requestAnimationFrame(() => { measureMarquee(ui.name); measureMarquee(ui.track); });
     lastUsb = usb;
@@ -411,7 +420,7 @@
     }
     syncInputs(st.input);
     render();
-    maybeLoadStations();
+    if (!isUsb()) maybeLoadStations();           // у режимі USB список станцій не потрібен
   }
   const poller = createPoller(refreshStatus, { intervalMs: CONFIG.pollStatusMs });
 
@@ -421,5 +430,6 @@
   render();
   poller.start();
 })();
+
 
 
