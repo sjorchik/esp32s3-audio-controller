@@ -1,5 +1,6 @@
 'use strict';
-/* Сторінка «Головна» (Prompt 19; P51a: 3 входи, без аудіочіпа / тембру). Залежить від common.js і nav.js. */
+/* Сторінка «Головна» (Prompt 19; P51a: без аудіочіпа / тембру; USB16a-1: 4 входи, слот 3 = USB із заглушкою замість
+   блоків радіо й станцій). Залежить від common.js і nav.js. */
 (() => {
   const STREAM = {
     Idle: ['Зупинено', ''], Connecting: ['Підключення…', 'badge-warn'],
@@ -12,6 +13,7 @@
   const ui = {
     wifi: g('wifi'), power: g('btn-power'), wake: g('btn-wake'), standby: g('standby'), live: g('live'),
     grpPlayer: g('grp-player'), grpVolume: g('grp-volume'), grpInput: g('grp-input'), grpStations: g('grp-stations'),
+    grpUsb: g('grp-usb'), usbName: g('usb-name'),
     badge: g('badge'), inputName: g('input-name'), menuNote: g('menu-note'), name: g('station-name'), track: g('track'),
     dial: g('dial'), needle: g('dial-needle'), dialCaption: g('dial-caption'), hint: g('player-hint'),
     prev: g('btn-prev'), play: g('btn-play'), next: g('btn-next'),
@@ -31,10 +33,14 @@
   let countTried = -1;
   let scrolledOnce = false;
   let inputsSig = '';
+  let lastUsb = false;           // попередній render був у режимі USB (для перемірювання біжучих рядків)
+  const pending = createInputPending();   // очікування 202 pending (вхід у USB / вихід з нього)
+  let pendTimer = null;
 
   /* ---------- Стан ---------- */
   const isStandby = () => !!st && (st.standby === true || st.mode === 'Standby');
   const isRadio = () => !!st && st.input === 0;
+  const isUsb = () => !!st && st.input === CONFIG.usbInputIndex;   // INP4b: status.input = 3, поки активний режим USB
   /* Що відкрито на екрані пристрою (P50a: status.menuContext при mode === 'Menu'). Невідоме значення = «меню». */
   const MENU_TEXT = {
     StationList: 'На пристрої відкрито список станцій.',
@@ -83,14 +89,23 @@
     const d = getInputs();
     const src = d ? d.inputs.filter((i) => i.selectable !== false && i.available !== false && i.enabled !== false)
                   : (st.inputs || []).filter((i) => i.available && isInputEnabled(i.index));
-    const list = src.slice(0, CONFIG.inputCount);
+    const list = src.slice(0, CONFIG.inputSlotCount);
     const sig = JSON.stringify(list.map((i) => [i.index, i.name]));
     if (sig !== inputsSig) {
       inputsSig = sig;
       ui.inputs.replaceChildren(...list.map((i) =>
         el('button', { type: 'button', role: 'radio', 'data-i': i.index }, i.name)));
     }
-    [...ui.inputs.children].forEach((b) => setAttr(b, 'aria-checked', Number(b.dataset.i) === st.input));
+    const pd = pending.get();
+    [...ui.inputs.children].forEach((b) => {
+      const i = Number(b.dataset.i);
+      const entry = list.find((x) => x.index === i);
+      const busy = !!pd && pd.target === i;
+      // «Підключення…» / «Перемикання…» на цільовій кнопці до status.input === ціль (st.input НЕ чіпаємо)
+      setText(b, busy ? (i === CONFIG.usbInputIndex ? 'Підключення…' : 'Перемикання…') : ((entry && entry.name) || ''));
+      setAttr(b, 'aria-busy', busy);
+      setAttr(b, 'aria-checked', i === st.input);
+    });
   }
 
   function renderBanners(lock) {
@@ -115,6 +130,7 @@
     const lock = lockKind();
     const standby = isStandby();
     const radio = isRadio();
+    const usb = isUsb();
     const locked = lock !== null;
 
     renderBanners(lock);
@@ -127,6 +143,14 @@
     setAttr(ui.power, 'aria-pressed', !standby);
     ui.wake.disabled = ui.power.disabled;
 
+    // USB (INP4b): блоки радіо й станцій ховаємо, на місці станцій — тимчасова заглушка (USB16b замінить її плеєром).
+    // status.mode / station / playing у цей час належать ПОПЕРЕДНЬОМУ входу й не використовуються.
+    ui.grpPlayer.hidden = usb;
+    ui.grpStations.hidden = usb;
+    ui.grpUsb.hidden = !usb;
+    if (usb) setText(ui.usbName, st.inputName || inputName(CONFIG.usbInputIndex, st.inputs));
+    if (lastUsb && !usb) requestAnimationFrame(() => { measureMarquee(ui.name); measureMarquee(ui.track); });
+    lastUsb = usb;
     ui.grpPlayer.disabled = locked || !radio;
     ui.grpStations.disabled = locked || !radio;
     ui.grpVolume.disabled = locked;
@@ -251,13 +275,40 @@
   ui.next.addEventListener('click', () => command('/api/player/next'));
   ui.power.addEventListener('click', () => command('/api/power', { state: 'toggle' }));
   ui.wake.addEventListener('click', () => command('/api/power', { state: 'on' }));
+  /* Вибір входу. Крок, що торкається USB (вхід у режим або вихід із нього) або йде під час очікування, дає 202 pending
+     РАНІШЕ, ніж status.input зміниться: st.input НЕ ставимо, а показуємо «Підключення…» на цільовій кнопці до збігу
+     status.input з ціллю або таймауту CONFIG.inputPendingTimeoutMs. Решта входів — як раніше (оптимістично). */
+  function schedulePendingPoll() {
+    clearTimeout(pendTimer);
+    pendTimer = setTimeout(() => {
+      pendTimer = null;
+      if (!pending.get()) return;
+      poller.now();
+      schedulePendingPoll();
+    }, CONFIG.inputPendingPollMs);
+  }
+  async function selectInput(i) {
+    const pd = pending.get();
+    if (i === st.input && !pd) return;
+    const usbStep = !!pd || i === CONFIG.usbInputIndex || st.input === CONFIG.usbInputIndex;
+    if (!usbStep) {
+      st.input = i; render();
+      command('/api/input', { index: i });
+      return;
+    }
+    pending.start(i, i === CONFIG.usbInputIndex ? 'usb_enter' : 'usb_exit');
+    render();
+    schedulePendingPoll();
+    const r = await command('/api/input', { index: i });
+    const p = r ? pendingFromResponse(r) : null;
+    if (!p) pending.clear();                                       // відмова (409 …) або 200 без pending
+    else if (pending.get()) pending.start(p.target, p.reason);     // сервер підтвердив ціль; poller міг уже завершити очікування
+    render();
+  }
   ui.inputs.addEventListener('click', (ev) => {
     const b = ev.target.closest('button[data-i]');
     if (!b || !st) return;
-    const i = Number(b.dataset.i);
-    if (i === st.input) return;
-    st.input = i; render();
-    command('/api/input', { index: i });
+    selectInput(Number(b.dataset.i));
   });
 
   /* ---------- Станції ---------- */
@@ -351,6 +402,13 @@
   /* ---------- Опитування ---------- */
   async function refreshStatus() {
     st = await api.get('/api/status');
+    if (isStandby()) pending.clear();            // standby виводить із режиму USB: очікувати нічого
+    const pd = pending.get();
+    if (pending.check(st.input) === 'timeout') {
+      toast(pd && pd.reason === 'usb_exit'
+        ? 'Пристрій не перемкнувся на вибраний вхід вчасно. Спробуйте ще раз.'
+        : 'USB-вхід не підключився вчасно. Спробуйте ще раз.', 'error');
+    }
     syncInputs(st.input);
     render();
     maybeLoadStations();
@@ -363,4 +421,5 @@
   render();
   poller.start();
 })();
+
 

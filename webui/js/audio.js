@@ -1,5 +1,5 @@
 'use strict';
-/* Сторінка «Аудіо» (P51b): еквалайзер (5 смуг) і баланс ДЛЯ КОЖНОГО з 3 входів.
+/* Сторінка «Аудіо» (P51b; USB16a-2: 4 входи, слот 3 = USB): еквалайзер (5 смуг) і баланс ДЛЯ КОЖНОГО входу.
    Залежить від common.js і nav.js. Контракт: web_api.md §11 (/api/eq), §13 (/api/balance), §1.3 (профілі входів).
    Вкладка вибирає лише профіль для редагування — вхід на пристрої НЕ перемикається.
    Для кожного входу створено власний набір повзунків (createSlider): відкладена відправка з повзунка
@@ -10,7 +10,7 @@
     wifi: g('wifi'), grp: g('grp'), tabs: g('tabs'), scope: g('scope'), reset: g('btn-reset-input'),
     eqPanels: g('eq-panels'), eqErr: g('eq-err'), balPanels: g('bal-panels'), balNote: g('bal-note'), balErr: g('bal-err'),
   };
-  const INPUTS = CONFIG.inputCount;
+  const INPUTS = CONFIG.inputSlotCount;      // слоти входів (0..2 + 3 = USB); видимість вкладок — з API
   const BANDS = CONFIG.eqBandFreqHz.length;     // кількість смуг (довжина gainsDb); частоти й межі — з відповіді
 
   let st = null;             // останній /api/status
@@ -293,3 +293,4 @@
   render();
   poller.start();
 })();
+

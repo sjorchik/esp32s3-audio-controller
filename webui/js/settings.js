@@ -1,6 +1,6 @@
 'use strict';
 /* Сторінка «Налаштування» (Prompt 23). Залежить від common.js і nav.js.
-   Лише конфігурація пристрою (звук — на «Аудіо»). Назви входів — масив рівно з 3 елементів; яскравість і
+   Лише конфігурація пристрою (звук — на «Аудіо»). Назви входів — масив із 4 елементів (USB16a-2: слот 3 = USB); яскравість і
    displayFlipped — окремі POST /api/settings (P51a: тип процесора й тембр прибрано).
    Блок «Входи» (V3): у кожному рядку — галочка активації входу (POST /api/inputs) і повзунок чутливості VU
    (GET / POST /api/vu, web_api.md §15). Блок Wi-Fi — короткий підсумок поточної мережі; керування мережами —
@@ -22,7 +22,7 @@
   let flipBusy = false;       // триває запит перемикача: опитування його не чіпає
   let loadingCfg = false;
   let cfgFailed = false;
-  let vu = null;              // {minDb, maxDb, stepDb, vals[3]} з GET /api/vu; null = ще не прочитано
+  let vu = null;              // {minDb, maxDb, stepDb, vals[4]} з GET /api/vu; null = ще не прочитано
   let vuLoading = false;
   let vuFailed = false;
   const hideTimers = {};
@@ -53,10 +53,10 @@
   }
 
   /* ---------- Назви входів ---------- */
-  const INPUT_LABELS = ['Вхід 0 · інтернет-радіо', 'Вхід 1', 'Вхід 2'];
-  const fields = Array.from({ length: CONFIG.inputCount }, (_, i) => {
+  const INPUT_LABELS = ['Вхід 0 · інтернет-радіо', 'Вхід 1', 'Вхід 2', 'Вхід 3 · USB-плеєр'];
+  const fields = Array.from({ length: CONFIG.inputSlotCount }, (_, i) => {
     const input = el('input', { class: 'input', type: 'text', id: 'in-' + i, autocomplete: 'off', spellcheck: 'false',
-      placeholder: CONFIG.inputDefaultNames[i] || '' });
+      placeholder: CONFIG.inputSlotDefaultNames[i] || '' });
     const cnt = el('small', { class: 'hint num' });
     const err = el('div', { class: 'field-error', role: 'alert', hidden: true });
     const wrap = el('div', { class: 'field' },
@@ -91,7 +91,7 @@
 
   async function saveNames() {
     if (busy || !cfg) return;
-    const arr = new Array(CONFIG.inputCount).fill(null);  // рівно 3 елементи; null = не змінювати (web_api.md §3.2)
+    const arr = new Array(CONFIG.inputSlotCount).fill(null);  // 4 елементи (3 — застаріла форма); null = не змінювати (web_api.md §3.2)
     let any = false, bad = false;
     fields.forEach((f, i) => {
       setErr(f, '');
@@ -120,7 +120,7 @@
   // Чутливість активного входу недоступна в standby (409 standby з POST /api/vu).
   const sensLocked = (i) => !!st && i === st.input && (st.standby === true || st.mode === 'Standby');
 
-  const inRows = Array.from({ length: CONFIG.inputCount }, (_, i) => {
+  const inRows = Array.from({ length: CONFIG.inputSlotCount }, (_, i) => {
     const box = el('input', { type: 'checkbox', id: 'inen-' + i });
     const name = el('span');
     const note = el('p', { class: 'hint', hidden: true });
@@ -159,11 +159,14 @@
       const radio = i === 0;
       const active = !!st && st.input === i;
       const avail = x.available !== false;
+      const usbSlot = i === CONFIG.usbInputIndex;
+      // INP4b: слот USB не можна вимкнути, поки активний режим USB (409 input_active); canDisable це не відображає
+      const usbHeld = usbSlot && active;
 
       // Галочка активації (як раніше)
-      setText(r.name, x.name || CONFIG.inputDefaultNames[i] || 'Вхід ' + i);
+      setText(r.name, x.name || CONFIG.inputSlotDefaultNames[i] || 'Вхід ' + i);
       if (!inputsBusy) r.box.checked = radio ? true : x.enabled !== false;
-      r.box.disabled = radio || x.canDisable === false || !avail || inputsBusy;
+      r.box.disabled = radio || x.canDisable === false || !avail || usbHeld || inputsBusy;
 
       // Повзунок чутливості VU
       if (vu) {
@@ -172,14 +175,15 @@
         setAttr(r.input, 'step', vu.stepDb);
         if (!r.ctl.held()) { r.input.value = vu.vals[i]; setText(r.out, fmtVu(vu.vals[i])); }
       }
-      const off = !vu || sensLocked(i);
+      const off = !vu || sensLocked(i) || (usbSlot && !avail);
       r.input.disabled = off;
       r.zero.disabled = off;
 
       // Пояснення: лише там, де воно справді потрібне
       const notes = [];
       if (radio) notes.push('Радіо завжди доступне.');
-      else if (!avail) notes.push('Вхід апаратно недоступний.');
+      else if (!avail) notes.push(usbSlot ? 'Недоступно в цій збірці прошивки.' : 'Вхід апаратно недоступний.');
+      if (usbHeld) notes.push('Щоб вимкнути цей вхід, спершу оберіть інший вхід (вийдіть з режиму USB).');
       if (vu && !active) notes.push('Не активний вхід: чутливість діє після перемикання на нього.');
       if (sensLocked(i)) notes.push('У режимі очікування чутливість активного входу не змінюється.');
       setText(r.note, notes.join(' '));
@@ -194,9 +198,9 @@
 
   function applyVuState(d) {
     if (!d || !Array.isArray(d.inputs)) throw new ApiError(200, null, 'bad_response');
-    const vals = new Array(CONFIG.inputCount).fill(0);
+    const vals = new Array(CONFIG.inputSlotCount).fill(0);
     d.inputs.forEach((x) => {
-      if (x && isNum(x.index) && x.index >= 0 && x.index < CONFIG.inputCount && isNum(x.sensitivityDb)) {
+      if (x && isNum(x.index) && x.index >= 0 && x.index < CONFIG.inputSlotCount && isNum(x.sensitivityDb)) {
         vals[x.index] = x.sensitivityDb;
       }
     });

@@ -34,7 +34,13 @@ const CONFIG = {
   searchDebounceMs: 150,
   // --- Звук і входи (P51a; web_api.md §1.3, §13). createSlider використовує volumeSendMinMs / volumeHoldMs ---
   inputCount: 3,             // логічних входів: 0 = радіо, 1 = TV Box, 2 = Computer
-  inputDefaultNames: ['WiFi Radio', 'TV Box', 'Computer'], // типові назви (підказка в полях; справжні віддає API)
+  inputDefaultNames: ['WiFi Radio', 'TV Box', 'Computer'], // ЗАСТАРІЛЕ (USB16a): 3 типові назви; нові сторінки беруть inputSlotDefaultNames
+  // --- USB як 4-й вхід (USB16a; web_api.md §12, §17). inputCount вище лишено сумісним для сторінок, ще не переведених на 4 слоти ---
+  inputSlotCount: 4,         // слотів входів: 0 = радіо, 1 = TV Box, 2 = Computer, 3 = «Player» (режим USB)
+  usbInputIndex: 3,          // слот USB
+  inputSlotDefaultNames: ['WiFi Radio', 'TV Box', 'Computer', 'Player'], // типові назви 4 слотів (справжні віддає API)
+  inputPendingTimeoutMs: 8000, // скільки чекати status.input === ціль після 202 pending (usb_enter / usb_exit) — ПРИПУЩЕННЯ
+  inputPendingPollMs: 500,   // як часто пришвидшувати опитування /api/status, поки триває очікування
   volumeMin: 0, volumeMax: 100,        // шкала гучності фіксована (web_api.md §2, §4.3)
   balanceMinDb: -20, balanceMaxDb: 20, balanceStepDb: 1, balanceNeutralDb: 0, // баланс, дБ; «+» = вправо
   // --- Пульт (Prompt 22) ---
@@ -107,6 +113,8 @@ const REASONS = {
   wifi_setup: 'Пристрій налаштовує Wi-Fi.',
   no_stations: 'Список станцій порожній.',
   input_disabled: 'Цей вхід вимкнено в налаштуваннях.',
+  input_active: 'Спершу вийдіть з режиму USB: оберіть інший вхід.',
+  input_unavailable: 'USB-входу немає в цій збірці прошивки.',
   station_out_of_range: 'Такої станції немає в списку.',
   index_out_of_range: 'Такої станції немає в списку.',
   volume_out_of_range: 'Гучність поза допустимими межами.',
@@ -175,6 +183,7 @@ const REASONS = {
   not_in_conflict: 'Конфлікту вже немає.',
   invalid_name: 'Недопустима назва входу.',
   expected_array_of_3: 'Потрібно рівно 3 назви входів.',
+  expected_array_of_4: 'Потрібно 4 назви входів.',
   empty_request: 'Порожній запит.',
   // Wi-Fi (P29)
   wifi_ssid_invalid: 'Некоректна назва мережі: 1…32 байти, без керівних символів.',
@@ -604,13 +613,13 @@ async function rebootAndWait(path, body, before) {
 }
 
 /* ---------- Вимкнені входи (Prompt 39b; web_api.md §12) ---------- */
-/* Спільний кеш GET /api/inputs (рівно 3 входи) для «Головної», «Аудіо» і «Налаштувань».
+/* Спільний кеш GET /api/inputs (4 слоти з INP4b; слот 3 = USB) для «Головної», «Аудіо» і «Налаштувань».
    /api/status.inputs[] не містить enabled, тож сторінки фільтрують списки входів через isInputEnabled(). */
 const inputsState = { data: null, sig: '', input: null, busy: null, dirty: false, nextAt: 0, listeners: [] };
 
 /* Підписка на зміну списку входів (дані реально змінилися). */
 function onInputsChange(fn) { inputsState.listeners.push(fn); }
-/* Останні дані {inputs:[{index,name,available,enabled,selectable,canDisable}×3], enabledMask, input} або null. */
+/* Останні дані {inputs:[{index,name,available,enabled,selectable,canDisable}×4], enabledMask, input} або null. */
 function getInputs() { return inputsState.data; }
 /* true, якщо вхід не вимкнено. Невідомо (кеш ще не завантажено) -> true; радіо (0) -> завжди true. */
 function isInputEnabled(index) {
@@ -671,11 +680,38 @@ function inputName(index, statusInputs) {
   if (a && a.name) return a.name;
   const b = Array.isArray(statusInputs) && statusInputs.find((x) => x && x.index === index);
   if (b && b.name) return b.name;
-  return CONFIG.inputDefaultNames[index] || 'Вхід ' + (index + 1);
+  return CONFIG.inputSlotDefaultNames[index] || 'Вхід ' + (index + 1);
 }
 /* Після невдалої команди: якщо вхід виявився вимкненим (гонка з іншим клієнтом) - перечитати список. */
 function noteInputError(e) {
   if (e instanceof ApiError && (e.reason === 'input_disabled' || e.code === 'input_disabled')) loadInputs().catch(() => {});
+}
+
+/* ---------- Очікування 202 pending (USB16a; web_api.md §4.5, §17) ---------- */
+/* POST /api/input {index:3} → 202 {pending:true, reason:'usb_enter', target:3}; вибір 0..2 у режимі USB →
+   202 {pending:true, reason:'usb_exit', target:N}. Відповідь приходить РАНІШЕ, ніж status.input зміниться, тож
+   сторінка НЕ ставить st.input оптимістично, а тримає «очікування» і звіряє його з кожним status.input. */
+/* Тіло відповіді → {target, reason} або null, якщо це не pending. */
+function pendingFromResponse(r) {
+  if (!r || r.pending !== true || !Number.isInteger(r.target)) return null;
+  return { target: r.target, reason: typeof r.reason === 'string' ? r.reason : null };
+}
+/* Лічильник очікування одного входу. check(activeInput) після кожного status:
+   'none' (нема очікування) | 'wait' | 'done' (status.input === ціль) | 'timeout' (очікування вичерпано). */
+function createInputPending(opts) {
+  const timeoutMs = (opts && opts.timeoutMs) || CONFIG.inputPendingTimeoutMs;
+  let cur = null;
+  return {
+    start(target, reason) { cur = { target, reason: reason || null, until: Date.now() + timeoutMs }; },
+    get() { return cur; },
+    clear() { cur = null; },
+    check(activeInput) {
+      if (!cur) return 'none';
+      if (activeInput === cur.target) { cur = null; return 'done'; }
+      if (Date.now() >= cur.until) { cur = null; return 'timeout'; }
+      return 'wait';
+    },
+  };
 }
 
 /* ---------- Каркас сторінки ---------- */
@@ -687,5 +723,6 @@ function initShell(activeId) {
   if (typeof renderNav === 'function') renderNav(activeId);
   if (api.base()) setBanner('dev', 'Режим розробки: пристрій ' + api.base().slice(7), 'info');
 }
+
 
 

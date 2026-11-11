@@ -22,11 +22,11 @@
     UP: ['Вгору', 'nav'], DOWN: ['Вниз', 'nav'], LEFT: ['Вліво', 'nav'], RIGHT: ['Вправо', 'nav'],
     OK: ['OK', 'nav'], BACK: ['Назад', 'nav'], MENU: ['Меню', 'nav'],
   };
-  const INPUT_ACTIONS = { INPUT_RADIO: 0, INPUT_TV: 1, INPUT_PC: 2 };   // → індекс логічного входу
+  const INPUT_ACTIONS = { INPUT_RADIO: 0, INPUT_TV: 1, INPUT_PC: 2, INPUT_USB: 3 };   // → індекс логічного входу (USB16a-3: слот 3 = USB)
   /* Дії, які не навчаються (web_api.md §6.5): ENC_*, BASS_*, TREBLE_*, GAIN_*, INPUT_AUX.
      Контракт їх у /api/ir/actions не віддає, а поле `learnable` (якщо з'явиться) має пріоритет;
      шаблон — страховка на випадок, якщо пристрій їх усе ж поверне. */
-  const NOT_LEARNABLE = /^(ENC_|BASS_|TREBLE_|GAIN_)|^INPUT_AUX$/;
+  const NOT_LEARNABLE = /^(ENC_|BASS_|TREBLE_|GAIN_)|^INPUT_AUX$|^USB_MODE$/;   // USB_MODE (INP4a-2) більше не існує — не показувати
   const isLearnable = (a) => !!a && typeof a.action === 'string' && a.learnable !== false && !NOT_LEARNABLE.test(a.action);
   function info(a) {
     if (Object.prototype.hasOwnProperty.call(INPUT_ACTIONS, a)) {
@@ -311,4 +311,5 @@
   loadMap();
   statusPoller.start();
 })();
+
 
