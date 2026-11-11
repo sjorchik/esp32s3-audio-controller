@@ -283,3 +283,19 @@ fieldset.group-bare{border:0;padding:0;margin:0}
 .usb-transport{gap:var(--sp-3)}
 .usb-opts{display:flex;flex-wrap:wrap;gap:var(--sp-2);margin-top:var(--sp-4)}
 .usb-opts .btn{flex:1 1 auto;padding:0 var(--sp-3);font-size:.9rem}
+
+/* --- Головна: браузер файлів USB (USB16b-2b; логіка — usb_browser.js, рядки фіксованої висоти 48 px) --- */
+.usb-br-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.usb-br-tools{display:flex;gap:var(--sp-1);flex:none}
+.usb-path{font-size:.85rem;overflow-wrap:anywhere;margin-bottom:var(--sp-2)}
+.usb-path:empty{display:none}
+.usb-br-note,.usb-br-info{margin-top:var(--sp-2)}
+.usb-list{border:1px solid var(--line);overscroll-behavior:contain}
+.usb-vwin{box-sizing:content-box}
+.usb-item{box-sizing:border-box;border-bottom:1px solid var(--line)}
+.usb-row{height:100%}
+.usb-row svg{width:22px;height:22px;flex:none;color:var(--muted)}
+.usb-row[data-dir="1"] svg{color:var(--accent)}
+.usb-row:disabled{opacity:.55;cursor:progress}
+.usb-row[aria-busy="true"]{opacity:1;box-shadow:inset 3px 0 0 var(--info)}
+.usb-more{width:100%;margin-top:var(--sp-2)}

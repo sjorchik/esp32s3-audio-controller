@@ -1,5 +1,5 @@
 'use strict';
-/* Плеєр USB на «Головній» (USB16b-1). Підключати ПІСЛЯ common.js і nav.js, ПЕРЕД home.js.
+/* Плеєр USB на «Головній» (USB16b-1; USB16b-2a: спільні хуки window.usbShared для браузера файлів). Підключати ПІСЛЯ common.js і nav.js, ПЕРЕД home.js.
    Контракт — docs/web_api.md §16 (/api/usb/*) і §17 (USB = вхід 3). Усе USB-специфічне (CONFIG, REASONS, іконки,
    запити) живе ТУТ, common.js не змінюється. Дані з флешки (імʼя файла) виводяться лише через textContent / el().
    Зовнішній інтерфейс: createUsbPlayer(mountEl) → {setActive(bool), setTitle(text)}. */
@@ -70,11 +70,43 @@
     control: (action) => api.post('/api/usb/control', { action }),
     seek: (deltaSec) => api.post('/api/usb/seek', { deltaSec }),
     options: (o) => api.post('/api/usb/options', o),
+    // USB16b-2a: браузер файлів (usb_browser.js)
+    list: (offset, limit, version) => api.get('/api/usb/list?offset=' + offset + '&limit=' + limit +
+      (version === null || version === undefined ? '' : '&version=' + version)),
+    cd: (body) => api.post('/api/usb/cd', body),
+    play: (body) => api.post('/api/usb/play', body),
   };
 
   /* result.why — не ApiError, тому текст беремо з REASONS напряму. */
   const whyText = (why) => REASONS[why] || (why ? 'Помилка: ' + why : 'Команда не виконана.');
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /* Чекає результат команди з reqId. alive() — чи ще потрібен результат (за замовчуванням завжди). */
+  async function waitReqFor(id, alive) {
+    const live = alive || (() => true);
+    const until = Date.now() + CONFIG.usbCmdTimeoutMs;
+    while (Date.now() < until && live()) {
+      await sleep(CONFIG.usbCmdPollMs);
+      try {
+        const r = await usbApi.result(id);
+        if (r.req && r.req.done) return r.req;
+      } catch (e) {
+        if (e instanceof ApiError && e.code === 'unknown_req') return { done: true, ok: null, why: 'unknown_req' };
+        if (e instanceof ApiError && (e.code === 'network' || e.code === 'timeout')) continue;
+        return null;
+      }
+    }
+    return null;
+  }
+
+  /* Спільний доступ до останнього GET /api/usb/status (USB16b-2a): браузер файлів не опитує status сам. */
+  const shared = { status: null, listeners: new Set() };
+  const notifyStatus = () => { shared.listeners.forEach((fn) => { try { fn(shared.status); } catch (_) { /* слухач не ламає плеєр */ } }); };
+  window.usbShared = {
+    usbApi, whyText, waitReq: waitReqFor,
+    getStatus: () => shared.status,
+    onStatus(fn) { shared.listeners.add(fn); return () => shared.listeners.delete(fn); },
+  };
 
   function fmtTime(sec) {
     const s = Math.max(0, Math.floor(sec));
@@ -157,13 +189,14 @@
       try {
         r = await usbApi.status();
       } catch (e) {
-        if (e instanceof ApiError && e.status === 404) { unavailable = true; render(); }
+        if (e instanceof ApiError && e.status === 404) { unavailable = true; shared.status = null; render(); notifyStatus(); }
         throw e;                                   // пулер збільшить інтервал; мережеві збої — банер «Немає звʼязку»
       }
       if (!started) return;                        // відповідь прийшла вже після зупинки
       unavailable = false;
       const prevPos = curPos(), prevName = nowPlaying() && nowPlaying().name, wasRunning = isRunning();
       s = r;
+      shared.status = r;
       if (hold && (hold.paused === statusPaused() || Date.now() >= hold.until)) hold = null;
       const np = nowPlaying();
       if (!np) anchor = null;
@@ -175,6 +208,7 @@
         anchor = { pos: same && Math.abs(prevPos - base) < 1.6 ? prevPos : base, at: performance.now(), lockUntil: 0 };
       }
       render();
+      notifyStatus();
     }
     const poller = createPoller(refresh, { intervalMs: CONFIG.usbStatusPollMs });
 
@@ -240,21 +274,7 @@
     }
 
     /* ---- Команди ---- */
-    async function waitReq(id) {
-      const until = Date.now() + CONFIG.usbCmdTimeoutMs;
-      while (Date.now() < until && started) {
-        await sleep(CONFIG.usbCmdPollMs);
-        try {
-          const r = await usbApi.result(id);
-          if (r.req && r.req.done) return r.req;
-        } catch (e) {
-          if (e instanceof ApiError && e.code === 'unknown_req') return { done: true, ok: null, why: 'unknown_req' };
-          if (e instanceof ApiError && (e.code === 'network' || e.code === 'timeout')) continue;
-          return null;
-        }
-      }
-      return null;
-    }
+    const waitReq = (id) => waitReqFor(id, () => started);
 
     async function doControl(action) {
       if (ctlBusy || reqBusy) return;
@@ -328,7 +348,9 @@
           poller.stop();
           clearInterval(ticker); ticker = null;
           s = null; anchor = null; hold = null; optHold = null; unavailable = false; ctlBusy = false; reqBusy = false;
+          shared.status = null;
           render();
+          notifyStatus();
         }
       },
       setTitle(text) { setText(ui.inputName, text || ''); },
@@ -337,3 +359,4 @@
 
   window.createUsbPlayer = createUsbPlayer;
 })();
+

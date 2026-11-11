@@ -1,7 +1,7 @@
 'use strict';
 /* Сторінка «Головна» (Prompt 19; P51a: без аудіочіпа / тембру; USB16a-1: 4 входи, слот 3 = USB із заглушкою замість
-   блоків радіо й станцій; USB16b-1: на місці блоку радіо — блок плеєра USB із usb_player.js). Залежить від common.js, nav.js
-   і (необовʼязково) usb_player.js. */
+   блоків радіо й станцій; USB16b-1: на місці блоку радіо — блок плеєра USB із usb_player.js; USB16b-2b: на місці списку станцій — браузер файлів флешки з usb_browser.js).
+   Залежить від common.js, nav.js і (необовʼязково) usb_player.js, usb_browser.js. */
 (() => {
   const STREAM = {
     Idle: ['Зупинено', ''], Connecting: ['Підключення…', 'badge-warn'],
@@ -38,6 +38,9 @@
   const pending = createInputPending();   // очікування 202 pending (вхід у USB / вихід з нього)
   // USB16b-1: якщо usb_player.js не завантажився, Головна працює як у USB16a (лише заглушка)
   const usbPlayer = typeof createUsbPlayer === 'function' ? createUsbPlayer(ui.grpUsbPlayer) : null;
+  // USB16b-2b: браузер файлів на місці списку станцій; без usb_browser.js (або usb_player.js) лишається заглушка з index.html
+  const usbBrowser = typeof createUsbBrowser === 'function' ? createUsbBrowser(ui.grpUsb) : null;
+  if (usbBrowser) { ui.grpUsb.removeAttribute('aria-labelledby'); ui.grpUsb.setAttribute('aria-label', 'Файли й папки флешки'); }
   let pendTimer = null;
 
   /* ---------- Стан ---------- */
@@ -146,7 +149,7 @@
     setAttr(ui.power, 'aria-pressed', !standby);
     ui.wake.disabled = ui.power.disabled;
 
-    // USB (INP4b): блоки радіо й станцій ховаємо; на місці радіо — плеєр USB (16b-1), на місці станцій — заглушка (16b-2).
+    // USB (INP4b): блоки радіо й станцій ховаємо; на місці радіо — плеєр USB (16b-1), на місці станцій — браузер файлів (16b-2).
     // status.mode / station / playing у цей час належать ПОПЕРЕДНЬОМУ входу й не використовуються.
     ui.grpPlayer.hidden = usb;
     ui.grpStations.hidden = usb;
@@ -157,7 +160,11 @@
       usbPlayer.setTitle(st.inputName || inputName(CONFIG.usbInputIndex, st.inputs));
       usbPlayer.setActive(usb && !standby);       // опитування /api/usb/status лише в режимі USB і не в standby
     }
-    if (usb) setText(ui.usbName, st.inputName || inputName(CONFIG.usbInputIndex, st.inputs));
+    if (usbBrowser) {
+      usbBrowser.setTitle(st.inputName || inputName(CONFIG.usbInputIndex, st.inputs));
+      usbBrowser.setActive(usb && !standby);      // запити списку лише в режимі USB і не в standby
+      ui.grpUsb.toggleAttribute('inert', locked);  // OTA / навчання IR / офлайн: список недоступний для дій
+    } else if (usb) setText(ui.usbName, st.inputName || inputName(CONFIG.usbInputIndex, st.inputs));
     if (lastUsb && !usb) requestAnimationFrame(() => { measureMarquee(ui.name); measureMarquee(ui.track); });
     lastUsb = usb;
     ui.grpPlayer.disabled = locked || !radio;
@@ -430,6 +437,3 @@
   render();
   poller.start();
 })();
-
-
-
