@@ -8,11 +8,15 @@
 
 Режими:
     (без прапорців)   лише GET. Нічого не змінює на пристрої.
-    --write           POST/PUT/DELETE-перевірки: гучність, мʼют, баланс і чутливість VU (активний і неактивний вхід), яскравість,
-                      вхід (без зміни), станція-тимчасова (додається й видаляється), негативні випадки
+    --write           POST/PUT/DELETE-перевірки: гучність, мʼют, баланс і чутливість VU (активний і ВСІ неактивні входи, у тому
+                      числі слот 3), яскравість, вхід (без зміни), слот 3 (вимкнення / увімкнення, ім'я, EQ «Player», масиви
+                      з 3 і 4 елементів), станція-тимчасова (додається й видаляється), негативні випадки
                       (очікувані 400/404: застарілі ключі /api/settings, /api/gain тощо).
-                      Кожна зміна повертається до початкового значення.
-    --player          (разом з --write) перемикання play/pause та next/prev станції: чутні переходи.
+                      Кожна зміна повертається до початкового значення (маска слота 3, його ім'я, профіль EQ / баланс / VU
+                      і гучність «Player» включно).
+    --player          (разом з --write) перемикання play/pause та next/prev станції ТА вхід у режим «USB» (POST /api/input 3) з
+                      виходом назад: усе чутно, потрібна флешка (без неї режим теж піднімається, але частину перевірок буде
+                      пропущено).
     --confirm-checks  (разом з --write) негативні перевірки factory-reset / wifi-reset БЕЗ підтвердження
                       (очікується 400 confirm_required). Якщо прошивка має баг і не перевіряє confirm,
                       пристрій скине налаштування/Wi-Fi й перезапуститься — тому окремий прапорець.
@@ -20,14 +24,19 @@
 НІКОЛИ не запускається: POST /api/system/reboot, /api/ota, /api/stations/import, /api/ir/map/import,
 /api/power (standby), реальні factory-reset / wifi-reset.
 
-Оновлено в P50a: без processor / gain / тембру; додано GET /api/balance, menuContext, 3 входи.
+Оновлено в P50a: без processor / gain / тембру; додано GET /api/balance, menuContext (на той час 3 входи; тепер 4, див. INP4b).
 Оновлено у V2: GET /api/vu, status.vuSens; з --write — чутливість VU активного й неактивного входу (зміна й повернення),
-негативні випадки POST /api/vu (value поза діапазоном, невідомий ключ, input = 3).
+негативні випадки POST /api/vu (value поза діапазоном, невідомий ключ, input = 4).
 
 Оновлено в USB15: GET /api/usb/status|list|result (форма відповідей; за режиму «USB» вимкненому — 409 usb_mode_off на list); з --write — негативні
 перевірки POST /api/usb/* (400 за тілом; 409 usb_mode_off, лише коли режим вимкнений). Нічого не змінює: POST /api/usb/mode з коректною дією
 (вхід у режим) НЕ викликається — це перевіряється вручну за hwcheck_USB15.md. Якщо /api/usb/status повертає 404 (збірка з
 FEATURE_USB_MODE = 0), усі USB-перевірки позначаються SKIP.
+
+Оновлено в INP4b: 4 входи (3 логічні + слот 3 «Player» / USB). Перевіряються: GET /api/inputs, GET /api/eq?input=N, status.input == 3
+у режимі «USB», POST /api/input 3 -> 202 usb_enter (повторно 200), 409 input_active (вимкнення слота 3 у режимі), index 4 ->
+out_of_range (max 3), масиви з 3 елементів (застаріле) НЕ змінюють слот 3 (маска й ім'я), EQ / баланс / VU слота 3 get / set.
+Режим «USB» піднімається лише з --write --player (і лише з увімкненого пристрою на вході Radio / ExternalInput).
 
 Код виходу: 0 — немає FAIL; 1 — є хоча б один FAIL; 2 — пристрій недоступний.
 """
@@ -41,7 +50,9 @@ import urllib.request
 
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
 VOLUME_MIN, VOLUME_MAX = 0, 100          # audio_cfg::kVolumeUiMin / kVolumeUiMax (processor.capabilities прибрано в P50a)
-INPUT_COUNT = 3                          # defaults::kInputCount (0 радіо, 1 TV Box, 2 Computer)
+LOGICAL_COUNT = 3                        # defaults::kInputCount (0 радіо, 1 TV Box, 2 Computer)
+SLOT_COUNT = 4                           # [INP4b] defaults::kInputSlotCount: слоти входів веб-API (0..2 логічні + слот 3)
+USB_SLOT = 3                             # [INP4b] defaults::kUsbInputIndex: слот 3 = «Player» / режим «USB»
 BALANCE_MIN, BALANCE_MAX = -20, 20       # balance_cfg::kMinDb / kMaxDb
 VU_MIN, VU_MAX, VU_STEP = -20, 20, 1     # vu_sens_cfg::kMinDb / kMaxDb / kStepDb (V2)
 MENU_CONTEXTS = ("None", "StationList", "EqBalance")
@@ -127,8 +138,10 @@ def read_checks(d):
                      "playing", "streamStatus", "station", "track", "wifi", "otaProgress", "heap", "uptimeMs"])
     if ok:
         record("status.station.{index,count,max}", has_keys(st["station"], ["index", "count", "max", "name"]))
-        record("status.inputs[] має index/name/available, рівно %d" % INPUT_COUNT,
-               isinstance(st["inputs"], list) and len(st["inputs"]) == INPUT_COUNT and
+        record("status.input ∈ 0..%d" % (SLOT_COUNT - 1), isinstance(st["input"], int) and 0 <= st["input"] < SLOT_COUNT,
+               "got %r" % (st["input"],))
+        record("status.inputs[] має index/name/available, рівно %d" % SLOT_COUNT,
+               isinstance(st["inputs"], list) and len(st["inputs"]) == SLOT_COUNT and
                all(has_keys(i, ["index", "name", "available"]) for i in st["inputs"]))
         gone = [k for k in REMOVED_STATUS_KEYS if k in st]
         record("status без застарілих полів (processor/bass/treble/gain/loudness)", not gone,
@@ -150,8 +163,58 @@ def read_checks(d):
         gone = [k for k in REMOVED_SETTINGS_KEYS if k in sett]
         record("settings без застарілих полів (processorType/bass/treble/balance/loudness)", not gone,
                "ще є: %s" % ", ".join(gone) if gone else "")
-        record("settings.inputNames рівно %d" % INPUT_COUNT,
-               isinstance(sett["inputNames"], list) and len(sett["inputNames"]) == INPUT_COUNT)
+        record("settings.inputNames рівно %d" % SLOT_COUNT,
+               isinstance(sett["inputNames"], list) and len(sett["inputNames"]) == SLOT_COUNT)
+
+    # --- [INP4b] GET /api/inputs (4 слоти) ---
+    inp = get_inputs(d)
+    expect("GET /api/inputs", d.get("/api/inputs"), 200, ["inputs", "enabledMask", "input"])
+    if inp is None:
+        record("inputs[] рівно %d" % SLOT_COUNT, False, "відповідь не має рівно %d входів" % SLOT_COUNT)
+    else:
+        arr = inp["inputs"]
+        fields = ["index", "name", "available", "enabled", "selectable", "canDisable"]
+        record("inputs[] рівно %d, index 0..%d, поля %s" % (SLOT_COUNT, SLOT_COUNT - 1, "/".join(fields)),
+               all(has_keys(i, fields) for i in arr) and [i["index"] for i in arr] == list(range(SLOT_COUNT)), str(arr)[:100])
+        if all(has_keys(i, fields) for i in arr):
+            bits = sum((1 << i["index"]) for i in arr if i["enabled"])
+            record("inputs.enabledMask 4-бітний (0..15), біт 0 = 1, збігається з enabled[]",
+                   isinstance(inp["enabledMask"], int) and 0 <= inp["enabledMask"] <= 15 and inp["enabledMask"] & 1 and
+                   inp["enabledMask"] == bits, "mask=%s, з enabled[]=%s" % (inp["enabledMask"], bits))
+            record("inputs: selectable == available && enabled; canDisable == (index != 0)",
+                   all(i["selectable"] == (i["available"] and i["enabled"]) and i["canDisable"] == (i["index"] != 0) for i in arr))
+            record("inputs[0] (радіо): available, enabled, !canDisable",
+                   arr[0]["available"] and arr[0]["enabled"] and not arr[0]["canDisable"])
+            record("inputs[1..2] (логічні входи): available == true", all(arr[i]["available"] for i in (1, 2)))
+        if ok:
+            record("inputs.input == status.input", inp["input"] == st["input"], "%s vs %s" % (inp["input"], st["input"]))
+            record("inputs[].name == status.inputs[].name",
+                   all(inp["inputs"][i]["name"] == st["inputs"][i]["name"] for i in range(SLOT_COUNT)
+                       if isinstance(st["inputs"], list) and len(st["inputs"]) == SLOT_COUNT))
+        if ok_s:
+            record("inputs[].name == settings.inputNames (непорожні)",
+                   all(sett["inputNames"][i] in ("", inp["inputs"][i]["name"]) for i in range(SLOT_COUNT)
+                       if isinstance(sett["inputNames"], list) and len(sett["inputNames"]) == SLOT_COUNT))
+
+    # --- [INP4b] GET /api/eq (усі 4 слоти) ---
+    ok_e, eqa = expect("GET /api/eq (активний вхід)", d.get("/api/eq"), 200,
+                       ["input", "gainsDb", "freqHz", "minDb", "maxDb", "stepDb"])
+    if ok_e and ok:
+        record("eq: input == status.input", eqa["input"] == st["input"], "%s vs %s" % (eqa["input"], st["input"]))
+    for n in range(SLOT_COUNT):
+        okn, en = expect("GET /api/eq?input=%d" % n, d.get("/api/eq?input=%d" % n), 200,
+                         ["input", "gainsDb", "freqHz", "minDb", "maxDb", "stepDb"])
+        if okn:
+            record("eq?input=%d: input == %d, 5 цілих у межах minDb..maxDb, freqHz[5]" % (n, n),
+                   en["input"] == n and isinstance(en["gainsDb"], list) and len(en["gainsDb"]) == 5 and
+                   isinstance(en["freqHz"], list) and len(en["freqHz"]) == 5 and
+                   all(isinstance(g, int) and en["minDb"] <= g <= en["maxDb"] for g in en["gainsDb"]), str(en)[:100])
+    status, body = d.get("/api/eq?input=%d" % SLOT_COUNT)
+    record("GET /api/eq?input=%d -> 400 out_of_range (max %d)" % (SLOT_COUNT, SLOT_COUNT - 1),
+           status == 400 and isinstance(body, dict) and body.get("error") == "out_of_range" and
+           body.get("field") == "input" and body.get("min") == 0 and body.get("max") == SLOT_COUNT - 1,
+           "HTTP %s %s" % (status, str(body)[:80]))
+    expect("GET /api/eq?input=x -> 400", d.get("/api/eq?input=x"), 400, ["error"], "invalid_value")
 
     # --- GET /api/balance (P50a) ---
     ok_b, bal = expect("GET /api/balance (активний вхід)", d.get("/api/balance"), 200, ["input", "balance"])
@@ -159,16 +222,16 @@ def read_checks(d):
         record("balance: input == status.input", bal["input"] == st["input"], "%s vs %s" % (bal["input"], st["input"]))
         record("balance: balance == status.balance", bal["balance"] == st["balance"],
                "%s vs %s" % (bal["balance"], st["balance"]))
-    for n in range(INPUT_COUNT):
+    for n in range(SLOT_COUNT):
         okn, bn = expect("GET /api/balance?input=%d" % n, d.get("/api/balance?input=%d" % n), 200, ["input", "balance"])
         if okn:
             record("balance?input=%d: input == %d, значення в межах" % (n, n),
                    bn["input"] == n and isinstance(bn["balance"], int) and BALANCE_MIN <= bn["balance"] <= BALANCE_MAX,
                    str(bn))
-    status, body = d.get("/api/balance?input=%d" % INPUT_COUNT)
-    record("GET /api/balance?input=%d -> 400 out_of_range" % INPUT_COUNT,
+    status, body = d.get("/api/balance?input=%d" % SLOT_COUNT)
+    record("GET /api/balance?input=%d -> 400 out_of_range" % SLOT_COUNT,
            status == 400 and isinstance(body, dict) and body.get("error") == "out_of_range" and
-           body.get("field") == "input" and body.get("min") == 0 and body.get("max") == INPUT_COUNT - 1,
+           body.get("field") == "input" and body.get("min") == 0 and body.get("max") == SLOT_COUNT - 1,
            "HTTP %s %s" % (status, str(body)[:80]))
     expect("GET /api/balance?input=-1 -> 400", d.get("/api/balance?input=-1"), 400, ["error"], "out_of_range")
     expect("GET /api/balance?input=x -> 400", d.get("/api/balance?input=x"), 400, ["error"], "invalid_value")
@@ -180,17 +243,17 @@ def read_checks(d):
                vu["minDb"] == VU_MIN and vu["maxDb"] == VU_MAX and vu["stepDb"] == VU_STEP,
                "%s / %s / %s" % (vu["minDb"], vu["maxDb"], vu["stepDb"]))
         vins = vu["inputs"]
-        good = (isinstance(vins, list) and len(vins) == INPUT_COUNT and
+        good = (isinstance(vins, list) and len(vins) == SLOT_COUNT and
                 all(has_keys(i, ["index", "sensitivityDb"]) for i in vins) and
-                [i["index"] for i in vins] == list(range(INPUT_COUNT)))
-        record("vu.inputs[] рівно %d, index 0..%d, має sensitivityDb" % (INPUT_COUNT, INPUT_COUNT - 1), good, str(vins)[:100])
+                [i["index"] for i in vins] == list(range(SLOT_COUNT)))
+        record("vu.inputs[] рівно %d, index 0..%d, має sensitivityDb" % (SLOT_COUNT, SLOT_COUNT - 1), good, str(vins)[:100])
         if good:
             record("vu: sensitivityDb цілі в %d..%d" % (VU_MIN, VU_MAX),
                    all(isinstance(i["sensitivityDb"], int) and not isinstance(i["sensitivityDb"], bool) and
                        VU_MIN <= i["sensitivityDb"] <= VU_MAX for i in vins), str(vins)[:100])
         if ok:
             record("vu: input == status.input", vu["input"] == st["input"], "%s vs %s" % (vu["input"], st["input"]))
-            if good and not st["standby"] and 0 <= st["input"] < INPUT_COUNT:
+            if good and not st["standby"] and 0 <= st["input"] < SLOT_COUNT:
                 # у standby AppState.vuSensDb не гарантовано відображає профіль -> порівнюємо лише при працюючому пристрої
                 record("vu: inputs[active].sensitivityDb == status.vuSens",
                        vins[st["input"]]["sensitivityDb"] == st["vuSens"],
@@ -353,17 +416,18 @@ def write_checks(d, st, args):
         codes = [e.get("code") for e in resp.get("errors", [])] if isinstance(resp, dict) else []
         record("POST /api/settings {%s} -> 400 unknown_field" % key,
                status == 400 and codes == ["unknown_field"], "HTTP %s %s" % (status, str(resp)[:80]))
-    status, resp = d.post("/api/settings", {"inputNames": ["a", "b"]})
-    codes = [e.get("code") for e in resp.get("errors", [])] if isinstance(resp, dict) else []
-    record("POST /api/settings inputNames (2 елементи) -> 400 expected_array_of_3",
-           status == 400 and codes == ["expected_array_of_3"], "HTTP %s %s" % (status, str(resp)[:80]))
+    for cnt in (2, SLOT_COUNT + 1):  # [INP4b] приймається 3 (застаріло) або 4 елементи; інше -> expected_array_of_4
+        status, resp = d.post("/api/settings", {"inputNames": ["a"] * cnt})
+        codes = [e.get("code") for e in resp.get("errors", [])] if isinstance(resp, dict) else []
+        record("POST /api/settings inputNames (%d елементи) -> 400 expected_array_of_4" % cnt,
+               status == 400 and codes == ["expected_array_of_4"], "HTTP %s %s" % (status, str(resp)[:80]))
     expect("POST /api/balance {} -> 400 missing_field", d.post("/api/balance", {}), 400, ["error"], "missing_field")
     expect("POST /api/balance unknown field -> 400", d.post("/api/balance", {"value": 0, "x": 1}), 400, ["error"],
            "unknown_field")
     expect("POST /api/balance value=%d -> 400 out_of_range" % (BALANCE_MAX + 1),
            d.post("/api/balance", {"value": BALANCE_MAX + 1}), 400, ["error", "min", "max"], "out_of_range")
-    expect("POST /api/balance input=%d -> 400 out_of_range" % INPUT_COUNT,
-           d.post("/api/balance", {"value": 0, "input": INPUT_COUNT}), 400, ["error", "min", "max"], "out_of_range")
+    expect("POST /api/balance input=%d -> 400 out_of_range" % SLOT_COUNT,
+           d.post("/api/balance", {"value": 0, "input": SLOT_COUNT}), 400, ["error", "min", "max"], "out_of_range")
 
     # --- V2: POST /api/vu, негативні (валідація йде до застосування: побічних ефектів немає) ---
     expect("POST /api/vu {} -> 400 missing_field", d.post("/api/vu", {}), 400, ["error"], "missing_field")
@@ -375,8 +439,8 @@ def write_checks(d, st, args):
            d.post("/api/vu", {"value": VU_MAX + 1}), 400, ["error", "min", "max"], "out_of_range")
     expect("POST /api/vu value=%d -> 400 out_of_range" % (VU_MIN - 1),
            d.post("/api/vu", {"value": VU_MIN - 1}), 400, ["error", "min", "max"], "out_of_range")
-    expect("POST /api/vu input=%d -> 400 out_of_range" % INPUT_COUNT,
-           d.post("/api/vu", {"value": 0, "input": INPUT_COUNT}), 400, ["error", "min", "max"], "out_of_range")
+    expect("POST /api/vu input=%d -> 400 out_of_range" % SLOT_COUNT,
+           d.post("/api/vu", {"value": 0, "input": SLOT_COUNT}), 400, ["error", "min", "max"], "out_of_range")
     status, body = d.post("/api/vu", {"value": VU_MAX + 1})
     record("POST /api/vu out_of_range: field=value, min/max == %d/%d" % (VU_MIN, VU_MAX),
            status == 400 and isinstance(body, dict) and body.get("field") == "value" and
@@ -385,51 +449,61 @@ def write_checks(d, st, args):
     vmin, vmax = VOLUME_MIN, VOLUME_MAX
     expect("POST /api/volume above max -> 400", d.post("/api/volume", {"value": vmax + 1}), 400, ["error", "min", "max"],
            "out_of_range")
-    bad_input = INPUT_COUNT
-    expect("POST /api/input out of range -> 400", d.post("/api/input", {"index": bad_input}), 400,
-           ["error", "min", "max"], "out_of_range")
+    bad_input = SLOT_COUNT
+    status, body = d.post("/api/input", {"index": bad_input})
+    record("POST /api/input {index:%d} -> 400 out_of_range, min/max == 0/%d" % (bad_input, SLOT_COUNT - 1),
+           status == 400 and isinstance(body, dict) and body.get("error") == "out_of_range" and body.get("min") == 0 and
+           body.get("max") == SLOT_COUNT - 1, "HTTP %s %s" % (status, str(body)[:80]))
     expect("POST /api/input {index:cur} (без зміни)", d.post("/api/input", {"index": st["input"]})
            if not standby else (409, {"error": "standby"}), 409 if standby else 200)
 
-    # --- баланс неактивного входу: дозволено й у standby (лише профіль у Settings) ---
-    other = (st["input"] + 1) % INPUT_COUNT
-    status, o0 = d.get("/api/balance?input=%d" % other)
-    if status == 200 and isinstance(o0, dict):
-        b0 = o0["balance"]
-        b1 = b0 + 1 if b0 < BALANCE_MAX else b0 - 1
-        ok, _ = expect("POST /api/balance {value, input:%d} (неактивний)" % other,
-                       d.post("/api/balance", {"value": b1, "input": other}), 200, ["input", "balance"])
-        if ok:
+    # --- баланс неактивних входів (ВСІ слоти крім активного, у тому числі слот 3): дозволено й у standby (лише профіль) ---
+    inactive = [i for i in range(SLOT_COUNT) if i != st["input"]]
+    for other in inactive:
+        status, o0 = d.get("/api/balance?input=%d" % other)
+        if status == 200 and isinstance(o0, dict):
+            b0 = o0["balance"]
+            b1 = b0 + 1 if b0 < BALANCE_MAX else b0 - 1
+            ok, _ = expect("POST /api/balance {value, input:%d} (неактивний)" % other,
+                           d.post("/api/balance", {"value": b1, "input": other}), 200, ["input", "balance"])
+            if ok:
+                status, now = d.get("/api/balance?input=%d" % other)
+                record("balance (неактивний %d): GET == %d" % (other, b1), status == 200 and now.get("balance") == b1, str(now))
+            expect("POST /api/balance повернути %d (вхід %d)" % (b0, other),
+                   d.post("/api/balance", {"value": b0, "input": other}), 200, ["input", "balance"])
             status, now = d.get("/api/balance?input=%d" % other)
-            record("balance (неактивний): GET == %d" % b1, status == 200 and now.get("balance") == b1, str(now))
-        expect("POST /api/balance повернути %d (вхід %d)" % (b0, other),
-               d.post("/api/balance", {"value": b0, "input": other}), 200, ["input", "balance"])
-    else:
-        record("balance неактивного входу", False, "не вдалося прочитати", skip=True)
+            record("balance (неактивний %d): після повернення == %d" % (other, b0), status == 200 and now.get("balance") == b0, str(now))
+        else:
+            record("balance неактивного входу %d" % other, False, "не вдалося прочитати", skip=True)
 
-    # --- V2: чутливість VU неактивного входу: дозволено й у standby (лише профіль у Settings) ---
+    # --- V2: чутливість VU неактивних входів (ВСІ слоти крім активного, у тому числі слот 3): дозволено й у standby ---
     status, w0 = d.get("/api/vu")
-    if status == 200 and isinstance(w0, dict) and isinstance(w0.get("inputs"), list) and len(w0["inputs"]) == INPUT_COUNT:
-        vu_act = w0["input"]
-        vu_other = (vu_act + 1) % INPUT_COUNT
-        u0 = w0["inputs"][vu_other]["sensitivityDb"]
-        u1 = u0 + 1 if u0 < VU_MAX else u0 - 1
-        ok, b = expect("POST /api/vu {value, input:%d} (неактивний)" % vu_other,
-                       d.post("/api/vu", {"value": u1, "input": vu_other}), 200, ["input", "sensitivityDb"])
-        if ok:
-            record("vu (неактивний): відповідь input == %d, sensitivityDb == %d" % (vu_other, u1),
-                   b["input"] == vu_other and b["sensitivityDb"] == u1, str(b))
+    if status == 200 and isinstance(w0, dict) and isinstance(w0.get("inputs"), list) and len(w0["inputs"]) == SLOT_COUNT:
+        for vu_other in [i for i in range(SLOT_COUNT) if i != w0["input"]]:
+            u0 = w0["inputs"][vu_other]["sensitivityDb"]
+            u1 = u0 + 1 if u0 < VU_MAX else u0 - 1
+            ok, b = expect("POST /api/vu {value, input:%d} (неактивний)" % vu_other,
+                           d.post("/api/vu", {"value": u1, "input": vu_other}), 200, ["input", "sensitivityDb"])
+            if ok:
+                record("vu (неактивний %d): відповідь input == %d, sensitivityDb == %d" % (vu_other, vu_other, u1),
+                       b["input"] == vu_other and b["sensitivityDb"] == u1, str(b))
+                status, now = d.get("/api/vu")
+                record("vu (неактивний %d): GET inputs[%d] == %d" % (vu_other, vu_other, u1),
+                       status == 200 and now["inputs"][vu_other]["sensitivityDb"] == u1, str(now)[:100])
+                if status == 200:
+                    others_ok = all(now["inputs"][i]["sensitivityDb"] == w0["inputs"][i]["sensitivityDb"]
+                                    for i in range(SLOT_COUNT) if i != vu_other)
+                    record("vu (неактивний %d): інші входи не змінились" % vu_other, others_ok, str(now["inputs"])[:100])
+            expect("POST /api/vu повернути %d (вхід %d)" % (u0, vu_other),
+                   d.post("/api/vu", {"value": u0, "input": vu_other}), 200, ["input", "sensitivityDb"])
             status, now = d.get("/api/vu")
-            record("vu (неактивний): GET inputs[%d] == %d" % (vu_other, u1),
-                   status == 200 and now["inputs"][vu_other]["sensitivityDb"] == u1, str(now)[:100])
-            if status == 200:
-                others_ok = all(now["inputs"][i]["sensitivityDb"] == w0["inputs"][i]["sensitivityDb"]
-                                for i in range(INPUT_COUNT) if i != vu_other)
-                record("vu (неактивний): інші входи не змінились", others_ok, str(now["inputs"])[:100])
-        expect("POST /api/vu повернути %d (вхід %d)" % (u0, vu_other),
-               d.post("/api/vu", {"value": u0, "input": vu_other}), 200, ["input", "sensitivityDb"])
+            record("vu (неактивний %d): після повернення == %d" % (vu_other, u0),
+                   status == 200 and now["inputs"][vu_other]["sensitivityDb"] == u0, str(now)[:100])
     else:
         record("vu неактивного входу", False, "не вдалося прочитати", skip=True)
+
+    # --- [INP4b] слот 3 («Player» / USB): маска, ім'я, EQ (режим «USB» не активний) ---
+    slot3_checks(d, st, standby)
 
     if standby:
         record("volume/mute/balance(активний) зміни", False, "пристрій у standby (очікувано 409)", skip=True)
@@ -541,6 +615,364 @@ def write_checks(d, st, args):
         record("confirm-перевірки reset", False, "додайте --confirm-checks", skip=True)
 
 
+# --------------------------------------------------------------------------
+# [INP4b] Вхід-слот 3 («Player» / USB): допоміжні функції, перевірки в неактивному стані й у режимі «USB»
+# --------------------------------------------------------------------------
+def get_inputs(d):
+    """GET /api/inputs -> тіло (dict) з рівно SLOT_COUNT входами або None."""
+    status, body = d.get("/api/inputs")
+    if status == 200 and isinstance(body, dict) and isinstance(body.get("inputs"), list) \
+            and len(body["inputs"]) == SLOT_COUNT:
+        return body
+    return None
+
+
+def wait_until(fn, timeout=10.0, step=0.4):
+    """Викликає fn() до першого «істинного» результату (його й повертає) або до таймауту (-> None)."""
+    end = time.time() + timeout
+    while True:
+        try:
+            v = fn()
+        except Exception:  # noqa: BLE001 - тимчасова відсутність поля тощо
+            v = None
+        if v:
+            return v
+        if time.time() >= end:
+            return None
+        time.sleep(step)
+
+
+def usb_active_body(d):
+    """GET /api/usb/status -> тіло, якщо режим «USB» активний (active == true), інакше None."""
+    status, body = d.get("/api/usb/status")
+    if status == 200 and isinstance(body, dict) and body.get("active") is True:
+        return body
+    return None
+
+
+def usb_inactive_body(d):
+    """GET /api/usb/status -> тіло, якщо режим повністю вимкнено (mode.state == "Off"), інакше None.
+    (active == false ще й під час Exiting, тому лише active для «вийшли» недостатньо.)"""
+    status, body = d.get("/api/usb/status")
+    if status == 200 and isinstance(body, dict) and body.get("active") is False and \
+            isinstance(body.get("mode"), dict) and body["mode"].get("state") == "Off":
+        return body
+    return None
+
+
+def status_where(d, pred):
+    """GET /api/status -> тіло, якщо pred(тіло) істинний, інакше None."""
+    status, body = d.get("/api/status")
+    if status == 200 and isinstance(body, dict) and pred(body):
+        return body
+    return None
+
+
+def post_inputs_slot3(d, value, form):
+    """Змінює слот 3 в /api/inputs: form 'index' — {index:3,enabled:v}; 'array4' — [null,null,null,v]."""
+    if form == "index":
+        return d.post("/api/inputs", {"index": USB_SLOT, "enabled": value})
+    return d.post("/api/inputs", {"enabled": [None, None, None, value]})
+
+
+def slot3_checks(d, st, standby):
+    """[INP4b] Слот 3 у НЕАКТИВНОМУ стані (режим «USB» вимкнено): маска, ім'я, профіль EQ. Усе повертається.
+    (Баланс і VU слота 3 перевіряються в циклах «неактивних входів» у write_checks.)"""
+    inp0 = get_inputs(d)
+    status, sett0 = d.get("/api/settings")
+    if inp0 is None or status != 200 or not isinstance(sett0, dict) or \
+            not isinstance(sett0.get("inputNames"), list) or len(sett0["inputNames"]) != SLOT_COUNT:
+        record("слот 3 (USB): маска / ім'я / EQ", False, "не вдалося прочитати /api/inputs або /api/settings", skip=True)
+        return
+    s3 = inp0["inputs"][USB_SLOT]
+    if not s3.get("available"):
+        record("слот 3 (USB): маска / ім'я / EQ", False, "inputs[3].available=false (збірка без USB-входу)", skip=True)
+        expect("POST /api/inputs {index:3,enabled:true} без USB-входу -> 400 input_unavailable",
+               d.post("/api/inputs", {"index": USB_SLOT, "enabled": True}), 400, ["error"], "input_unavailable")
+        return
+    en0, mask0 = bool(s3["enabled"]), inp0["enabledMask"]
+    names0 = list(sett0["inputNames"])
+    eq_status, eq0 = d.get("/api/eq?input=%d" % USB_SLOT)
+    eq0_gains = eq0.get("gainsDb") if eq_status == 200 and isinstance(eq0, dict) else None
+    try:
+        # (а) вимкнення слота 3 (форма {index, enabled}); відповідь повертає повний стан
+        ok, b = expect("POST /api/inputs {index:3,enabled:false}", post_inputs_slot3(d, False, "index"), 200,
+                       ["inputs", "enabledMask", "input"])
+        if ok:
+            s = b["inputs"][USB_SLOT]
+            record("слот 3 вимкнено: enabled=false, selectable=false, біт 3 маски знято, біти 0..2 не змінились",
+                   s["enabled"] is False and s["selectable"] is False and (b["enabledMask"] & 8) == 0 and
+                   (b["enabledMask"] & 7) == (mask0 & 7), str(b)[:120])
+        g = get_inputs(d)
+        record("слот 3 вимкнено: GET /api/inputs збігається", g is not None and g["inputs"][USB_SLOT]["enabled"] is False)
+        if standby:
+            record("POST /api/input {index:3} при вимкненому слоті -> 409 input_disabled", False,
+                   "пристрій у standby (там 409 standby)", skip=True)
+        else:
+            expect("POST /api/input {index:3} при вимкненому слоті -> 409 input_disabled",
+                   d.post("/api/input", {"index": USB_SLOT}), 409, ["error"], "input_disabled")
+        # (б) увімкнення слота 3 (форма масиву з 4 елементів)
+        ok, b = expect("POST /api/inputs {enabled:[null,null,null,true]} (4 елементи)", post_inputs_slot3(d, True, "array4"),
+                       200, ["inputs", "enabledMask", "input"])
+        if ok:
+            record("слот 3 увімкнено: enabled=true, selectable=true, біт 3 маски",
+                   b["inputs"][USB_SLOT]["enabled"] is True and b["inputs"][USB_SLOT]["selectable"] is True and
+                   (b["enabledMask"] & 8) == 8, str(b)[:120])
+        # (в) масив із 3 елементів (ЗАСТАРІЛО) НЕ чіпає слот 3: поточні значення входів 1..2 передаємо без змін
+        cur = get_inputs(d)
+        if cur is not None:
+            e1, e2 = cur["inputs"][1]["enabled"], cur["inputs"][2]["enabled"]
+            for want3 in (True, False):
+                post_inputs_slot3(d, want3, "index")
+                ok, b = expect("POST /api/inputs {enabled:[null,%s,%s]} (3 елементи, застаріло), слот 3 == %s"
+                               % (str(e1).lower(), str(e2).lower(), want3),
+                               d.post("/api/inputs", {"enabled": [None, e1, e2]}), 200, ["inputs", "enabledMask"])
+                if ok:
+                    record("3 елементи: слот 3 не змінився (enabled == %s), входи 1..2 без змін" % want3,
+                           b["inputs"][USB_SLOT]["enabled"] is want3 and b["inputs"][1]["enabled"] is e1 and
+                           b["inputs"][2]["enabled"] is e2, str(b)[:120])
+        expect("POST /api/inputs {enabled:[null,true]} (2 елементи) -> 400 invalid_value",
+               d.post("/api/inputs", {"enabled": [None, True]}), 400, ["error", "field"], "invalid_value")
+        expect("POST /api/inputs {enabled: 5 елементів} -> 400 invalid_value",
+               d.post("/api/inputs", {"enabled": [None] * (SLOT_COUNT + 1)}), 400, ["error", "field"], "invalid_value")
+        expect("POST /api/inputs {index:%d,enabled:true} -> 400 out_of_range" % SLOT_COUNT,
+               d.post("/api/inputs", {"index": SLOT_COUNT, "enabled": True}), 400, ["error", "min", "max"], "out_of_range")
+
+        # (г) імена: слот 3 змінюється лише 4-елементним масивом; 3 елементи його не чіпають
+        test_name = "Плеєр-смоук"
+        ok, _ = expect("POST /api/settings {inputNames:[null,null,null,\"%s\"]} (4 елементи)" % test_name,
+                       d.post("/api/settings", {"inputNames": [None, None, None, test_name]}), 200, ["ok", "results"])
+        status, sett = d.get("/api/settings")
+        record("ім'я слота 3 == %r, імена 0..2 без змін" % test_name,
+               status == 200 and sett["inputNames"][USB_SLOT] == test_name and sett["inputNames"][:3] == names0[:3],
+               str(sett.get("inputNames") if isinstance(sett, dict) else sett)[:100])
+        g = get_inputs(d)
+        status, sst = d.get("/api/status")
+        record("ім'я слота 3 видно в /api/inputs і /api/status.inputs",
+               g is not None and g["inputs"][USB_SLOT]["name"] == test_name and status == 200 and
+               isinstance(sst, dict) and sst["inputs"][USB_SLOT]["name"] == test_name)
+        ok, _ = expect("POST /api/settings {inputNames: 3 елементи (поточні), застаріло}",
+                       d.post("/api/settings", {"inputNames": names0[:3]}), 200, ["ok", "results"])
+        status, sett = d.get("/api/settings")
+        record("3 елементи inputNames: слот 3 не змінився (%r)" % test_name,
+               status == 200 and sett["inputNames"][USB_SLOT] == test_name and sett["inputNames"][:3] == names0[:3],
+               str(sett.get("inputNames") if isinstance(sett, dict) else sett)[:100])
+        status, body = d.post("/api/settings", {"inputNames": [None, None, None, "x" * 32]})
+        errs = body.get("errors") if isinstance(body, dict) else None
+        record("POST /api/settings ім'я слота 3 > 31 байта -> 400 invalid_name (index 3)",
+               status == 400 and isinstance(errs, list) and len(errs) == 1 and errs[0].get("code") == "invalid_name" and
+               errs[0].get("index") == USB_SLOT, "HTTP %s %s" % (status, str(body)[:100]))
+
+        # (д) EQ слота 3 (профіль «Player»; режим не активний -> лише збереження), вхід 0 не змінюється
+        if eq0_gains is not None and isinstance(eq0.get("minDb"), int):
+            st0, e_in0 = d.get("/api/eq?input=0")
+            g0 = list(eq0_gains)
+            g1 = g0[0] + 1 if g0[0] < eq0["maxDb"] else g0[0] - 1
+            ok, b = expect("POST /api/eq {input:3,band:0,gainDb:%d} (профіль «Player»)" % g1,
+                           d.post("/api/eq", {"input": USB_SLOT, "band": 0, "gainDb": g1}), 200, ["input", "gainsDb"])
+            if ok:
+                record("eq слота 3: відповідь input == 3, gainsDb[0] == %d, решта без змін" % g1,
+                       b["input"] == USB_SLOT and b["gainsDb"][0] == g1 and b["gainsDb"][1:] == g0[1:], str(b)[:100])
+            status, now = d.get("/api/eq?input=%d" % USB_SLOT)
+            record("eq слота 3: GET == збережене", status == 200 and now.get("gainsDb", [None])[0] == g1, str(now)[:100])
+            status, e_in0b = d.get("/api/eq?input=0")
+            record("eq слота 3: профіль входу 0 не змінився",
+                   st0 == 200 and status == 200 and e_in0.get("gainsDb") == e_in0b.get("gainsDb"), str(e_in0b)[:100])
+            expect("POST /api/eq {input:3,gainsDb:[...]} повернути", d.post("/api/eq", {"input": USB_SLOT, "gainsDb": g0}),
+                   200, ["input", "gainsDb"])
+            status, now = d.get("/api/eq?input=%d" % USB_SLOT)
+            record("eq слота 3: після повернення == початкове", status == 200 and now.get("gainsDb") == g0, str(now)[:100])
+        else:
+            record("eq слота 3", False, "не вдалося прочитати GET /api/eq?input=3", skip=True)
+        expect("POST /api/eq {input:%d,band:0,gainDb:0} -> 400 out_of_range" % SLOT_COUNT,
+               d.post("/api/eq", {"input": SLOT_COUNT, "band": 0, "gainDb": 0}), 400, ["error", "min", "max"], "out_of_range")
+    finally:
+        # --- відновлення: ім'я, EQ (на випадок збою посередині), маска слота 3 ---
+        d.post("/api/settings", {"inputNames": [None, None, None, names0[USB_SLOT]]})
+        if eq0_gains is not None:
+            d.post("/api/eq", {"input": USB_SLOT, "gainsDb": eq0_gains})
+        post_inputs_slot3(d, en0, "array4")
+        g = get_inputs(d)
+        status, sett = d.get("/api/settings")
+        record("слот 3 відновлено: enabledMask == %d, ім'я == %r" % (mask0, names0[USB_SLOT]),
+               g is not None and g["enabledMask"] == mask0 and status == 200 and
+               sett["inputNames"][USB_SLOT] == names0[USB_SLOT],
+               "mask=%s name=%s" % (g["enabledMask"] if g else None, sett["inputNames"][USB_SLOT] if status == 200 else None))
+
+
+def usb_leave(d, prev, vol0, bal0, vu0):
+    """Вихід із режиму «USB» на вхід prev + перевірка, що профіль входу prev відновився. Викликається завжди (finally)."""
+    act = usb_active_body(d)
+    cur = status_where(d, lambda s: s.get("input") == USB_SLOT)
+    if act is None and cur is None:
+        return  # режим не було піднято (або вже вийшли)
+    status, b = d.post("/api/input", {"index": prev})
+    record("POST /api/input {index:%d} з режиму «USB» -> 202 usb_exit" % prev,
+           status == 202 and isinstance(b, dict) and b.get("ok") is True and b.get("pending") is True and
+           b.get("reason") == "usb_exit" and b.get("target") == prev, "HTTP %s %s" % (status, str(b)[:120]))
+    off = wait_until(lambda: usb_inactive_body(d), 15)
+    record("вихід: /api/usb/status mode.state == Off", bool(off), "" if off else "режим не вимкнувся за 15 с")
+    back = wait_until(lambda: status_where(d, lambda s: s.get("input") == prev), 8)
+    record("вихід: status.input == %d" % prev, bool(back), "" if back else "input не повернувся")
+    prof = wait_until(lambda: status_where(
+        d, lambda s: s.get("input") == prev and s.get("volume") == vol0 and s.get("balance") == bal0 and
+        s.get("vuSens") == vu0), 8)
+    record("вихід: профіль входу %d відновлено (volume %s, balance %s, vuSens %s)" % (prev, vol0, bal0, vu0), bool(prof),
+           "" if prof else "після виходу інші значення")
+
+
+def usb_input_checks(d, st):
+    """[INP4b] Режим «USB» через слот 3 (ЧУТНІ переходи; лише з --write --player). Вхід: POST /api/input 3; вихід — на
+    попередній вхід. Усе, що змінюється всередині (EQ / баланс / VU / гучність «Player»), повертається. Якщо слот 3 вимкнено
+    в налаштуваннях — на час перевірки він тимчасово вмикається й після виходу з режиму повертається вимкненим."""
+    if not st or st.get("standby") or st.get("mode") not in ("Radio", "ExternalInput"):
+        record("режим «USB» через вхід 3", False, "потрібен увімкнений пристрій у режимі Radio / ExternalInput", skip=True)
+        return
+    inp = get_inputs(d)
+    if inp is None or not inp["inputs"][USB_SLOT].get("available"):
+        record("режим «USB» через вхід 3", False, "слот 3 недоступний (збірка без USB-входу)", skip=True)
+        return
+    temp_enabled = False
+    if not inp["inputs"][USB_SLOT].get("enabled"):
+        ok, _ = expect("POST /api/inputs {enabled:[null,null,null,true]} (слот 3 тимчасово вмикається для перевірки режиму)",
+                       post_inputs_slot3(d, True, "array4"), 200, ["inputs", "enabledMask"])
+        if not ok:
+            return
+        temp_enabled = True
+        inp = get_inputs(d)
+        if inp is None:
+            return
+    try:
+        _usb_input_checks_body(d, st, inp)
+    finally:
+        if temp_enabled:
+            post_inputs_slot3(d, False, "array4")
+            g = get_inputs(d)
+            record("слот 3 повернуто вимкненим після перевірки режиму «USB» (enabledMask == %d)" % (inp["enabledMask"] & ~8),
+                   g is not None and g["inputs"][USB_SLOT]["enabled"] is False and g["enabledMask"] == (inp["enabledMask"] & ~8),
+                   str(g.get("enabledMask") if g else None))
+
+
+def _usb_input_checks_body(d, st, inp):
+    status, s0 = d.get("/api/status")
+    if status != 200 or not isinstance(s0, dict):
+        record("режим «USB» через вхід 3", False, "не вдалося прочитати /api/status", skip=True)
+        return
+    prev, vol0, bal0, vu0 = s0["input"], s0["volume"], s0["balance"], s0["vuSens"]
+    status, eq3 = d.get("/api/eq?input=%d" % USB_SLOT)
+    eq3_0 = list(eq3["gainsDb"]) if status == 200 and isinstance(eq3, dict) and "gainsDb" in eq3 else None
+    status, vu_before = d.get("/api/vu")
+    try:
+        status, b = d.post("/api/input", {"index": USB_SLOT})
+        record("POST /api/input {index:3} -> 202 usb_enter",
+               status == 202 and isinstance(b, dict) and b.get("ok") is True and b.get("pending") is True and
+               b.get("reason") == "usb_enter" and b.get("target") == USB_SLOT and isinstance(b.get("state"), dict),
+               "HTTP %s %s" % (status, str(b)[:120]))
+        if status != 202:
+            return
+        up = wait_until(lambda: usb_active_body(d), 15)
+        record("після входу: /api/usb/status.active == true", bool(up), "" if up else "режим не піднявся за 15 с")
+        if not up:
+            return
+        su = wait_until(lambda: status_where(d, lambda s: s.get("input") == USB_SLOT), 6)
+        record("у режимі «USB»: status.input == 3", bool(su), "" if su else "status.input != 3")
+        if su:
+            record("у режимі «USB»: status.inputName == назва слота 3 (/api/inputs)",
+                   su.get("inputName") == get_inputs(d)["inputs"][USB_SLOT]["name"], str(su.get("inputName")))
+        gi = get_inputs(d)
+        record("у режимі «USB»: /api/inputs.input == 3", gi is not None and gi.get("input") == USB_SLOT)
+        for path in ("/api/balance", "/api/vu", "/api/eq"):
+            status, body = d.get(path)
+            record("у режимі «USB»: GET %s (без input) -> input == 3" % path,
+                   status == 200 and isinstance(body, dict) and body.get("input") == USB_SLOT, str(body)[:80])
+
+        status, b = d.post("/api/input", {"index": USB_SLOT})
+        record("повторний POST /api/input {index:3} у режимі -> 200 без pending",
+               status == 200 and isinstance(b, dict) and b.get("ok") is True and "pending" not in b,
+               "HTTP %s %s" % (status, str(b)[:100]))
+
+        # --- input_active: вимкнення слота 3 у режимі «USB» заборонено, маска не змінюється ---
+        expect("POST /api/inputs {index:3,enabled:false} у режимі «USB» -> 409 input_active",
+               post_inputs_slot3(d, False, "index"), 409, ["error"], "input_active")
+        expect("POST /api/inputs {enabled:[null,null,null,false]} у режимі «USB» -> 409 input_active",
+               post_inputs_slot3(d, False, "array4"), 409, ["error"], "input_active")
+        gi = get_inputs(d)
+        record("input_active: слот 3 лишився enabled, маска не змінилась",
+               gi is not None and gi["inputs"][USB_SLOT]["enabled"] is True and gi["enabledMask"] == inp["enabledMask"],
+               str(gi.get("enabledMask") if gi else None))
+
+        # --- EQ «Player» у режимі (живе застосування; чутно) і незалежність від входу prev ---
+        if eq3_0 is not None and isinstance(eq3.get("maxDb"), int):
+            g1 = eq3_0[0] + 1 if eq3_0[0] < eq3["maxDb"] else eq3_0[0] - 1
+            ok, b = expect("POST /api/eq {band:0,gainDb:%d} у режимі (без input -> слот 3)" % g1,
+                           d.post("/api/eq", {"band": 0, "gainDb": g1}), 200, ["input", "gainsDb"])
+            if ok:
+                record("eq у режимі: відповідь input == 3, gainsDb[0] == %d" % g1,
+                       b["input"] == USB_SLOT and b["gainsDb"][0] == g1, str(b)[:100])
+            d.post("/api/eq", {"input": USB_SLOT, "gainsDb": eq3_0})
+            status, now = d.get("/api/eq?input=%d" % USB_SLOT)
+            record("eq у режимі: повернуто початковий пресет «Player»", status == 200 and now.get("gainsDb") == eq3_0)
+        else:
+            record("eq у режимі «USB»", False, "не вдалося прочитати EQ слота 3", skip=True)
+
+        # --- баланс / VU: без input -> слот 3; профіль входу prev не змінюється ---
+        status, bu = d.get("/api/balance")
+        status_s, su0 = d.get("/api/status")
+        if status == 200 and status_s == 200 and isinstance(bu, dict):
+            b0 = bu["balance"]
+            b1 = b0 + 1 if b0 < BALANCE_MAX else b0 - 1
+            ok, b = expect("POST /api/balance {value:%d} у режимі (без input -> слот 3)" % b1,
+                           d.post("/api/balance", {"value": b1}), 200, ["input", "balance"])
+            if ok:
+                record("balance у режимі: відповідь input == 3, balance == %d" % b1,
+                       b["input"] == USB_SLOT and b["balance"] == b1, str(b))
+                status, now = d.get("/api/status")
+                record("balance у режимі: /api/status.balance == %d" % b1, status == 200 and now.get("balance") == b1)
+                status, other = d.get("/api/balance?input=%d" % prev)
+                record("balance у режимі: профіль входу %d не змінився (%d)" % (prev, bal0),
+                       status == 200 and other.get("balance") == bal0, str(other))
+            expect("POST /api/balance повернути %d (слот 3)" % b0, d.post("/api/balance", {"value": b0}), 200,
+                   ["input", "balance"])
+        if status_s == 200 and isinstance(su0, dict):
+            k0 = su0["vuSens"]
+            k1 = k0 + 1 if k0 < VU_MAX else k0 - 1
+            ok, b = expect("POST /api/vu {value:%d} у режимі (без input -> слот 3)" % k1,
+                           d.post("/api/vu", {"value": k1}), 200, ["input", "sensitivityDb"])
+            if ok:
+                record("vu у режимі: відповідь input == 3, sensitivityDb == %d" % k1,
+                       b["input"] == USB_SLOT and b["sensitivityDb"] == k1, str(b))
+                status, now = d.get("/api/vu")
+                if status == 200 and isinstance(vu_before, dict) and isinstance(vu_before.get("inputs"), list):
+                    record("vu у режимі: inputs[3] == %d, inputs[%d] без змін" % (k1, prev),
+                           now["inputs"][USB_SLOT]["sensitivityDb"] == k1 and
+                           now["inputs"][prev]["sensitivityDb"] == vu_before["inputs"][prev]["sensitivityDb"],
+                           str(now.get("inputs"))[:100])
+            expect("POST /api/vu повернути %d (слот 3)" % k0, d.post("/api/vu", {"value": k0}), 200, ["input", "sensitivityDb"])
+
+        # --- гучність «Player» і lastInput / lastVolume ---
+        status, sv = d.get("/api/status")
+        if status == 200 and isinstance(sv, dict):
+            v0 = sv["volume"]
+            v1 = v0 + 1 if v0 < VOLUME_MAX else v0 - 1
+            ok, b = expect("POST /api/volume {value:%d} у режимі «USB» (гучність «Player»)" % v1,
+                           d.post("/api/volume", {"value": v1}), 200, ["state"])
+            if ok:
+                record("volume у режимі: state.input == 3, state.volume == %d" % v1,
+                       b["state"].get("input") == USB_SLOT and b["state"].get("volume") == v1, str(b)[:100])
+            sett = wait_until(lambda: (lambda r: r[1] if r[0] == 200 and isinstance(r[1], dict) and
+                                       r[1].get("lastInput") == USB_SLOT and r[1].get("lastVolume") == v1 else None)(
+                d.get("/api/settings")), 10)
+            record("settings у режимі: lastInput == 3, lastVolume == %d (профіль «Player», не радіо)" % v1, bool(sett),
+                   "" if sett else "lastInput / lastVolume не збіглись за 10 с")
+            expect("POST /api/volume повернути %d («Player»)" % v0, d.post("/api/volume", {"value": v0}), 200, ["state"])
+            back = wait_until(lambda: status_where(d, lambda s: s.get("volume") == v0), 6)
+            record("volume «Player» відновлено (%d)" % v0, bool(back))
+    except Exception as exc:  # noqa: BLE001
+        record("режим «USB» через вхід 3: неочікуваний виняток", False, repr(exc))
+    finally:
+        usb_leave(d, prev, vol0, bal0, vu0)
+
+
 def usb_write_checks(d, st, active):
     """[USB15] Негативні POST /api/usb/* без побічних ефектів. 400 перевіряються завжди (валідація йде до перевірки режиму);
     409 usb_mode_off — лише коли режим вимкнений. Коректних команд, що змінюють стан, тут НЕМАЄ (див. hwcheck_USB15.md)."""
@@ -632,6 +1064,18 @@ def main():
 
     st = read_checks(d)
     usb_present, usb_active = usb_read_checks(d)  # [USB15]
+    # [INP4b] Узгодженість «веб-активного входу»: у режимі «USB» (usb/status.active) status.input має бути 3; слот 3 доступний
+    # (inputs[3].available) тоді й лише тоді, коли USB-маршрути зібрано.
+    inp_main = get_inputs(d)
+    if usb_present and usb_active:
+        status, cur = d.get("/api/status")
+        record("режим «USB» активний -> status.input == 3", status == 200 and isinstance(cur, dict) and cur.get("input") == USB_SLOT,
+               "got %r" % (cur.get("input") if isinstance(cur, dict) else cur))
+    else:
+        record("режим «USB» активний -> status.input == 3", False, "режим «USB» не активний (див. hwcheck_INP4b2.md)", skip=True)
+    if inp_main is not None:
+        record("inputs[3].available == (USB-маршрути присутні)", bool(inp_main["inputs"][USB_SLOT]["available"]) == bool(usb_present),
+               "available=%s, usb=%s" % (inp_main["inputs"][USB_SLOT]["available"], usb_present))
     if args.write:
         if usb_present and usb_active:
             # [USB15] У режимі «USB» POST /api/input -> 202 (вихід із режиму), тож старі write-перевірки (очікують 200) й сам режим зламались би.
@@ -639,6 +1083,11 @@ def main():
                    "режим USB активний: пропущено; вийдіть з режиму (POST /api/usb/mode exit) і запустіть --write ще раз", skip=True)
         else:
             write_checks(d, st, args)
+            if args.player:
+                usb_input_checks(d, st)  # [INP4b] чутний вхід у режим «USB» слотом 3 і вихід назад
+            else:
+                record("режим «USB» через вхід 3 (202 usb_enter, input_active, status.input == 3)", False,
+                       "додайте --player", skip=True)
         if usb_present:
             usb_write_checks(d, st, usb_active)
     else:

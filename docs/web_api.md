@@ -1,7 +1,7 @@
 # HTTP API пристрою (ESP32-S3 Audio Controller)
 
 Документ-контракт для фронтенду. Опис ПОВНИЙ і самодостатній: C++ читати не треба.
-Версія контракту: **P50a** (3 входи, цифровий баланс і EQ по входах, без аудіочіпів). Історія: Prompt 18 (прошивка
+Версія контракту: **INP4b** (4 входи: 3 логічні + слот 3 «Player» / USB; цифровий баланс і EQ по входах, без аудіочіпів). Історія: Prompt 18 (прошивка
 `0.18.0`, див. `GET /api/system`); семантику `station.name` уточнено в Prompt 20b; Prompt 25: поле станції `levelDb`
 (§5); Prompt 29: кілька збережених Wi-Fi мереж (§7); Prompt 30: еквалайзер `GET` / `POST /api/eq` (§11);
 Prompt 39: відключення входів `GET` / `POST /api/inputs` (§12), причина `409 input_disabled`; P46–P49: профіль входу =
@@ -10,6 +10,7 @@ Prompt 39: відключення входів `GET` / `POST /api/inputs` (§12)
 у `GET /api/status` (§2).** V2: чутливість VU по входах — `GET` / `POST /api/vu` (§15) і поле `vuSens` у
 `GET /api/status` (§2); профіль входу доповнено чутливістю VU (§1.3). V3 (веб-інтерфейс «Налаштування → Входи», перевірено на залізі 2026-10-22): фронтенд використовує `GET` / `POST /api/vu` (§15); сам контракт не змінювався.
 **USB15: веб-API плеєра USB (режим «USB», `/api/usb/*`, §16; лише при збірці з `FEATURE_USB_MODE = 1`), HTTP `202` для команд, що виконуються асинхронно (§1.1), і `POST /api/input` у режимі «USB» (§4.5).**
+**INP4b: USB — четвертий вхід (слот 3): `POST /api/input {"index":3}` піднімає режим «USB» (`202 usb_enter`), `/api/inputs`, `/api/eq`, `/api/balance`, `/api/vu`, `/api/settings` працюють з 4 слотами, `status.input` = 3 у режимі «USB», нова відмова `409 input_active`; масиви з 3 елементів у `POST /api/inputs` і `POST /api/settings` ЗАСТАРІЛІ, але приймаються (§17).**
 
 ## 1. Загальні правила
 
@@ -67,22 +68,29 @@ Prompt 39: відключення входів `GET` / `POST /api/inputs` (§12)
 | `wifi_setup` | пристрій у режимі `WifiSetup` (потоку немає) |
 | `no_stations` | список станцій порожній |
 | `input_disabled` | `POST /api/input` на вхід, який вимкнено в налаштуваннях входів (§12) |
+| `input_active` | `POST /api/inputs`: спроба вимкнути слот 3 («USB»), поки активний режим «USB» (§12.2) |
 
 ### 1.3. Профілі входів
 
-Пристрій має **3 логічні входи**: `0` = радіо (WiFi Radio), `1` = TV Box, `2` = Computer. Налаштування звуку
-зберігаються в NVS **окремо для кожного входу**: профіль входу = `{гучність, пресет EQ на 5 смуг, баланс, чутливість VU}`.
+Пристрій має **4 слоти входів**: `0` = радіо (WiFi Radio), `1` = TV Box, `2` = Computer (3 логічні входи) і `3` = «Player»
+(режим «USB», флешка; INP4b). Налаштування звуку зберігаються в NVS **окремо для кожного слота**: профіль слота =
+`{гучність, пресет EQ на 5 смуг, баланс, чутливість VU}`. Профіль слота 3 («Player») — окремий від радіо: у режимі «USB» діє він.
 Бас / дискант / gain / loudness не існують (див. §14). Мʼют (`mute`) глобальний і в профіль не входить.
 Чутливість VU (V2, §15) впливає лише на показ індикатора рівня, не на звук.
 
-- `POST /api/volume` і `POST /api/balance` (без `input` або з `input` = поточний) працюють з профілем **поточного**
-  входу: значення застосовується одразу й запамʼятовується для цього входу (запис у NVS — з дебаунсом).
-- `/api/eq`, `/api/balance` і `POST /api/vu` приймають необовʼязковий `input` (0..2) (`GET /api/vu` віддає всі 3 входи одразу): тоді читається / змінюється профіль цього входу
-  (для неактивного входу — лише запис у профіль, звук не змінюється; застосується при перемиканні на вхід).
+**«Активний вхід» у вебі** = `3`, поки активний режим «USB» (стан `usbUi != Off`: піднімається, працює, виходить, помилка), інакше
+поточний логічний вхід `0..2`. Саме його повертають `status.input`, `GET /api/inputs` → `input` і «поточний» вхід у `/api/eq`,
+`/api/balance`, `/api/vu` (коли `input` у запиті не вказано).
+
+- `POST /api/volume` і `POST /api/balance` (без `input` або з `input` = активний) працюють з профілем **активного**
+  входу (у режимі «USB» — з профілем слота 3): значення застосовується одразу й запамʼятовується (запис у NVS — з дебаунсом).
+- `/api/eq`, `/api/balance` і `POST /api/vu` приймають необовʼязковий `input` (0..3) (`GET /api/vu` віддає всі 4 слоти одразу): тоді
+  читається / змінюється профіль цього слота (для неактивного — лише запис у профіль, звук не змінюється; застосується при
+  перемиканні на нього). У режимі «USB» профілі входів 0..2 теж лише зберігаються (екземпляр EQ радіо зайнятий пресетом «Player»).
 - При перемиканні входу (`POST /api/input`, `POST /api/player/station` із `switchInput`, кнопки, пульт) і при виході зі
   standby пристрій під мʼютом застосовує профіль нового входу (гучність, EQ, баланс, чутливість VU), після чого розмʼючує звук;
   `GET /api/status` одразу показує `volume`, `balance` і `vuSens` нового входу.
-- Гучність неактивних входів через API не читається й не змінюється (окремого ендпоїнта немає); EQ, баланс і чутливість
+- Гучність неактивних слотів через API не читається й не змінюється (окремого ендпоїнта немає); EQ, баланс і чутливість
   VU — так (`input`).
 
 ---
@@ -101,7 +109,8 @@ Prompt 39: відключення входів `GET` / `POST /api/inputs` (§12)
   "inputs": [
     {"index": 0, "name": "WiFi Radio", "available": true},
     {"index": 1, "name": "TV Box",     "available": true},
-    {"index": 2, "name": "Computer",   "available": true}
+    {"index": 2, "name": "Computer",   "available": true},
+    {"index": 3, "name": "Player",     "available": true}
   ],
   "volume": 35, "balance": 0, "vuSens": 0,
   "mute": false,
@@ -125,9 +134,14 @@ Prompt 39: відключення входів `GET` / `POST /api/inputs` (§12)
 - **`menuContext`** (P50a) — підрежим меню: `"None" | "StationList" | "EqBalance"`. Поза `mode == "Menu"` завжди
   `"None"`. `mode` лишається `"Menu"` для будь-якого контексту, тож щоб відрізнити список станцій від екрана EQ,
   дивіться `menuContext`. Невідоме майбутнє значення клієнт має трактувати як `"None"`.
-- `inputName` — назва поточного входу (користувацька з налаштувань, інакше типова). `inputs[]` — усі **3** логічні
-  входи з назвами; `available` — апаратна доступність (зараз завжди `true`); чи вхід **дозволено користувачем**
-  (вимкнено в налаштуваннях), віддає `GET /api/inputs` (§12).
+- `input` (INP4b) — **активний вхід**: `0..2` у звичайних режимах і **`3`, поки активний режим «USB»** (піднімається, працює, виходить,
+  помилка; `usbUi != Off`). `inputName` — назва цього входу (користувацька з налаштувань, інакше типова; для слота 3 типово
+  «Player»). `inputs[]` — усі **4** слоти з назвами; `available` — апаратна / збіркова доступність (входи 0..2 — завжди `true`; слот 3 —
+  `true`, якщо прошивку зібрано з USB-входом); чи вхід **дозволено користувачем** (вимкнено в налаштуваннях), віддає `GET /api/inputs` (§12).
+- **Для фронтенду (INP4b): поки `status.input == 3`, поля `status.mode`, `status.station`, `status.playing`, `status.streamStatus` і
+  `status.track` належать ПОПЕРЕДНЬОМУ входу (його стан збережено до виходу з режиму) і НЕ використовуються для відображення
+  плеєра** (`mode` лишається `Radio` / `ExternalInput`, `playing` може бути `true`, станція — стара). Стан плеєра — лише
+  `GET /api/usb/status` (§16.2). `volume`, `balance` і `vuSens` у цей час — профіль слота 3 («Player»).
 - `volume` — **цільова** гучність поточного входу, шкала **0..100** (під час плавного підйому після розмʼюту
   фактичний рівень може бути тихіше). `volume`, `balance` і `vuSens` — значення **профілю поточного входу** (§1.3); після
   перемикання входу вони одразу змінюються на значення нового.
@@ -151,7 +165,7 @@ Prompt 39: відключення входів `GET` / `POST /api/inputs` (§12)
 - `otaProgress` — 0..100; осмислений лише коли `mode == "OtaUpdate"`.
 - `heap`, `psramFree` — вільні байти; `uptimeMs` — мс від старту.
 - **Видалено в P50a:** обʼєкт `processor` (`type`, `ready`, `i2cErrors`, `capabilities.*`) і поля `bass`, `treble`,
-  `gain`, `loudness` (§14). Шкала гучності фіксована: `0..100`; кількість входів — 3.
+  `gain`, `loudness` (§14). Шкала гучності фіксована: `0..100`; слотів входів — 4 (3 логічні + «Player», §1.3).
 
 ---
 
@@ -164,7 +178,7 @@ Prompt 39: відключення входів `GET` / `POST /api/inputs` (§12)
 
 ```json
 {
-  "inputNames": ["WiFi Radio", "TV Box", "Computer"],
+  "inputNames": ["WiFi Radio", "TV Box", "Computer", "Player"],
   "brightness": 80, "displayFlipped": false,
   "lastInput": 0, "lastStation": 4, "lastVolume": 35, "lastMute": false
 }
@@ -181,7 +195,7 @@ Prompt 39: відключення входів `GET` / `POST /api/inputs` (§12)
 |---|---|---|
 | `brightness` | ціле 0..100 | застосовується одразу |
 | `displayFlipped` | bool | застосовується одразу |
-| `inputNames` | масив з **рівно 3** елементів | елемент `null` = не змінювати; рядок 1..31 байт UTF-8 без керувальних символів |
+| `inputNames` | масив з **4** елементів (слоти 0..3); **3 елементи — ЗАСТАРІЛО, але приймається** | елемент `null` = не змінювати; рядок 1..31 байт UTF-8 без керувальних символів. Масив із 3 елементів оновлює лише слоти 0..2, слот 3 («Player») лишається без змін; `GET` завжди віддає 4 |
 
 Будь-який інший ключ, зокрема колишні `processorType`, `bass`, `treble`, `balance`, `loudness`, відхиляється як
 невідомий: `400`, `errors:[{"field":"bass","code":"unknown_field"}]` (§14).
@@ -189,7 +203,7 @@ Prompt 39: відключення входів `GET` / `POST /api/inputs` (§12)
 Запит:
 
 ```json
-{"brightness": 60, "inputNames": [null, "TV", null]}
+{"brightness": 60, "inputNames": [null, "TV", null, null]}
 ```
 
 Успіх `200`:
@@ -214,7 +228,7 @@ Prompt 39: відключення входів `GET` / `POST /api/inputs` (§12)
 ```
 
 Коди `errors[].code`: `invalid_value` (не той тип / не ціле), `out_of_range` (+`min`,`max`), `unknown_field`,
-`expected_array_of_3` (`inputNames` не масив або довжина ≠ 3), `invalid_name` (+`index`, `maxBytes`), `empty_request`.
+`expected_array_of_4` (`inputNames` не масив або довжина не 4 і не 3; код `expected_array_of_3` більше не повертається), `invalid_name` (+`index`, `maxBytes`), `empty_request`.
 Інші помилки тіла: `400 no_body | invalid_json`, `413 body_too_large`.
 
 > Гучність, мʼют, вхід, баланс, standby — **не** тут, див. §4 і §13.
@@ -264,17 +278,23 @@ Prompt 39: відключення входів `GET` / `POST /api/inputs` (§12)
 
 ### 4.5. `POST /api/input`
 
-`{"index":N}` — вибір входу `0..2` (0 радіо, 1 TV Box, 2 Computer). Індекс поза `0..2` → `400 out_of_range`
-(`min:0`,`max:2`). Вхід, вимкнений у налаштуваннях (§12), → `409 input_disabled` (радіо, вхід 0, вимкнути не можна).
+`{"index":N}` — вибір входу `0..3` (0 радіо, 1 TV Box, 2 Computer, **3 «Player» / режим «USB»**). Індекс поза `0..3` → `400 out_of_range`
+(`min:0`,`max:3`). Вхід, вимкнений у налаштуваннях (§12) або недоступний (USB-стек), → `409 input_disabled` (радіо, вхід 0, вимкнути не можна).
 Зміна входу з/на Radio зупиняє/запускає потік; мʼют і плавний підйом — як на пристрої. Під мʼютом застосовується
 профіль нового входу (гучність, EQ, баланс; §1.3), тож `GET /api/status` одразу показує його `volume` і `balance`.
 Якщо на пристрої відкрито список станцій або екран «EQ + баланс», він закривається. `409 standby` у standby.
 
-**У режимі «USB» (USB15):** запит НЕ відхиляється (раніше був `409 input_unavailable`), а виконується так само, як UP / DOWN на пристрої:
+**Вхід 3 (INP4b) — вхід у режим «USB»:** виконується так само, як UP / DOWN на пристрої й `POST /api/usb/mode {"action":"enter"}`: режим піднімається
+у фоні (≈ 1 с з носієм, ≈ 1,7 с без). Відповідь — `202 {"ok":true,"pending":true,"reason":"usb_enter","target":3,"state":{...}}`;
+стежте за `GET /api/usb/status` (`active:true`) і `GET /api/status` (`input:3`). Якщо режим уже активний і виходу не заплановано — `200 {"ok":true,"state":{...}}`
+(ідемпотентно, без `pending`). Слот 3 вимкнений маскою (§12) або USB-вхід не зібрано → `409 input_disabled`. Швидкі запити: остання ціль виграє.
+
+**У режимі «USB» (USB15):** запит на вхід `0..2` НЕ відхиляється, а виконується так само, як UP / DOWN на пристрої:
 режим «USB» закривається (≈ 1 с, у фоні) і пристрій переходить на вказаний вхід; радіо повертається на ту саму станцію.
-Відповідь — `202 {"ok":true,"pending":true,"reason":"usb_exit","target":N,"state":{...}}`; у `state` вхід іще СТАРИЙ — стежте за
-`GET /api/status` (`input`) і `GET /api/usb/status` (`active:false`). Швидкі запити: остання ціль виграє. Валідація (`400 out_of_range`,
+Відповідь — `202 {"ok":true,"pending":true,"reason":"usb_exit","target":N,"state":{...}}`; у `state` вхід іще СТАРИЙ (3) — стежте за
+`GET /api/status` (`input`) і `GET /api/usb/status` (`mode.state:"Off"`). Швидкі запити: остання ціль виграє. Валідація (`400 out_of_range`,
 `409 input_disabled`, `409 standby` …) — як поза режимом. Поза режимом «USB» поведінка й відповідь `200` без змін.
+`state.input` у відповідях команд керування — активний вхід (§1.3).
 Станційні команди (`/api/player/*`, `/api/player/station`) у режимі «USB» і далі дають `409 not_radio_input`.
 
 ### 4.6. `POST /api/player/{play|pause|stop|toggle|next|prev}`
@@ -694,9 +714,14 @@ curl -X POST --data-binary @firmware.bin -H "Content-Type: application/octet-str
   можна опустити (= без змін).
 - `levelDb` станції — не частина профілю входу й не гучність: це послаблення сигналу декодера перед ЦАП (§5), діє лише
   на вході Radio.
-- Вимкнені входи (§12): `GET /api/status` → `inputs[].available` їх **не** відображає (лише апаратну доступність);
+- Вимкнені входи (§12): `GET /api/status` → `inputs[].available` їх **не** відображає (лише апаратну / збіркову доступність);
   вибір вимкненого входу відхиляється (`409 input_disabled`). Для списку «що можна вибрати» використовуйте
   `selectable` з `GET /api/inputs`.
+- **Режим «USB» і `GET /api/status` (INP4b):** поки `status.input == 3`, поля `mode`, `station`, `playing`, `streamStatus`, `track`
+  належать попередньому входу й не описують плеєр; стан плеєра — `GET /api/usb/status` (§16.2). Знімок `usbUi` публікується
+  контролером періодично, тому на межі входу / виходу `status.input` може відставати від команди на десятки мілісекунд.
+- Масиви з 3 елементів у `POST /api/inputs` і `POST /api/settings` (`inputNames`) — **застаріла** форма (до INP4b): приймаються
+  лише для сумісності й не змінюють слот 3. Нові клієнти надсилають 4 елементи (§17).
 - Чутливість VU (§15) — лише зсув показу індикатора рівня: не змінює гучність, EQ, баланс і вихідний сигнал. На
   пристрої її змінити не можна (кнопок / енкодера / IR немає) — лише через API.
 - Екран «EQ + баланс» на пристрої не блокує API: `/api/eq`, `/api/balance`, `/api/vu` працюють, поки він відкрито; `mode` у
@@ -709,8 +734,8 @@ curl -X POST --data-binary @firmware.bin -H "Content-Type: application/octet-str
 ## 11. Еквалайзер (Prompt 30; по входах — P46–P47)
 
 5-смуговий цифровий графічний еквалайзер (peaking-фільтри другого порядку, Q = 1.0). Пресет **окремий для кожного
-входу** і є частиною профілю входу (§1.3): на радіо діє пресет входу 0, на зовнішніх входах (TV Box / Computer) —
-пресет активного входу. Порядок обробки радіо: еквалайзер → рівень станції (`levelDb`, §5) → гучність → ЦАП.
+слота входу** і є частиною профілю (§1.3): на радіо діє пресет входу 0, на зовнішніх входах (TV Box / Computer) —
+пресет активного входу, у режимі «USB» — пресет слота 3 («Player»). Порядок обробки радіо: еквалайзер → рівень станції (`levelDb`, §5) → гучність → ЦАП.
 
 | Смуга (`band`) | 0 | 1 | 2 | 3 | 4 |
 |---|---:|---:|---:|---:|---:|
@@ -727,13 +752,13 @@ curl -X POST --data-binary @firmware.bin -H "Content-Type: application/octet-str
 {"input":0,"gainsDb":[0,0,0,0,0],"freqHz":[60,250,1000,4000,12000],"minDb":-12,"maxDb":12,"stepDb":1}
 ```
 
-(без `ok`, як інші `GET`; `gainsDb[i]` — підсилення смуги `i`.) `input` у запиті — `0..2`, без нього — **поточний**
-вхід; у відповіді `input` — вхід, чий пресет віддано. Доступний завжди, також у standby. Помилки: `400 invalid_value`
-(`field:"input"`, не число), `400 out_of_range` (`field:"input"`, `min:0`, `max:2`).
+(без `ok`, як інші `GET`; `gainsDb[i]` — підсилення смуги `i`.) `input` у запиті — `0..3` (3 = «Player»), без нього — **активний**
+вхід (§1.3; у режимі «USB» це 3); у відповіді `input` — вхід, чий пресет віддано. Доступний завжди, також у standby. Помилки: `400 invalid_value`
+(`field:"input"`, не число), `400 out_of_range` (`field:"input"`, `min:0`, `max:3`).
 
 ### 11.2. `POST /api/eq`
 
-Одна з двох форм (одночасно — `400 conflicting_fields`), плюс необовʼязкове `input` (0..2; без нього — поточний вхід):
+Одна з двох форм (одночасно — `400 conflicting_fields`), плюс необовʼязкове `input` (0..3; без нього — активний вхід, у режимі «USB» — слот 3):
 
 | Форма | Тіло | Дія |
 |---|---|---|
@@ -741,8 +766,9 @@ curl -X POST --data-binary @firmware.bin -H "Content-Type: application/octet-str
 | Одна смуга | `{"band":N,"gainDb":X}` — обидва поля обовʼязкові | задає лише смугу `N` (0..4) |
 
 Успіх `200`: `{"ok":true, ...}` + те саме, що віддає `GET` (`input`, `gainsDb`, `freqHz`, `minDb`, `maxDb`, `stepDb`) —
-уже **після** зміни. Пресет входу 0 і пресет **поточного** зовнішнього входу застосовуються одразу (за кілька
-мілісекунд); пресет неактивного входу лише зберігається в профілі й застосується при перемиканні на нього.
+уже **після** зміни. Пресет **активного** входу застосовується одразу (за кілька мілісекунд): пресет входу 0 — на радіо, пресет зовнішнього входу — на
+його екземпляр проходу, пресет слота 3 — у режимі «USB» (через екземпляр EQ радіо, яким звучить файл). Пресет **неактивного** слота лише
+зберігається в профілі й застосується при перемиканні на нього; зокрема в режимі «USB» зміна пресету входів 0..2 звук не змінює.
 Значення зберігається в NVS (запис із дебаунсом, лише коли пресет справді змінився) і відновлюється після
 перезапуску. Повторне надсилання тих самих значень — `200`, без запису.
 
@@ -754,7 +780,7 @@ curl -X POST --data-binary @firmware.bin -H "Content-Type: application/octet-str
 | 400 | `missing_field` (`field`: `gainsDb` \| `band` \| `gainDb`) | немає потрібного поля |
 | 400 | `conflicting_fields` (`field`:`gainsDb`) | `gainsDb` разом із `band` / `gainDb` |
 | 400 | `invalid_value` (`field`: `gainsDb` \| `band` \| `gainDb` \| `input`) | не масив / довжина ≠ 5 / не ціле число (в т.ч. `1.5`, рядок) |
-| 400 | `out_of_range` (`field`, `min`, `max`) | значення поза `minDb..maxDb`, `band` поза `0..4` або `input` поза `0..2` |
+| 400 | `out_of_range` (`field`, `min`, `max`) | значення поза `minDb..maxDb`, `band` поза `0..4` або `input` поза `0..3` |
 | 409 | `ota_in_progress` | іде запис прошивки (§8.4) |
 | 413 | `body_too_large` | тіло > 1024 байт |
 
@@ -764,6 +790,7 @@ curl -X POST --data-binary @firmware.bin -H "Content-Type: application/octet-str
 POST /api/eq  {"band":0,"gainDb":6}                 -> 200 {"ok":true,"input":0,"gainsDb":[6,0,0,0,0],...}
 POST /api/eq  {"gainsDb":[null,-3,null,null,2]}     -> 200 (змінено смуги 1 і 4 поточного входу)
 POST /api/eq  {"input":2,"gainsDb":[0,0,0,0,0]}     -> 200 (плоский пресет входу 2)
+POST /api/eq  {"input":3,"band":0,"gainDb":4}         -> 200 (пресет «Player»; чути одразу, лише коли активний режим «USB»)
 POST /api/eq  {"band":2,"gainDb":20}                -> 400 {"ok":false,"error":"out_of_range","field":"gainDb","min":-12,"max":12}
 ```
 
@@ -774,11 +801,11 @@ POST /api/eq  {"band":2,"gainDb":20}                -> 400 {"ok":false,"error":"
 
 ## 12. Входи: доступність і відключення (Prompt 39)
 
-Зовнішні входи 1–2 (TV Box / Computer) можна **відключити**: вони зникають із перемикання на пристрої
+Зовнішні входи 1–2 (TV Box / Computer) і слот 3 («Player» / USB) можна **відключити**: вони зникають із перемикання на пристрої
 (кнопки UP/DOWN, пульт, енкодер) і не приймаються `POST /api/input`. **Радіо (вхід 0) відключити не можна** — воно
-завжди дозволене. Налаштування глобальне і зберігається в NVS (запис із дебаунсом, лише при зміні); за замовчуванням
-дозволені всі входи. Керування — лише з вебу. Вхід «вибирається» (`selectable`), коли він і **апаратно є**
-(`available`, зараз завжди `true`), і **дозволений** (`enabled`).
+завжди дозволене. Слот 3 **не можна вимкнути, поки активний режим «USB»** (`409 input_active`). Налаштування глобальне й зберігається в NVS (запис із
+дебаунсом, лише при зміні); за замовчуванням дозволені всі входи. Керування — лише з вебу. Вхід «вибирається» (`selectable`), коли він і **є**
+(`available`; входи 0..2 — завжди, слот 3 — якщо прошивку зібрано з USB-входом), і **дозволений** (`enabled`).
 
 ### 12.1. `GET /api/inputs`
 
@@ -787,17 +814,18 @@ POST /api/eq  {"band":2,"gainDb":20}                -> 400 {"ok":false,"error":"
   "inputs": [
     {"index": 0, "name": "WiFi Radio", "available": true, "enabled": true,  "selectable": true,  "canDisable": false},
     {"index": 1, "name": "TV Box",     "available": true, "enabled": false, "selectable": false, "canDisable": true},
-    {"index": 2, "name": "Computer",   "available": true, "enabled": true,  "selectable": true,  "canDisable": true}
+    {"index": 2, "name": "Computer",   "available": true, "enabled": true,  "selectable": true,  "canDisable": true},
+    {"index": 3, "name": "Player",     "available": true, "enabled": true,  "selectable": true,  "canDisable": true}
   ],
-  "enabledMask": 5,
+  "enabledMask": 13,
   "input": 0
 }
 ```
 
-(без `ok`, як інші `GET`; доступний завжди, також у standby і під час OTA.) Масив завжди має **3** елементи
-(логічні входи). `name` — користувацька назва з налаштувань, інакше типова. `enabledMask` — біти дозволених входів
-(біт `i` = вхід `i`; біт 0 завжди 1; за замовчуванням `7`). `input` — поточний активний вхід (як `input` у
-`GET /api/status`).
+(без `ok`, як інші `GET`; доступний завжди, також у standby і під час OTA.) Масив завжди має **4** елементи (слоти 0..3).
+`name` — користувацька назва з налаштувань, інакше типова. `enabledMask` — **4-бітна** маска дозволених входів (біт `i` = вхід `i`;
+біт 0 завжди 1; за замовчуванням `15`; `7`, якщо слот 3 вимкнено або USB-вхід не зібрано). `input` — активний вхід (як `input` у
+`GET /api/status`; у режимі «USB» — 3).
 
 ### 12.2. `POST /api/inputs`
 
@@ -805,13 +833,16 @@ POST /api/eq  {"band":2,"gainDb":20}                -> 400 {"ok":false,"error":"
 
 | Форма | Тіло | Дія |
 |---|---|---|
-| Усі входи | `{"enabled":[a,b,c]}` — рівно 3 елементи: `true` / `false` / `null` (= не змінювати) | задає кілька входів за раз |
-| Один вхід | `{"index":N,"enabled":true\|false}` — обидва поля обовʼязкові, `N` = 0..2 | задає лише вхід `N` |
+| Усі входи | `{"enabled":[a,b,c,d]}` — **4 елементи**: `true` / `false` / `null` (= не змінювати). **3 елементи — ЗАСТАРІЛО, але приймається**: оновлює слоти 0..2, слот 3 лишається без змін | задає кілька входів за раз |
+| Один вхід | `{"index":N,"enabled":true\|false}` — обидва поля обовʼязкові, `N` = 0..3 | задає лише вхід `N` |
 
 Правила:
 
 - Елемент / вхід **0 (радіо) ігнорується без помилки**: `false` для нього не діє, радіо лишається дозволеним
-  (у відповіді `enabled:true`). Входи 1 і 2 можна вмикати й вимикати незалежно.
+  (у відповіді `enabled:true`). Входи 1, 2 і 3 можна вмикати й вимикати незалежно.
+- Слот 3: якщо USB-входу в збірці нема, **увімкнути** його не можна (`400 input_unavailable`, `field:"enabled"`); **вимкнути**, поки активний режим «USB»
+  (піднімається, працює; не в standby), не можна — `409 input_active`, маска не змінюється. Спершу вийдіть з режиму (`POST /api/input` на вхід `0..2`
+  або `POST /api/usb/mode {"action":"exit"}`).
 - Якщо вимикається **активний** вхід — пристрій сам переходить на радіо тим самим шляхом, що й ручне перемикання
   входу (мʼют → профіль радіо → розмʼют, запуск потоку). У standby вхід лише змінюється в стані, а при виході зі
   standby вмикається радіо.
@@ -827,8 +858,10 @@ POST /api/eq  {"band":2,"gainDb":20}                -> 400 {"ok":false,"error":"
 | 400 | `no_body` / `invalid_json` / `unknown_field` | порожнє тіло / не JSON-обʼєкт / невідоме поле (дозволені `enabled`, `index`) |
 | 400 | `missing_field` (`field`: `enabled` \| `index`) | немає `enabled`; або `enabled` — bool, але немає `index` |
 | 400 | `conflicting_fields` (`field`:`enabled`) | `enabled` — масив разом із `index` |
-| 400 | `invalid_value` (`field`: `enabled` \| `index`) | `enabled` — не масив і не bool; масив не з 3 елементів; елемент не `true`/`false`/`null`; `index` не ціле |
-| 400 | `out_of_range` (`field`:`index`, `min`:0, `max`:2) | `index` поза 0..2 |
+| 400 | `invalid_value` (`field`: `enabled` \| `index`) | `enabled` — не масив і не bool; масив не з 4 і не з 3 елементів; елемент не `true`/`false`/`null`; `index` не ціле |
+| 400 | `out_of_range` (`field`:`index`, `min`:0, `max`:3) | `index` поза 0..3 |
+| 400 | `input_unavailable` (`field`:`enabled`) | спроба ввімкнути слот 3 у збірці без USB-входу |
+| 409 | `input_active` | спроба вимкнути слот 3, поки активний режим «USB» (§1.2) |
 | 409 | `ota_in_progress` | іде запис прошивки (§8.4) |
 | 409 | `ir_learn_active` | іде навчання IR-кнопки (спершу `POST /api/ir/learn/cancel`) |
 | 413 | `body_too_large` | тіло > 1024 байт |
@@ -837,16 +870,18 @@ POST /api/eq  {"band":2,"gainDb":20}                -> 400 {"ok":false,"error":"
 Приклади:
 
 ```
-POST /api/inputs  {"index":2,"enabled":false}           -> 200 {"ok":true,"inputs":[...],"enabledMask":3,"input":0}
-POST /api/inputs  {"enabled":[null,false,true]}         -> 200 (вхід 1 вимкнено, вхід 2 увімкнено)
+POST /api/inputs  {"index":2,"enabled":false}           -> 200 {"ok":true,"inputs":[...],"enabledMask":11,"input":0}
+POST /api/inputs  {"enabled":[null,false,true,true]}    -> 200 (вхід 1 вимкнено, входи 2 і 3 увімкнено)
+POST /api/inputs  {"enabled":[null,false,true]}         -> 200 (ЗАСТАРІЛО: 3 елементи; слот 3 не змінюється)
 POST /api/inputs  {"index":0,"enabled":false}           -> 200 (радіо лишається дозволеним, enabledMask без змін)
+POST /api/inputs  {"index":3,"enabled":false}  (режим «USB» активний) -> 409 {"ok":false,"error":"input_active"}
 POST /api/inputs  {"enabled":[true,true]}               -> 400 {"ok":false,"error":"invalid_value","field":"enabled"}
 POST /api/input   {"index":2}  (вхід 2 вимкнено)        -> 409 {"ok":false,"error":"input_disabled"}
 ```
 
 ### 12.3. Що ще змінюється через маску входів
 
-- `POST /api/input` на вимкнений вхід → `409 input_disabled`; `POST /api/player/station` із `switchInput` не залежить
+- `POST /api/input` на вимкнений вхід (у тому числі слот 3) → `409 input_disabled`; `POST /api/player/station` із `switchInput` не залежить
   від маски (радіо завжди дозволене).
 - Після перезапуску й при виході зі standby пристрій відновлює останній вхід лише якщо він дозволений; інакше
   вмикається радіо.
@@ -857,7 +892,7 @@ POST /api/input   {"index":2}  (вхід 2 вимкнено)        -> 409 {"ok"
 
 ## 13. Баланс (P48b; `GET` і `menuContext` — P50a)
 
-Цифровий баланс L/R, **окремий для кожного входу** (частина профілю, §1.3). Діапазон — ціле `−20..+20` дБ, крок 1;
+Цифровий баланс L/R, **окремий для кожного слота входу** (частина профілю, §1.3; слот 3 = «Player»). Діапазон — ціле `−20..+20` дБ, крок 1;
 **додатне = вправо** (лівий канал послаблюється), відʼємне = вліво, `0` = без змін. Лише послаблення одного каналу
 (підсилення немає). Баланс активного входу також видно в `GET /api/status` (`balance`).
 
@@ -867,20 +902,20 @@ POST /api/input   {"index":2}  (вхід 2 вимкнено)        -> 409 {"ok"
 {"input": 1, "balance": -3}
 ```
 
-(без `ok`, як інші `GET`.) Без `input` — **активний** вхід (значення збігається з `status.balance`); з `input` =
-`0..2` — баланс профілю цього входу. Нічого не змінює й не обчислює. Доступний завжди, також у standby й під час OTA.
+(без `ok`, як інші `GET`.) Без `input` — **активний** вхід (у режимі «USB» — слот 3; значення збігається з `status.balance`); з `input` =
+`0..3` — баланс профілю цього слота. Нічого не змінює й не обчислює. Доступний завжди, також у standby й під час OTA.
 
 | HTTP | `error` | Коли |
 |---:|---|---|
 | 400 | `invalid_value` (`field`:`input`) | `input` — не число (`?input=x`, порожній) |
-| 400 | `out_of_range` (`field`:`input`, `min`:0, `max`:2) | `input` поза `0..2` |
+| 400 | `out_of_range` (`field`:`input`, `min`:0, `max`:3) | `input` поза `0..3` |
 
 ### 13.2. `POST /api/balance`
 
-Тіло `{"value":V}` або `{"value":V,"input":N}`; `value` — ціле `−20..+20` (обовʼязкове), `input` — `0..2`
-(необовʼязкове; без нього — поточний вхід, як у `/api/eq`).
+Тіло `{"value":V}` або `{"value":V,"input":N}`; `value` — ціле `−20..+20` (обовʼязкове), `input` — `0..3`
+(необовʼязкове; без нього — активний вхід, у режимі «USB» — слот 3, як у `/api/eq`).
 
-- **Активний вхід** (без `input` або `input` = поточний): виконує контролер — баланс застосовується одразу (DSP) і
+- **Активний вхід** (без `input` або `input` = активний; у режимі «USB» — `3`): виконує контролер — баланс застосовується одразу (DSP) і
   зберігається в профілі (NVS з дебаунсом). Правила доступності як у `/api/volume` (§1.2): `409 standby |
   ota_in_progress | ir_learn_active`, `503 busy`.
 - **Неактивний вхід:** лише запис у профіль (звук не змінюється, застосується при перемиканні на вхід). Дозволено й у
@@ -894,7 +929,7 @@ POST /api/input   {"index":2}  (вхід 2 вимкнено)        -> 409 {"ok"
 | 400 | `no_body` / `invalid_json` / `unknown_field` | порожнє тіло / не JSON-обʼєкт / невідоме поле (дозволені `value`, `input`) |
 | 400 | `missing_field` (`field`:`value`) | немає `value` |
 | 400 | `invalid_value` (`field`: `value` \| `input`) | не ціле число (в т.ч. `1.5`, рядок) |
-| 400 | `out_of_range` (`field`: `value` \| `input`, `min`, `max`) | `value` поза `−20..20` або `input` поза `0..2` |
+| 400 | `out_of_range` (`field`: `value` \| `input`, `min`, `max`) | `value` поза `−20..20` або `input` поза `0..3` |
 | 409 | `standby` / `ota_in_progress` / `ir_learn_active` | див. вище |
 | 413 | `body_too_large` | тіло > 1024 байт |
 | 503 | `busy` | контролер зайнятий або іде перезапуск — повторіть |
@@ -904,7 +939,8 @@ POST /api/input   {"index":2}  (вхід 2 вимкнено)        -> 409 {"ok"
 ```
 GET  /api/balance                           -> 200 {"input":0,"balance":0}
 GET  /api/balance?input=2                   -> 200 {"input":2,"balance":4}
-GET  /api/balance?input=3                   -> 400 {"ok":false,"error":"out_of_range","field":"input","min":0,"max":2}
+GET  /api/balance?input=4                   -> 400 {"ok":false,"error":"out_of_range","field":"input","min":0,"max":3}
+GET  /api/balance?input=3                   -> 200 {"input":3,"balance":0}            (профіль «Player»)
 POST /api/balance {"value":5}               -> 200 {"ok":true,"input":0,"balance":5}      (поточний вхід)
 POST /api/balance {"value":-3,"input":2}    -> 200 {"ok":true,"input":2,"balance":-3}     (профіль входу 2)
 POST /api/balance {"value":21}              -> 400 {"ok":false,"error":"out_of_range","field":"value","min":-20,"max":20}
@@ -918,13 +954,13 @@ POST /api/balance {"value":21}              -> 400 {"ok":false,"error":"out_of_r
 
 | Було | Тепер |
 |---|---|
-| `GET /api/status` → обʼєкт `processor` (`type`, `ready`, `i2cErrors`, `capabilities.*`) | немає; шкала гучності `0..100`, входів 3 — константи |
+| `GET /api/status` → обʼєкт `processor` (`type`, `ready`, `i2cErrors`, `capabilities.*`) | немає; шкала гучності `0..100` — константа; слотів входів 4 (INP4b, §17) |
 | `GET /api/status` → `bass`, `treble`, `gain`, `loudness` | немає |
 | `GET /api/settings` → `processorType`, `bass`, `treble`, `balance` (завжди 0), `loudness` | немає; баланс — `GET /api/balance` |
 | `POST /api/settings` з `processorType` / `bass` / `treble` / `balance` / `loudness` | `400`, `errors[].code = "unknown_field"` |
 | `POST /api/gain` | `404 not_found` (маршруту немає) |
 | помилки `not_supported`, `audio_unavailable` | більше не повертаються |
-| `expected_array_of_4` (`inputNames`), 4/5 входів у `/api/inputs`, `/api/status.inputs` | `expected_array_of_3`, рівно 3 елементи |
+| `expected_array_of_4` (`inputNames`), 4/5 входів у `/api/inputs`, `/api/status.inputs` | у P50a: `expected_array_of_3`, рівно 3 елементи; **з INP4b — знову 4 слоти** (3-й вхід «Player»): `expected_array_of_4`, 3 елементи лише як застаріла сумісна форма (§17) |
 | `status.mode = "Menu"` без уточнення | `mode = "Menu"` + `menuContext` (`StationList` \| `EqBalance`) |
 
 Дії IR `BASS_*`, `TREBLE_*`, `GAIN_*`, `INPUT_AUX` зарезервовані й не навчаються (§6.5).
@@ -948,22 +984,23 @@ POST /api/balance {"value":21}              -> 400 {"ok":false,"error":"out_of_r
   "inputs": [
     {"index": 0, "sensitivityDb": 0},
     {"index": 1, "sensitivityDb": -10},
-    {"index": 2, "sensitivityDb": 3}
+    {"index": 2, "sensitivityDb": 3},
+    {"index": 3, "sensitivityDb": 0}
   ]
 }
 ```
 
-(без `ok`, як інші `GET`.) `input` — **активний** вхід; `inputs[]` — завжди рівно 3 елементи (`index` 0..2) із
-чутливістю з профілю кожного входу; для активного входу `sensitivityDb` збігається зі `status.vuSens`. Межі (`minDb`,
+(без `ok`, як інші `GET`.) `input` — **активний** вхід (у режимі «USB» — `3`); `inputs[]` — завжди рівно **4** елементи (`index` 0..3) із
+чутливістю з профілю кожного слота; для активного входу `sensitivityDb` збігається зі `status.vuSens`. Межі (`minDb`,
 `maxDb`) і крок (`stepDb`) віддає прошивка — не зашивайте їх у сторінку. Параметрів запиту немає. Нічого не змінює й не
 обчислює. Доступний завжди, також у standby й під час OTA.
 
 ### 15.2. `POST /api/vu`
 
-Тіло `{"value":V}` або `{"value":V,"input":N}`; `value` — ціле `−20..+20` (обовʼязкове), `input` — `0..2`
-(необовʼязкове; без нього — поточний вхід, як у `/api/balance`).
+Тіло `{"value":V}` або `{"value":V,"input":N}`; `value` — ціле `−20..+20` (обовʼязкове), `input` — `0..3`
+(необовʼязкове; без нього — активний вхід, у режимі «USB» — слот 3, як у `/api/balance`).
 
-- **Активний вхід** (без `input` або `input` = поточний): виконує контролер — VU реагує **одразу** й значення
+- **Активний вхід** (без `input` або `input` = активний; у режимі «USB» — `3`): виконує контролер — VU реагує **одразу** й значення
   зберігається в профілі (NVS з дебаунсом). Правила доступності як у `/api/volume` і `POST /api/balance` (§1.2):
   `409 standby | ota_in_progress | ir_learn_active`, `503 busy`.
 - **Неактивний вхід:** лише запис у профіль; VU не змінюється, поки не перемкнуться на цей вхід (тоді застосується
@@ -977,7 +1014,7 @@ POST /api/balance {"value":21}              -> 400 {"ok":false,"error":"out_of_r
 | 400 | `no_body` / `invalid_json` / `unknown_field` | порожнє тіло / не JSON-обʼєкт / невідоме поле (дозволені `value`, `input`) |
 | 400 | `missing_field` (`field`:`value`) | немає `value` |
 | 400 | `invalid_value` (`field`: `value` \| `input`) | не ціле число (в т.ч. `1.5`, рядок) |
-| 400 | `out_of_range` (`field`: `value` \| `input`, `min`, `max`) | `value` поза `−20..20` або `input` поза `0..2` |
+| 400 | `out_of_range` (`field`: `value` \| `input`, `min`, `max`) | `value` поза `−20..20` або `input` поза `0..3` |
 | 409 | `standby` / `ota_in_progress` / `ir_learn_active` | див. вище |
 | 413 | `body_too_large` | тіло > 1024 байт |
 | 503 | `busy` | контролер зайнятий або іде перезапуск — повторіть |
@@ -985,11 +1022,12 @@ POST /api/balance {"value":21}              -> 400 {"ok":false,"error":"out_of_r
 Приклади:
 
 ```
-GET  /api/vu                              -> 200 {"input":0,"minDb":-20,"maxDb":20,"stepDb":1,"inputs":[{"index":0,"sensitivityDb":0},{"index":1,"sensitivityDb":0},{"index":2,"sensitivityDb":0}]}
+GET  /api/vu                              -> 200 {"input":0,"minDb":-20,"maxDb":20,"stepDb":1,"inputs":[{"index":0,"sensitivityDb":0},{"index":1,"sensitivityDb":0},{"index":2,"sensitivityDb":0},{"index":3,"sensitivityDb":0}]}
 POST /api/vu {"value":8}                  -> 200 {"ok":true,"input":0,"sensitivityDb":8}     (поточний вхід; VU сильніше)
 POST /api/vu {"value":-10,"input":1}      -> 200 {"ok":true,"input":1,"sensitivityDb":-10}   (профіль входу 1)
 POST /api/vu {"value":25}                 -> 400 {"ok":false,"error":"out_of_range","field":"value","min":-20,"max":20}
-POST /api/vu {"value":0,"input":3}        -> 400 {"ok":false,"error":"out_of_range","field":"input","min":0,"max":2}
+POST /api/vu {"value":0,"input":4}        -> 400 {"ok":false,"error":"out_of_range","field":"input","min":0,"max":3}
+POST /api/vu {"value":6,"input":3}        -> 200 {"ok":true,"input":3,"sensitivityDb":6}    (профіль «Player»)
 POST /api/vu {"value":1,"x":2}            -> 400 {"ok":false,"error":"unknown_field","field":"unknown"}
 ```
 
@@ -1005,7 +1043,7 @@ POST /api/vu {"value":1,"x":2}            -> 400 {"ok":false,"error":"unknown_fi
 Фронтенд (сторінка) і екран пристрою цього кроку не стосуються.
 
 **Модель.** «Режим USB» — це стан пристрою, у якому звук веде файловий плеєр, а радіо / TV / PC зупинені. Увійти в режим можна на
-пристрої (RC5 `USB_MODE`, коло входів) або `POST /api/usb/mode`. Каталоги читає окрема фонова задача; HTTP-обробники лише ставлять
+пристрої (RC5 `USB_MODE`, коло входів), `POST /api/input {"index":3}` (§4.5; INP4b) або `POST /api/usb/mode`. Каталоги читає окрема фонова задача; HTTP-обробники лише ставлять
 команди в чергу й читають знімки, тому **жоден запит не чекає флешку**. Команда, що торкається флешки або черги, повертає
 `202 {"ok":true,"reqId":N}`, а її результат (успіх чи причина відмови) видно за номером `N` (§16.3).
 
@@ -1134,6 +1172,8 @@ POST /api/usb/mode {"action":"exit"}    -> 200 {"ok":true,"changed":false,"state
 Відмови: `400 missing_field` / `invalid_value` (`field:"action"`), `409 standby`, `409 wifi_setup`, `409 ota_in_progress`, `409 ir_learn_active`,
 `409 usb_unavailable` (стек USB потребує перезавантаження), `503 busy`. Команда лише ставить ціль: коли вхід не вдасться (напр. помилка носія),
 це видно зі `status.mode.state` / `mode.reason`, а не з відповіді.
+(INP4b) `POST /api/input {"index":3}` (§4.5) дає той самий результат — вхід у режим, але з відповіддю `202 ... "reason":"usb_enter"`; `POST /api/usb/mode`
+відповідає `{"changed", "state"}`. Поки активний режим «USB», `status.input == 3`, а `status.mode` / `station` / `playing` належать попередньому входу (§2, §10).
 
 ### 16.6. `POST /api/usb/cd`, `POST /api/usb/play`
 
@@ -1197,7 +1237,37 @@ POST /api/usb/control {"action":"next"}               -> 202 {"ok":true,"reqId":
 POST /api/usb/seek    {"deltaSec":30}                 -> 200 {"ok":true,"deltaSec":30}
 POST /api/usb/options {"shuffle":true}                -> 200 {"ok":true,"shuffle":true,"repeat":false}
 POST /api/input       {"index":1}                     -> 202 {"ok":true,"pending":true,"reason":"usb_exit","target":1,"state":{...}}   (у режимі «USB»)
+POST /api/input       {"index":3}                     -> 202 {"ok":true,"pending":true,"reason":"usb_enter","target":3,"state":{...}}   (вхід у режим «USB»)
 ```
 
 Порада клієнту: під час відтворення опитуйте лише `GET /api/usb/status` (≈ 2 Гц); `list` запитуйте після зміни `list.version`. Не відправляйте паралельно
 багато `cd` / `play` (сервер однозадачний, черга команд — 8).
+
+---
+
+## 17. Зміни контракту INP4b (USB = четвертий вхід)
+
+Що змінилося відносно P50a / USB15. Нові клієнти спираються на цей розділ; старі (до INP4b) продовжують працювати, поки не покладаються на «рівно 3».
+
+| Було | Стало (INP4b) |
+|---|---|
+| 3 входи: масиви `inputs[]` (`/api/status`, `/api/inputs`, `/api/vu`) і `inputNames` — по 3 елементи | **4 слоти**: 0..2 логічні + 3 «Player» / USB; `GET` завжди віддає 4 елементи |
+| `POST /api/inputs {"enabled":[a,b,c]}`, `POST /api/settings {"inputNames":[a,b,c]}` — рівно 3 | приймається **4 або 3** елементи. **3 — застаріла форма** (лише сумісність): оновлює слоти 0..2, слот 3 лишається без змін. Інша довжина → `400` (`invalid_value` для `enabled`; `expected_array_of_4` для `inputNames`) |
+| `enabledMask` — 3 біти (`7`) | **4 біти** (`15`); біт 0 завжди 1; біт 3 = «Player» (скинутий, якщо USB-вхід не зібрано) |
+| `POST /api/input`: `index` 0..2, `max` = 2 | `index` **0..3**, `max` = 3; `index` 3 → `202 {"ok":true,"pending":true,"reason":"usb_enter","target":3,"state":{...}}` (режим уже активний → `200`); вимкнений / недоступний слот 3 → `409 input_disabled` |
+| `status.input` = вхід до режиму «USB» | **`status.input` = 3 і `inputName` слота 3, поки активний режим «USB»** (`usbUi != Off`) |
+| у режимі «USB» `status.mode` / `station` / `playing` читали як стан пристрою | у режимі «USB» ці поля належать **попередньому входу** і не описують плеєр; плеєр — `GET /api/usb/status` (§16.2) |
+| `/api/eq`, `/api/balance`, `/api/vu`: `input` 0..2; «поточний» = `status.input` | `input` **0..3**; без `input` — **активний вхід** (у режимі «USB» — слот 3), тож `POST /api/balance` / `/api/vu` / `/api/eq` без `input` змінюють профіль «Player» |
+| живе застосування EQ: вхід 0 і поточний зовнішній | додано: слот 3 — у режимі «USB» (через екземпляр EQ радіо); у режимі «USB» зміна пресету входів 0..2 звук не змінює |
+| `GET /api/settings`: `lastVolume` — гучність профілю `lastInput` (для `lastInput` = 3 помилково брався профіль 0) | `lastVolume` — гучність профілю `lastInput`, у тому числі слота 3 |
+| — | нова відмова **`409 input_active`**: `POST /api/inputs` вимикає слот 3, поки активний режим «USB» (§12.2) |
+| — | нова відмова **`400 input_unavailable`** (`field:"enabled"`): спроба ввімкнути слот 3 у збірці без USB-входу |
+| `reason` у `202` команди `POST /api/input` — лише `usb_exit` | `usb_exit` (вихід із режиму на вхід `0..2`) і **`usb_enter`** (вхід у режим, `target:3`) |
+
+Примітки:
+
+- `status.inputs[3].available` = «USB-вхід зібрано» (compile-time); динамічну недоступність (перезапуск, стек USB) веб не бачить —
+  вибір такого входу дає `409 input_disabled`.
+- Окремого поля `inputEnabledMask` у `GET /api/status` немає: маску віддає лише `GET /api/inputs` (`enabledMask`).
+- «Активний вхід» береться з опублікованого стану (`usbUi`), який оновлюється періодично: на самій межі входу / виходу `status.input`
+  може відставати від команди на десятки мілісекунд; клієнт має стежити за `status.input` / `GET /api/usb/status`, а не покладатися на відповідь `202`.
