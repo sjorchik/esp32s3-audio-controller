@@ -1,3 +1,4 @@
+// [DEF6] ДОДАНО команду usb.eof [stat] -> лічильники справжніх / синтезованих eof (AudioPlayer::fileEofStats).
 // [CLEAN1] ПРИБРАНО неробочий псевдонім tls.mem (диспетчер консолі пропускає лише рядки на «u»); лишилась usb.tls [stat].
 // [DEF5d] ДОДАНО команду usb.tls [stat] -> tls_psram::handleConsole (лічильники виділень буферів TLS).
 // [DEF5b] ДОДАНО команду usb.preflight [test | force on | force off | stat] -> ssl_preflight::handleConsole (запобіжна перевірка DEF-5).
@@ -54,7 +55,7 @@ bool matchWord(const char* s, const char* word, const char** rest) {
     return true;
 }
 
-const char* const kWords[] = {"usb.play", "usb.pstat", "usb.seek", "usb.stopf", "usb.ended", "usb.fx", "usb.sslfail",
+const char* const kWords[] = {"usb.play", "usb.pstat", "usb.seek", "usb.stopf", "usb.ended", "usb.fx", "usb.eof", "usb.sslfail",
                                  "usb.tls"  // [DEF5d]
 #if SSL_PREFLIGHT
                                  ,
@@ -234,6 +235,25 @@ void cmdFx(const char* rest) {
                   (unsigned long)extra, (long)dig, dig < 0 ? " (radio DSP unmuted at file start)" : "", level);
 }
 
+// [DEF6] usb.eof [stat]: лічильники природних і синтезованих кінців файлу, останній випадок завмирання.
+void cmdEof(const char* rest) {
+    if (rest != nullptr && rest[0] != '\0' && strcmp(rest, "stat") != 0) {
+        Serial.printf("%s usage: usb.eof [stat]\n", kTag);
+        return;
+    }
+    AudioPlayer::FileEofStats st;
+    AudioPlayer::fileEofStats(&st);
+    Serial.printf("%s eof: real=%lu synthesized=%lu stall_no_action=%lu FILE_EOF_WATCHDOG=%d\n", kTag,
+                  (unsigned long)st.real, (unsigned long)st.synth, (unsigned long)st.stallNoAction, st.watchdogOn ? 1 : 0);
+    if (st.haveLast) {
+        Serial.printf("%s eof last %s: cur=%lu dur=%lu s inbuf=%lu stalled_ms=%lu file='%s'\n", kTag,
+                      st.lastSynthesized ? "synthesized" : "stall (no action)", (unsigned long)st.lastCur,
+                      (unsigned long)st.lastDur, (unsigned long)st.lastInbuf, (unsigned long)st.lastStalledMs, st.lastName);
+    } else {
+        Serial.printf("%s eof last: none\n", kTag);
+    }
+}
+
 }  // namespace
 
 bool isPlayCommand(const char* line) {
@@ -263,6 +283,8 @@ void handleConsoleLine(const char* line) {
         cmdEnded(rest);
     } else if (matchWord(line, "usb.fx", &rest)) {
         cmdFx(rest);
+    } else if (matchWord(line, "usb.eof", &rest)) {
+        cmdEof(rest);  // [DEF6]
     } else if (matchWord(line, "usb.sslfail", &rest)) {
         ssl_workaround::handleConsole(rest);  // [USB13b]
     } else if (matchWord(line, "usb.tls", &rest)) {

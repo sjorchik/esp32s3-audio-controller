@@ -11,6 +11,9 @@
 //   стиль 2: Audio::audio_info_callback, Audio::msg_t, Audio::evt_info,
 //            evt_bitrate, evt_eof, evt_name, evt_streamtitle, evt_id3data;
 
+// [DEF6] ДОДАНО: монітор «хвоста» файлу (tailMonitor, лише USB_HOST_DIAG), сторожовий таймер кінця файлу (stalledNearEnd /
+// synthesizeFileEof, FILE_EOF_WATCHDOG) у monitorFile, лічильники для usb.eof (AudioPlayer::fileEofStats). Справжній шлях eof
+// (handleEof -> s_evtFileEof -> kEndTailMs -> finishFile) не змінено; радіо не чіпається.
 // [DEF5b] ДОДАНО в connectNow() виклик ssl_preflight::beforeConnect() ПЕРЕД HEAPMAP_POINT(C6) / connecttohost() (запобіжна
 // перевірка буферів TLS після USB-сесії; RestartRequested -> failStream + довга пауза замість підключення).
 // [DEF5a] ДОДАНО лише HEAPMAP_POINT(C6) і HEAPMAP_CONNECT_RESULT(ok) у connectNow() (порожні при USB_HEAPMAP = 0).
@@ -455,6 +458,25 @@ uint32_t s_fileDacOpenAtMs = 0;
 bool s_fileEofPending = false;
 uint32_t s_fileEofAtMs = 0;
 uint32_t s_filePosPollMs = 0;
+// [DEF6] Сторожовий таймер кінця файлу / монітор «хвоста» (лише задача плеєра; скидаються в doPlayFile / processSeek / паузі).
+bool s_wdPosValid = false;       // s_wdPosSec / s_wdPosChangedMs актуальні
+uint32_t s_wdPosSec = 0;         // остання побачена позиція (кеш, секунди)
+uint32_t s_wdPosChangedMs = 0;   // millis(), коли позиція востаннє змінилась (або почався відлік)
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+uint32_t s_tailLastLogMs = 0;    // останній рядок «tail» (мс)
+uint8_t s_tailLines = 0;         // скільки рядків «tail» надруковано для поточного треку
+bool s_wdStallLogged = false;    // FILE_EOF_WATCHDOG = 0: завмирання цього треку вже зафіксовано
+volatile uint32_t s_eofRealCount = 0;        // справжні eof, оброблені monitorFile
+volatile uint32_t s_eofSynthCount = 0;       // синтезовані eof
+volatile uint32_t s_stallNoActionCount = 0;  // завмирання при FILE_EOF_WATCHDOG = 0
+volatile bool s_lastStallValid = false;
+volatile bool s_lastStallSynth = false;
+volatile uint32_t s_lastStallCur = 0;
+volatile uint32_t s_lastStallDur = 0;
+volatile uint32_t s_lastStallInbuf = 0;
+volatile uint32_t s_lastStallMs = 0;
+char s_lastStallName[file_player_cfg::kEofStatNameMax] = {0};
+#endif
 
 // Тільки задача плеєра.
 char s_url[player_cfg::kUrlMax];
@@ -857,6 +879,7 @@ void failFile(const char* reason) {
 // Природний кінець файлу (пауза kEndTailMs після eof вже минула): мʼют ЦАП, Idle, прапорець «файл закінчився».
 void finishFile() {
     s_fileActive = false;
+    s_evtFileEof = false;  // [DEF6] пізня подія бібліотеки після синтезованого eof не лишається «висіти»
     s_filePaused = false;  // [USB14] (на паузі eof не приходить; запобіжник)
     s_pauseReq = 0;
     muteDacWithLead("file end");
@@ -901,6 +924,12 @@ void doPlayFile(const char* path, int32_t startSec) {
     s_filePosSec = 0;
     s_fileDurSec = 0;
     s_filePosPollMs = millis();
+    s_wdPosValid = false;  // [DEF6] новий файл: відлік завмирання з нуля
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+    s_tailLines = 0;
+    s_tailLastLogMs = 0;
+    s_wdStallLogged = false;
+#endif
     clearMetadata();
     {
         Guard g;
@@ -967,6 +996,10 @@ void processSeek() {
     }
     // Audio::setTimeOffset(int): семантика (відносний / абсолютний зсув) у закріпленому коміті не звірена.
     s_audio->setTimeOffset(static_cast<int>(sec));
+    s_wdPosValid = false;  // [DEF6] після seek позиція може стрибнути / затриматись: відлік завмирання з нуля
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+    s_tailLines = 0;  // [DEF6] монітор «хвоста» — знову для нового положення
+#endif
     Serial.printf("[PLAYER] seek requested: setTimeOffset(%ld) at pos %lu s\n", static_cast<long>(sec),
                   static_cast<unsigned long>(s_filePosSec));
 }
@@ -1166,6 +1199,124 @@ bool elapsedAtLeast(uint32_t now, uint32_t since, uint32_t ms) {
     return static_cast<int32_t>(now - since - ms) >= 0;
 }
 
+#if FILE_EOF_WATCHDOG || (FEATURE_USB_HOST && USB_HOST_DIAG)
+// [DEF6] Відлік «позиція файлу не змінюється» (лише задача плеєра; кеш s_filePosSec оновлює pollFilePosition).
+// s_wdPosValid = false скидає відлік: новий файл, seek, пауза / продовження.
+void trackPosProgress(uint32_t now) {
+    const uint32_t pos = s_filePosSec;
+    if (!s_wdPosValid || pos != s_wdPosSec) {
+        s_wdPosValid = true;
+        s_wdPosSec = pos;
+        s_wdPosChangedMs = now;
+    }
+}
+
+// [DEF6] Скільки мс позиція не змінюється (відлік не раніше за вхід у Playing).
+uint32_t posStalledMs(uint32_t now) {
+    uint32_t base = s_wdPosChangedMs;
+    if (static_cast<int32_t>(s_playingSinceMs - base) > 0) {
+        base = s_playingSinceMs;
+    }
+    return now - base;
+}
+#endif
+
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+// [DEF6] Монітор «хвоста» (лише лог). Викликається із задачі плеєра (не з колбека бібліотеки, без блокувань).
+void tailMonitor(uint32_t now, bool running) {
+    const uint32_t dur = s_fileDurSec;
+    const uint32_t pos = s_filePosSec;
+    if (dur == 0 || pos + file_player_cfg::kTailWatchSec < dur) {
+        return;  // невідома тривалість або ще далеко від кінця
+    }
+    if (s_tailLines >= file_player_cfg::kTailLogMaxLines) {
+        return;
+    }
+    if (s_tailLines != 0 && !elapsedAtLeast(now, s_tailLastLogMs, file_player_cfg::kTailLogMs)) {
+        return;
+    }
+    ++s_tailLines;
+    s_tailLastLogMs = now;
+    Serial.printf("[PLAYER] tail: t=%lu/%lu s inbuf=%lu running=%d state=%s since_progress=%lu\n",
+                  static_cast<unsigned long>(pos), static_cast<unsigned long>(dur),
+                  static_cast<unsigned long>(s_audio->inBufferFilled()), running ? 1 : 0,
+                  AudioPlayer::stateName(s_state), static_cast<unsigned long>(posStalledMs(now)));
+}
+
+// [DEF6] Запис останнього випадку завмирання для `usb.eof`.
+void recordLastStall(uint32_t cur, uint32_t dur, uint32_t inbuf, uint32_t stalled, bool synthesized) {
+    s_lastStallCur = cur;
+    s_lastStallDur = dur;
+    s_lastStallInbuf = inbuf;
+    s_lastStallMs = stalled;
+    s_lastStallSynth = synthesized;
+    copyUtf8Trunc(s_lastStallName, sizeof(s_lastStallName), s_filePath);
+    s_lastStallValid = true;
+}
+#endif
+
+#if FILE_EOF_WATCHDOG || (FEATURE_USB_HOST && USB_HOST_DIAG)
+// [DEF6] Завмирання «наприкінці файлу»: Playing (не пауза / seek / старт), декодер «працює» (isRunning), тривалість відома,
+// до кінця <= kEofNearEndSec, а позиція не змінюється >= kEofStallMs. Лише локальні файли (monitorFile викликається лише для них).
+bool stalledNearEnd(uint32_t now, bool running, uint32_t* stalledOut) {
+    if (s_state != PlayerState::Playing || s_filePaused || !running) {
+        return false;
+    }
+    if (s_pauseReq != 0 || s_seekPending || s_fileEofPending) {
+        return false;
+    }
+    const uint32_t dur = s_fileDurSec;
+    const uint32_t pos = s_filePosSec;
+    if (dur == 0 || pos + file_player_cfg::kEofNearEndSec < dur) {
+        return false;  // тривалість невідома — не синтезуємо; або ще далеко від кінця
+    }
+    const uint32_t stalled = posStalledMs(now);
+    if (stalled < file_player_cfg::kEofStallMs) {
+        return false;
+    }
+    *stalledOut = stalled;
+    return true;
+}
+#endif
+
+#if FILE_EOF_WATCHDOG
+// [DEF6] Синтез кінця файлу тим самим шляхом, що й справжній eof: зупинка в бібліотеці (як usb.stopf / stopSong у finishFile),
+// s_fileEofPending -> після kEndTailMs finishFile() (мʼют ЦАП, Idle, прапорець «файл закінчився») -> usb_queue бачить
+// takeFileEnded() і переходить на наступний трек, а не вважає це ручною зупинкою (s_fileActive лишається true до finishFile).
+void synthesizeFileEof(uint32_t now, uint32_t stalled) {
+    const uint32_t cur = s_filePosSec;
+    const uint32_t dur = s_fileDurSec;
+    const uint32_t inbuf = s_audio->inBufferFilled();
+    Serial.printf("[PLAYER] eof synthesized (stall at t=%lu/%lu s, inbuf=%lu, stalled=%lu ms)\n",
+                  static_cast<unsigned long>(cur), static_cast<unsigned long>(dur), static_cast<unsigned long>(inbuf),
+                  static_cast<unsigned long>(stalled));
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+    s_eofSynthCount = s_eofSynthCount + 1;
+    recordLastStall(cur, dur, inbuf, stalled, true);
+#endif
+    s_evtFileEof = false;  // пізня справжня подія не має дублювати кінець
+    s_audio->stopSong();
+    s_fileEofPending = true;
+    s_fileEofAtMs = now;
+}
+#elif FEATURE_USB_HOST && USB_HOST_DIAG
+// [DEF6] FILE_EOF_WATCHDOG = 0: лише фіксуємо завмирання (раз на трек), нічого не робимо.
+void noteStallNoAction(uint32_t stalled) {
+    if (s_wdStallLogged) {
+        return;
+    }
+    s_wdStallLogged = true;
+    const uint32_t cur = s_filePosSec;
+    const uint32_t dur = s_fileDurSec;
+    const uint32_t inbuf = s_audio->inBufferFilled();
+    s_stallNoActionCount = s_stallNoActionCount + 1;
+    recordLastStall(cur, dur, inbuf, stalled, false);
+    Serial.printf("[PLAYER] stall at end detected, FILE_EOF_WATCHDOG=0 -> no action (t=%lu/%lu s, inbuf=%lu, stalled=%lu ms)\n",
+                  static_cast<unsigned long>(cur), static_cast<unsigned long>(dur), static_cast<unsigned long>(inbuf),
+                  static_cast<unsigned long>(stalled));
+}
+#endif
+
 // [USB7] Нагляд за файлом (Buffering / Playing). Замість monitorStream(): без reconnect, буфера й недовантажень.
 void monitorFile(uint32_t now) {
     // Подія eof (прийшла ПІСЛЯ stopSong() бібліотеки). Якщо флешки вже немає — це НЕ кінець файлу (обгортка при
@@ -1180,6 +1331,9 @@ void monitorFile(uint32_t now) {
 #endif
         s_fileEofPending = true;
         s_fileEofAtMs = now;
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+        s_eofRealCount = s_eofRealCount + 1;  // [DEF6]
+#endif
         const uint32_t pos = s_filePosSec;
         const uint32_t dur = s_fileDurSec;
         Serial.printf("[PLAYER] file eof event t=%lu ms (pos=%lu/%lu s)%s\n", static_cast<unsigned long>(now),
@@ -1202,6 +1356,7 @@ void monitorFile(uint32_t now) {
 
     if (s_filePaused) {  // [USB14] пауза: декодер свідомо стоїть, це не збій («decoder stopped» не рахується)
         s_notRunning = false;
+        s_wdPosValid = false;  // [DEF6] після продовження відлік завмирання з нуля
         return;
     }
     const bool running = s_audio->isRunning();
@@ -1216,6 +1371,27 @@ void monitorFile(uint32_t now) {
     } else {
         s_notRunning = false;
     }
+
+    // [DEF6] Відлік прогресу позиції; монітор «хвоста» (USB_HOST_DIAG); сторожовий таймер кінця файлу.
+#if FILE_EOF_WATCHDOG || (FEATURE_USB_HOST && USB_HOST_DIAG)
+    trackPosProgress(now);
+#endif
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+    tailMonitor(now, running);
+#endif
+#if FILE_EOF_WATCHDOG || (FEATURE_USB_HOST && USB_HOST_DIAG)
+    {
+        uint32_t stalled = 0;
+        if (stalledNearEnd(now, running, &stalled)) {
+#if FILE_EOF_WATCHDOG
+            synthesizeFileEof(now, stalled);
+            return;
+#else
+            noteStallNoAction(stalled);
+#endif
+        }
+    }
+#endif
 
     if (s_state == PlayerState::Buffering) {
         // Для файлу «готовий» = декодер щось повідомив (bitrate / SampleRate / stream ready) або минув запасний час.
@@ -1691,3 +1867,24 @@ void AudioPlayer::getFileTune(uint32_t* extraMs, int32_t* digMs, int* levelDb) {
         *levelDb = static_cast<int>(s_fxLevelDb);
     }
 }
+
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+// [DEF6] Лічильники кінців файлу для консолі `usb.eof`.
+void AudioPlayer::fileEofStats(FileEofStats* out) {
+    if (out == nullptr) {
+        return;
+    }
+    out->real = s_eofRealCount;
+    out->synth = s_eofSynthCount;
+    out->stallNoAction = s_stallNoActionCount;
+    out->watchdogOn = (FILE_EOF_WATCHDOG != 0);
+    out->haveLast = s_lastStallValid;
+    out->lastSynthesized = s_lastStallSynth;
+    out->lastCur = s_lastStallCur;
+    out->lastDur = s_lastStallDur;
+    out->lastInbuf = s_lastStallInbuf;
+    out->lastStalledMs = s_lastStallMs;
+    memcpy(out->lastName, s_lastStallName, sizeof(out->lastName));
+    out->lastName[sizeof(out->lastName) - 1] = '\0';
+}
+#endif

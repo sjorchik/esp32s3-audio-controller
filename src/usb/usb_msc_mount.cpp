@@ -1,3 +1,4 @@
+// [DEF6] ДОДАНО два рядки в usb.help (USB_HOST_DIAG): команда usb.eof [stat]; логіка без змін.
 // [CLEAN1b] ДОДАНО другий рядок usb.help (`[USB] commands (more):`) для usb.hm / usb.preflight / usb.tls; логіка без змін.
 // [USB13] DEF-9: unmountLocked() ПЕРЕД msc_host_vfs_unregister закриває всі відкриті файли / каталоги обгортки
 // (usb_fs::closeAllForUnmountLocked); `usb.heap` розширено (класи пам'яті, невдалі виділення, дескриптори).
@@ -1820,6 +1821,9 @@ void handleLine(const char* line) {
 #endif
                       "usb.tls [stat]\n",
                       kTag);
+        // [DEF6] Рядки довідки для usb.eof (диспетчеризація в usb_play_diag.cpp).
+        Serial.printf("%s commands (DEF6): usb.eof [stat]\n", kTag);
+        Serial.printf("%s   usb.eof: counters of real / synthesized end-of-file events and the last stall (FILE_EOF_WATCHDOG)\n", kTag);
 #endif
 #if USB_HOST_DIAG
     } else if (usb_play_diag::isPlayCommand(line)) {

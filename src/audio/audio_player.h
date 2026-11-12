@@ -14,6 +14,9 @@
 // [Prompt 25] ДОДАНО: setOutputTrimDb()/outputTrimDb() — рівень виходу декодера по станціях.
 // [Prompt 44] ДОДАНО: setFixedOutputRate()/fixedOutputRate() — фіксація 48 кГц на I2S0 для line_path.
 //
+// [DEF6] ДОДАНО: структура FileEofStats і fileEofStats() (лише FEATURE_USB_HOST && USB_HOST_DIAG; лічильники для консолі
+// usb.eof). Сторожовий таймер кінця файлу (FILE_EOF_WATCHDOG) публічного інтерфейсу НЕ змінює: синтезований eof піднімає
+// той самий прапорець, що takeFileEnded() / fileEndedPending().
 // [USB7] ДОДАНО: playFile() і допоміжні (файлове джерело з USB-флешки через Audio::connecttoFS, секція «Файл»
 // нижче). Публічний інтерфейс радіо, begin() та сигнатури наявних методів НЕ змінено.
 //
@@ -24,6 +27,9 @@
 #include <Arduino.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#include "config/features.h"           // [DEF6] FEATURE_USB_HOST / USB_HOST_DIAG
+#include "config/file_player_config.h"  // [DEF6] kEofStatNameMax
 
 // ДОДАНО: стан підключення для UI.
 //  Idle         — нічого не відтворюється (початковий стан і після stop()).
@@ -196,6 +202,27 @@ public:
 
     // true — файл на паузі (виставляє задача плеєра ПІСЛЯ виконання паузи; скидається при продовженні / зупинці / збої).
     static bool filePaused();
+
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+    // [DEF6] Лічильники кінців файлу (консоль `usb.eof`). real — справжні eof від бібліотеки (оброблені плеєром), synth —
+    // синтезовані сторожовим таймером, stallNoAction — завмирання біля кінця, виявлені при FILE_EOF_WATCHDOG = 0 (без дій).
+    // haveLast — був хоч один випадок завмирання; lastSynthesized — він закінчився синтезом (інакше «без дій»).
+    // Значення пише задача плеєра; читання з іншої задачі без блокувань (діагностика: можливе неузгоджене читання).
+    struct FileEofStats {
+        uint32_t real;
+        uint32_t synth;
+        uint32_t stallNoAction;
+        bool watchdogOn;
+        bool haveLast;
+        bool lastSynthesized;
+        uint32_t lastCur;      // секунди
+        uint32_t lastDur;      // секунди
+        uint32_t lastInbuf;    // байти у вхідному буфері бібліотеки
+        uint32_t lastStalledMs;
+        char lastName[file_player_cfg::kEofStatNameMax];
+    };
+    static void fileEofStats(FileEofStats* out);
+#endif
 
     // [Prompt 17] Декодовані PCM-семпли для VU перехоплює вільна функція
     // audio_process_i2s(int32_t*, int16_t, bool*) в audio/vu_pcm_hook.cpp (за VU_PCM_HOOK_STYLE

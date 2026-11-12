@@ -1,5 +1,7 @@
 #pragma once
 
+// [DEF6] ДОДАНО kTailWatchSec / kTailLogMs / kTailLogMaxLines (монітор «хвоста», USB_HOST_DIAG), kEofStallMs / kEofNearEndSec
+// (сторожовий таймер FILE_EOF_WATCHDOG), kEofStatNameMax (usb.eof). Решта без змін.
 // [USB7] Константи відтворення файлу з USB-флешки (AudioPlayer::playFile, src/audio/audio_player.*).
 // Піни й I2S тут не дублюються. Часові значення — у мілісекундах.
 // Позначки: [ГАДКА] — вибір планування БЕЗ вимірювання, потребує підтвердження на залізі (hwcheck_USB7.md).
@@ -51,6 +53,22 @@ constexpr uint32_t kTuneMaxMs = 2000;  // верхня межа для usb.fx
 // Консоль usb.seek: скільки чекати після seek перед повторним читанням позиції. [ГАДКА]
 constexpr uint32_t kSeekSettleMs = 1000;
 
+// [DEF6] Монітор «хвоста» (лише USB_HOST_DIAG; лише лог). Коли до кінця файлу лишилось <= kTailWatchSec секунд
+// (getAudioFileDuration - getAudioCurrentTime, роздільність 1 с), раз на kTailLogMs пишеться рядок «[PLAYER] tail: ...»,
+// не більше kTailLogMaxLines рядків на трек. [ПРИПУЩЕННЯ] 2 с / 500 мс / 12 рядків (≈ 6 с спостереження).
+constexpr uint32_t kTailWatchSec = 2;
+constexpr uint32_t kTailLogMs = 500;
+constexpr uint8_t kTailLogMaxLines = 12;
+
+// [DEF6] Сторожовий таймер кінця файлу (FILE_EOF_WATCHDOG): позиція файлу в стані Playing не змінюється >= kEofStallMs
+// І до кінця лишилось <= kEofNearEndSec секунд (dur > 0) -> синтезується eof. Позиція має роздільність 1 с, тож
+// kEofStallMs має суттєво перевищувати 1 с. [ПРИПУЩЕННЯ] 2500 мс / 3 с; підбір — за hwcheck_DEF6.md.
+constexpr uint32_t kEofStallMs = 2500;
+constexpr uint32_t kEofNearEndSec = 3;
+
+// [DEF6] Довжина буфера імені файлу в лічильниках usb.eof (останній випадок; лише USB_HOST_DIAG).
+constexpr size_t kEofStatNameMax = 96;
+
 // Назви задач для вимірювання стека (uxTaskGetStackHighWaterMark). Внутрішня задача декодера бібліотеки
 // (за спекою розділ 11: `PeriodicTask`, ядро 1, prio 2) і задача плеєра (audio_player.cpp).
 constexpr const char* kDecoderTaskName = "PeriodicTask";
@@ -59,6 +77,10 @@ constexpr const char* kPlayerTaskName = "audio_player";
 static_assert(kFileLevelDb >= station_level_cfg::kLevelMinDb && kFileLevelDb <= station_level_cfg::kLevelMaxDb,
               "file level must be inside the station level range");
 static_assert(kPathMax >= 64, "kPathMax too small");
+static_assert(kEofStallMs > 1000 + kPosPollMs, "eof stall time must exceed the 1 s position resolution");
+static_assert(kTailLogMs > 0 && kTailLogMaxLines > 0 && kEofNearEndSec > 0 && kTailWatchSec > 0,
+              "DEF6 tail / watchdog constants must be positive");
+static_assert(kEofStatNameMax >= 16, "kEofStatNameMax too small");
 static_assert(kStartTimeoutMs > kAssumePlayingMs, "start timeout must exceed the assume-playing delay");
 #if FEATURE_USB_HOST
 static_assert(kPathMax >= usb_host_cfg::kPathMax, "player path buffer smaller than the USB wrapper path limit");
