@@ -1,5 +1,6 @@
 #pragma once
 
+// [USB18a] ДОДАНО kSeekEndMarginSec (seek за кінець файлу = кінець треку) і kTagMaxBytes (ID3-теги для веб-API). Решта без змін.
 // [DEF6] ДОДАНО kTailWatchSec / kTailLogMs / kTailLogMaxLines (монітор «хвоста», USB_HOST_DIAG), kEofStallMs / kEofNearEndSec
 // (сторожовий таймер FILE_EOF_WATCHDOG), kEofStatNameMax (usb.eof). Решта без змін.
 // [USB7] Константи відтворення файлу з USB-флешки (AudioPlayer::playFile, src/audio/audio_player.*).
@@ -69,6 +70,13 @@ constexpr uint32_t kEofNearEndSec = 3;
 // [DEF6] Довжина буфера імені файлу в лічильниках usb.eof (останній випадок; лише USB_HOST_DIAG).
 constexpr size_t kEofStatNameMax = 96;
 
+// [USB18a] Seek за кінець файлу: якщо (позиція + зсув) >= тривалість - kSeekEndMarginSec (dur > 0, зсув > 0), бібліотечний seek НЕ
+// викликається, а трек завершується як звичайний кінець (синтез eof, як у DEF6). Запас покриває роздільність 1 с кешу
+// позиції / тривалості. ПРИПУЩЕННЯ: 1 с.
+constexpr uint32_t kSeekEndMarginSec = 1;
+// [USB18a] Макс. байтів одного ID3-тегу (title / artist / album) разом з '\0', UTF-8; довші усікаються по межі символу.
+// ПРИПУЩЕННЯ: 64 Б (≈ 30 кириличних літер).
+constexpr size_t kTagMaxBytes = 64;
 // Назви задач для вимірювання стека (uxTaskGetStackHighWaterMark). Внутрішня задача декодера бібліотеки
 // (за спекою розділ 11: `PeriodicTask`, ядро 1, prio 2) і задача плеєра (audio_player.cpp).
 constexpr const char* kDecoderTaskName = "PeriodicTask";
@@ -77,6 +85,8 @@ constexpr const char* kPlayerTaskName = "audio_player";
 static_assert(kFileLevelDb >= station_level_cfg::kLevelMinDb && kFileLevelDb <= station_level_cfg::kLevelMaxDb,
               "file level must be inside the station level range");
 static_assert(kPathMax >= 64, "kPathMax too small");
+static_assert(kSeekEndMarginSec <= 10, "kSeekEndMarginSec: sane margin");
+static_assert(kTagMaxBytes >= 8 && kTagMaxBytes <= 256, "kTagMaxBytes: sane tag size");
 static_assert(kEofStallMs > 1000 + kPosPollMs, "eof stall time must exceed the 1 s position resolution");
 static_assert(kTailLogMs > 0 && kTailLogMaxLines > 0 && kEofNearEndSec > 0 && kTailWatchSec > 0,
               "DEF6 tail / watchdog constants must be positive");

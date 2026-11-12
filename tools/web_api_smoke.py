@@ -38,6 +38,9 @@ FEATURE_USB_MODE = 0), усі USB-перевірки позначаються SK
 out_of_range (max 3), масиви з 3 елементів (застаріле) НЕ змінюють слот 3 (маска й ім'я), EQ / баланс / VU слота 3 get / set.
 Режим «USB» піднімається лише з --write --player (і лише з увімкненого пристрою на вході Radio / ExternalInput).
 
+Оновлено в USB18a: nowPlaying.path/dir/title/artist/album і queue.pos (типи; з --write --player — реальне відтворення: path відповідає
+запущеному файлу, теги після next, seek за кінець -> atEnd, наступний трек без read_error, повернення до початкового треку).
+
 Код виходу: 0 — немає FAIL; 1 — є хоча б один FAIL; 2 — пристрій недоступний.
 """
 
@@ -327,6 +330,7 @@ def usb_read_checks(d):
     if st["nowPlaying"] is not None:
         record("usb.status.nowPlaying має name/posSec/durSec/paused",
                has_keys(st["nowPlaying"], ["name", "posSec", "durSec", "paused"]))
+    usb18a_shape_checks(st)  # [USB18a]
     if st["lastReq"] is not None:
         record("usb.status.lastReq має id/ok/why", has_keys(st["lastReq"], ["id", "ok", "why"]))
 
@@ -967,10 +971,205 @@ def _usb_input_checks_body(d, st, inp):
             expect("POST /api/volume повернути %d («Player»)" % v0, d.post("/api/volume", {"value": v0}), 200, ["state"])
             back = wait_until(lambda: status_where(d, lambda s: s.get("volume") == v0), 6)
             record("volume «Player» відновлено (%d)" % v0, bool(back))
+        usb18a_track_checks(d)  # [USB18a] чутне відтворення: path / теги / next / seek за кінець
     except Exception as exc:  # noqa: BLE001
         record("режим «USB» через вхід 3: неочікуваний виняток", False, repr(exc))
     finally:
         usb_leave(d, prev, vol0, bal0, vu0)
+
+
+# --------------------------------------------------------------------------
+# [USB18a] Нові поля status: nowPlaying.path/dir/title/artist/album, queue.pos; відтворення, теги, seek за кінець
+# --------------------------------------------------------------------------
+def parent_dir(path):
+    i = path.rfind("/")
+    return "/" if i <= 0 else path[:i]
+
+
+def usb18a_shape_checks(st, label="usb18a"):
+    """Типи нових полів у відповіді GET /api/usb/status (st — розібране тіло). Нічого не змінює."""
+    q = st.get("queue") if isinstance(st, dict) else None
+    record("%s: queue.pos — ціле >= 0" % label,
+           isinstance(q, dict) and isinstance(q.get("pos"), int) and not isinstance(q.get("pos"), bool) and q["pos"] >= 0,
+           "pos=%r" % (q.get("pos") if isinstance(q, dict) else None))
+    np = st.get("nowPlaying")
+    if np is None:
+        record("%s: nowPlaying == null -> path/dir/теги відсутні" % label, True)
+        return
+    record("%s: nowPlaying.path — рядок від кореня, закінчується на name" % label,
+           isinstance(np.get("path"), str) and np["path"].startswith("/") and isinstance(np.get("name"), str) and
+           np["path"].endswith(np["name"]), "path=%r name=%r" % (np.get("path"), np.get("name")))
+    record("%s: nowPlaying.dir == батьківська папка path" % label,
+           isinstance(np.get("dir"), str) and isinstance(np.get("path"), str) and np["dir"] == parent_dir(np["path"]),
+           "dir=%r" % np.get("dir"))
+    bad = [k for k in ("title", "artist", "album") if k in np and not (isinstance(np[k], str) and np[k] != "")]
+    record("%s: теги title/artist/album — непорожні рядки або відсутні" % label, not bad, "некоректні: %s" % ", ".join(bad))
+
+
+def usb_status_body(d):
+    status, body = d.get("/api/usb/status")
+    return body if status == 200 and isinstance(body, dict) else None
+
+
+def wait_track_change(d, old_path, timeout=10):
+    """Чекає, поки nowPlaying.path стане іншим (трек стартував) -> тіло status; або None."""
+    def probe():
+        b = usb_status_body(d)
+        np = b.get("nowPlaying") if b else None
+        return b if np and np.get("path") and np["path"] != old_path else None
+    return wait_until(probe, timeout, 0.4)
+
+
+def usb_settled(d, timeout=5):
+    """Тіло status, коли трек уже Playing, тривалість відома (durSec > 0) і немає паузи (короткі файли: дії одразу після next
+    потрапляють у фазу старту, коли durSec == 0 і пауза / seek відхиляються). None — не дочекались."""
+    def probe():
+        b = usb_status_body(d)
+        n = b.get("nowPlaying") if b else None
+        return b if n and b["queue"].get("state") == "Playing" and (n.get("durSec") or 0) > 0 and not n.get("paused") else None
+    return wait_until(probe, timeout, 0.2)
+
+
+def usb18a_track_checks(d):
+    """[USB18a] Реальне відтворення (ЧУТНЕ; лише з --write --player, у режимі «USB»): path / dir / теги / pos, next, seek,
+    seek за кінець, повернення до початкового треку. Режим «USB» і профіль «Player» повертає зовнішній код (usb_leave)."""
+    # Після входу в режим пристрій сам відновлює останню папку й трек (автостарт, §16.2): список може змінитись під ногами.
+    # Тому чекаємо, поки cwd / list.version стабільні, і запускаємо перший файл з повторами (до 3 спроб).
+    def stable_status():
+        seen, same, end = None, 0, time.time() + 12
+        while time.time() < end:
+            b = usb_status_body(d)
+            key = (b.get("cwd"), b["list"].get("version"), b["list"].get("valid")) if b and isinstance(b.get("list"), dict) else None
+            same = same + 1 if key is not None and key == seen else 0
+            seen = key
+            if same >= 3:
+                return b
+            time.sleep(0.5)
+        return None
+
+    cur = first = None
+    dirs = count = ver = nfiles = 0
+    for attempt in range(3):
+        st = stable_status()
+        if st is None or st.get("media") != "mounted" or not st["list"].get("valid"):
+            record("usb18a: відтворення", False, "потрібен змонтований носій зі стабільним списком", skip=True)
+            return
+        dirs, count, ver = st["list"]["dirs"], st["list"]["count"], st["list"]["version"]
+        nfiles = count - dirs
+        if nfiles < 1:
+            record("usb18a: відтворення", False, "у поточній папці немає файлів", skip=True)
+            return
+        status, pg = d.get("/api/usb/list?offset=%d&limit=3&version=%d" % (dirs, ver))
+        files = [it for it in pg.get("items", []) if not it.get("dir")] if status == 200 and isinstance(pg, dict) else []
+        if not files:
+            continue  # список змінився між читаннями (409 stale) — спробуємо ще раз
+        first = files[0]
+        status, pb = d.post("/api/usb/play", {"index": first["i"], "version": ver})
+        if status != 202:
+            continue
+        cur = wait_until(lambda: (lambda b: b if b and b.get("nowPlaying") and b["nowPlaying"].get("name") == first["name"] and
+                                  b["queue"].get("state") == "Playing" else None)(usb_status_body(d)), 8)
+        if cur:
+            break
+    record("usb18a: POST /api/usb/play {index:%s} (перший файл папки) і трек стартував" % (first["i"] if first else "?"),
+           bool(cur), "" if cur else "не вдалося запустити перший файл за 3 спроби")
+    if not cur:
+        return
+    cur = usb_settled(d) or cur
+    np = cur["nowPlaying"]
+    usb18a_shape_checks(cur, "usb18a play")
+    record("usb18a: nowPlaying.name == ім'я запущеного файла, dir == cwd",
+           np.get("name") == first["name"] and np.get("dir") == cur.get("cwd"),
+           "name=%r (список: %r) dir=%r cwd=%r" % (np.get("name"), first["name"], np.get("dir"), cur.get("cwd")))
+    q = cur["queue"]
+    if not q.get("shuffle"):
+        record("usb18a: послідовно -> queue.pos == queue.index + 1", q.get("pos") == q.get("index") + 1,
+               "pos=%r index=%r" % (q.get("pos"), q.get("index")))
+    record("usb18a: queue.pos <= queue.count", 1 <= q.get("pos", 0) <= q.get("count", 0), "pos=%r count=%r" % (q.get("pos"), q.get("count")))
+    # теги: порожні поля = файл без тегів (SKIP), не FAIL
+    tagged = bool(np.get("title") or np.get("artist"))
+    record("usb18a: тестові файли мають title / artist", tagged,
+           "title=%r artist=%r album=%r" % (np.get("title"), np.get("artist"), np.get("album")), skip=not tagged)
+    start_path = np["path"]
+
+    # --- seek у межах файла: atEnd == false ---
+    dur = np.get("durSec") or 0
+    pos0 = np.get("posSec") or 0
+    if dur > 0 and pos0 + 2 < dur - 2 and not np.get("paused"):
+        ok, b = expect("usb18a: POST /api/usb/seek {deltaSec:2} -> 200", d.post("/api/usb/seek", {"deltaSec": 2}), 200,
+                       ["ok", "deltaSec", "atEnd"])
+        if ok:
+            record("usb18a: seek у межах файла -> atEnd == false", b.get("atEnd") is False, str(b))
+    else:
+        record("usb18a: seek у межах файла", False, "durSec=%r posSec=%r (замало до кінця або тривалість невідома)" % (dur, pos0), skip=True)
+
+    # --- next: path змінився, теги й pos оновились ---
+    prev_pos = q.get("pos")
+    if nfiles >= 2:
+        expect("usb18a: POST /api/usb/control next", d.post("/api/usb/control", {"action": "next"}), 202, ["reqId"])
+        b = wait_track_change(d, start_path, 10)
+        record("usb18a: після next nowPlaying.path змінився (<= 10 с)", bool(b), "" if b else "path не змінився")
+        if b:
+            usb18a_shape_checks(b, "usb18a next")
+            if not b["queue"].get("shuffle") and prev_pos:
+                record("usb18a: після next queue.pos == %d" % (prev_pos + 1), b["queue"].get("pos") == prev_pos + 1,
+                       "pos=%r" % b["queue"].get("pos"))
+            cur = b
+    else:
+        record("usb18a: next / теги оновились", False, "у папці лише один файл", skip=True)
+
+    # --- seek на паузі -> 409 paused ---
+    usb_settled(d)
+    status, pb = d.post("/api/usb/control", {"action": "pause"})
+    if status == 200:
+        wait_until(lambda: (usb_status_body(d) or {}).get("queue", {}).get("paused") is True, 6, 0.4)
+        expect("usb18a: seek на паузі -> 409 paused", d.post("/api/usb/seek", {"deltaSec": 5}), 409, ["error"], "paused")
+        d.post("/api/usb/control", {"action": "resume"})
+        wait_until(lambda: (usb_status_body(d) or {}).get("queue", {}).get("paused") is False, 6, 0.4)
+    else:
+        record("usb18a: seek на паузі -> 409 paused", False, "pause -> HTTP %s" % status, skip=True)
+
+    # --- seek за кінець: atEnd, наступний трек, без read_error ---
+    b0 = usb_settled(d) or usb_status_body(d)
+    np0 = b0.get("nowPlaying") if b0 else None
+    if np0 and (np0.get("durSec") or 0) > 0 and not np0.get("paused"):
+        path0, idx0 = np0["path"], b0["queue"].get("index")
+        status, sb = d.post("/api/usb/seek", {"deltaSec": 3600})  # kSeekMaxAbsSec: більшого web API не приймає
+        record("usb18a: POST /api/usb/seek {deltaSec:3600} -> 200 atEnd:true",
+               status == 200 and isinstance(sb, dict) and sb.get("ok") is True and sb.get("atEnd") is True,
+               "HTTP %s %s" % (status, str(sb)[:100]))
+        if status == 200 and isinstance(sb, dict) and sb.get("atEnd") is True:
+            def moved():
+                b = usb_status_body(d)
+                if not b:
+                    return None
+                n = b.get("nowPlaying")
+                if n and n.get("path") and n["path"] != path0:
+                    return b
+                if b["queue"].get("state") == "Idle" and b["queue"].get("reason") == "end_of_queue":
+                    return b
+                return None
+            b = wait_until(moved, 10, 0.3)
+            record("usb18a: після seek за кінець — наступний трек або end_of_queue (<= 10 с)", bool(b),
+                   "" if b else "трек не змінився")
+            time.sleep(1.0)
+            b = usb_status_body(d) or b
+            if b:
+                lr = b.get("lastReq") or {}
+                reason = b["queue"].get("reason")
+                record("usb18a: seek за кінець без read_error / too_many_skips",
+                       reason in (None, "end_of_queue") and "read_error" not in str(lr.get("why")),
+                       "queue.reason=%r lastReq.why=%r" % (reason, lr.get("why")))
+    else:
+        record("usb18a: seek за кінець", False, "тривалість треку невідома (durSec == 0) або пауза", skip=True)
+
+    # --- повернення до початкового треку ---
+    b = usb_status_body(d)
+    lv = b["list"]["version"] if b and isinstance(b.get("list"), dict) else ver
+    d.post("/api/usb/play", {"index": first["i"], "version": lv})
+    back = wait_until(lambda: (lambda x: x if x and x.get("nowPlaying") and x["nowPlaying"].get("path") == start_path else None)(
+        usb_status_body(d)), 10, 0.4)
+    record("usb18a: повернуто початковий трек", bool(back), "" if back else "path != %s" % start_path)
 
 
 def usb_write_checks(d, st, active):

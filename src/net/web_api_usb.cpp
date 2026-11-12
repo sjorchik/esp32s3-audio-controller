@@ -252,6 +252,15 @@ const char* baseName(const char* path) {
     return (sl != nullptr) ? sl + 1 : path;
 }
 
+// [USB18a] Папка треку: усе до останнього '/' ("/" для файла в корені).
+String parentDir(const char* path) {
+    const char* slash = strrchr(path, '/');
+    if (slash == nullptr || slash == path) {
+        return String("/");
+    }
+    return String(path).substring(0, static_cast<unsigned int>(slash - path));
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/usb/status
 // ---------------------------------------------------------------------------
@@ -299,6 +308,7 @@ void handleStatus(AsyncWebServerRequest* req) {
     q["index"] = qs.index;
     q["count"] = qs.count;
     q["position"] = qs.position;
+    q["pos"] = qs.pos;  // [USB18a] 1-based, 0 = немає
     q["shuffle"] = qs.shuffle;
     q["repeat"] = qs.repeatAll;
     q["paused"] = qs.paused;
@@ -309,9 +319,18 @@ void handleStatus(AsyncWebServerRequest* req) {
     if (haveCur && (qs.state == usb_queue::State::Playing || qs.state == usb_queue::State::Starting)) {
         JsonObject np = doc["nowPlaying"].to<JsonObject>();
         np["name"] = String(baseName(cur));
+        np["path"] = String(cur);    // [USB18a] повний шлях від кореня носія (як у list / play)
+        np["dir"] = parentDir(cur);  // [USB18a] папка черги
         np["posSec"] = AudioPlayer::filePositionSec();
         np["durSec"] = AudioPlayer::fileDurationSec();
         np["paused"] = qs.paused;
+        // [USB18a] ID3: лише теги САМЕ цього файлу (хеш шляху); відсутні / порожні — без поля.
+        AudioPlayer::FileTags tg;
+        if (AudioPlayer::fileTags(cur, &tg)) {
+            if (tg.title[0] != '\0') np["title"] = String(tg.title);
+            if (tg.artist[0] != '\0') np["artist"] = String(tg.artist);
+            if (tg.album[0] != '\0') np["album"] = String(tg.album);
+        }
     } else {
         doc["nowPlaying"] = nullptr;
     }
@@ -778,13 +797,15 @@ void handleSeek(AsyncWebServerRequest* req) {
         sendError(req, 409, "paused");
         return;
     }
-    if (delta != 0 && !AudioPlayer::seekFileSec(delta)) {
+    bool atEnd = false;  // [USB18a] ціль за кінцем файла = кінець треку (див. AudioPlayer::seekFileSec)
+    if (delta != 0 && !AudioPlayer::seekFileSec(delta, &atEnd)) {
         sendError(req, 409, "seek_refused");
         return;
     }
     JsonDocument doc;
     doc["ok"] = true;
     doc["deltaSec"] = delta;
+    doc["atEnd"] = atEnd;  // [USB18a]
     sendJson(req, 200, doc);
 }
 

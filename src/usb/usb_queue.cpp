@@ -119,6 +119,17 @@ void publish() {
     st.count = s_haveList ? s_list.count : 0;
     st.index = (s_phase == Phase::Inactive) ? -1 : s_cur;
     st.position = (s_phase == Phase::Inactive) ? -1 : s_pos;
+    // [USB18a] pos: де поточний трек у ПОТОЧНОМУ порядку проходу. s_pos не оновлюється на шляхах історії (prev / next-назад у
+    // shuffle), тож місце шукається в s_order (лише при зміні стану; <= kMaxEntries кроків).
+    st.pos = 0;
+    if (s_phase != Phase::Inactive && s_cur >= 0 && s_order != nullptr) {
+        for (uint16_t i = 0; i < s_orderLen; ++i) {
+            if (s_order[i] == static_cast<uint16_t>(s_cur)) {
+                st.pos = static_cast<int32_t>(i) + 1;
+                break;
+            }
+        }
+    }
     st.skips = s_skips;
     st.started = s_started;
     st.reason = s_reason;

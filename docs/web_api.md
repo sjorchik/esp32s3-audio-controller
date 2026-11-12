@@ -1082,9 +1082,11 @@ POST /api/vu {"value":1,"x":2}            -> 400 {"ok":false,"error":"unknown_fi
   "media": "mounted",
   "cwd": "/Музика/Rock",
   "list": {"valid": true, "version": 12, "count": 120, "dirs": 8, "depth": 2, "truncated": false},
-  "queue": {"state": "Playing", "index": 4, "count": 112, "position": 4, "shuffle": false, "repeat": false,
+  "queue": {"state": "Playing", "index": 4, "count": 112, "position": 4, "pos": 5, "shuffle": false, "repeat": false,
             "paused": false, "prepared": false, "reason": null},
-  "nowPlaying": {"name": "Track 05.mp3", "posSec": 73, "durSec": 201, "paused": false},
+  "nowPlaying": {"name": "Track 05.mp3", "path": "/Музика/Rock/Track 05.mp3", "dir": "/Музика/Rock",
+                 "title": "Highway To Hell", "artist": "AC-DC", "album": "Highway To Hell",
+                 "posSec": 73, "durSec": 201, "paused": false},
   "lastReq": {"id": 41, "ok": true, "why": null},
   "pending": 0
 }
@@ -1098,11 +1100,18 @@ POST /api/vu {"value":1,"x":2}            -> 400 {"ok":false,"error":"unknown_fi
   `list.dirs` — перші `dirs` індексів це папки, далі файли. `list.truncated=true` — папку обрізано до 1000 записів
   (перших у порядку FAT, не за алфавітом).
 - `queue.state`: `Idle` \| `Starting` \| `Playing`. `queue.index` — номер файла в черзі (папка, з якої запущено відтворення; може
-  відрізнятись від поточної папки браузера), `-1` — нема. `queue.reason` — причина останньої зупинки: `end_of_queue`, `user_stop`, `media_removed`,
+  відрізнятись від поточної папки браузера), `-1` — нема. `queue.count` — файлів у черзі. `queue.position` — курсор у порядку проходу (0-based;
+  у послідовному режимі збігається з `index`; у shuffle НЕ оновлюється на шляхах історії (`prev` / «next після prev»), тож для «трек N з M» його
+  не використовуйте). **`queue.pos`** (USB18a) — 1-based місце поточного треку в ПОТОЧНОМУ порядку проходу (`1..count`, точне й у shuffle після
+  історії), `0` — немає: «трек N з M» = `queue.pos` з `queue.count`. `queue.reason` — причина останньої зупинки: `end_of_queue`, `user_stop`, `media_removed`,
   `mode_exit`, `too_many_skips` тощо (стабільні рядки) або `null`. `queue.prepared=true` — черга стоїть, але є підготовлений трек
   (після відновлення без автостарту / після кінця черги): `control resume` / `toggle` запускає його.
   `queue.shuffle` / `queue.repeat` відображають поточні налаштування режиму; поза режимом значення не мають сенсу.
-- `nowPlaying` — `null`, якщо трек не стартує й не грає. `posSec` / `durSec` — кеш плеєра, роздільність 1 с, `0` = невідомо
+- `nowPlaying` — `null`, якщо трек не стартує й не грає. **`path`** (USB18a) — повний шлях файла від кореня носія (UTF-8, ті самі рядки, що в
+  `list` / `play`; для підсвічування в списку порівнюйте `path` з `cwd` + `name`); **`dir`** — папка черги (= батьківська папка `path`, `"/"` для
+  кореня; може відрізнятись від `cwd`); **`title` / `artist` / `album`** — ID3-теги (UTF-8, до 63 байтів кожен; поле ВІДСУТНЄ, якщо тегу нема, він ще
+  не прочитаний або не є дійсним UTF-8 — перекодування cp1251 / UTF-16 не виконується; теги з'являються за ≈ сотні мс після старту треку, теги
+  попереднього треку не показуються). `posSec` / `durSec` — кеш плеєра, роздільність 1 с, `0` = невідомо
   (VBR / ще не відомо). На паузі `posSec` не змінюється, `paused:true`.
 - `lastReq` — результат НАЙНОВІШОЇ завершеної команди (усіх клієнтів разом), `null`, якщо команд ще не було. Для власної команди
   користуйтеся `reqId` і `GET /api/usb/result` (§16.3), а не `lastReq`. `pending` — команд у черзі + виконується.
@@ -1208,9 +1217,13 @@ LEFT / RIGHT = попередній / наступний).
 ### 16.8. `POST /api/usb/seek`
 
 `{"deltaSec":N}` — ВІДНОСНИЙ зсув позиції, секунди, знак — напрям; `N` ціле `−3600..3600` (`400 out_of_range`, `field:"deltaSec"`, `min`, `max`).
-Точність ≈ 1-2 с (розділ 11 MASTER SPEC; для VBR не вимірювалась). `200 {"ok":true,"deltaSec":N}` — запит прийнято плеєром; нову позицію
+Точність ≈ 1-2 с (розділ 11 MASTER SPEC; для VBR не вимірювалась). `200 {"ok":true,"deltaSec":N,"atEnd":false}` — запит прийнято плеєром; нову позицію
 видно в `nowPlaying.posSec` за ≈ 1-2 с. `deltaSec:0` — нічого не робить. Відмови: `409 not_playing` (файл не грає), `409 paused` (на паузі
-перемотування не підтримується — спершу `resume`), `409 seek_refused`. Перемотування за межі треку — на розсуд плеєра: за кінець = природний кінець треку.
+перемотування не підтримується — спершу `resume`), `409 seek_refused`. **Seek за кінець (USB18a).** Якщо тривалість відома (`durSec > 0`), `deltaSec > 0` і позиція + `deltaSec` ≥ `durSec` − 1 с, бібліотечний seek
+не виконується: трек завершується як звичайний кінець (черга переходить на наступний за правилами repeat / shuffle / `end_of_queue`, без помилки
+читання й без внеску в лічильник пропусків), відповідь `200 {"ok":true,"deltaSec":N,"atEnd":true}`; наступний трек видно в `nowPlaying` за ≈ 1-2 с.
+`deltaSec ≤ 0` або невідома тривалість (`durSec` = 0) — поведінка як у межах треку (`atEnd:false`). Рішення ухвалюється за кешем позиції
+(роздільність 1 с). `N` обмежено `−3600..3600`, тож для «в кінець» достатньо `3600`.
 
 ### 16.9. `POST /api/usb/options`
 
@@ -1234,7 +1247,7 @@ POST /api/usb/play    {"index":20,"version":4}        -> 202 {"ok":true,"reqId":
 GET  /api/usb/result?id=8                             -> 200 {"ok":true,"req":{"id":8,"done":true,"ok":true,"why":null}}
 POST /api/usb/control {"action":"pause"}              -> 200 {"ok":true,"result":"paused","changed":true}
 POST /api/usb/control {"action":"next"}               -> 202 {"ok":true,"reqId":9}
-POST /api/usb/seek    {"deltaSec":30}                 -> 200 {"ok":true,"deltaSec":30}
+POST /api/usb/seek    {"deltaSec":30}                 -> 200 {"ok":true,"deltaSec":30,"atEnd":false}
 POST /api/usb/options {"shuffle":true}                -> 200 {"ok":true,"shuffle":true,"repeat":false}
 POST /api/input       {"index":1}                     -> 202 {"ok":true,"pending":true,"reason":"usb_exit","target":1,"state":{...}}   (у режимі «USB»)
 POST /api/input       {"index":3}                     -> 202 {"ok":true,"pending":true,"reason":"usb_enter","target":3,"state":{...}}   (вхід у режим «USB»)
@@ -1271,3 +1284,23 @@ POST /api/input       {"index":3}                     -> 202 {"ok":true,"pending
 - Окремого поля `inputEnabledMask` у `GET /api/status` немає: маску віддає лише `GET /api/inputs` (`enabledMask`).
 - «Активний вхід» береться з опублікованого стану (`usbUi`), який оновлюється періодично: на самій межі входу / виходу `status.input`
   може відставати від команди на десятки мілісекунд; клієнт має стежити за `status.input` / `GET /api/usb/status`, а не покладатися на відповідь `202`.
+
+---
+
+## 18. Зміни контракту USB18a (розширений `status`, seek за кінець)
+
+Лише адитивні зміни: наявні поля й їх семантика не змінюються, нових ендпоїнтів немає. Старі клієнти (USB16b, евристика за `name` і `count − dirs`)
+працюють як раніше.
+
+| Було | Стало (USB18a) |
+|---|---|
+| `nowPlaying`: `name`, `posSec`, `durSec`, `paused` | додано **`path`**, **`dir`** і (якщо відомі) **`title`**, **`artist`**, **`album`** (§16.2) |
+| `queue.index` / `queue.position` без опису для shuffle | задокументовано: `position` — курсор проходу (у shuffle відстає після `prev` / «next після prev»); додано **`queue.pos`** (1-based, точне) |
+| `POST /api/usb/seek` → `{"ok":true,"deltaSec":N}`; seek за кінець давав збій читання й пропуск треку | `{"ok":true,"deltaSec":N,"atEnd":bool}`; за кінець файла = **звичайний кінець треку** (§16.8) |
+
+Примітки:
+
+- Підсвічування поточного треку в списку без евристик: `nowPlaying.dir` == `cwd` списку і `nowPlaying.name` == `items[].name` (або порівняння повних шляхів).
+- Теги не мають окремого оповіщення: клієнт бачить їх у наступних відповідях `status` (≈ 2 Гц). Додаток до відповіді `status` — ≈ 230 байтів
+  типово (ID3 + шлях), до ≈ 1 КБ у найгіршому випадку (довгі шляхи й теги).
+- Теги з недійсним UTF-8 (типово cp1251 / UTF-16 без перекодування) не показуються: поле відсутнє.

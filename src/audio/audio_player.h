@@ -20,6 +20,8 @@
 // [USB7] ДОДАНО: playFile() і допоміжні (файлове джерело з USB-флешки через Audio::connecttoFS, секція «Файл»
 // нижче). Публічний інтерфейс радіо, begin() та сигнатури наявних методів НЕ змінено.
 //
+// [USB18a] ДОДАНО: seekFileSec(sec, atEnd) (необовʼязковий вихідний параметр; seek за кінець файлу = кінець треку), FileTags і
+// fileTags(path, out) (ID3 title / artist / album для веб-API), fileTagStats() (лише USB_HOST_DIAG). Наявне не змінено.
 // [Prompt 5] Заглушку замінено. Позначки:
 //   ЗМІНЕНО — сигнатура відрізняється від заглушки (розділ 12);
 //   ДОДАНО  — нове.
@@ -168,7 +170,12 @@ public:
     // Запит на зсув позиції: тонка обгортка над Audio::setTimeOffset(int). ВІДНОСНИЙ зсув у секундах (знак — напрям):
     // підтверджено на залізі (USB7, партія 2: +30 з 6 с -> 37 с, -10 з 41 с -> 32 с). Точність у межах ~1 с на CBR
     // 128 кбіт/с; VBR не вимірювалось. false — файл не грає.
-    static bool seekFileSec(int32_t sec);
+    // [USB18a] Якщо sec > 0, тривалість відома (> 0) і (кеш позиції + sec) >= тривалість - kSeekEndMarginSec — бібліотечний seek НЕ
+    // виконується: файл завершується як звичайний кінець треку (той самий шлях, що синтезований eof з DEF6: takeFileEnded()
+    // підніметься за ≈ kEndTailMs, черга перейде на наступний трек; без збою й без внеску в послідовність пропусків), а
+    // *atEnd = true (atEnd може бути nullptr). Рішення ухвалюється за кешем (роздільність 1 с); sec <= 0 або тривалість
+    // невідома — поведінка як раніше. false — файл не грає.
+    static bool seekFileSec(int32_t sec, bool* atEnd = nullptr);
 
     // [USB7] Налаштування на льоту для підбору клацань на старті (консоль `usb.fx`; діють на НАСТУПНИЙ файл).
     //  extraMs  — додаткова пауза перед XSMT HIGH (поверх xsmt::clockSettleMs());
@@ -181,6 +188,18 @@ public:
 
     // Копіює шлях останнього запитаного файлу (порожній рядок, якщо файлу не було). true — шлях непорожній.
     static bool currentFilePath(char* out, size_t cap);
+
+    // [USB18a] ID3-теги файлу (UTF-8, кожен <= file_player_cfg::kTagMaxBytes - 1 байтів; порожній рядок — тегу немає, він не
+    // зустрівся ще або містив недійсний UTF-8 — перекодування cp1251 / UTF-16 НЕ робиться). Скидаються на старті кожного
+    // файлу. Будь-яка задача; короткий критичний розділ (без блокувань довше за копіювання ≈ 200 Б).
+    struct FileTags {
+        char title[file_player_cfg::kTagMaxBytes];
+        char artist[file_player_cfg::kTagMaxBytes];
+        char album[file_player_cfg::kTagMaxBytes];
+    };
+    // Копіює теги, ЯКЩО вони належать файлу path (той самий рядок, що передано в playFile; порівняння за хешем шляху — тож теги
+    // попереднього файлу не «протікають» у вікні між запитом і стартом нового). true — теги цього файлу (можливо порожні).
+    static bool fileTags(const char* path, FileTags* out);
 
     // Причина останнього збою файлу (статичний рядок) або nullptr. Скидається при старті нового файлу.
     static const char* lastFileError();
@@ -222,6 +241,11 @@ public:
         char lastName[file_player_cfg::kEofStatNameMax];
     };
     static void fileEofStats(FileEofStats* out);
+#endif
+
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+    // [USB18a] Лічильники: відхилені теги з недійсним UTF-8 і seek-и за кінець файлу (atEnd). Без блокувань (діагностика).
+    static void fileTagStats(uint32_t* rejected, uint32_t* seekEnd);
 #endif
 
     // [Prompt 17] Декодовані PCM-семпли для VU перехоплює вільна функція

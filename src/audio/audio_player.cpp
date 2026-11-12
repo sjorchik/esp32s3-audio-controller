@@ -22,6 +22,10 @@
 // doPlayFile / failFile / finishFile / monitorFile; радіо-логіка (reconnect, backoff, буфер, недовантаження) для
 // файлу НЕ виконується (s_source == Source::File). Решта файлу для радіо — без змін.
 
+// [USB18a] ДОДАНО: ID3-теги файлу (handleId3 -> s_tags під критичним розділом s_tagMux; скидання в doPlayFile; fileTags()),
+// seek за кінець файлу (seekFileSec(sec, atEnd) + seekToEnd() у processSeek: синтез кінця треку без read_error), лічильники
+// (USB_HOST_DIAG). Друк із handleId3 прибрано (колбек бібліотеки не друкує): теги логуються з задачі плеєра (tagLogPoll).
+
 #include "audio/audio_player.h"
 
 #include <Audio.h>
@@ -433,6 +437,7 @@ volatile uint32_t s_filePosSec = 0;       // кеш позиції / трива�
 volatile uint32_t s_fileDurSec = 0;
 volatile bool s_seekPending = false;
 volatile int32_t s_seekSec = 0;
+volatile bool s_seekEndPending = false;  // [USB18a] seek за кінець файлу: виконує задача плеєра (seekToEnd)
 // [USB14] Пауза файлу: запит (0 — немає, 1 — пауза, 2 — продовження; пише API, виконує й скидає задача плеєра) і стан
 // (пише лише задача плеєра; читається з будь-якої).
 volatile uint8_t s_pauseReq = 0;
@@ -663,8 +668,172 @@ void handleEof(const char* text) {
     PLAYER_LOG("[PLAYER] eof: %s\n", (text != nullptr) ? text : "?");
 }
 
+// --- [USB18a] ID3-теги файлу ---------------------------------------------------------------------------------------------
+// Колбек бібліотеки може виконуватись не в задачі плеєра (скидання в doPlayFile — у задачі плеєра, читання — з async_tcp), тож
+// усі доступи до s_tags — під КОРОТКИМ критичним розділом (портовий спінлок, копіювання ≈ 200 Б, без друку й виділень).
+// Розбір і перевірка UTF-8 виконуються ДО входу в розділ (на стеку).
+portMUX_TYPE s_tagMux = portMUX_INITIALIZER_UNLOCKED;
+struct TagStore {
+    uint32_t pathHash;  // хеш шляху файлу, якому належать теги
+    char title[file_player_cfg::kTagMaxBytes];
+    char artist[file_player_cfg::kTagMaxBytes];
+    char album[file_player_cfg::kTagMaxBytes];
+};
+TagStore s_tags = {};
+volatile uint32_t s_tagVer = 0;  // змінюється при кожному записі / скиданні (лише для логу з задачі плеєра)
+uint32_t s_tagLoggedVer = 0;
+uint32_t s_tagSeenVer = 0;
+uint32_t s_tagSeenMs = 0;
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+volatile uint32_t s_tagRejected = 0;   // теги з недійсним UTF-8 (відкинуто)
+volatile uint32_t s_seekEndCount = 0;  // seek-и за кінець файлу (atEnd)
+#endif
+
+uint32_t pathHash(const char* p) {  // FNV-1a
+    uint32_t h = 2166136261u;
+    for (; p != nullptr && *p != '\0'; ++p) {
+        h ^= static_cast<uint8_t>(*p);
+        h *= 16777619u;
+    }
+    return h;
+}
+
+// Строга перевірка UTF-8 (без надкоротких форм, сурогатів і значень > U+10FFFF).
+bool validUtf8(const char* s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        const uint8_t c = static_cast<uint8_t>(s[i]);
+        if (c < 0x80) {
+            ++i;
+            continue;
+        }
+        size_t len = 0;
+        uint32_t cp = 0;
+        if (c >= 0xC2 && c <= 0xDF) {
+            len = 2;
+            cp = c & 0x1F;
+        } else if ((c & 0xF0) == 0xE0) {
+            len = 3;
+            cp = c & 0x0F;
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            len = 4;
+            cp = c & 0x07;
+        } else {
+            return false;
+        }
+        if (i + len > n) {
+            return false;
+        }
+        for (size_t k = 1; k < len; ++k) {
+            const uint8_t cc = static_cast<uint8_t>(s[i + k]);
+            if ((cc & 0xC0) != 0x80) {
+                return false;
+            }
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        if ((len == 3 && (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF))) || (len == 4 && (cp < 0x10000 || cp > 0x10FFFF))) {
+            return false;
+        }
+        i += len;
+    }
+    return true;
+}
+
+// Значення тегу -> out (обрізано по межі символу). false: порожнє або недійсний UTF-8 (останнє рахується).
+bool extractTag(const char* v, char* out) {
+    size_t n = strlen(v);
+    while (n > 0 && static_cast<uint8_t>(v[n - 1]) <= 0x20) {
+        --n;
+    }
+    while (n > 0 && static_cast<uint8_t>(*v) <= 0x20) {
+        ++v;
+        --n;
+    }
+    if (n == 0) {
+        return false;
+    }
+    if (!validUtf8(v, n)) {
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+        s_tagRejected = s_tagRejected + 1;
+#endif
+        return false;
+    }
+    if (n >= file_player_cfg::kTagMaxBytes) {
+        n = file_player_cfg::kTagMaxBytes - 1;
+        while (n > 0 && (static_cast<uint8_t>(v[n]) & 0xC0) == 0x80) {
+            --n;  // v[n] — продовження: відступаємо до початку символу
+        }
+    }
+    memcpy(out, v, n);
+    out[n] = '\0';
+    return n > 0;
+}
+
+// Скидання на старті файлу: теги попереднього не «протікають»; хеш шляху привʼязує нові теги до цього файлу.
+void tagsReset(const char* path) {
+    const uint32_t h = pathHash(path);
+    portENTER_CRITICAL(&s_tagMux);
+    s_tags.pathHash = h;
+    s_tags.title[0] = '\0';
+    s_tags.artist[0] = '\0';
+    s_tags.album[0] = '\0';
+    s_tagVer = s_tagVer + 1;
+    portEXIT_CRITICAL(&s_tagMux);
+}
+
+// ГІПОТЕЗА: бібліотека віддає кожен тег окремим викликом «Title: …» / «Artist: …» / «Album: …» (формат звіряється за логом
+// «[PLAYER] tags:» у hwcheck). Рядок, що не починається з відомого префікса, ігнорується. Перше непорожнє значення поля лишається.
 void handleId3(const char* text) {
-    PLAYER_LOG("[PLAYER] id3: %s\n", (text != nullptr) ? text : "?");
+    if (text == nullptr || s_source != Source::File) {
+        return;
+    }
+    int field = -1;
+    size_t off = 0;
+    if (strncmp(text, "Title: ", 7) == 0) {
+        field = 0;
+        off = 7;
+    } else if (strncmp(text, "Artist: ", 8) == 0) {
+        field = 1;
+        off = 8;
+    } else if (strncmp(text, "Album: ", 7) == 0) {
+        field = 2;
+        off = 7;
+    } else {
+        return;
+    }
+    char tmp[file_player_cfg::kTagMaxBytes];
+    if (!extractTag(text + off, tmp)) {
+        return;
+    }
+    portENTER_CRITICAL(&s_tagMux);
+    char* dst = (field == 0) ? s_tags.title : (field == 1) ? s_tags.artist : s_tags.album;
+    if (dst[0] == '\0') {
+        memcpy(dst, tmp, strlen(tmp) + 1);
+        s_tagVer = s_tagVer + 1;
+    }
+    portEXIT_CRITICAL(&s_tagMux);
+}
+
+// Лог тегів із ЗАДАЧІ плеєра (не з колбека): один рядок після того, як набір тегів не змінювався >= 500 мс.
+void tagLogPoll(uint32_t now) {
+    const uint32_t ver = s_tagVer;
+    if (s_source != Source::File || ver == s_tagLoggedVer) {
+        return;
+    }
+    if (ver != s_tagSeenVer) {
+        s_tagSeenVer = ver;
+        s_tagSeenMs = now;
+        return;
+    }
+    if (static_cast<uint32_t>(now - s_tagSeenMs) < 500) {
+        return;
+    }
+    TagStore snap;
+    portENTER_CRITICAL(&s_tagMux);
+    snap = s_tags;
+    portEXIT_CRITICAL(&s_tagMux);
+    s_tagLoggedVer = ver;
+    Serial.printf("[PLAYER] tags: title='%s' artist='%s' album='%s'\n", snap.title, snap.artist, snap.album);
 }
 
 // --- Підключення й збої ---
@@ -931,6 +1100,11 @@ void doPlayFile(const char* path, int32_t startSec) {
     s_wdStallLogged = false;
 #endif
     clearMetadata();
+    tagsReset(path);  // [USB18a] теги попереднього файлу не «протікають»
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+    Serial.printf("[PLAYER] DIAG usb18a: tags_rejected=%lu seek_end=%lu\n", static_cast<unsigned long>(s_tagRejected),
+                  static_cast<unsigned long>(s_seekEndCount));
+#endif
     {
         Guard g;
         if (g.ok()) {
@@ -984,7 +1158,35 @@ void doPlayFile(const char* path, int32_t startSec) {
 #endif
 }
 
+// [USB18a] Seek за кінець файлу = кінець треку. Той самий шлях, що синтез eof у DEF6 (але БЕЗ залежності від
+// FILE_EOF_WATCHDOG): зупинка в бібліотеці, s_fileEofPending -> після kEndTailMs finishFile() (мʼют ЦАП, Idle, прапорець
+// «файл закінчився») -> usb_queue бачить takeFileEnded() і переходить далі за правилами repeat / shuffle / end_of_queue.
+// s_fileActive лишається true до finishFile, тож «decoder stopped» / read_error не виникає.
+void seekToEnd() {
+    const int32_t delta = s_seekSec;
+    if (!s_fileActive || s_fileEofPending || s_filePaused || (s_state != PlayerState::Playing && s_state != PlayerState::Buffering)) {
+        Serial.println("[PLAYER] seek ignored: no file is playing");
+        return;
+    }
+    Serial.printf("[PLAYER] seek past end -> end of track (cur=%lu dur=%lu delta=%ld)\n", static_cast<unsigned long>(s_filePosSec),
+                  static_cast<unsigned long>(s_fileDurSec), static_cast<long>(delta));
+    s_seekPending = false;
+    s_evtFileEof = false;  // пізня справжня подія не має дублювати кінець
+    s_audio->stopSong();
+    s_fileEofPending = true;
+    s_fileEofAtMs = millis();
+    s_wdPosValid = false;
+#if FEATURE_USB_HOST && USB_HOST_DIAG
+    s_seekEndCount = s_seekEndCount + 1;
+#endif
+}
+
 void processSeek() {
+    if (s_seekEndPending) {  // [USB18a]
+        s_seekEndPending = false;
+        seekToEnd();
+        return;
+    }
     if (!s_seekPending) {
         return;
     }
@@ -1692,6 +1894,7 @@ void AudioPlayer::taskLoop() {
 #endif
         updateState(millis());
         pollFilePosition(millis());  // [USB7] кеш позиції / тривалості файлу
+        tagLogPoll(millis());        // [USB18a] лог ID3-тегів (із задачі плеєра)
         vTaskDelay(msToTicksAtLeastOne(player_cfg::kLoopDelayMs));
     }
 }
@@ -1790,10 +1993,27 @@ uint32_t AudioPlayer::fileDurationSec() { return s_fileDurSec; }
 
 uint32_t AudioPlayer::filePositionSec() { return s_filePosSec; }
 
-bool AudioPlayer::seekFileSec(int32_t sec) {
+bool AudioPlayer::seekFileSec(int32_t sec, bool* atEnd) {
+    if (atEnd != nullptr) {
+        *atEnd = false;
+    }
     if (s_task == nullptr || !s_fileActive) {
         return false;
     }
+    // [USB18a] Єдине спільне місце рішення «seek за кінець»: за кешем позиції / тривалості (роздільність 1 с). sec > 0:
+    // повернення назад біля кінця не завершує трек.
+    const int64_t dur = static_cast<int64_t>(s_fileDurSec);
+    const int64_t target = static_cast<int64_t>(s_filePosSec) + static_cast<int64_t>(sec);
+    if (sec > 0 && dur > 0 && target >= dur - static_cast<int64_t>(file_player_cfg::kSeekEndMarginSec)) {
+        s_seekSec = sec;
+        s_seekPending = false;
+        s_seekEndPending = true;
+        if (atEnd != nullptr) {
+            *atEnd = true;
+        }
+        return true;
+    }
+    s_seekEndPending = false;  // новіший звичайний seek замінює невиконаний «за кінець»
     s_seekSec = sec;
     s_seekPending = true;
     return true;
@@ -1831,6 +2051,27 @@ bool AudioPlayer::currentFilePath(char* out, size_t cap) {
     }
     copyUtf8Trunc(out, cap, s_filePath);
     return out[0] != '\0';
+}
+
+// [USB18a] Теги файлу path (див. audio_player.h).
+bool AudioPlayer::fileTags(const char* path, FileTags* out) {
+    if (path == nullptr || out == nullptr) {
+        return false;
+    }
+    out->title[0] = '\0';
+    out->artist[0] = '\0';
+    out->album[0] = '\0';
+    const uint32_t h = pathHash(path);
+    bool mine = false;
+    portENTER_CRITICAL(&s_tagMux);
+    if (s_tags.pathHash == h) {
+        memcpy(out->title, s_tags.title, sizeof(out->title));
+        memcpy(out->artist, s_tags.artist, sizeof(out->artist));
+        memcpy(out->album, s_tags.album, sizeof(out->album));
+        mine = true;
+    }
+    portEXIT_CRITICAL(&s_tagMux);
+    return mine;
 }
 
 const char* AudioPlayer::lastFileError() { return s_fileError; }
@@ -1886,5 +2127,15 @@ void AudioPlayer::fileEofStats(FileEofStats* out) {
     out->lastStalledMs = s_lastStallMs;
     memcpy(out->lastName, s_lastStallName, sizeof(out->lastName));
     out->lastName[sizeof(out->lastName) - 1] = '\0';
+}
+
+// [USB18a] Лічильники відхилених тегів і seek-ів за кінець.
+void AudioPlayer::fileTagStats(uint32_t* rejected, uint32_t* seekEnd) {
+    if (rejected != nullptr) {
+        *rejected = s_tagRejected;
+    }
+    if (seekEnd != nullptr) {
+        *seekEnd = s_seekEndCount;
+    }
 }
 #endif
