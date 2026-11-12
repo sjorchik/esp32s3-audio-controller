@@ -1,7 +1,7 @@
 'use strict';
-/* Плеєр USB на «Головній» (USB16b-1; USB16b-2a: спільні хуки window.usbShared для браузера файлів). Підключати ПІСЛЯ common.js і nav.js, ПЕРЕД home.js.
+/* Плеєр USB на «Головній» (USB16b-1; USB16b-2a: спільні хуки window.usbShared для браузера файлів; USB18b: картка треку з ID3, «N / M», seek за кінець). Підключати ПІСЛЯ common.js і nav.js, ПЕРЕД home.js.
    Контракт — docs/web_api.md §16 (/api/usb/*) і §17 (USB = вхід 3). Усе USB-специфічне (CONFIG, REASONS, іконки,
-   запити) живе ТУТ, common.js не змінюється. Дані з флешки (імʼя файла) виводяться лише через textContent / el().
+   запити) живе ТУТ, common.js не змінюється. Дані з флешки (імʼя файла, теги ID3) виводяться лише через textContent / el().
    Зовнішній інтерфейс: createUsbPlayer(mountEl) → {setActive(bool), setTitle(text)}. */
 (() => {
   /* ---------- Розширення спільних об'єктів (лише нові ключі; наявні не перезаписуємо) ---------- */
@@ -17,6 +17,7 @@
     usbSeekMaxSec: 3600,     // межа deltaSec у контракті
     usbCmdPollMs: 300,       // GET /api/usb/result?id=N
     usbCmdTimeoutMs: 8000,   // скільки чекати результат команди з reqId — ПРИПУЩЕННЯ
+    usbTagGraceMs: 800,      // USB18b: скільки тримати теги ТОГО САМОГО треку (той самий path), якщо знімок раптом без тегів — ПРИПУЩЕННЯ
   });
 
   addMissing(REASONS, {
@@ -108,6 +109,15 @@
     onStatus(fn) { shared.listeners.add(fn); return () => shared.listeners.delete(fn); },
   };
 
+  const tagStr = (v) => (typeof v === 'string' ? v.trim() : '');
+  /* Імʼя файла без розширення (останню крапку не за першим символом вважаємо розширенням). */
+  function fileBase(name) {
+    const n = String(name || '');
+    const k = n.lastIndexOf('.');
+    return k > 0 ? n.slice(0, k) : n;
+  }
+  const trackKey = (np) => (np && (np.path || np.name)) || '';
+
   function fmtTime(sec) {
     const s = Math.max(0, Math.floor(sec));
     const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), r = s % 60;
@@ -127,6 +137,8 @@
       inputName: el('span', { class: 'muted' }),
       note: el('p', { class: 'hint usb-note', role: 'status', hidden: true }),
       title: el('div', { class: 'usb-title' }),
+      sub: el('div', { class: 'usb-sub' }),
+      count: el('span', { class: 'usb-count', 'aria-hidden': 'true' }),
       tCur: el('span', { class: 'usb-time' }, '0:00'),
       tDur: el('span', { class: 'usb-time' }, '—:—'),
       seek: el('input', { class: 'slider', type: 'range', min: 0, max: 1, step: CONFIG.usbSeekStepSec, value: 0,
@@ -138,6 +150,8 @@
       repeat: el('button', { type: 'button', class: 'btn usb-opt', 'aria-pressed': 'false' }, 'Повтор'),
       stop: el('button', { type: 'button', class: 'btn usb-opt' }, 'Стоп'),
     };
+    ui.meta = el('div', { class: 'usb-meta', hidden: true }, ui.sub, ui.count);
+    ui.card = el('div', { class: 'usb-card', role: 'group' }, ui.title, ui.meta);
     setIcon(ui.shuffle, 'shuffle');
     setIcon(ui.repeat, 'repeat');
     setIcon(ui.stop, 'stop');
@@ -146,7 +160,7 @@
       el('legend', { class: 'visually-hidden' }, 'Плеєр USB'),
       el('div', { class: 'hero-head' }, ui.badge, ui.inputName),
       ui.note,
-      ui.title,
+      ui.card,
       el('div', { class: 'usb-prog' }, ui.tCur, ui.seek, ui.tDur),
       el('div', { class: 'transport usb-transport' }, ui.prev, ui.play, ui.next),
       el('div', { class: 'usb-opts' }, ui.shuffle, ui.repeat, ui.stop));
@@ -161,6 +175,9 @@
     let dragging = false;
     let ctlBusy = false;           // іде запит control / options / seek
     let reqBusy = false;           // чекаємо результат команди з reqId (next / prev / stop)
+    let endHold = null;            // {key, until}: seek за кінець (atEnd) — тримаємо кінець треку, доки не прийде НАСТУПНИЙ трек
+    let tagHold = null;            // {key, tags, at}: останні теги треку з цим path (короткий «грейс» без мерехтіння)
+    let tagHeld = false;           // зараз показано утримані теги (потрібне перемальовування за таймером)
     let ticker = null;
 
     const nowPlaying = () => (s && s.media === 'mounted' && s.nowPlaying) || null;   // без носія трек не показуємо
@@ -194,16 +211,18 @@
       }
       if (!started) return;                        // відповідь прийшла вже після зупинки
       unavailable = false;
-      const prevPos = curPos(), prevName = nowPlaying() && nowPlaying().name, wasRunning = isRunning();
+      const prevPos = curPos(), prevKey = trackKey(nowPlaying()), wasRunning = isRunning();
       s = r;
       shared.status = r;
       if (hold && (hold.paused === statusPaused() || Date.now() >= hold.until)) hold = null;
       const np = nowPlaying();
-      if (!np) anchor = null;
+      if (!np) { anchor = null; endHold = null; }
+      else if (endHold && endHold.key === trackKey(np) && Date.now() < endHold.until) { /* seek за кінець: лишаємо кінець треку, доки status не покаже інший трек */ }
       else if (anchor && anchor.lockUntil > performance.now()) { /* після seek позицію зі status поки ігноруємо */ }
       else {
+        endHold = null;
         const base = np.posSec || 0;
-        const same = prevName === np.name && wasRunning && anchor;
+        const same = prevKey === trackKey(np) && wasRunning && anchor;
         // posSec має роздільність 1 с: щоб час не «підстрибував» назад між опитуваннями, лишаємо екстрапольоване значення
         anchor = { pos: same && Math.abs(prevPos - base) < 1.6 ? prevPos : base, at: performance.now(), lockUntil: 0 };
       }
@@ -245,6 +264,41 @@
       setText(ui.tDur, np && dur > 0 ? fmtTime(dur) : '—:—');
     }
 
+    /* Теги треку для показу. Теги ПОПЕРЕДНЬОГО треку не показуємо ніколи: утримання діє лише при тому самому path
+       (знімок на 0-й секунді нового треку приходить без тегів — це норма, показуємо імʼя файла). */
+    function tagsFor(np) {
+      const own = { title: tagStr(np.title), artist: tagStr(np.artist), album: tagStr(np.album) };
+      const key = typeof np.path === 'string' ? np.path : '';
+      const now = Date.now();
+      tagHeld = false;
+      if (own.title || own.artist || own.album) { tagHold = key ? { key, tags: own, at: now } : null; return own; }
+      if (key && tagHold && tagHold.key === key && now - tagHold.at < CONFIG.usbTagGraceMs) { tagHeld = true; return tagHold.tags; }
+      if (!tagHold || tagHold.key !== key) tagHold = null;
+      return own;
+    }
+
+    function renderCard() {
+      const np = nowPlaying(), q = queue();
+      if (!np) {
+        tagHold = null; tagHeld = false;
+        setText(ui.title, 'Нічого не грає'); setAttr(ui.title, 'title', '');
+        setText(ui.sub, ''); setAttr(ui.sub, 'title', ''); setText(ui.count, ''); setAttr(ui.count, 'title', '');
+        ui.meta.hidden = true;
+        setAttr(ui.card, 'aria-label', 'Нічого не грає');
+        return;
+      }
+      const tg = tagsFor(np);
+      const title = tg.title || fileBase(np.name) || '—';
+      const sub = tg.artist && tg.album ? tg.artist + ' — ' + tg.album : tg.artist || tg.album;
+      const numbered = q.pos > 0 && q.count > 0 && q.pos <= q.count;     // queue.position НЕ використовуємо (у shuffle відстає)
+      const cnt = numbered ? q.pos + ' / ' + q.count : '';
+      setText(ui.title, title); setAttr(ui.title, 'title', title);
+      setText(ui.sub, sub); setAttr(ui.sub, 'title', sub);
+      setText(ui.count, cnt); setAttr(ui.count, 'title', numbered ? 'Трек ' + q.pos + ' з ' + q.count : '');
+      ui.meta.hidden = !sub && !cnt;
+      setAttr(ui.card, 'aria-label', 'Зараз грає: ' + title + (sub ? ', ' + sub : '') + (numbered ? ', трек ' + q.pos + ' з ' + q.count : ''));
+    }
+
     function render() {
       const d = describe();
       const np = nowPlaying(), q = queue();
@@ -253,7 +307,7 @@
       if (ui.badge.className !== bc) ui.badge.className = bc;
       ui.note.hidden = !d.note;
       setText(ui.note, d.note);
-      setText(ui.title, np ? np.name || '—' : 'Нічого не грає');
+      renderCard();
 
       const ready = d.ready, active = !!s && s.active === true && !unavailable;
       const idle = ctlBusy || reqBusy;
@@ -282,7 +336,7 @@
       try {
         const r = await usbApi.control(action);
         if (typeof r.reqId === 'number') {            // next / prev / stop
-          hold = null; anchor = null;
+          hold = null; anchor = null; endHold = null;
           reqBusy = true; render();
           const req = await waitReq(r.reqId);
           if (req && req.ok === false) toast(whyText(req.why), req.why === 'end_of_queue' ? 'info' : 'error');
@@ -314,8 +368,18 @@
       if (delta === 0) { render(); return; }
       ctlBusy = true; render();
       try {
-        await usbApi.seek(delta);
-        anchor = { pos: target, at: performance.now(), lockUntil: performance.now() + CONFIG.usbSeekHoldMs };
+        const r = await usbApi.seek(delta);
+        const np = nowPlaying();
+        if (r && r.atEnd === true && np) {
+          // USB18b: seek за кінець = штатний кінець треку (не помилка). Утримання позиції зі seek НЕ ставимо: показуємо кінець
+          // треку, доки status не покаже наступний трек (інший path), — стару позицію зі status ігноруємо лише до цього моменту.
+          const dur = np.durSec || 0;
+          endHold = { key: trackKey(np), until: Date.now() + CONFIG.usbSeekHoldMs };
+          anchor = { pos: dur > 0 ? dur : target, at: performance.now(), lockUntil: 0 };
+        } else {
+          endHold = null;
+          anchor = { pos: target, at: performance.now(), lockUntil: performance.now() + CONFIG.usbSeekHoldMs };
+        }
       } catch (e) {
         toast(errorText(e), 'error');
         poller.now();
@@ -343,11 +407,12 @@
         started = on;
         if (on) {
           poller.start();
-          ticker = setInterval(() => { if (!document.hidden) renderProgress(); }, CONFIG.usbTickMs);
+          ticker = setInterval(() => { if (!document.hidden) { renderProgress(); if (tagHeld) renderCard(); } }, CONFIG.usbTickMs);
         } else {
           poller.stop();
           clearInterval(ticker); ticker = null;
           s = null; anchor = null; hold = null; optHold = null; unavailable = false; ctlBusy = false; reqBusy = false;
+          endHold = null; tagHold = null; tagHeld = false;
           shared.status = null;
           render();
           notifyStatus();

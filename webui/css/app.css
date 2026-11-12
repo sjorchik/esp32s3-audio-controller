@@ -271,9 +271,13 @@ fieldset.group-bare{border:0;padding:0;margin:0}
 .in-row .btn-zero{flex:none}
 .in-row>.hint{margin-top:var(--sp-1)}
 
-/* --- Головна: плеєр USB (USB16b-1) --- */
+/* --- Головна: плеєр USB (USB16b-1; USB18b: картка треку — назва, виконавець / альбом, «N / M») --- */
+.usb-card{min-width:0}
 .usb-title{font-size:clamp(1.25rem,5vw,1.6rem);font-weight:700;line-height:1.25;min-height:2.5em;overflow-wrap:anywhere;
-  display:-webkit-box;-webkit-line-clamp:3;line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+  display:-webkit-box;-webkit-line-clamp:2;line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.usb-meta{display:flex;align-items:baseline;gap:var(--sp-3);margin-top:var(--sp-1)}
+.usb-sub{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:.95rem}
+.usb-count{flex:none;margin-left:auto;font-size:.85rem;color:var(--muted);font-variant-numeric:tabular-nums}
 .usb-note{margin-bottom:var(--sp-2)}
 .usb-prog{display:flex;align-items:center;gap:var(--sp-2);margin-top:var(--sp-3)}
 .usb-prog .slider{flex:1;min-width:0}
@@ -296,6 +300,8 @@ fieldset.group-bare{border:0;padding:0;margin:0}
 .usb-row{height:100%}
 .usb-row svg{width:22px;height:22px;flex:none;color:var(--muted)}
 .usb-row[data-dir="1"] svg{color:var(--accent)}
+.usb-row[data-in="1"]{box-shadow:inset 3px 0 0 var(--muted)}
+.usb-row[data-in="1"] .name{font-weight:600}
 .usb-row:disabled{opacity:.55;cursor:progress}
 .usb-row[aria-busy="true"]{opacity:1;box-shadow:inset 3px 0 0 var(--info)}
 .usb-more{width:100%;margin-top:var(--sp-2)}

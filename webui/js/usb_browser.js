@@ -1,5 +1,5 @@
 'use strict';
-/* Браузер файлів USB на «Головній» (USB16b-2a). Підключати ПІСЛЯ common.js і usb_player.js, ПЕРЕД home.js.
+/* Браузер файлів USB на «Головній» (USB16b-2a; USB18b: точне підсвічування за nowPlaying.path). Підключати ПІСЛЯ common.js і usb_player.js, ПЕРЕД home.js.
    Контракт — docs/web_api.md §16 (/api/usb/list, cd, play, result) і §17. Статус (media, list.version, nowPlaying)
    береться з window.usbShared (його опитує usb_player.js), власного опитування status тут немає; list НЕ опитується
    в циклі — лише після зміни list.version, дій користувача або stale.
@@ -63,9 +63,9 @@
     let staleRetries = 0;
     let cmdBusy = false;           // іде cd / up / play: рядки й кнопки заблоковані
     let busyIndex = -1;
-    let curKey = '', curIdx = -1;  // кеш підсвічування
+    let markKey = '', markVal = null;   // кеш підсвічування (USB18b)
     let rFirst = -1, rLast = -1;   // межі змонтованого вікна
-    let rCi = -2;                  // підсвічений індекс у змонтованих рядках
+    let rSig = '';                 // підпис підсвічування у змонтованих рядках (файл, папка-«всередині»)
     let rafPending = false;
     let unsub = null;
 
@@ -77,20 +77,40 @@
     const ready = () => modeOn() && media() === 'mounted';
     const mayUse = () => ready() && !invalid && !!list && !cmdBusy;
 
-    /* ---- Підсвічування поточного треку (ПРИПУЩЕННЯ через прогалину контракту) ----
-       Збіг імені nowPlaying.name із файлом списку І queue.count === list.count − list.dirs
-       (черга = файли тієї самої папки). Інакше — без підсвічування: краще без, ніж хибне. */
-    function currentIndex() {
+    /* ---- Підсвічування поточного треку (USB18b: точне, за nowPlaying.path; евристику за іменем і кількістю прибрано) ----
+       Рядок-файл поточний, якщо join(list.cwd, item.name) === nowPlaying.path (повне порівняння рядків, регістр як є).
+       Папка, у якій (на будь-якій глибині) лежить поточний трек, позначається приглушеним маркером «грає всередині».
+       Немає path / носія / списку, трек не в завантаженому списку (інша папка, обрізаний список) — без підсвічування. */
+    const NO_MARK = { file: -1, inside: -1, sig: '-1,-1' };
+    /* Єдина нормалізація слеша: без кінцевих '/', корінь = '/'. Решту (регістр, символи) НЕ чіпаємо. */
+    const normDir = (d) => {
+      let s = String(d || '/');
+      while (s.length > 1 && s.endsWith('/')) s = s.slice(0, -1);
+      return s.charAt(0) === '/' ? s : '/' + s;
+    };
+    const dirOf = (p) => { const k = p.lastIndexOf('/'); return k <= 0 ? '/' : p.slice(0, k); };
+    const baseOf = (p) => p.slice(p.lastIndexOf('/') + 1);
+
+    function playingMarks() {
       const np = st && st.media === 'mounted' && st.nowPlaying;
-      const q = st && st.queue;
-      if (!np || !np.name || !list || !q || q.count !== list.count - list.dirs) return -1;
-      const key = np.name + '|' + items.length + '|' + list.version;
-      if (key === curKey) return curIdx;
-      curKey = key; curIdx = -1;
-      for (let i = list.dirs; i < items.length; i++) {
-        if (items[i] && items[i].name === np.name) { curIdx = i; break; }
+      const p = np && typeof np.path === 'string' && np.path.charAt(0) === '/' ? np.path : '';
+      if (!p || !list) return NO_MARK;
+      const key = p + '|' + list.version + '|' + list.cwd + '|' + items.length;
+      if (key === markKey && markVal) return markVal;
+      const cwd = normDir(list.cwd), pd = dirOf(p);
+      let file = -1, inside = -1;
+      if (pd === cwd) {                                          // трек лежить у цій папці: файли йдуть після папок
+        const nm = baseOf(p);
+        for (let i = list.dirs; i < items.length; i++) { if (items[i] && !items[i].dir && items[i].name === nm) { file = i; break; } }
+      } else {
+        const base = cwd === '/' ? '/' : cwd + '/';
+        if (pd.startsWith(base)) {                               // трек глибше: шукаємо дочірню папку цього списку
+          const first = pd.slice(base.length).split('/')[0];
+          for (let i = 0; i < list.dirs && i < items.length; i++) { if (items[i] && items[i].dir && items[i].name === first) { inside = i; break; } }
+        }
       }
-      return curIdx;
+      markKey = key; markVal = { file, inside, sig: file + ',' + inside };
+      return markVal;
     }
 
     /* ---- Рендер ---- */
@@ -121,12 +141,13 @@
       return parts.join(' ');
     }
 
-    function buildItem(i, cur) {
+    function buildItem(i, cur, inside) {
       const it = items[i];
       const btn = el('button', { type: 'button', class: 'row usb-row', 'data-i': i, 'data-dir': it.dir ? '1' : '0',
-        'aria-label': (it.dir ? 'Папка ' : 'Файл ') + it.name });
+        'aria-label': (it.dir ? 'Папка ' : 'Файл ') + it.name + (inside ? ' (тут грає трек)' : '') });
       btn.append(icon(it.dir ? 'folder' : 'music'), el('span', { class: 'name' }, it.name));
       if (cur) btn.setAttribute('aria-current', 'true');
+      if (inside) btn.setAttribute('data-in', '1');
       if (cmdBusy || invalid) btn.disabled = true;
       if (cmdBusy && i === busyIndex) btn.setAttribute('aria-busy', 'true');
       const li = el('div', { class: 'usb-item', role: 'listitem' }, btn);
@@ -143,11 +164,11 @@
       const last = Math.min(total, Math.ceil((top + vh) / h) + CONFIG.usbOverscanRows);
       if (!force && first === rFirst && last === rLast) return;
       rFirst = first; rLast = last;
-      const ci = currentIndex();
-      rCi = ci;
+      const mk = playingMarks();
+      rSig = mk.sig;
       const focusedI = ui.vwin.contains(document.activeElement) ? document.activeElement.getAttribute('data-i') : null;
       const frag = document.createDocumentFragment();
-      for (let i = first; i < last; i++) frag.append(buildItem(i, i === ci));
+      for (let i = first; i < last; i++) frag.append(buildItem(i, i === mk.file, i === mk.inside));
       ui.vwin.replaceChildren(frag);
       ui.vwin.style.paddingTop = first * h + 'px';
       ui.vwin.style.paddingBottom = (total - last) * h + 'px';
@@ -185,7 +206,7 @@
     function clearList() {
       reqNo++;
       list = null; items = []; loading = false; loadError = ''; invalid = false;
-      curKey = ''; curIdx = -1; rFirst = rLast = -1; staleRetries = 0;
+      markKey = ''; markVal = null; rFirst = rLast = -1; staleRetries = 0;
     }
 
     /* ---- Читання списку ---- */
@@ -196,7 +217,7 @@
 
     function loadFirst() {
       reqNo++;
-      items = []; curKey = ''; curIdx = -1; rFirst = rLast = -1;
+      items = []; markKey = ''; markVal = null; rFirst = rLast = -1;
       list = null; loading = false; loadError = ''; ui.view.scrollTop = 0;
       return fetchPage(true);
     }
@@ -259,7 +280,7 @@
       invalid = false;
       if (loading || cmdBusy || Date.now() < nextTry) { render(false); return; }
       if (!list || sl.version !== list.version) loadFirst();
-      else { render(false); if (currentIndex() !== rCi) renderRows(true); }   // лише підсвічування, без перебудови щосекунди
+      else { render(false); if (playingMarks().sig !== rSig) renderRows(true); }   // лише підсвічування, без перебудови щосекунди
     }
 
     /* ---- Команди ---- */
