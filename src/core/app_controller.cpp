@@ -3537,6 +3537,7 @@ bool usbModeEnterLocked(const char*& why) {
         const Settings ps = SettingsStore::snapshot();
         usb_queue::setShuffle(ps.playerShuffle);
         usb_queue::setRepeatAll(ps.playerRepeat);
+        usb_queue::setScope(SettingsStore::getPlayerScope());  // [USB20a-1] область черги: окремий ключ NVS pl_scope
     }
     if (s_input == 0) {
         s_usbPrevRadioPaused = !bootRestore && !playerActive();
@@ -3964,6 +3965,16 @@ WebCmdResult execWebCommandLocked(const WebCommand& c, const char*& why) {
                 persistPlayerFlags();  // той самий шлях NVS, що RC5; без зміни значень — без запису
                 Serial.printf("[USBN] options (WEB): shuffle=%d repeat=%d\n", usb_queue::shuffle() ? 1 : 0,
                               usb_queue::repeatAll() ? 1 : 0);
+            }
+            if ((c.value & usb_queue_scope_cfg::kOptBitChange) != 0) {  // [USB20a-1] область черги (діє на НАСТУПНИЙ play)
+                const usb_queue_scope_cfg::Scope ns = ((c.value & usb_queue_scope_cfg::kOptBitValue) != 0)
+                                                          ? usb_queue_scope_cfg::Scope::All
+                                                          : usb_queue_scope_cfg::Scope::Folder;
+                if (ns != usb_queue::scope()) {
+                    usb_queue::setScope(ns);
+                    SettingsStore::setPlayerScope(ns);  // окремий ключ pl_scope; запис лише при зміні
+                    Serial.printf("[USBN] options (WEB): scope=%s\n", usb_queue_scope_cfg::name(ns));
+                }
             }
             break;
         }

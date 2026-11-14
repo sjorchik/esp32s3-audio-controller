@@ -27,6 +27,8 @@
 // Окремо від blob-а (ключі NVS `pl_usb_dir` / `pl_usb_trk` / `pl_usb_pos`, namespace «audioctl») зберігається ПОЗИЦІЯ
 // відтворення джерела (SettingsStore::getPlayerResume / setPlayerResume): шляхи на 2 × 256 Б не роздувають blob
 // і не копіюються в кожен snapshot().
+// [USB20a-1] Опція області черги плеєра (scope: folder / all) зберігається ОКРЕМИМ ключем NVS `pl_scope` (кеш у RAM, запис — тією
+// ж фоновою задачею з тим самим дебаунсом); blob Settings (170 / 174 Б) і kFormatVersion НЕ змінено. Відсутній ключ = folder.
 // [INP4a-1] NVS blob v9 (БЕЗ міграції): inputNames[defaults::kInputSlotCount = 4][32] (слот 3 = вхід «USB», дефолт «Player»),
 // inputEnabledMask 4-бітна (біт 3 = USB). Розкладка: Settings 170 Б, blob 174 Б (було 138 / 142). defaults::kInputCount (3)
 // НЕ змінено; lastInput допускає 0..defaults::kUsbInputIndex (у цьому кроці його ніхто не ставить у 3).
@@ -40,6 +42,7 @@
 #include "config/defaults.h"
 #include "config/eq_config.h"
 #include "config/player_mode_config.h"  // [USB14] PlayerSource, player_mode_cfg::kProfileCount
+#include "config/usb_queue_scope_config.h"  // [USB20a-1] Scope
 #include "config/vu_sens_config.h"  // [V1] діапазон чутливості VU
 
 // [Prompt 46a] Профіль одного логічного входу: гучність (шкала UI 0..100, діапазон обрізає
@@ -178,6 +181,12 @@ public:
     static void setPlayerResume(PlayerSource src, const char* dir, const char* track, uint32_t posSec);
     static void clearPlayerResume(PlayerSource src);
     static uint32_t playerResumeWriteCount();
+
+    // [USB20a-1] ДОДАНО: опція області черги плеєра (окремий ключ NVS `pl_scope`, не в blob-і). setPlayerScope позначає «брудним»
+    // ЛИШЕ при зміні значення (повтор того ж значення NVS не чіпає); запис робить фонова задача (дебаунс), flush() — негайно.
+    // resetToDefaults() / eraseStored() скидають значення в folder (ключ видаляється). Потокобезпечні.
+    static usb_queue_scope_cfg::Scope getPlayerScope();
+    static void setPlayerScope(usb_queue_scope_cfg::Scope s);
 };
 
 

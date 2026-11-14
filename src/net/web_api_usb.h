@@ -14,7 +14,7 @@
 //   POST /api/usb/play               {"index":N[,"version":V]}
 //   POST /api/usb/control            {"action":"pause"|"resume"|"toggle"|"next"|"prev"|"stop"}
 //   POST /api/usb/seek               {"deltaSec":±N}
-//   POST /api/usb/options            {"shuffle":bool,"repeat":bool} (одне чи обидва)
+//   POST /api/usb/options            {"shuffle":bool,"repeat":bool,"scope":"folder"|"all"} (одне чи кілька; [USB20a-1] scope)
 //
 // Потоки. Обробники виконуються в задачі async_tcp і НЕ блокують: команди каталогу / черги лише ставляться в чергу usb_nav
 // (результат — за reqId), гетери беруть мьютекс списку з таймаутом usb_browser_cfg::kApiLockWaitMs (20 мс; при таймауті —

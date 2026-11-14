@@ -6,6 +6,8 @@
 // і Idle — USB7), далі вибирає наступний трек і викликає AudioPlayer::playFile(). Час переходу друкується в логу
 // («[USBQ] track ... transition: flag->accept=… accept->active=… accept->playing=… flag->playing=… ms»).
 
+// [USB20a-1] Опція scope (folder / all) і поля Status::builtScope / truncated / building; сама черга «all» — USB20a-2.
+
 #include "usb/usb_queue.h"
 
 #if FEATURE_USB_MODE
@@ -19,6 +21,7 @@
 #include "audio/audio_player.h"
 #include "config/player_mode_config.h"  // [USB14]
 #include "config/usb_queue_config.h"
+#include "config/usb_queue_scope_config.h"  // [USB20a-1]
 #include "esp_heap_caps.h"
 #include "esp_random.h"
 #include "freertos/FreeRTOS.h"
@@ -69,6 +72,8 @@ bool s_skipBack = false;   // пропуск биттого треку йде н
 
 std::atomic<bool> s_shuffle{false};
 std::atomic<bool> s_repeat{false};
+std::atomic<uint8_t> s_scope{static_cast<uint8_t>(usb_queue_scope_cfg::kDefaultScope)};  // [USB20a-1] опція (не область побудованої черги)
+bool s_truncated = false;  // [USB20a-1] список, з якого побудовано чергу, був обрізаний (лише usb_nav)
 
 // Опублікований знімок (під usb_nav::lock).
 Status s_pub = {};
@@ -135,6 +140,9 @@ void publish() {
     st.reason = s_reason;
     st.paused = false;
     st.prepared = false;
+    st.builtScope = s_haveList ? 1 : 0;  // [USB20a-1] 0 — нема, 1 — folder (черга зараз завжди з однієї папки), 2 — all (USB20a-2)
+    st.truncated = s_haveList && s_truncated;
+    st.building = false;
     s_prepared.store(s_phase == Phase::Inactive && s_haveList && s_list.count > 0 && s_cur >= 0);
     char path[usb_browser_cfg::kPathMax];
     path[0] = '\0';
@@ -459,6 +467,7 @@ void rsPrepare(uint16_t ordinal, uint32_t pos) {
     }
     s_skipBack = false;
     s_haveList = true;
+    s_truncated = lv.truncated;  // [USB20a-1]
     s_appliedShuffle = s_shuffle.load();
     clearHistory();
     s_skips = 0;
@@ -760,6 +769,7 @@ void handle(const Cmd& c) {
             }
             s_skipBack = false;
             s_haveList = true;
+            s_truncated = lv.truncated;  // [USB20a-1]
             s_appliedShuffle = s_shuffle.load();
             clearHistory();
             s_skips = 0;
@@ -1077,6 +1087,11 @@ void setShuffle(bool on) { s_shuffle.store(on); }
 bool shuffle() { return s_shuffle.load(); }
 void setRepeatAll(bool on) { s_repeat.store(on); }
 bool repeatAll() { return s_repeat.load(); }
+void setScope(usb_queue_scope_cfg::Scope s) { s_scope.store(static_cast<uint8_t>(s)); }  // [USB20a-1]
+usb_queue_scope_cfg::Scope scope() {
+    return s_scope.load() == static_cast<uint8_t>(usb_queue_scope_cfg::Scope::All) ? usb_queue_scope_cfg::Scope::All
+                                                                                   : usb_queue_scope_cfg::Scope::Folder;
+}
 
 #if USB_HOST_DIAG
 namespace {
@@ -1174,6 +1189,9 @@ void printStat() {
         Serial.printf("%s stat: task '%s' not running\n", kTag, usb_browser_cfg::kTaskName);
     }
     printPlayerStat();  // [USB14]
+    Serial.printf("%s stat: scope option=%s saved=%s built=%s truncated=%d building=%d\n", kTag,  // [USB20a-1]
+                  usb_queue_scope_cfg::name(scope()), usb_queue_scope_cfg::name(SettingsStore::getPlayerScope()),
+                  q.builtScope == 0 ? "-" : (q.builtScope == 1 ? "folder" : "all"), q.truncated ? 1 : 0, q.building ? 1 : 0);
     Serial.printf("%s stat: heap internal free=%u largest=%u min_free=%u psram_free=%u\n", kTag,
                   static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
                   static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
@@ -1236,8 +1254,20 @@ void handleConsoleLine(const char* line) {
             return;
         }
         Serial.printf("%s repeat=%d\n", kTag, repeatAll() ? 1 : 0);
+    } else if (word(rest, "scope", &arg)) {  // [USB20a-1] usb.q scope [folder|all]: RAM-дзеркало + NVS (як POST /api/usb/options)
+        usb_queue_scope_cfg::Scope sc;
+        if (arg[0] != '\0') {
+            if (!usb_queue_scope_cfg::parse(arg, &sc)) {
+                Serial.printf("%s usage: usb.q scope folder|all\n", kTag);
+                return;
+            }
+            setScope(sc);
+            SettingsStore::setPlayerScope(sc);
+        }
+        Serial.printf("%s scope option=%s saved=%s (applies to the NEXT play)\n", kTag, usb_queue_scope_cfg::name(scope()),
+                      usb_queue_scope_cfg::name(SettingsStore::getPlayerScope()));
     } else {
-        Serial.printf("%s usage: usb.q play <index> | next | prev | stop | stat | shuffle on|off | repeat on|off\n", kTag);
+        Serial.printf("%s usage: usb.q play <index> | next | prev | stop | stat | shuffle on|off | repeat on|off | scope [folder|all]\n", kTag);
     }
 }
 #endif  // USB_HOST_DIAG

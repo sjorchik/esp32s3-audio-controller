@@ -10,6 +10,8 @@
 //    список, індекс поза межами, не той тип запису), виконуються ОДРАЗУ й дають 409 / 400 без постановки команди; команда все
 //    одно ставиться з expectVersion, тож гонка зі зміною списку закривається в usb_nav.
 //  - Формат помилок і хелпери — net/web_api_common.h (той самий, що P13–P18).
+//  - [USB20a-1] POST /api/usb/options приймає scope ("folder" | "all"; той самий шлях runWebCommand(UsbOptionsSet), біти
+//    usb_queue_scope_cfg::kOptBit*); GET /api/usb/status додає options {shuffle, repeat, scope} і queue.scope / truncated / building.
 
 #include "net/web_api_usb.h"
 
@@ -27,9 +29,11 @@
 
 #include "audio/audio_player.h"
 #include "config/usb_browser_config.h"
+#include "config/usb_queue_scope_config.h"  // [USB20a-1]
 #include "config/web_api_usb_config.h"
 #include "core/app_controller.h"
 #include "core/app_state.h"
+#include "core/settings.h"  // [USB20a-1] збережені опції (options у status)
 #include "net/web_api_common.h"
 #include "usb/usb_browser.h"
 #include "usb/usb_mode.h"
@@ -314,6 +318,24 @@ void handleStatus(AsyncWebServerRequest* req) {
     q["paused"] = qs.paused;
     q["prepared"] = qs.prepared;
     q["reason"] = qs.reason;  // nullptr -> null
+    // [USB20a-1] Область ПОБУДОВАНОЇ черги (null — черги нема), ознаки неповної / добудовуваної черги.
+    if (qs.builtScope == 1) {
+        q["scope"] = usb_queue_scope_cfg::kNameFolder;
+    } else if (qs.builtScope == 2) {
+        q["scope"] = usb_queue_scope_cfg::kNameAll;
+    } else {
+        q["scope"] = nullptr;
+    }
+    q["truncated"] = qs.truncated;
+    q["building"] = qs.building;
+    // [USB20a-1] Опції плеєра: ЗБЕРЕЖЕНІ значення (мають сенс і поза режимом «USB»; queue.shuffle / repeat лишено як було).
+    {
+        const Settings sv = SettingsStore::snapshot();
+        JsonObject opt = doc["options"].to<JsonObject>();
+        opt["shuffle"] = sv.playerShuffle;
+        opt["repeat"] = sv.playerRepeat;
+        opt["scope"] = usb_queue_scope_cfg::name(SettingsStore::getPlayerScope());
+    }
 
     // «Зараз грає»: трек черги, що стартує або грає (на паузі — теж). Позиція / тривалість — кеш плеєра, 1 с.
     if (haveCur && (qs.state == usb_queue::State::Playing || qs.state == usb_queue::State::Starting)) {
@@ -819,7 +841,15 @@ void handleOptions(AsyncWebServerRequest* req) {
     JsonDocument in;
     if (!readJsonObjectBody(req, in)) return;
     JsonObjectConst root = in.as<JsonObjectConst>();
-    if (!allowKeys(req, root, "shuffle", "repeat")) return;
+    {  // [USB20a-1] «scope» перевіряється нижче; решта ключів — тим самим allowKeys (формат unknown_field не змінено)
+        JsonDocument rest;
+        for (JsonPairConst kv : root) {
+            if (strcmp(kv.key().c_str(), "scope") != 0) {
+                rest[kv.key().c_str()] = kv.value();
+            }
+        }
+        if (!allowKeys(req, rest.as<JsonObjectConst>(), "shuffle", "repeat")) return;
+    }
 
     int32_t mask = 0;
     JsonVariantConst sv = root["shuffle"];
@@ -838,6 +868,15 @@ void handleOptions(AsyncWebServerRequest* req) {
         }
         mask |= 0x4 | (rv.as<bool>() ? 0x8 : 0);
     }
+    JsonVariantConst cv = root["scope"];  // [USB20a-1]
+    if (!cv.isNull()) {
+        usb_queue_scope_cfg::Scope sc = usb_queue_scope_cfg::kDefaultScope;
+        if (!cv.is<const char*>() || !usb_queue_scope_cfg::parse(cv.as<const char*>(), &sc)) {
+            sendFieldError(req, 400, "invalid_value", "scope");
+            return;
+        }
+        mask |= usb_queue_scope_cfg::kOptBitChange | (sc == usb_queue_scope_cfg::Scope::All ? usb_queue_scope_cfg::kOptBitValue : 0);
+    }
     if (mask == 0) {
         sendFieldError(req, 400, "missing_field", "shuffle");
         return;
@@ -854,6 +893,7 @@ void handleOptions(AsyncWebServerRequest* req) {
     doc["ok"] = true;
     doc["shuffle"] = usb_queue::shuffle();
     doc["repeat"] = usb_queue::repeatAll();
+    doc["scope"] = usb_queue_scope_cfg::name(usb_queue::scope());  // [USB20a-1]
     sendJson(req, 200, doc);
 }
 

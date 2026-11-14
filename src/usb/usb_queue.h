@@ -26,6 +26,10 @@
 //
 // [USB18a] ДОДАНО: Status::pos (лише в кінець). Наявні функції й поля не змінено.
 //
+// [USB20a-1] ДОДАНО (лише в кінець / нові функції): опція області черги scope (setScope / scope; mirror збереженого значення,
+// його виставляє AppController при вході в режим і з вебу) та Status::builtScope / truncated / building. У USB20a-1 черга
+// ЗАВЖДИ будується з файлів однієї папки (builtScope = 1), тож scope = «all» поки лише зберігається й показується.
+//
 // Потоки: як usb_browser (задача usb_nav); усі функції неблокуючі й безпечні з будь-якої задачі.
 // Заголовок не підключає заголовки IDF, AppController, AudioPlayer.
 
@@ -33,6 +37,7 @@
 #include <stdint.h>
 
 #include "config/features.h"
+#include "config/usb_queue_scope_config.h"  // [USB20a-1]
 
 #if FEATURE_USB_MODE
 
@@ -61,6 +66,11 @@ struct Status {
     // [USB18a] ДОДАНО (лише в кінець):
     int32_t pos;         // 1-based позиція поточного треку в ПОТОЧНОМУ порядку проходу (shuffle: місце s_cur у перестановці, тож
                          // «трек N з count» точний і після prev / next-назад, коли position відстає); 0 — немає
+    // [USB20a-1] ДОДАНО (лише в кінець):
+    uint8_t builtScope;  // область ПОБУДОВАНОЇ черги: 0 — черги нема (значення за замовчуванням, безпечне до запуску воркера), 1 — folder, 2 — all
+                         // (USB20a-1: завжди 0 або 1)
+    bool truncated;      // черга неповна: список папки браузера було обрізано (kMaxEntries / пул імен); для «all» — ліміт (USB20a-2)
+    bool building;       // черга добудовується (лише «all», USB20a-2): next / prev / shuffle -> «queue_building»; у USB20a-1 завжди false
 };
 
 const char* stateName(State s);
@@ -104,6 +114,11 @@ bool shuffle();
 void setRepeatAll(bool on);
 bool repeatAll();
 
+// [USB20a-1] ДОДАНО: опція області черги (RAM-дзеркало; збереження в NVS — SettingsStore::setPlayerScope). Діє на НАСТУПНУ
+// команду play; поточну чергу не перебудовує й відтворення не перериває. Будь-яка задача.
+void setScope(usb_queue_scope_cfg::Scope s);
+usb_queue_scope_cfg::Scope scope();
+
 #if USB_HOST_DIAG
 // Консоль: usb.q play <індекс> | next | prev | stop | stat | shuffle on|off | repeat on|off. Блокує loopTask до завершення.
 // [USB14] Стан паузи / підготовленої черги / відновлення, збережені значення й лічильники записів у NVS (друкує usb.q stat і usb.mode stat).
@@ -115,4 +130,3 @@ void handleConsoleLine(const char* line);
 }  // namespace usb_queue
 
 #endif  // FEATURE_USB_MODE
-

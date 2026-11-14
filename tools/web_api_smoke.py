@@ -307,6 +307,53 @@ USB_QUEUE_STATES = ("Idle", "Starting", "Playing")
 USB_LIST_MAX = 100
 
 
+def usb20a1_shape_checks(st, label="usb20a1"):
+    """[USB20a-1] options{shuffle,repeat,scope} і queue.scope / truncated / building (типи). Нічого не змінює."""
+    o = st.get("options") if isinstance(st, dict) else None
+    record("%s: options має shuffle / repeat / scope" % label,
+           isinstance(o, dict) and has_keys(o, ["shuffle", "repeat", "scope"]), "options=%r" % (o,))
+    if isinstance(o, dict):
+        record("%s: options.shuffle / repeat — bool" % label,
+               isinstance(o.get("shuffle"), bool) and isinstance(o.get("repeat"), bool),
+               "shuffle=%r repeat=%r" % (o.get("shuffle"), o.get("repeat")))
+        record("%s: options.scope in {folder, all}" % label, o.get("scope") in ("folder", "all"), "scope=%r" % (o.get("scope"),))
+    q = st.get("queue") if isinstance(st, dict) else None
+    q = q if isinstance(q, dict) else {}
+    record("%s: queue.scope — null | folder | all" % label, "scope" in q and q.get("scope") in (None, "folder", "all"),
+           "scope=%r" % (q.get("scope"),))
+    record("%s: queue.truncated i queue.building — bool" % label,
+           isinstance(q.get("truncated"), bool) and isinstance(q.get("building"), bool),
+           "truncated=%r building=%r" % (q.get("truncated"), q.get("building")))
+
+
+def usb20a1_scope_roundtrip(d):
+    """[USB20a-1] (режим USB активний) options.scope: змінити -> перевірити status -> повторити (без змін) -> повернути."""
+    b = usb_status_body(d)
+    o = b.get("options") if isinstance(b, dict) else None
+    cur = o.get("scope") if isinstance(o, dict) else None
+    if cur not in ("folder", "all"):
+        record("usb20a1: scope round-trip", False, "options.scope відсутній (%r)" % (cur,), skip=True)
+        return
+    other = "all" if cur == "folder" else "folder"
+    try:
+        ok, bd = expect("usb20a1: POST /api/usb/options {scope:%s} -> 200" % other,
+                        d.post("/api/usb/options", {"scope": other}), 200, ["ok", "shuffle", "repeat", "scope"])
+        if ok:
+            record("usb20a1: відповідь options.scope == %s" % other, bd.get("scope") == other, "scope=%r" % (bd.get("scope"),))
+        b2 = usb_status_body(d)
+        o2 = b2.get("options") if isinstance(b2, dict) else None
+        record("usb20a1: status.options.scope == %s" % other, isinstance(o2, dict) and o2.get("scope") == other, "options=%r" % (o2,))
+        if isinstance(b2, dict):
+            usb20a1_shape_checks(b2, "usb20a1 після зміни")
+        expect("usb20a1: повтор того ж scope -> 200 (без зміни)", d.post("/api/usb/options", {"scope": other}), 200,
+               ["ok", "scope"])
+    finally:
+        d.post("/api/usb/options", {"scope": cur})
+        b3 = usb_status_body(d)
+        o3 = b3.get("options") if isinstance(b3, dict) else None
+        record("usb20a1: scope повернуто до %s" % cur, isinstance(o3, dict) and o3.get("scope") == cur, "options=%r" % (o3,))
+
+
 def usb_read_checks(d):
     """-> (usb_present, active). usb_present=False, якщо маршрутів нема (FEATURE_USB_MODE = 0)."""
     status, body = d.get("/api/usb/status")
@@ -331,6 +378,7 @@ def usb_read_checks(d):
         record("usb.status.nowPlaying має name/posSec/durSec/paused",
                has_keys(st["nowPlaying"], ["name", "posSec", "durSec", "paused"]))
     usb18a_shape_checks(st)  # [USB18a]
+    usb20a1_shape_checks(st)  # [USB20a-1]
     if st["lastReq"] is not None:
         record("usb.status.lastReq має id/ok/why", has_keys(st["lastReq"], ["id", "ok", "why"]))
 
@@ -972,6 +1020,7 @@ def _usb_input_checks_body(d, st, inp):
             back = wait_until(lambda: status_where(d, lambda s: s.get("volume") == v0), 6)
             record("volume «Player» відновлено (%d)" % v0, bool(back))
         usb18a_track_checks(d)  # [USB18a] чутне відтворення: path / теги / next / seek за кінець
+        usb20a1_scope_roundtrip(d)  # [USB20a-1]
     except Exception as exc:  # noqa: BLE001
         record("режим «USB» через вхід 3: неочікуваний виняток", False, repr(exc))
     finally:
@@ -1197,6 +1246,10 @@ def usb_write_checks(d, st, active):
            "invalid_value")
     expect("POST /api/usb/options unknown field -> 400", d.post("/api/usb/options", {"shuffle": True, "x": 1}), 400, ["error"],
            "unknown_field")
+    expect("POST /api/usb/options {scope:x} -> 400", d.post("/api/usb/options", {"scope": "x"}), 400, ["error", "field"],
+           "invalid_value")  # [USB20a-1]
+    expect("POST /api/usb/options {scope:5} -> 400", d.post("/api/usb/options", {"scope": 5}), 400, ["error", "field"],
+           "invalid_value")  # [USB20a-1]
     expect("POST /api/usb/cd {} -> 400", d.post("/api/usb/cd", {}), 400, ["error", "field"], "missing_field")
     expect("POST /api/usb/cd {up:true,index:1} -> 400", d.post("/api/usb/cd", {"up": True, "index": 1}), 400, ["error", "field"],
            "conflicting_fields")

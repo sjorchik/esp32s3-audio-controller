@@ -1,5 +1,7 @@
 // Реалізація SettingsStore: один blob у NVS з версією формату, кеш у RAM,
 // відкладений запис з дебаунсом у власній легкій задачі.
+// [USB20a-1] Опція scope області черги плеєра — окремий ключ `pl_scope` (кеш s_scope, прапорець s_scopeDirty; пишеться разом з blob-ом
+// і позицією тією ж фоновою задачею). Розкладка blob-а не змінена. Відсутній ключ = folder; «folder» зберігається видаленням ключа.
 // [INP4a-1] Формат v9: inputNames[4][32] (слот 3 = USB), маска входів 4-бітна; Settings 170 Б, blob 174 Б (було 138 / 142).
 // БЕЗ МІГРАЦІЇ: blob v8 (142 Б) відхиляється за версією й розміром, діють дефолти.
 // [USB14] Розкладка після кроку USB14: profiles[4] (4-й слот — профіль «Player»), + playerShuffle / playerRepeat: Settings 138 Б,
@@ -84,6 +86,12 @@ uint32_t s_resPos = 0;
 bool s_resValid = false;
 bool s_resDirty = false;
 uint32_t s_resWrites = 0;
+
+// [USB20a-1] Опція області черги плеєра (окремо від blob-а). Усе під мʼютексом.
+usb_queue_scope_cfg::Scope s_scope = usb_queue_scope_cfg::kDefaultScope;
+bool s_scopeDirty = false;
+// Що реально лежить у NVS (відсутній ключ = folder). Запис / видалення робимо лише коли s_scope відрізняється від нього.
+usb_queue_scope_cfg::Scope s_scopeStored = usb_queue_scope_cfg::kDefaultScope;
 
 // RAII-захоплення рекурсивного мʼютекса. До begin() (мʼютекса ще немає)
 // працює без блокування — це однопотокова рання фаза старту.
@@ -193,7 +201,7 @@ void applyEqLocked() {
 // ---------------------------------------------------------------------------
 void markDirtyLocked() {
     const uint32_t now = millis();
-    if (!s_dirty && !s_resDirty) {  // [USB14] таймери спільні для blob-а й позиції плеєра
+    if (!s_dirty && !s_resDirty && !s_scopeDirty) {  // [USB14] таймери спільні для blob-а й позиції плеєра
         s_firstDirtyMs = now;
     }
     s_dirty = true;
@@ -203,7 +211,7 @@ void markDirtyLocked() {
 // [USB14] Те саме для позиції плеєра: той самий дебаунс (settings_cfg::kSaveDebounceMs / kSaveMaxDelayMs).
 void markResumeDirtyLocked() {
     const uint32_t now = millis();
-    if (!s_dirty && !s_resDirty) {
+    if (!s_dirty && !s_resDirty && !s_scopeDirty) {
         s_firstDirtyMs = now;
     }
     s_resDirty = true;
@@ -295,10 +303,68 @@ void loadResumeLocked() {
     }
 }
 
+// [USB20a-1] Опція scope: той самий дебаунс, що й blob / позиція.
+void markScopeDirtyLocked() {
+    const uint32_t now = millis();
+    if (!s_dirty && !s_resDirty && !s_scopeDirty) {
+        s_firstDirtyMs = now;
+    }
+    s_scopeDirty = true;
+    s_lastRequestMs = now;
+}
+
+// [USB20a-1] Запис scope (мʼютекс захоплено): «all» -> ключ = 1, «folder» -> ключ видаляється (відсутній = folder).
+bool writeScopeLocked() {
+    if (s_scope == s_scopeStored) {  // у NVS уже це значення (напр. all -> folder швидше за дебаунс): NVS не чіпаємо
+        s_scopeDirty = false;
+        return true;
+    }
+    Preferences prefs;
+    if (!prefs.begin(settings_cfg::kNvsNamespace, false)) {
+        Serial.println("[SET] scope write failed: NVS open");
+        return false;
+    }
+    bool ok = true;
+    if (s_scope == usb_queue_scope_cfg::Scope::All) {
+        ok = prefs.putUChar(usb_queue_scope_cfg::kNvsKeyScope, 1) == sizeof(uint8_t);
+    } else if (prefs.isKey(usb_queue_scope_cfg::kNvsKeyScope)) {  // без isKey remove() логує E «NOT_FOUND»
+        prefs.remove(usb_queue_scope_cfg::kNvsKeyScope);
+    }
+    prefs.end();
+    if (!ok) {
+        Serial.println("[SET] scope write failed");
+        return false;
+    }
+    s_scopeDirty = false;
+    s_scopeStored = s_scope;
+    Serial.printf("[SET] player scope saved: %s\n", usb_queue_scope_cfg::name(s_scope));
+    return true;
+}
+
+// [USB20a-1] Читання scope з NVS (мʼютекс захоплено; з load()). Немає ключа / нечинне значення -> folder.
+void loadScopeLocked() {
+    s_scope = usb_queue_scope_cfg::kDefaultScope;
+    s_scopeStored = usb_queue_scope_cfg::kDefaultScope;
+    s_scopeDirty = false;
+    Preferences prefs;
+    if (!prefs.begin(settings_cfg::kNvsNamespace, true)) {
+        return;
+    }
+    if (prefs.isKey(usb_queue_scope_cfg::kNvsKeyScope)) {
+        s_scope = (prefs.getUChar(usb_queue_scope_cfg::kNvsKeyScope, 0) == 1) ? usb_queue_scope_cfg::Scope::All
+                                                                              : usb_queue_scope_cfg::Scope::Folder;
+    }
+    prefs.end();
+    s_scopeStored = s_scope;
+    if (s_scope == usb_queue_scope_cfg::Scope::All) {
+        Serial.println("[SET] player scope: all");
+    }
+}
+
 // Виконується в фоновій задачі.
 void flushIfDue() {
     Lock lock;
-    if (!lock.ok() || (!s_dirty && !s_resDirty)) {
+    if (!lock.ok() || (!s_dirty && !s_resDirty && !s_scopeDirty)) {
         return;
     }
     const uint32_t now = millis();
@@ -312,6 +378,9 @@ void flushIfDue() {
         ok = false;
     }
     if (s_resDirty && !writeResumeLocked()) {  // [USB14]
+        ok = false;
+    }
+    if (s_scopeDirty && !writeScopeLocked()) {  // [USB20a-1]
         ok = false;
     }
     if (!ok) {
@@ -416,6 +485,7 @@ bool SettingsStore::load() {
     }
 
     loadResumeLocked();  // [USB14] позиція плеєра (окремі ключі; не залежить від версії blob-а)
+    loadScopeLocked();   // [USB20a-1] опція scope (окремий ключ; не залежить від версії blob-а)
 
     if (haveStored) {
         sanitize(loaded);
@@ -484,7 +554,7 @@ bool SettingsStore::flush() {
     if (!lock.ok()) {
         return false;
     }
-    if (!s_dirty && !s_resDirty) {
+    if (!s_dirty && !s_resDirty && !s_scopeDirty) {
         return true;
     }
     bool ok = true;
@@ -496,11 +566,15 @@ bool SettingsStore::flush() {
         markResumeDirtyLocked();
         ok = false;
     }
+    if (s_scopeDirty && !writeScopeLocked()) {  // [USB20a-1]
+        markScopeDirtyLocked();
+        ok = false;
+    }
     return ok;
 }
 
 bool SettingsStore::isDirty() {
-    return s_dirty || s_resDirty;  // [USB14]
+    return s_dirty || s_resDirty || s_scopeDirty;  // [USB14, USB20a-1]
 }
 
 bool SettingsStore::resetToDefaults() {
@@ -517,9 +591,15 @@ bool SettingsStore::resetToDefaults() {
     s_resTrack[0] = '\0';
     s_resPos = 0;
     s_resDirty = false;
+    s_scope = usb_queue_scope_cfg::kDefaultScope;  // [USB20a-1] скидання налаштувань: folder (ключ pl_scope видаляється)
+    s_scopeDirty = false;
     bool ok = writeLocked();
     if (!writeResumeLocked()) {
         markResumeDirtyLocked();
+        ok = false;
+    }
+    if (!writeScopeLocked()) {  // [USB20a-1]
+        markScopeDirtyLocked();
         ok = false;
     }
     if (!ok) {
@@ -542,9 +622,14 @@ bool SettingsStore::eraseStored() {
     prefs.remove(player_mode_cfg::kNvsKeyUsbDir);    // [USB14] позиція плеєра теж
     prefs.remove(player_mode_cfg::kNvsKeyUsbTrack);
     prefs.remove(player_mode_cfg::kNvsKeyUsbPos);
+    if (prefs.isKey(usb_queue_scope_cfg::kNvsKeyScope)) {  // [USB20a-1]
+        prefs.remove(usb_queue_scope_cfg::kNvsKeyScope);
+    }
+    s_scopeStored = usb_queue_scope_cfg::kDefaultScope;
     prefs.end();
     s_dirty = false;  // щоб відкладений запис не воскресив ключ
     s_resDirty = false;
+    s_scopeDirty = false;  // [USB20a-1] (значення в кеші лишається; ключ видалено -> після перезапуску folder)
     return true;
 }
 
@@ -614,6 +699,24 @@ void SettingsStore::clearPlayerResume(PlayerSource src) {
 
 uint32_t SettingsStore::playerResumeWriteCount() {
     return s_resWrites;
+}
+
+// --- [USB20a-1] Опція області черги плеєра ---------------------------------------------------------------------------
+usb_queue_scope_cfg::Scope SettingsStore::getPlayerScope() {
+    Lock lock;  // якщо не вдалося захопити — віддаємо значення без захисту (однобайтове читання)
+    return s_scope;
+}
+
+void SettingsStore::setPlayerScope(usb_queue_scope_cfg::Scope s) {
+    Lock lock;
+    if (!lock.ok()) {
+        return;
+    }
+    if (s_scope == s) {
+        return;  // без змін: NVS не чіпаємо
+    }
+    s_scope = s;
+    markScopeDirtyLocked();
 }
 
 
