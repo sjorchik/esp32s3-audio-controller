@@ -10,6 +10,7 @@
 #include "config/eq_config.h"          // [Prompt 49a] eq_cfg::kBandCount / kBandFreqHz (тимчасовий екран EQ)
 #include "config/eq_screen_config.h"   // [Prompt 49a/49b] розкладка екрана EQ + Balance
 #include "config/screens_config.h"
+#include "config/usb_screen_config.h"   // [USB17b] розкладка екрана «зараз грає»
 #include "audio/vu_source.h"      // [Prompt 17] рівні VU (читаються напряму); [Prompt 48d] + VuSourceLinePath
 #include "config/features.h"
 #include "config/line_path_config.h"  // [Prompt 48d] LINE_PATH_ENABLE (раніше приходив через adc_vu.h)
@@ -19,6 +20,7 @@
 #include "ui/fonts.h"
 #include "stations/station_store.h"  // [Prompt 11] ДОДАНО: чисті дані, не залізо
 #include "ui/icons.h"
+#include "ui/usb_np_format.h"   // [USB17b] формат часу / ширина смуги (чиста логіка)
 
 #if DISPLAY_DEMO
 #warning "DISPLAY_DEMO = 1: постав 0 у config/display_config.h, щоб показувати реальні екрани"
@@ -56,6 +58,10 @@
 // config/eq_screen_config.h; читає лише AppState (eqSelected, eqGainsDb, balanceDb, inputName).
 // [USB11] Режим «USB»: AppState.usbUi != Off на Mode::Radio / ExternalInput малює drawUsb() (текст «USB» / «No media» тощо
 // у слоті назви входу); VU і метадані в цьому режимі не показуються (повний екран — g2c).
+// [USB17b] Екран режиму «USB» показує стан відтворення (AppStateData::usbNow, його збирає USB17a): назва (Large) і виконавець
+// (Small) через fitText() без marquee, «m:ss / m:ss», смуга прогресу, «N / M», індикатор паузи, SHUF / REP. Розкладка — в
+// config/usb_screen_config.h. Стани носія (Starting / NoMedia / Fault / Stopping / Error) і «Ready» — XLarge як раніше. У режимі
+// «USB» (usbUi != Off) VU і marquee Radio НЕ оновлюються, щоб не давати зайвих перемальовувань (dirty) під час відтворення файлу.
 // [Prompt 17] ВИНЯТОК З ІЗОЛЯЦІЇ: рівні VU беруться напряму з VuSourceDecodedPcm::read() (з
 // частотою кадру), МИНАЮЧИ AppState; AppStateData.vuLeft/vuRight не використовуються.
 
@@ -126,6 +132,7 @@ uint32_t s_popupUntilMs  = 0;
 AppStateData s_prev;            // попередній знімок
 bool         s_havePrev = false;
 bool         s_modeKnown = false;
+bool         s_usbOn = false;   // [USB17b] минулий кадр: usbUi != Off (зміна скидає marquee Radio)
 Mode         s_prevMode = Mode::Standby;
 uint8_t      s_savedBrightness = defaults::kDefaultBrightness;
 
@@ -496,11 +503,75 @@ void drawExternal(const AppStateData& s, int vuLitL, int vuLitR, int peakL, int 
     drawVu(vuLitL, vuLitR, peakL, peakR);
 }
 
-// [USB11] Мінімальний екран режиму «USB» (крок g2b-1): текст у місці назви входу (той самий слот kExtNameY, що в
-// ExternalInput). Список / «зараз грає» / VU — крок g2c. Написи англійською (розділ 10 MASTER SPEC).
+// [USB17b] Буфер під fitText() для назви / виконавця: cap >= розмір тексту + 8 (запас під "...").
+constexpr size_t kUsbFitCap = usb_now_playing_cfg::kTextMax + 8;
+
+// [USB17b] Екран «зараз грає»: усе з AppStateData::usbNow, без String і без блокувань. Малюється лише при active.
+void drawUsbPlaying(const AppStateData& s) {
+    namespace uc = usb_screen_cfg;
+    const UsbNowPlaying& n = s.usbNow;
+
+    // Назва й виконавець. На старті треку спершу приходить імʼя файла, потім теги: поки нічого не відомо про трек,
+    // текст не малюється (kHoldTextUntilKnown), щоб не блимало.
+    const bool textKnown = !uc::kHoldTextUntilKnown || n.durSec > 0 || n.posSec > 0;
+    char fit[kUsbFitCap];
+    if (textKnown && n.title[0] != '\0') {
+        fitText(n.title, fit, sizeof(fit), FontSize::Large, uc::kTextW);
+        drawCentered(fit, uc::kTitleY, FontSize::Large, uc::kColorTitle);
+    }
+    if (textKnown && n.artist[0] != '\0') {
+        fitText(n.artist, fit, sizeof(fit), FontSize::Small, uc::kTextW);
+        drawCentered(fit, uc::kArtistY, FontSize::Small, uc::kColorArtist);
+    }
+
+    // Час «m:ss / m:ss» (оновлюється раз на секунду: posSec має роздільність 1 с) і смуга прогресу (рамка + заливка, як у OTA).
+    char tbuf[32];
+    usb_np_format::formatTime(n.posSec, n.durSec, uc::kMaxMinutes, tbuf, sizeof(tbuf));
+    drawCentered(tbuf, uc::kTimeY, FontSize::Large, uc::kColorTime);
+    D::drawRect(uc::kBarX, uc::kBarY, uc::kBarW, uc::kBarH, uc::kColorBarFrame);
+    const int32_t fillW = usb_np_format::barFillPx(n.posSec, n.durSec, uc::kBarW - 2);
+    if (fillW > 0) {
+        D::fillRect(static_cast<int16_t>(uc::kBarX + 1), static_cast<int16_t>(uc::kBarY + 1),
+                    static_cast<int16_t>(fillW), static_cast<int16_t>(uc::kBarH - 2), uc::kColorBarFill);
+    }
+
+    // Нижній рядок: «N / M» ліворуч, пауза по центру, SHUF / REP праворуч (лише ввімкнені).
+    char nm[24];
+    if (n.pos > 0) snprintf(nm, sizeof(nm), "%u / %u", static_cast<unsigned>(n.pos), static_cast<unsigned>(n.count));
+    else           snprintf(nm, sizeof(nm), "- / %u", static_cast<unsigned>(n.count));
+    D::drawText(nm, c::kMargin, uc::kInfoY, FontSize::Small, uc::kColorInfo);
+
+    if (n.paused) {
+        const int16_t px = static_cast<int16_t>((c::kW - (2 * uc::kPauseBarW + uc::kPauseBarGap)) / 2);
+        const int16_t py = static_cast<int16_t>(uc::kInfoY + (dc::kFontSmallPx - uc::kPauseBarH) / 2);
+        D::fillRect(px, py, uc::kPauseBarW, uc::kPauseBarH, uc::kColorPause);
+        D::fillRect(static_cast<int16_t>(px + uc::kPauseBarW + uc::kPauseBarGap), py, uc::kPauseBarW, uc::kPauseBarH,
+                    uc::kColorPause);
+    }
+
+    const int16_t flagY = static_cast<int16_t>(uc::kInfoY + (dc::kFontSmallPx - dc::kFontTinyPx) / 2);
+    int32_t fx = c::kW - c::kMargin;
+    if (n.repeatAll) {
+        fx -= UiFonts::textWidth("REP", FontSize::Tiny);
+        D::drawText("REP", static_cast<int16_t>(fx), flagY, FontSize::Tiny, uc::kColorFlagOn);
+        fx -= uc::kFlagGap;
+    }
+    if (n.shuffle) {
+        fx -= UiFonts::textWidth("SHUF", FontSize::Tiny);
+        D::drawText("SHUF", static_cast<int16_t>(fx), flagY, FontSize::Tiny, uc::kColorFlagOn);
+    }
+}
+
+// [USB11] Екран режиму «USB» (крок g2b-1): текст у місці назви входу (той самий слот kExtNameY, що в ExternalInput).
+// [USB17b] Якщо носій готовий і трек стартує / грає / на паузі (usbNow.active) — екран «зараз грає» (drawUsbPlaying());
+// «Ready» (носій є, нічого не грає) замість колишнього «USB». Написи англійською (розділ 10 MASTER SPEC).
 void drawUsb(const AppStateData& s) {
     drawTopIcons(s, true);
     drawNetInfo(s);
+    if (s.usbUi == UsbUiState::Ready && s.usbNow.active) {
+        drawUsbPlaying(s);
+        return;
+    }
     const char* text = "USB";
     uint16_t color = dc::kColorFg;
     switch (s.usbUi) {
@@ -509,7 +580,7 @@ void drawUsb(const AppStateData& s) {
         case UsbUiState::Fault:    text = "Read error"; color = c::kColorBad;    break;
         case UsbUiState::Stopping: text = "USB exit..."; color = c::kColorDim;   break;
         case UsbUiState::Error:    text = "USB error";  color = c::kColorBad;    break;
-        case UsbUiState::Ready:
+        case UsbUiState::Ready:    text = "Ready";      break;   // [USB17b]
         case UsbUiState::Off:
             break;
     }
@@ -756,6 +827,14 @@ bool frame() {
     handleModeChange(s.mode);
     wifiBarsUpdate(s);   // [Prompt 36] гістерезис іконки Wi-Fi; зміна rssi вже дає dirty через memcmp
 
+    // [USB17b] Режим «USB» (usbUi != Off): VU і marquee Radio не оновлюються (див. нижче); зміна режиму скидає marquee.
+    const bool usbOn = s.usbUi != UsbUiState::Off;
+    if (usbOn != s_usbOn) {
+        s_usbOn = usbOn;
+        s_station.seeded = false;
+        s_track.seeded   = false;
+    }
+
     bool dirty = !s_havePrev || memcmp(&s, &s_prev, sizeof(s)) != 0;
     if (dirty) {
         s_prev = s;
@@ -770,7 +849,8 @@ bool frame() {
     int litR = 0;
     bool vuValid = false;
 #if ENABLE_VU
-    if (s.mode == Mode::Radio && s.streamStatus == StreamStatus::Playing) {
+    // [USB17b] У режимі «USB» файл теж дає streamStatus == Playing: без !usbOn VU читався б і давав dirty майже кожен кадр.
+    if (!usbOn && s.mode == Mode::Radio && s.streamStatus == StreamStatus::Playing) {
         float vuL = 0.0f;
         float vuR = 0.0f;
         if (s_vu.read(vuL, vuR)) {
@@ -783,7 +863,7 @@ bool frame() {
     // [Prompt 48d] Зовнішні входи (будь-який inputIndex >= 1): рівні з line_path (VuSourceLinePath).
     // Немає даних / прохід не працює —
     // як у радіо: два базові сегменти, пік скинуто.
-    else if (s.mode == Mode::ExternalInput && s.inputIndex >= 1 && !s.restarting) {
+    else if (!usbOn && s.mode == Mode::ExternalInput && s.inputIndex >= 1 && !s.restarting) {   // [USB17b]
         float vuL = 0.0f;
         float vuR = 0.0f;
         if (s_vuLine.read(vuL, vuR)) {
@@ -836,7 +916,7 @@ bool frame() {
         dirty = true;                           // перемалювати кадр без вікна
     }
 
-    if (s.mode == Mode::Radio) {
+    if (s.mode == Mode::Radio && !usbOn) {   // [USB17b] у режимі «USB» marquee Radio не потрібен
         dirty |= marqueeUpdate(s_station, s.stationName[0] ? s.stationName : "No station",
                                FontSize::XLarge, now);   // [Prompt 35]
 
@@ -889,6 +969,7 @@ bool frame() {
 bool UiScreens::begin() {
     s_havePrev  = false;
     s_modeKnown = false;
+    s_usbOn     = false;   // [USB17b]
     s_station.seeded = false;
     s_track.seeded   = false;
     s_trackStationKnown = false;   // [Prompt 33]
@@ -906,4 +987,5 @@ bool UiScreens::begin() {
     DisplayManager::setFrameCallback(&frame);
     return true;
 }
+
 

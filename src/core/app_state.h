@@ -48,6 +48,11 @@
 // [USB11] ДОДАНО: enum UsbUiState та поле usbUi (лише в кінець структури) — стан режиму «USB» для мінімального екрана
 // (ui/screens::drawUsb). Нуль = Off = режиму немає (екрани Radio / ExternalInput як раніше). Публікує AppController
 // (publishState + періодично syncPlayer: носій може зʼявитись / зникнути без події). Без FEATURE_USB_MODE завжди Off.
+// [USB17a] ДОДАНО: структура UsbNowPlaying та поле usbNow (лише в кінець AppStateData) — дані «зараз грає» для екрана режиму
+// «USB» (малює крок USB17b): трек / виконавець / N з M / час / пауза / shuffle / repeat. Збирає src/usb/usb_now_playing.* з
+// ТИХ САМИХ джерел, що й nowPlaying / queue веб-API (usb_queue::status, AudioPlayer), у фіксовані буфери; публікує
+// AppController у syncPlayer() (≈ раз на app_controller_cfg::kSyncPeriodMs), стан між потоками — як усе в AppState. Нуль = нічого
+// не грає (поза режимом «USB» завжди нуль). Структура без padding, тож однакові дані дають однакові байти для memcmp у screens.
 // [Prompt 17] НЕ ВИКОРИСТОВУЮТЬСЯ: ui/screens читає рівні VU напряму з
 // VuSourceDecodedPcm::read() (частота кадру), минаючи AppState. Поля лишено, щоб не міняти POD-структуру.
 
@@ -55,6 +60,7 @@
 #include <stdint.h>
 
 #include "config/eq_config.h"  // [Prompt 49a] eq_cfg::kBandCount для AppStateData::eqGainsDb
+#include "config/usb_now_playing_config.h"  // [USB17a] usb_now_playing_cfg::kTextMax для UsbNowPlaying
 #include "core/events.h"  // [Prompt 15] ДОДАНО: тип Action
 
 // Режими пристрою.
@@ -124,6 +130,24 @@ enum class IrLearnStatus : uint8_t {
 // [Prompt 23b] ДОДАНО: розмір буфера назви входу (байт разом із '\0'); має збігатися з
 // sizeof(Settings::inputNames[0]) (перевіряє static_assert у app_controller.cpp).
 constexpr size_t kInputNameMax = 32;
+
+// [USB17a] ДОДАНО: «зараз грає» в режимі «USB». Порядок полів підібрано так, щоб padding не було (static_assert нижче).
+// Не підключає заголовки usb / audio: структуру заповнює usb/usb_now_playing.cpp.
+struct UsbNowPlaying {
+    uint32_t posSec;     // позиція треку, с (кеш плеєра, роздільність 1 с); 0 — невідомо
+    uint32_t durSec;     // тривалість, с; 0 — ще невідомо (екран показує «--:--» і порожню смугу)
+    uint16_t count;      // файлів у черзі (знімок папки, на якій запущено відтворення); 0 — черги немає
+    uint16_t pos;        // 1-based позиція треку в ПОТОЧНОМУ порядку проходу (usb_queue::Status::pos); 0 — невідомо
+    bool active;         // трек стартує / грає / на паузі (черга не Idle); інакше всі «трекові» поля нульові
+    bool paused;         // файл на паузі
+    bool shuffle;        // перемішування (дійсне й коли active == false, поки режим «USB» у Ready / Playing)
+    bool repeatAll;      // повтор усього (так само)
+    // Текст УЖЕ нормалізований під шрифти дисплея (usb/usb_np_text.h): UTF-8, лише символи, що має шрифт; хвіст обнулено.
+    char title[usb_now_playing_cfg::kTextMax];    // тег title, інакше імʼя файла без розширення; порожньо, якщо active == false
+    char artist[usb_now_playing_cfg::kTextMax];   // тег artist; порожньо, якщо тегу нема
+};
+static_assert(sizeof(UsbNowPlaying) == 16 + 2 * usb_now_playing_cfg::kTextMax,
+              "UsbNowPlaying must have no padding (memcmp of AppStateData snapshots)");
 
 // Дані стану.
 // Розміри буферів під метадані залишаються константами.
@@ -229,6 +253,10 @@ struct AppStateData {
     // --- [USB11] ДОДАНО (в кінець структури) ---
     // Стан режиму «USB» для мінімального екрана (UsbUiState::Off = режиму нема). Лише AppController пише.
     UsbUiState usbUi;
+
+    // --- [USB17a] ДОДАНО (в кінець структури) ---
+    // Дані «зараз грає» режиму «USB» (UsbNowPlaying; нуль = нічого не грає / режиму нема). Лише AppController пише (syncPlayer).
+    UsbNowPlaying usbNow;
 };
 
 class AppState {

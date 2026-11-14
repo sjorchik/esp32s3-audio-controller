@@ -239,6 +239,7 @@
 //   -> пропуск; (в) ознака «фатальна помилка USB» (navErrorService -> beginRestart) у тій самій RTC-структурі: наступний старт USB не відновлює.
 // Standby із USB: s_usbStandbyKeep тримає lastInput = 3 (інакше usbModeLeaveLocked() у фоні записав би вхід ДО режиму).
 #include "core/app_controller.h"
+#include "usb/usb_now_playing.h"  // [USB17a] collect() for AppStateData::usbNow
 
 #include <Arduino.h>
 #include <esp_system.h>  // [Prompt 39] esp_reset_reason()
@@ -1272,6 +1273,8 @@ struct SyncCtx {
     char inputName[kInputNameMax];  // [Prompt 23b]: назва могла змінитись з вебу
     int8_t wifiRssi;                // [Prompt 36]: квантований RSSI STA (0 = невідомо)
     UsbUiState usbUi;               // [USB11]: носій міг зʼявитись / зникнути без події
+    UsbNowPlaying usbNow;           // [USB17a]: now-playing data (zeros outside USB mode)
+    bool usbNowValid;               // [USB17a]: false = queue lock busy, keep the previous published value
 };
 
 void applySync(AppStateData& s, void* c) {
@@ -1289,6 +1292,9 @@ void applySync(AppStateData& s, void* c) {
     memcpy(s.inputName, x->inputName, sizeof(s.inputName));  // [Prompt 23b]
     s.wifiRssi = x->wifiRssi;  // [Prompt 36]
     s.usbUi = x->usbUi;        // [USB11]
+    if (x->usbNowValid) {          // [USB17a]: struct has no padding, plain assignment is byte-exact
+        s.usbNow = x->usbNow;
+    }
 }
 
 // [Prompt 36] RSSI (дБм) -> значення для AppState: 0, якщо невідомо (>= 0), інакше обрізано знизу й
@@ -1344,6 +1350,7 @@ void syncPlayer() {
     c.wifiRssi = c.wifi ? quantizeRssi(WifiManager::rssi()) : 0;  // [Prompt 36]
     resolveInputName(displayInputSlot(), c.inputName, sizeof(c.inputName));  // [Prompt 23b] [INP4a-2]
     c.usbUi = usbUiNow();                                         // [USB11]
+    c.usbNowValid = usb_now_playing::collect(&c.usbNow);          // [USB17a]
 
     // [Prompt 10] ДОДАНО: маппінг PlayerState → StreamStatus за назвою
     // audio_player.h::PlayerState і core/app_state.h::StreamStatus мають однакові
