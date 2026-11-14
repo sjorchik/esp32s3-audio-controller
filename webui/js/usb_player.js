@@ -13,7 +13,9 @@
     usbPauseHoldMs: 2500,    // після pause / resume ігноруємо paused зі status (прошивка змінює його за ≈ 1–2 с)
     usbOptHoldMs: 1500,      // після POST /api/usb/options ігноруємо shuffle / repeat зі status
     usbSeekHoldMs: 2500,     // після seek тримаємо позицію локально (нову позицію видно за ≈ 1–2 с)
-    usbSeekStepSec: 5,       // крок смуги прогресу (точність перемотування ≈ 1–2 с)
+    usbSeekStepSec: 1,       // USB19: крок смуги прогресу (1 с: max = durSec досяжний; точність перемотування ≈ 1–2 с)
+    usbSeekKeySec: 5,        // USB19: крок стрілок клавіатури на смузі
+    usbSeekReleaseMs: 150,   // USB19: скільки чекати `change` після відпускання, перш ніж вважати перетягування скасованим
     usbSeekMaxSec: 3600,     // межа deltaSec у контракті
     usbCmdPollMs: 300,       // GET /api/usb/result?id=N
     usbCmdTimeoutMs: 8000,   // скільки чекати результат команди з reqId — ПРИПУЩЕННЯ
@@ -173,6 +175,10 @@
     let unavailable = false;       // /api/usb/status → 404 (збірка без режиму USB)
     let started = false;
     let dragging = false;
+    let dragKey = '';              // USB19: трек (path) на початку перетягування — якщо змінився, seek не шлемо
+    let seekBusy = false;          // USB19: іде POST /api/usb/seek (смугу НЕ блокуємо: у ctlBusy її відключало б і губило фокус)
+    let seekTarget = null;         // USB19: обрана позиція, яку показуємо, доки seek у польоті
+    let seekQueued = null;         // USB19: новіша ціль, обрана під час польоту попереднього seek (лишається остання)
     let ctlBusy = false;           // іде запит control / options / seek
     let reqBusy = false;           // чекаємо результат команди з reqId (next / prev / stop)
     let endHold = null;            // {key, until}: seek за кінець (atEnd) — тримаємо кінець треку, доки не прийде НАСТУПНИЙ трек
@@ -257,10 +263,11 @@
       const pos = curPos();
       const canSeek = !!np && dur > 0 && isRunning() && !ctlBusy;
       setAttr(ui.seek, 'max', dur > 0 ? dur : 1);                     // max — ПЕРЕД value
-      if (!dragging) ui.seek.value = dur > 0 ? pos : 0;
+      const shown = seekTarget !== null && dur > 0 ? clamp(seekTarget, 0, dur) : pos;   // USB19
+      if (!dragging) ui.seek.value = dur > 0 ? shown : 0;
       ui.seek.disabled = !canSeek;
       setAttr(ui.seek, 'title', np && !canSeek && dur > 0 && pausedNow() ? 'На паузі перемотування недоступне' : '');
-      setText(ui.tCur, np ? fmtTime(dragging ? Number(ui.seek.value) : pos) : '0:00');
+      setText(ui.tCur, np ? fmtTime(dragging ? Number(ui.seek.value) : shown) : '0:00');
       setText(ui.tDur, np && dur > 0 ? fmtTime(dur) : '—:—');
     }
 
@@ -364,9 +371,11 @@
     }
 
     async function doSeek(target) {
+      // USB19: одна ціль у польоті; новіша ціль чекає (виграє остання) і йде одразу після відповіді.
+      if (seekBusy) { seekQueued = target; seekTarget = target; render(); return; }
       const delta = clamp(Math.round(target - curPos()), -CONFIG.usbSeekMaxSec, CONFIG.usbSeekMaxSec);
-      if (delta === 0) { render(); return; }
-      ctlBusy = true; render();
+      if (delta === 0) { seekTarget = null; render(); return; }   // нульову дельту не шлемо
+      seekBusy = true; seekTarget = target; render();
       try {
         const r = await usbApi.seek(delta);
         const np = nowPlaying();
@@ -376,15 +385,21 @@
           const dur = np.durSec || 0;
           endHold = { key: trackKey(np), until: Date.now() + CONFIG.usbSeekHoldMs };
           anchor = { pos: dur > 0 ? dur : target, at: performance.now(), lockUntil: 0 };
+          seekQueued = null;                      // трек закінчено: відкладена ціль втратила сенс
         } else {
           endHold = null;
           anchor = { pos: target, at: performance.now(), lockUntil: performance.now() + CONFIG.usbSeekHoldMs };
         }
       } catch (e) {
+        seekQueued = null;                        // відмова (409 paused / not_playing …): повзунок повертається до status
         toast(errorText(e), 'error');
         poller.now();
       }
-      ctlBusy = false; render();
+      seekBusy = false;
+      const next = seekQueued; seekQueued = null;
+      seekTarget = next;                          // null → далі показуємо позицію з anchor
+      render();
+      if (next !== null) doSeek(next);
     }
 
     ui.play.addEventListener('click', () => doControl('toggle'));
@@ -393,10 +408,34 @@
     ui.stop.addEventListener('click', () => doControl('stop'));
     ui.shuffle.addEventListener('click', () => doOption('shuffle'));
     ui.repeat.addEventListener('click', () => doOption('repeat'));
-    ui.seek.addEventListener('pointerdown', () => { dragging = true; });
-    ['pointerup', 'pointercancel'].forEach((ev) => window.addEventListener(ev, () => { if (dragging) { dragging = false; renderProgress(); } }));
-    ui.seek.addEventListener('input', () => { dragging = true; setText(ui.tCur, fmtTime(Number(ui.seek.value))); });
-    ui.seek.addEventListener('change', () => { dragging = false; doSeek(Number(ui.seek.value)); });
+    /* USB19: seek повзунком. Причина старого дефекту: pointerup скидав dragging і перемальовував смугу (value = поточна позиція)
+       ДО події `change`, тож `change` читав уже відкочене значення → дельта 0 → запиту не було. Тепер pointerup лише
+       запускає короткий таймер: якщо `change` не прийшов (скасоване перетягування / клік без зсуву), смуга розморожується. */
+    ui.seek.addEventListener('pointerdown', () => { dragging = true; dragKey = trackKey(nowPlaying()); });
+    const endDrag = () => {
+      if (!dragging) return;
+      setTimeout(() => { if (dragging) { dragging = false; renderProgress(); } }, CONFIG.usbSeekReleaseMs);
+    };
+    ['pointerup', 'pointercancel'].forEach((ev) => window.addEventListener(ev, endDrag));
+    ui.seek.addEventListener('input', () => {
+      if (!dragging) dragKey = trackKey(nowPlaying());
+      dragging = true;
+      setText(ui.tCur, fmtTime(Number(ui.seek.value)));
+    });
+    ui.seek.addEventListener('change', () => {
+      const sameTrack = dragKey === trackKey(nowPlaying());
+      const target = Number(ui.seek.value);
+      dragging = false;
+      if (ui.seek.disabled || !sameTrack) { seekTarget = null; renderProgress(); return; }   // трек змінився / смуга вимкнена
+      doSeek(target);                              // ОДИН запит після відпускання
+    });
+    ui.seek.addEventListener('keydown', (e) => {   // стрілки: ±usbSeekKeySec, один запит на натискання (послідовні зливаються)
+      const dir = e.key === 'ArrowRight' || e.key === 'ArrowUp' ? 1 : e.key === 'ArrowLeft' || e.key === 'ArrowDown' ? -1 : 0;
+      if (!dir || ui.seek.disabled || e.altKey || e.ctrlKey || e.metaKey) return;
+      e.preventDefault();
+      const dur = (nowPlaying() || {}).durSec || 0;
+      doSeek(clamp((seekTarget !== null ? seekTarget : curPos()) + dir * CONFIG.usbSeekKeySec, 0, dur));
+    });
 
     render();
 
@@ -413,6 +452,7 @@
           clearInterval(ticker); ticker = null;
           s = null; anchor = null; hold = null; optHold = null; unavailable = false; ctlBusy = false; reqBusy = false;
           endHold = null; tagHold = null; tagHeld = false;
+          dragging = false; seekTarget = null; seekQueued = null;
           shared.status = null;
           render();
           notifyStatus();
@@ -424,4 +464,3 @@
 
   window.createUsbPlayer = createUsbPlayer;
 })();
-
