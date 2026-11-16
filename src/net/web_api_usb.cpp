@@ -731,6 +731,14 @@ void handleControl(AsyncWebServerRequest* req) {
 
     if (!passDeviceGate(req) || !passModeGate(req)) return;
 
+    if (act == Act::Next || act == Act::Prev) {  // [USB20a-2] черга «all» ще добудовується
+        usb_queue::Status qs;
+        if (usb_queue::status(&qs) && qs.building) {
+            sendError(req, 409, usb_queue_scope_cfg::kWhyQueueBuilding);
+            return;
+        }
+    }
+
     uint32_t reqId = 0;
     const char* why = nullptr;
     if (act == Act::Next || act == Act::Prev || act == Act::Stop) {
@@ -883,6 +891,13 @@ void handleOptions(AsyncWebServerRequest* req) {
     }
 
     if (!passDeviceGate(req) || !passModeGate(req)) return;
+    if ((mask & 0x1) != 0) {  // [USB20a-2] shuffle не змінюється, поки черга «all» добудовується
+        usb_queue::Status qs;
+        if (usb_queue::status(&qs) && qs.building) {
+            sendError(req, 409, usb_queue_scope_cfg::kWhyQueueBuilding);
+            return;
+        }
+    }
     const char* why = nullptr;
     const WebCmdResult r = AppController::runWebCommand({WebCmdType::UsbOptionsSet, mask, false}, &why);
     if (r != WebCmdResult::Ok) {

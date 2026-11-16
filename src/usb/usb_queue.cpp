@@ -6,7 +6,11 @@
 // і Idle — USB7), далі вибирає наступний трек і викликає AudioPlayer::playFile(). Час переходу друкується в логу
 // («[USBQ] track ... transition: flag->accept=… accept->active=… accept->playing=… flag->playing=… ms»).
 
-// [USB20a-1] Опція scope (folder / all) і поля Status::builtScope / truncated / building; сама черга «all» — USB20a-2.
+// [USB20a-1] Опція scope (folder / all) і поля Status::builtScope / truncated / building.
+// [USB20a-2] Черга «all»: у режимі scope = all play файлу X будує СПОЧАТКУ звичайну папкову чергу (X стартує одразу), а скан усієї
+// флешки (обхід у глибину: файли папки, потім підпапки; порядок сортування як у браузері) іде кроками в tick(); коли X знайдено в
+// загальному порядку, черга одним кроком підміняється на «all» (звук не переривається). Поки скан іде: next / prev -> «queue_building»,
+// shuffle застосовується після скану, автоперехід по кінцю треку чекає. Не знайдено X (ліміт / глибина / помилка) — папкова черга.
 
 #include "usb/usb_queue.h"
 
@@ -21,6 +25,7 @@
 #include "audio/audio_player.h"
 #include "config/player_mode_config.h"  // [USB14]
 #include "config/usb_queue_config.h"
+#include "config/usb_queue_all_config.h"    // [USB20a-2]
 #include "config/usb_queue_scope_config.h"  // [USB20a-1]
 #include "esp_heap_caps.h"
 #include "esp_random.h"
@@ -34,6 +39,8 @@
 
 static_assert(player_mode_cfg::kResumePathMax >= usb_browser_cfg::kPathMax,
               "[USB14] resume path buffers must hold any browser path");
+static_assert(usb_queue_all_cfg::kQueueAllMax >= usb_browser_cfg::kMaxEntries,
+              "[USB20a-2] s_order is sized for the full queue; it must also hold a folder queue");
 
 namespace usb_queue {
 
@@ -75,6 +82,56 @@ std::atomic<bool> s_repeat{false};
 std::atomic<uint8_t> s_scope{static_cast<uint8_t>(usb_queue_scope_cfg::kDefaultScope)};  // [USB20a-1] опція (не область побудованої черги)
 bool s_truncated = false;  // [USB20a-1] список, з якого побудовано чергу, був обрізаний (лише usb_nav)
 
+// --- [USB20a-2] Черга «усе»: таблиці файлів і папок усієї флешки ------------------------------------------------------------
+// Усе в PSRAM; виділяється ЛІНИВО при першому play у режимі «all» (allocAll), вивільняється в onWorkerStop (freeAll). Шлях файлу не
+// зберігається цілком: файл знає свою папку (dirIdx), а папки утворюють дерево (parent) з імʼями в спільному пулі.
+struct AllFile {
+    uint32_t nameOff;  // імʼя в пулі (з '\0')
+    uint16_t dirIdx;   // індекс папки в dirs
+    uint16_t pad;
+};  // 8 Б
+struct AllDir {
+    uint32_t nameOff;
+    uint16_t parent;      // kNoNode — корінь
+    uint16_t firstChild;  // підпапки однієї папки лежать ПІДРЯД: [firstChild, firstChild + childCount)
+    uint16_t childCount;
+    uint8_t depth;        // 0 — корінь
+    uint8_t pad;
+};  // 12 Б
+struct AllCtx {
+    AllFile* files;
+    AllDir* dirs;
+    char* pool;
+    uint16_t nFiles;
+    uint16_t nDirs;
+    uint32_t poolUsed;
+    usb_nav::Listing scan;                    // буфер readDir (e / pool у PSRAM)
+    char scanPath[usb_browser_cfg::kPathMax];  // шлях папки, що читається
+    char xDir[usb_browser_cfg::kPathMax];      // папка й імʼя файлу X, з якого стартувала черга «all»
+    char xName[usb_browser_cfg::kPathMax];
+};
+constexpr uint16_t kNoNode = 0xFFFF;
+
+AllCtx* s_all = nullptr;      // лінивий (лише usb_nav)
+bool s_builtAll = false;      // черга побудована як «all»: індекси треків — у s_all->files
+bool s_building = false;      // скан іде; черга тим часом папкова
+bool s_endWait = false;       // трек закінчився, поки скан іде: автоперехід чекає кінця скану
+bool s_allTruncated = false;  // скан відкинув частину вмісту (ліміти / глибина / помилка читання / час)
+bool s_capHit = false;        // досягнуто ліміт файлів або пулу: скан зупиняється
+int32_t s_xOrdinal = -1;      // номер файлу X у таблиці «all» (-1 — ще не знайдено)
+uint16_t s_scanNode = 0;      // папка, яку читатимемо наступною
+uint32_t s_scanGen = 0;       // покоління монтування на початку скану
+uint32_t s_scanT0 = 0;
+uint32_t s_scanSteps = 0;
+uint32_t s_scanBusy = 0;
+uint16_t s_scanSkipped = 0;   // папки, які не вдалося прочитати
+uint8_t s_busyRetries = 0;
+bool s_scanHold = false;      // скан чекає, поки X заграє (або мине kScanStartGraceMs)
+uint16_t s_scanDelayMs = 0;   // ДІАГНОСТИКА: пауза після кожної прочитаної папки (usb.q scandelay <мс>); 0 — вимкнено
+uint32_t s_scanReqMs = 0;     // момент play, що почав скан
+
+void cancelBuild(const char* why);
+
 // Опублікований знімок (під usb_nav::lock).
 Status s_pub = {};
 char s_pubPath[usb_browser_cfg::kPathMax] = {0};
@@ -86,6 +143,7 @@ struct Scratch {
     char snapTrack[player_mode_cfg::kResumePathMax];  // знімок: імʼя поточного треку (під usb_nav::lock)
     char rsDir[player_mode_cfg::kResumePathMax];      // збережена папка (відновлення)
     char rsTrack[player_mode_cfg::kResumePathMax];    // збережений трек (відновлення)
+    char tmpDir[player_mode_cfg::kResumePathMax];     // [USB20a-2] папка треку черги «all» (лише usb_nav; перед копіюванням у snapDir)
 };
 Scratch* s_sc = nullptr;
 bool s_snapValid = false;                 // під usb_nav::lock
@@ -108,20 +166,66 @@ const char* s_rsOutcome = nullptr;        // підсумок останньог
 
 inline uint32_t rnd(uint32_t n) { return n == 0 ? 0 : esp_random() % n; }  // зсув ≤ n / 2^32 ≈ 2e-7 при n ≤ 1000: прийнятний
 
-bool buildPath(uint16_t t, char* out, size_t cap) {
-    if (t >= s_list.count) {
+// [USB20a-2] Єдиний доступ до черги: папкова (s_list) або «all» (s_all). Індекс t завжди < qCount().
+inline uint16_t qCount() { return s_builtAll ? (s_all != nullptr ? s_all->nFiles : 0) : s_list.count; }
+inline const char* qName(uint16_t t) {
+    return s_builtAll ? s_all->pool + s_all->files[t].nameOff : usb_nav::nameAt(s_list, t);
+}
+
+// Шлях папки таблиці «all»: "/" або "/a/b" (без '/' наприкінці; той самий формат, що Listing::cwd).
+bool allDirPath(uint16_t idx, char* out, size_t cap) {
+    const AllCtx* a = s_all;
+    if (a == nullptr || idx >= a->nDirs || cap < 2) {
         return false;
     }
-    const char* dir = s_list.cwd;
-    const bool root = (dir[0] == '/' && dir[1] == '\0');
-    const int n = snprintf(out, cap, "%s%s%s", dir, root ? "" : "/", usb_nav::nameAt(s_list, t));
-    return n > 0 && static_cast<size_t>(n) < cap;
+    uint16_t chain[usb_browser_cfg::kMaxDepth + 1];
+    size_t n = 0;
+    for (uint16_t cur = idx; cur != 0; cur = a->dirs[cur].parent) {
+        if (n >= sizeof(chain) / sizeof(chain[0])) {
+            return false;
+        }
+        chain[n++] = cur;
+    }
+    if (n == 0) {
+        out[0] = '/';
+        out[1] = '\0';
+        return true;
+    }
+    size_t off = 0;
+    for (size_t i = n; i > 0; --i) {
+        const int w = snprintf(out + off, cap - off, "/%s", a->pool + a->dirs[chain[i - 1]].nameOff);
+        if (w <= 0 || static_cast<size_t>(w) >= cap - off) {
+            return false;
+        }
+        off += static_cast<size_t>(w);
+    }
+    return true;
+}
+
+bool buildPath(uint16_t t, char* out, size_t cap) {
+    if (t >= qCount()) {
+        return false;
+    }
+    if (!s_builtAll) {
+        const char* dir = s_list.cwd;
+        const bool root = (dir[0] == '/' && dir[1] == '\0');
+        const int n = snprintf(out, cap, "%s%s%s", dir, root ? "" : "/", usb_nav::nameAt(s_list, t));
+        return n > 0 && static_cast<size_t>(n) < cap;
+    }
+    const AllFile& f = s_all->files[t];
+    if (!allDirPath(f.dirIdx, out, cap)) {
+        return false;
+    }
+    const size_t len = strlen(out);
+    const bool root = (len == 1);
+    const int n = snprintf(out + len, cap - len, "%s%s", root ? "" : "/", s_all->pool + f.nameOff);
+    return n > 0 && static_cast<size_t>(n) < cap - len;
 }
 
 void publish() {
     Status st = {};
     st.state = (s_phase == Phase::Inactive) ? State::Idle : (s_phase == Phase::Starting ? State::Starting : State::Playing);
-    st.count = s_haveList ? s_list.count : 0;
+    st.count = s_haveList ? qCount() : 0;  // [USB20a-2]
     st.index = (s_phase == Phase::Inactive) ? -1 : s_cur;
     st.position = (s_phase == Phase::Inactive) ? -1 : s_pos;
     // [USB18a] pos: де поточний трек у ПОТОЧНОМУ порядку проходу. s_pos не оновлюється на шляхах історії (prev / next-назад у
@@ -140,10 +244,10 @@ void publish() {
     st.reason = s_reason;
     st.paused = false;
     st.prepared = false;
-    st.builtScope = s_haveList ? 1 : 0;  // [USB20a-1] 0 — нема, 1 — folder (черга зараз завжди з однієї папки), 2 — all (USB20a-2)
+    st.builtScope = s_haveList ? (s_builtAll ? 2 : 1) : 0;  // [USB20a-2] 0 — нема, 1 — folder, 2 — all
     st.truncated = s_haveList && s_truncated;
-    st.building = false;
-    s_prepared.store(s_phase == Phase::Inactive && s_haveList && s_list.count > 0 && s_cur >= 0);
+    st.building = s_building;  // [USB20a-2]
+    s_prepared.store(s_phase == Phase::Inactive && s_haveList && qCount() > 0 && s_cur >= 0);
     char path[usb_browser_cfg::kPathMax];
     path[0] = '\0';
     if (s_phase != Phase::Inactive && s_cur >= 0) {
@@ -191,7 +295,7 @@ void logOrder(const char* why) {
 
 // Будує порядок проходу. first >= 0 — цей трек ставиться першим (поточний); first < 0 — новий прохід (перший ≠ lastPlayed).
 void buildOrder(int32_t first, const char* why) {
-    const uint16_t n = s_list.count;
+    const uint16_t n = qCount();  // [USB20a-2]
     s_orderLen = n;
     for (uint16_t i = 0; i < n; ++i) {
         s_order[i] = i;
@@ -238,11 +342,17 @@ bool mounted() { return usb_msc_mount::isMounted(); }
 // [USB14] Знімок «поточний трек + позиція» (RAM; публікується під usb_nav::lock для commitResume() з інших задач). Шляхи
 // беруться з s_list (папка черги, а не поточна папка браузера).
 void setSnapshotTrack(uint16_t t, uint32_t pos) {
-    if (s_sc == nullptr || t >= s_list.count) {
+    if (s_sc == nullptr || t >= qCount()) {
         return;
     }
-    const char* name = usb_nav::nameAt(s_list, t);
+    const char* name = qName(t);
     const char* dir = s_list.cwd;
+    if (s_builtAll) {  // [USB20a-2] папка треку черги «all» — з дерева папок
+        if (!allDirPath(s_all->files[t].dirIdx, s_sc->tmpDir, sizeof(s_sc->tmpDir))) {
+            return;
+        }
+        dir = s_sc->tmpDir;
+    }
     if (strlen(name) >= player_mode_cfg::kResumePathMax || strlen(dir) >= player_mode_cfg::kResumePathMax) {
         return;
     }
@@ -276,6 +386,7 @@ void refreshSnapshotPos() {
 }
 
 void stopQueue(const char* reason, bool stopPlayer) {
+    cancelBuild("queue_stopped");  // [USB20a-2] скан «all» не продовжується без черги
     if (stopPlayer && AudioPlayer::fileActive()) {
         AudioPlayer::stop();
     }
@@ -335,7 +446,7 @@ bool startTrack(uint16_t t, const char** why, int32_t startSec = -1) {
 
 // Вибір наступного треку за правилами. pushCur — запамʼятати поточний у історії (перемішування). false — кінець черги.
 bool pickNext(bool pushCur, uint16_t* t) {
-    const uint16_t n = s_list.count;
+    const uint16_t n = qCount();  // [USB20a-2]
     if (n == 0) {
         return false;
     }
@@ -367,7 +478,7 @@ bool pickNext(bool pushCur, uint16_t* t) {
 }
 
 bool pickPrev(uint16_t* t) {
-    const uint16_t n = s_list.count;
+    const uint16_t n = qCount();  // [USB20a-2]
     if (n == 0) {
         return false;
     }
@@ -393,6 +504,7 @@ bool pickPrev(uint16_t* t) {
 
 // Пропуск треку, що не відкрився / збій читання: переходимо далі, не більше kMaxConsecutiveSkips поспіль.
 void failAndSkip(const char* why) {
+    cancelBuild("track_failed");  // [USB20a-2] поточний трек змінюється: скан «all» (орієнтований на X) більше не має сенсу
     for (;;) {
         if (!mounted()) {
             stopQueue("media_removed", true);
@@ -451,6 +563,293 @@ void onEnded() {
     }
 }
 
+// --- [USB20a-2] Черга «усе»: рекурсивний скан у фоні ----------------------------------------------------------------------------
+// Скан іде кроками в tick(): за такт — не довше kScanSliceMs (плюс дочитування поточної папки), КОЖЕН крок = читання ОДНІЄЇ папки
+// наявним readDir (ті самі фільтри / службові імена / сортування, що в браузері). Між тактами usb_nav обробляє нові команди й перевіряє
+// носій, тож скан переривається вийманням носія, виходом із режиму, новим play, stop. Обхід у глибину: файли папки, потім підпапки.
+bool allocAll() {
+    if (s_all != nullptr) {
+        return true;
+    }
+    AllCtx* a = static_cast<AllCtx*>(heap_caps_malloc(sizeof(AllCtx), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (a == nullptr) {
+        return false;
+    }
+    memset(a, 0, sizeof(AllCtx));
+    a->files = static_cast<AllFile*>(
+        heap_caps_malloc(sizeof(AllFile) * usb_queue_all_cfg::kQueueAllMax, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    a->dirs = static_cast<AllDir*>(
+        heap_caps_malloc(sizeof(AllDir) * usb_queue_all_cfg::kQueueAllDirMax, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    a->pool = static_cast<char*>(heap_caps_malloc(usb_queue_all_cfg::kQueueAllPoolBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (a->files == nullptr || a->dirs == nullptr || a->pool == nullptr || !usb_nav::allocListing(a->scan)) {
+        usb_nav::freeListing(a->scan);
+        heap_caps_free(a->files);
+        heap_caps_free(a->dirs);
+        heap_caps_free(a->pool);
+        heap_caps_free(a);
+        return false;
+    }
+    s_all = a;
+    return true;
+}
+
+void freeAll() {
+    AllCtx* a = s_all;
+    if (a == nullptr) {
+        return;
+    }
+    s_all = nullptr;
+    s_builtAll = false;
+    usb_nav::freeListing(a->scan);
+    heap_caps_free(a->files);
+    heap_caps_free(a->dirs);
+    heap_caps_free(a->pool);
+    heap_caps_free(a);
+}
+
+void resetAll() {
+    AllCtx* a = s_all;
+    a->nFiles = 0;
+    a->nDirs = 1;  // корінь
+    a->poolUsed = 1;
+    a->pool[0] = '\0';  // імʼя кореня — порожнє
+    a->dirs[0] = AllDir{0, kNoNode, 0, 0, 0, 0};
+}
+
+// Наступна папка за обходом у глибину (підпапки лежать підряд): перша підпапка, інакше наступна «сестра» найближчого предка.
+uint16_t nextNode(uint16_t node) {
+    const AllCtx* a = s_all;
+    if (a->dirs[node].childCount > 0) {
+        return a->dirs[node].firstChild;
+    }
+    uint16_t n = node;
+    while (n != 0) {
+        const uint16_t p = a->dirs[n].parent;
+        if (static_cast<uint32_t>(n) + 1 < static_cast<uint32_t>(a->dirs[p].firstChild) + a->dirs[p].childCount) {
+            return static_cast<uint16_t>(n + 1);
+        }
+        n = p;
+    }
+    return kNoNode;
+}
+
+// Переносить щойно прочитану папку (a->scan) у таблиці: спершу її файли (у порядку списку браузера), потім створює записи підпапок.
+void absorb(uint16_t node, bool isXDir) {
+    AllCtx* a = s_all;
+    const usb_nav::Listing& L = a->scan;
+    for (uint16_t i = L.dirs; i < L.count; ++i) {
+        const char* nm = usb_nav::nameAt(L, i);
+        const uint32_t n = L.e[i].nameLen;
+        if (a->nFiles >= usb_queue_all_cfg::kQueueAllMax || a->poolUsed + n + 1 > usb_queue_all_cfg::kQueueAllPoolBytes) {
+            s_allTruncated = true;
+            s_capHit = true;
+            return;
+        }
+        if (isXDir && s_xOrdinal < 0 && strcmp(nm, a->xName) == 0) {
+            s_xOrdinal = static_cast<int32_t>(a->nFiles);
+        }
+        AllFile& f = a->files[a->nFiles++];
+        f.nameOff = a->poolUsed;
+        f.dirIdx = node;
+        f.pad = 0;
+        memcpy(a->pool + a->poolUsed, nm, n + 1);
+        a->poolUsed += n + 1;
+    }
+    if (L.dirs > 0) {
+        if (a->dirs[node].depth >= usb_browser_cfg::kMaxDepth) {
+            s_allTruncated = true;  // глибше за браузер (too_deep) не заходимо
+        } else {
+            const uint16_t first = a->nDirs;
+            for (uint16_t i = 0; i < L.dirs; ++i) {
+                const char* nm = usb_nav::nameAt(L, i);
+                const uint32_t n = L.e[i].nameLen;
+                if (a->nDirs >= usb_queue_all_cfg::kQueueAllDirMax || a->poolUsed + n + 1 > usb_queue_all_cfg::kQueueAllPoolBytes) {
+                    s_allTruncated = true;
+                    break;
+                }
+                AllDir& d = a->dirs[a->nDirs++];
+                d.nameOff = a->poolUsed;
+                d.parent = node;
+                d.firstChild = 0;
+                d.childCount = 0;
+                d.depth = static_cast<uint8_t>(a->dirs[node].depth + 1);
+                d.pad = 0;
+                memcpy(a->pool + a->poolUsed, nm, n + 1);
+                a->poolUsed += n + 1;
+            }
+            a->dirs[node].firstChild = first;
+            a->dirs[node].childCount = static_cast<uint16_t>(a->nDirs - first);
+        }
+    }
+    if (L.truncated) {
+        s_allTruncated = true;  // папка має > kMaxEntries записів / не вмістилась у пул браузера
+    }
+}
+
+enum class Step : uint8_t { More, Retry, Done };
+
+Step scanStepOne() {
+    AllCtx* a = s_all;
+    const uint16_t node = s_scanNode;
+    if (!allDirPath(node, a->scanPath, sizeof(a->scanPath))) {
+        s_allTruncated = true;
+        ++s_scanSkipped;
+    } else {
+        const usb_nav::ReadResult r = usb_nav::readDir(a->scanPath, a->dirs[node].depth, a->scan);
+        ++s_scanSteps;
+        if (r == usb_nav::ReadResult::VolumeBusy) {  // том зайнятий декодером довше kGenLockWaitMs: повторимо наступного такту
+            ++s_scanBusy;
+            if (++s_busyRetries <= usb_queue_all_cfg::kScanBusyRetryMax) {
+                return Step::Retry;
+            }
+            s_allTruncated = true;
+            ++s_scanSkipped;
+            Serial.printf("%s all: dir '%s' skipped (volume busy)\n", kTag, a->scanPath);
+        } else if (r == usb_nav::ReadResult::NotMounted || r == usb_nav::ReadResult::MediaChanged ||
+                   r == usb_nav::ReadResult::ModeGone) {
+            cancelBuild(usb_nav::readResultName(r));
+            publish();
+            return Step::Retry;
+        } else if (r != usb_nav::ReadResult::Ok) {
+            s_allTruncated = true;
+            ++s_scanSkipped;
+            Serial.printf("%s all: dir '%s' skipped (%s)\n", kTag, a->scanPath, usb_nav::readResultName(r));
+        } else {
+            absorb(node, strcmp(a->scanPath, a->xDir) == 0);
+        }
+    }
+    s_busyRetries = 0;
+    if (s_scanDelayMs != 0) {  // ДІАГНОСТИКА: розтягує скан, щоб встигнути перервати його (вийняття носія, вихід із режиму)
+        vTaskDelay(pdMS_TO_TICKS(s_scanDelayMs));
+    }
+    if (s_capHit) {
+        return Step::Done;
+    }
+    s_scanNode = nextNode(node);
+    return s_scanNode == kNoNode ? Step::Done : Step::More;
+}
+
+void cancelBuild(const char* why) {
+    if (!s_building) {
+        return;
+    }
+    s_building = false;
+    s_endWait = false;
+    Serial.printf("%s all: scan cancelled (%s) after %u ms - the queue stays per folder\n", kTag, why,
+                  static_cast<unsigned>(millis() - s_scanT0));
+}
+
+// Скан завершено (вся флешка, ліміт або час). X знайдено — черга підміняється на «all»; ні — лишається папкова.
+void finishScan() {
+    const AllCtx* a = s_all;
+    const uint32_t ms = millis() - s_scanT0;
+    s_building = false;
+    const bool found = s_xOrdinal >= 0;
+    if (found) {
+        s_builtAll = true;
+        s_cur = s_xOrdinal;
+        clearHistory();
+        s_appliedShuffle = s_shuffle.load();
+        buildOrder(s_xOrdinal, "all");
+        s_truncated = s_allTruncated;
+    } else {
+        s_truncated = s_truncated || s_allTruncated;
+    }
+    Serial.printf("%s all: scan done in %u ms: %u files in %u dirs (steps=%u busy=%u skipped_dirs=%u truncated=%d pool=%u/%u B); "
+                  "X %s (ordinal %d) -> queue scope=%s count=%u; psram_free=%u\n",
+                  kTag, static_cast<unsigned>(ms), static_cast<unsigned>(a->nFiles), static_cast<unsigned>(a->nDirs),
+                  static_cast<unsigned>(s_scanSteps), static_cast<unsigned>(s_scanBusy), static_cast<unsigned>(s_scanSkipped),
+                  s_allTruncated ? 1 : 0, static_cast<unsigned>(a->poolUsed),
+                  static_cast<unsigned>(usb_queue_all_cfg::kQueueAllPoolBytes), found ? "found" : "NOT found",
+                  static_cast<int>(s_xOrdinal), found ? "all" : "folder", static_cast<unsigned>(qCount()),
+                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+    publish();
+    if (s_endWait) {
+        s_endWait = false;
+        Serial.printf("%s all: the auto-advance that waited for the scan continues now\n", kTag);
+        onEnded();
+    }
+}
+
+// Один такт скану (з tick()).
+void scanTick() {
+    if (!s_building) {
+        return;
+    }
+    const uint32_t gen = usb_nav::generation();
+    if (!usb_nav::modeOk() || !mounted() || (gen != usb_nav::kGenUnknown && gen != s_scanGen)) {
+        cancelBuild("mode_or_media");
+        publish();
+        return;
+    }
+    if (s_scanHold) {  // не читаємо флешку, поки X відкривається: інакше його старт повільніший на ≈ 0,5 с
+        if (s_phase != Phase::Running && static_cast<uint32_t>(millis() - s_scanReqMs) < usb_queue_all_cfg::kScanStartGraceMs) {
+            return;
+        }
+        s_scanHold = false;
+        s_scanT0 = millis();  // «scan done in N ms» міряє сам скан
+    }
+    const uint32_t t0 = millis();
+    do {
+        if (static_cast<uint32_t>(t0 - s_scanT0) >= usb_queue_all_cfg::kScanMaxMs) {
+            s_allTruncated = true;
+            Serial.printf("%s all: scan time cap reached (%u ms)\n", kTag, static_cast<unsigned>(usb_queue_all_cfg::kScanMaxMs));
+            finishScan();
+            return;
+        }
+        const Step st = scanStepOne();
+        if (!s_building) {
+            return;
+        }
+        if (st == Step::Done) {
+            finishScan();
+            return;
+        }
+        if (st == Step::Retry) {
+            return;
+        }
+    } while (static_cast<uint32_t>(millis() - t0) < usb_queue_all_cfg::kScanSliceMs);
+}
+
+// Початок скану з play файлу index (індекс запису в живому списку браузера lv). false — «all» недоступна (черга лишається папковою).
+bool beginScan(const usb_nav::Listing& lv, uint16_t index) {
+    if (!allocAll()) {
+        Serial.printf("%s all: unavailable (no PSRAM for the full-queue tables) - the queue stays per folder\n", kTag);
+        return false;
+    }
+    uint32_t gen = usb_nav::generation();
+    if (gen == usb_nav::kGenUnknown) {
+        gen = usb_nav::generation();
+    }
+    if (gen == 0 || gen == usb_nav::kGenUnknown) {
+        Serial.printf("%s all: unavailable (volume not readable now) - the queue stays per folder\n", kTag);
+        return false;
+    }
+    resetAll();
+    strncpy(s_all->xDir, lv.cwd, sizeof(s_all->xDir) - 1);
+    s_all->xDir[sizeof(s_all->xDir) - 1] = '\0';
+    strncpy(s_all->xName, usb_nav::nameAt(lv, index), sizeof(s_all->xName) - 1);
+    s_all->xName[sizeof(s_all->xName) - 1] = '\0';
+    s_xOrdinal = -1;
+    s_allTruncated = false;
+    s_capHit = false;
+    s_scanNode = 0;
+    s_busyRetries = 0;
+    s_scanSteps = 0;
+    s_scanBusy = 0;
+    s_scanSkipped = 0;
+    s_scanGen = gen;
+    s_scanReqMs = millis();
+    s_scanT0 = s_scanReqMs;
+    s_scanHold = true;
+    s_endWait = false;
+    s_building = true;
+    Serial.printf("%s all: scan armed (X='%s' in '%s'; starts when the track plays; limits: %u files, %u dirs, depth %u, %u ms)\n", kTag, s_all->xName, s_all->xDir,
+                  static_cast<unsigned>(usb_queue_all_cfg::kQueueAllMax), static_cast<unsigned>(usb_queue_all_cfg::kQueueAllDirMax),
+                  static_cast<unsigned>(usb_browser_cfg::kMaxDepth), static_cast<unsigned>(usb_queue_all_cfg::kScanMaxMs));
+    return true;
+}
+
 // --- [USB14] Відновлення при вході в режим (автомат у задачі usb_nav; див. usb_queue.h: requestResume) ------------------------
 void rsEnd(const char* outcome) {
     s_rs = Rs::Idle;
@@ -468,6 +867,8 @@ void rsPrepare(uint16_t ordinal, uint32_t pos) {
     s_skipBack = false;
     s_haveList = true;
     s_truncated = lv.truncated;  // [USB20a-1]
+    cancelBuild("resume prepare");  // [USB20a-2] відновлення будує ПАПКОВУ чергу (scope діє на наступний play)
+    s_builtAll = false;
     s_appliedShuffle = s_shuffle.load();
     clearHistory();
     s_skips = 0;
@@ -611,7 +1012,7 @@ void resumeTick(uint32_t now) {
 
 // OK на підготовленій черзі: запустити підготовлений трек (зі збереженої позиції після відновлення, інакше з початку).
 void startPrepared() {
-    if (s_phase != Phase::Inactive || !s_haveList || s_cur < 0 || s_list.count == 0) {
+    if (s_phase != Phase::Inactive || !s_haveList || s_cur < 0 || qCount() == 0) {
         Serial.printf("%s start: nothing prepared\n", kTag);
         return;
     }
@@ -630,7 +1031,7 @@ void startPrepared() {
 }
 
 void rebuildForShuffle() {
-    if (!s_haveList || s_list.count == 0 || s_order == nullptr) {
+    if (!s_haveList || qCount() == 0 || s_order == nullptr) {
         return;
     }
     clearHistory();
@@ -659,12 +1060,15 @@ bool onWorkerStart() {
     s_orderLen = 0;
     s_skips = 0;
     s_started = 0;
+    s_builtAll = false;  // [USB20a-2]
+    s_building = false;
+    s_endWait = false;
     clearHistory();
     if (!allocListing(s_list)) {
         return false;
     }
     s_order = static_cast<uint16_t*>(
-        heap_caps_malloc(sizeof(uint16_t) * usb_browser_cfg::kMaxEntries, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        heap_caps_malloc(sizeof(uint16_t) * usb_queue_all_cfg::kQueueAllMax, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));  // [USB20a-2]
     if (s_order == nullptr) {
         freeListing(s_list);
         return false;
@@ -691,6 +1095,7 @@ bool onWorkerStart() {
 
 void onWorkerStop() {
     using namespace usb_queue;
+    cancelBuild("mode_exit");  // [USB20a-2]
     if (s_phase != Phase::Inactive) {
         // Вихід із режиму: файл зупиняє usb_mode (runExit); тут лише знімаємо стан черги.
         s_phase = Phase::Inactive;
@@ -717,12 +1122,15 @@ void onWorkerStop() {
         s_sc = nullptr;
     }
     usb_nav::unlock();
+    freeAll();  // [USB20a-2]
     freeListing(s_list);
     Serial.printf("%s worker stack min free=%u B\n", kTag, static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 }
 
 void onMediaGone() {
     using namespace usb_queue;
+    cancelBuild("media_gone");  // [USB20a-2]
+    s_builtAll = false;
     if (s_phase != Phase::Inactive) {
         stopQueue("media_removed", true);
     }
@@ -770,6 +1178,9 @@ void handle(const Cmd& c) {
             s_skipBack = false;
             s_haveList = true;
             s_truncated = lv.truncated;  // [USB20a-1]
+            cancelBuild("new play");  // [USB20a-2] нова черга замінює стару (і скан, що ще йшов)
+            s_builtAll = false;
+            s_endWait = false;
             s_appliedShuffle = s_shuffle.load();
             clearHistory();
             s_skips = 0;
@@ -789,10 +1200,17 @@ void handle(const Cmd& c) {
             }
             Serial.printf("%s play: queue = %u files of '%s', shuffle=%d repeat=%d\n", kTag, static_cast<unsigned>(s_list.count),
                           s_list.cwd, s_shuffle.load() ? 1 : 0, s_repeat.load() ? 1 : 0);
+            if (scope() == usb_queue_scope_cfg::Scope::All && beginScan(lv, c.index)) {  // [USB20a-2] скан у фоні; X уже грає
+                publish();                                                               // building = true
+            }
             finish(c.reqId, true, nullptr);
             break;
         }
         case CmdType::QNext: {
+            if (s_building) {  // [USB20a-2]
+                finish(c.reqId, false, usb_queue_scope_cfg::kWhyQueueBuilding);
+                break;
+            }
             if (s_phase == Phase::Inactive || !s_haveList) {
                 finish(c.reqId, false, "queue_idle");
                 break;
@@ -815,6 +1233,10 @@ void handle(const Cmd& c) {
             break;
         }
         case CmdType::QPrev: {
+            if (s_building) {  // [USB20a-2]
+                finish(c.reqId, false, usb_queue_scope_cfg::kWhyQueueBuilding);
+                break;
+            }
             if (s_phase == Phase::Inactive || !s_haveList) {
                 finish(c.reqId, false, "queue_idle");
                 break;
@@ -852,7 +1274,7 @@ void handle(const Cmd& c) {
 void tick() {
     using namespace usb_queue;
     const bool shuf = s_shuffle.load();
-    if (shuf != s_appliedShuffle) {
+    if (shuf != s_appliedShuffle && !s_building) {  // [USB20a-2] під час скану shuffle застосується після нього (finishScan)
         s_appliedShuffle = shuf;
         rebuildForShuffle();
     }
@@ -860,6 +1282,7 @@ void tick() {
     if (s_startReq.exchange(false)) {
         startPrepared();
     }
+    scanTick();  // [USB20a-2]
     if (s_phase == Phase::Inactive) {
         return;
     }
@@ -873,12 +1296,20 @@ void tick() {
                       static_cast<unsigned>(flag != 0 ? now - flag : 0), static_cast<int>(s_pos + 1),
                       static_cast<unsigned>(s_orderLen), static_cast<int>(s_cur));
         s_tFlag = flag;
+        if (s_building) {  // [USB20a-2] черга ще добудовується: автоперехід чекає кінця скану (finishScan)
+            s_endWait = true;
+            Serial.printf("%s all: track ended while the queue is still building - waiting for the scan\n", kTag);
+            return;
+        }
         // Бібліотека «дограє» і сміттєвий файл без помилки: eof при позиції 0 і тривалості 0 = аудіо не було (файл < 1 с теж).
         if (AudioPlayer::fileDurationSec() == 0 && AudioPlayer::filePositionSec() == 0) {
             failAndSkip("no_audio");
             return;
         }
         onEnded();
+        return;
+    }
+    if (s_endWait) {  // [USB20a-2] чекаємо кінця скану; «зовнішню зупинку» (Idle) не фіксуємо
         return;
     }
 
@@ -1192,6 +1623,14 @@ void printStat() {
     Serial.printf("%s stat: scope option=%s saved=%s built=%s truncated=%d building=%d\n", kTag,  // [USB20a-1]
                   usb_queue_scope_cfg::name(scope()), usb_queue_scope_cfg::name(SettingsStore::getPlayerScope()),
                   q.builtScope == 0 ? "-" : (q.builtScope == 1 ? "folder" : "all"), q.truncated ? 1 : 0, q.building ? 1 : 0);
+    Serial.printf("%s stat: all: tables=%s builtAll=%d building=%d endWait=%d xOrdinal=%d files=%u dirs=%u pool=%u/%u B steps=%u busy=%u "
+                  "skipped_dirs=%u truncated=%d\n",  // [USB20a-2]
+                  kTag, s_all != nullptr ? "allocated" : "-", s_builtAll ? 1 : 0, s_building ? 1 : 0, s_endWait ? 1 : 0,
+                  static_cast<int>(s_xOrdinal), s_all != nullptr ? static_cast<unsigned>(s_all->nFiles) : 0u,
+                  s_all != nullptr ? static_cast<unsigned>(s_all->nDirs) : 0u,
+                  s_all != nullptr ? static_cast<unsigned>(s_all->poolUsed) : 0u,
+                  static_cast<unsigned>(usb_queue_all_cfg::kQueueAllPoolBytes), static_cast<unsigned>(s_scanSteps),
+                  static_cast<unsigned>(s_scanBusy), static_cast<unsigned>(s_scanSkipped), s_allTruncated ? 1 : 0);
     Serial.printf("%s stat: heap internal free=%u largest=%u min_free=%u psram_free=%u\n", kTag,
                   static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
                   static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
@@ -1266,8 +1705,20 @@ void handleConsoleLine(const char* line) {
         }
         Serial.printf("%s scope option=%s saved=%s (applies to the NEXT play)\n", kTag, usb_queue_scope_cfg::name(scope()),
                       usb_queue_scope_cfg::name(SettingsStore::getPlayerScope()));
+    } else if (word(rest, "scandelay", &arg)) {  // [USB20a-2] діагностика: usb.q scandelay <мс> (0 — вимкнути)
+        if (arg[0] != '\0') {
+            long v = atol(arg);
+            if (v < 0) {
+                v = 0;
+            }
+            if (v > 2000) {
+                v = 2000;
+            }
+            s_scanDelayMs = static_cast<uint16_t>(v);
+        }
+        Serial.printf("%s scan delay per folder = %u ms (0 = off)\n", kTag, static_cast<unsigned>(s_scanDelayMs));
     } else {
-        Serial.printf("%s usage: usb.q play <index> | next | prev | stop | stat | shuffle on|off | repeat on|off | scope [folder|all]\n", kTag);
+        Serial.printf("%s usage: usb.q play <index> | next | prev | stop | stat | shuffle on|off | repeat on|off | scope [folder|all] | scandelay <ms>\n", kTag);
     }
 }
 #endif  // USB_HOST_DIAG

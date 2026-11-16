@@ -326,6 +326,79 @@ def usb20a1_shape_checks(st, label="usb20a1"):
            "truncated=%r building=%r" % (q.get("truncated"), q.get("building")))
 
 
+def usb20a2_set_scope(d, scope):
+    """[USB20a-2b] Ставить options.scope (режим USB активний), повертає попереднє значення. Перевірки usb18a очікують ПАПКОВУ
+    чергу: зі scope=all `next` одразу після `play` дає 409 queue_building (триває добудова) - це контракт, а не збій."""
+    b = usb_status_body(d)
+    o = b.get("options") if isinstance(b, dict) else None
+    old = o.get("scope") if isinstance(o, dict) else None
+    if old in ("folder", "all") and old != scope:
+        d.post("/api/usb/options", {"scope": scope})
+    return old
+
+
+def usb20a2_all_checks(d):
+    """[USB20a-2] scope=all: play першого файлу кореня -> черга добудовується й стає «all» (count >= файлів кореня, pos == 1);
+    next під час добудови -> 409 queue_building (лише якщо добудову встигли побачити); scope повертається до folder."""
+    b0 = usb_status_body(d)
+    o = b0.get("options") if isinstance(b0, dict) else None
+    old = o.get("scope") if isinstance(o, dict) else None
+    status, lst = d.get("/api/usb/list?limit=100")
+    items = lst.get("items") if status == 200 and isinstance(lst, dict) else None
+    first = next((it for it in (items or []) if not it.get("dir")), None)
+    if old not in ("folder", "all") or first is None or lst.get("cwd") != "/":
+        record("usb20a2: scope=all", False, "потрібен змонтований носій із файлами в корені (cwd=/)", skip=True)
+        return
+    root_files = lst.get("count", 0) - lst.get("dirs", 0)
+    try:
+        expect("usb20a2: POST /api/usb/options {scope:all} -> 200", d.post("/api/usb/options", {"scope": "all"}), 200,
+               ["ok", "scope"])
+        pst, pbody = d.post("/api/usb/play", {"index": first["i"], "version": lst["version"]})
+        record("usb20a2: play у режимі all прийнято", pst in (200, 202), "HTTP %s %r" % (pst, pbody))
+        saw_building = False
+        final = None
+        t0 = time.time()
+        while time.time() - t0 < 70:
+            b = usb_status_body(d)
+            q = b.get("queue") if isinstance(b, dict) else None
+            if isinstance(q, dict):
+                if q.get("building"):
+                    if not saw_building:
+                        saw_building = True
+                        st2, bd = d.post("/api/usb/control", {"action": "next"})
+                        record("usb20a2: next під час добудови -> 409 queue_building",
+                               st2 == 409 and isinstance(bd, dict) and bd.get("error") == "queue_building",
+                               "HTTP %s %r" % (st2, bd))
+                elif q.get("scope") == "all" or time.time() - t0 > 8:  # [USB20a-2c] play ще міг не дійти до воркера: старий статус
+                    final = b
+                    break
+            time.sleep(0.2)
+        record("usb20a2: добудова завершилась (<= 70 с)", final is not None, "queue.building лишився true")
+        if not saw_building:
+            record("usb20a2: next під час добудови -> 409 queue_building", False,
+                   "добудова закінчилась швидше за опитування (див. hwcheck_USB20a2.md)", skip=True)
+        if final is not None:
+            q = final["queue"]
+            record("usb20a2: queue.scope == all після добудови", q.get("scope") == "all",
+                   "scope=%r truncated=%r count=%r" % (q.get("scope"), q.get("truncated"), q.get("count")))
+            record("usb20a2: queue.count >= файлів кореня (%d)" % root_files, q.get("count", 0) >= root_files,
+                   "count=%r" % q.get("count"))
+            record("usb20a2: queue.count > файлів кореня (є файли в підпапках)", q.get("count", 0) > root_files,
+                   "count=%r root=%d" % (q.get("count"), root_files), skip=q.get("count", 0) <= root_files)
+            record("usb20a2: queue.truncated — bool", isinstance(q.get("truncated"), bool), "truncated=%r" % q.get("truncated"))
+            record("usb20a2: pos == 1 (X = перший файл кореня = перший у загальному порядку)", q.get("pos") == 1,
+                   "pos=%r index=%r" % (q.get("pos"), q.get("index")))
+            np = final.get("nowPlaying") or {}
+            record("usb20a2: nowPlaying.path == /%s" % first["name"], np.get("path") == "/" + first["name"],
+                   "path=%r" % np.get("path"))
+            expect("usb20a2: next після добудови -> 202", d.post("/api/usb/control", {"action": "next"}), 202, ["reqId"])
+    finally:
+        d.post("/api/usb/options", {"scope": old})
+        bk = usb_status_body(d)
+        ok_ = bk.get("options") if isinstance(bk, dict) else None
+        record("usb20a2: scope повернуто до %s" % old, isinstance(ok_, dict) and ok_.get("scope") == old, "options=%r" % (ok_,))
+
+
 def usb20a1_scope_roundtrip(d):
     """[USB20a-1] (режим USB активний) options.scope: змінити -> перевірити status -> повторити (без змін) -> повернути."""
     b = usb_status_body(d)
@@ -1019,8 +1092,11 @@ def _usb_input_checks_body(d, st, inp):
             expect("POST /api/volume повернути %d («Player»)" % v0, d.post("/api/volume", {"value": v0}), 200, ["state"])
             back = wait_until(lambda: status_where(d, lambda s: s.get("volume") == v0), 6)
             record("volume «Player» відновлено (%d)" % v0, bool(back))
+        scope_before = usb20a2_set_scope(d, "folder")  # [USB20a-2b] usb18a очікує папкову чергу
         usb18a_track_checks(d)  # [USB18a] чутне відтворення: path / теги / next / seek за кінець
         usb20a1_scope_roundtrip(d)  # [USB20a-1]
+        usb20a2_all_checks(d)  # [USB20a-2]
+        usb20a2_set_scope(d, scope_before)  # [USB20a-2b] повернути scope, що був до прогону
     except Exception as exc:  # noqa: BLE001
         record("режим «USB» через вхід 3: неочікуваний виняток", False, repr(exc))
     finally:
