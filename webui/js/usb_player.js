@@ -83,6 +83,8 @@
   /* result.why — не ApiError, тому текст беремо з REASONS напряму. */
   const whyText = (why) => REASONS[why] || (why ? 'Помилка: ' + why : 'Команда не виконана.');
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  /* USB20b: 409 queue_building (черга «Усі файли» ще збирається) — не помилка, без toast. */
+  const quietBuild = (e) => e instanceof ApiError && e.code === 'queue_building';
 
   /* Чекає результат команди з reqId. alive() — чи ще потрібен результат (за замовчуванням завжди). */
   async function waitReqFor(id, alive) {
@@ -151,8 +153,10 @@
       shuffle: el('button', { type: 'button', class: 'btn usb-opt', 'aria-pressed': 'false' }, 'Випадково'),
       repeat: el('button', { type: 'button', class: 'btn usb-opt', 'aria-pressed': 'false' }, 'Повтор'),
       stop: el('button', { type: 'button', class: 'btn usb-opt' }, 'Стоп'),
+      trunc: el('span', { class: 'usb-trunc', hidden: true, title: 'Не всі файли потрапили в чергу' }, 'Черга обрізана (ліміт)'),
+      build: el('p', { class: 'hint usb-build', role: 'status', hidden: true }, 'Збираю чергу…'),
     };
-    ui.meta = el('div', { class: 'usb-meta', hidden: true }, ui.sub, ui.count);
+    ui.meta = el('div', { class: 'usb-meta', hidden: true }, ui.sub, ui.trunc, ui.count);
     ui.card = el('div', { class: 'usb-card', role: 'group' }, ui.title, ui.meta);
     setIcon(ui.shuffle, 'shuffle');
     setIcon(ui.repeat, 'repeat');
@@ -165,7 +169,8 @@
       ui.card,
       el('div', { class: 'usb-prog' }, ui.tCur, ui.seek, ui.tDur),
       el('div', { class: 'transport usb-transport' }, ui.prev, ui.play, ui.next),
-      el('div', { class: 'usb-opts' }, ui.shuffle, ui.repeat, ui.stop));
+      el('div', { class: 'usb-opts' }, ui.shuffle, ui.repeat, ui.stop),
+      ui.build);
 
     /* ---- Стан ---- */
     let s = null;                  // останній GET /api/usb/status
@@ -188,6 +193,7 @@
 
     const nowPlaying = () => (s && s.media === 'mounted' && s.nowPlaying) || null;   // без носія трек не показуємо
     const queue = () => (s && s.queue) || {};
+    const building = () => queue().building === true;     // USB20b: черга «Усі файли» добудовується
     const statusPaused = () => {                   // пауза за останнім status (без утримання)
       const np = nowPlaying();
       return !!(np && np.paused) || !!queue().paused;
@@ -302,7 +308,9 @@
       setText(ui.title, title); setAttr(ui.title, 'title', title);
       setText(ui.sub, sub); setAttr(ui.sub, 'title', sub);
       setText(ui.count, cnt); setAttr(ui.count, 'title', numbered ? 'Трек ' + q.pos + ' з ' + q.count : '');
-      ui.meta.hidden = !sub && !cnt;
+      const tr = q.truncated === true;                    // USB20b
+      ui.trunc.hidden = !tr;
+      ui.meta.hidden = !sub && !cnt && !tr;
       setAttr(ui.card, 'aria-label', 'Зараз грає: ' + title + (sub ? ', ' + sub : '') + (numbered ? ', трек ' + q.pos + ' з ' + q.count : ''));
     }
 
@@ -318,16 +326,18 @@
 
       const ready = d.ready, active = !!s && s.active === true && !unavailable;
       const idle = ctlBusy || reqBusy;
+      const bld = active && building();                 // USB20b
+      ui.build.hidden = !bld;
       const paused = pausedNow();
       const showPause = !!np && !paused;
       setIcon(ui.play, showPause ? 'pause' : 'play');
       setAttr(ui.play, 'aria-label', showPause ? 'Пауза' : 'Грати');
       setAttr(ui.play, 'title', showPause ? 'Пауза' : 'Грати');
       ui.play.disabled = !(ready && (np || q.prepared)) || ctlBusy || reqBusy;
-      ui.prev.disabled = !ready || idle;
-      ui.next.disabled = !active || idle;           // «Наступний» доступний, поки режим активний (відомий дефект: може завмирати без eof)
+      ui.prev.disabled = !ready || idle || bld;
+      ui.next.disabled = !active || idle || bld;           // «Наступний» доступний, поки режим активний (відомий дефект: може завмирати без eof)
       ui.stop.disabled = !ready || idle;
-      ui.shuffle.disabled = !active || ctlBusy;
+      ui.shuffle.disabled = !active || ctlBusy || bld;
       ui.repeat.disabled = !active || ctlBusy;
       setAttr(ui.shuffle, 'aria-pressed', active && optVal('shuffle'));
       setAttr(ui.repeat, 'aria-pressed', active && optVal('repeat'));
@@ -346,13 +356,13 @@
           hold = null; anchor = null; endHold = null;
           reqBusy = true; render();
           const req = await waitReq(r.reqId);
-          if (req && req.ok === false) toast(whyText(req.why), req.why === 'end_of_queue' ? 'info' : 'error');
+          if (req && req.ok === false && req.why !== 'queue_building') toast(whyText(req.why), req.why === 'end_of_queue' ? 'info' : 'error');
         } else {                                       // pause / resume / toggle: пауза у status відстає на 1–2 с
           hold = { paused: r.result === 'paused', until: Date.now() + CONFIG.usbPauseHoldMs };
         }
       } catch (e) {
         hold = null;
-        toast(errorText(e), 'error');
+        if (!quietBuild(e)) toast(errorText(e), 'error');
       }
       ctlBusy = false; reqBusy = false; render(); poller.now();
     }
@@ -365,7 +375,7 @@
         const r = await usbApi.options({ [key]: want });
         optHold = { shuffle: !!r.shuffle, repeat: !!r.repeat, until: Date.now() + CONFIG.usbOptHoldMs };
       } catch (e) {
-        toast(errorText(e), 'error');
+        if (!quietBuild(e)) toast(errorText(e), 'error');
       }
       ctlBusy = false; render(); poller.now();
     }

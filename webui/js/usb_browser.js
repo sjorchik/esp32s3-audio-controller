@@ -46,9 +46,15 @@
     };
     ui.view = el('div', { class: 'list usb-list', tabindex: '0', 'aria-label': 'Файли й папки флешки' }, ui.vwin);
     ui.vwin.setAttribute('aria-live', 'off');
+    /* USB20b: перемикач «Папка / Усі файли» (options.scope); показується лише коли status має options.scope. */
+    ui.scF = el('button', { type: 'button', role: 'radio', 'aria-checked': 'true', 'data-scope': 'folder' }, 'Папка');
+    ui.scA = el('button', { type: 'button', role: 'radio', 'aria-checked': 'false', 'data-scope': 'all' }, 'Усі файли');
+    ui.scope = el('div', { class: 'seg usb-scope', role: 'radiogroup', 'aria-label': 'Що відтворювати' }, ui.scF, ui.scA);
+    ui.scBox = el('div', { class: 'usb-scope-box', hidden: true }, ui.scope,
+      el('p', { class: 'hint' }, 'Діє з наступного запуску треку; поточний звук не переривається.'));
     mount.replaceChildren(
       el('div', { class: 'card-head' }, ui.title, el('div', { class: 'usb-br-tools' }, ui.up, ui.reload)),
-      ui.path, ui.note, ui.view, ui.info, ui.more);
+      ui.path, ui.scBox, ui.note, ui.view, ui.info, ui.more);
 
     /* ---- Стан ---- */
     let active = false;
@@ -68,6 +74,8 @@
     let rSig = '';                 // підпис підсвічування у змонтованих рядках (файл, папка-«всередині»)
     let rafPending = false;
     let unsub = null;
+    let scopeHold = null;          // USB20b: {value, until} — оптимістичне значення scope (until = Infinity, поки POST у польоті)
+    let scopeBusy = false;         // USB20b: іде POST /api/usb/options {scope}
 
     const alive = () => active;
     const limit = () => (window.matchMedia('(min-width:' + CONFIG.usbWideMinPx + 'px)').matches
@@ -76,6 +84,9 @@
     const modeOn = () => !!st && st.active === true;
     const ready = () => modeOn() && media() === 'mounted';
     const mayUse = () => ready() && !invalid && !!list && !cmdBusy;
+    const hasScope = () => !!st && !!st.options && typeof st.options.scope === 'string';
+    const scopeVal = () => (scopeHold && Date.now() < scopeHold.until ? scopeHold.value
+      : (hasScope() && st.options.scope === 'all' ? 'all' : 'folder'));
 
     /* ---- Підсвічування поточного треку (USB18b: точне, за nowPlaying.path; евристику за іменем і кількістю прибрано) ----
        Рядок-файл поточний, якщо join(list.cwd, item.name) === nowPlaying.path (повне порівняння рядків, регістр як є).
@@ -179,6 +190,14 @@
       maybePrefetch();
     }
 
+    function renderScope() {
+      const on = ready() && hasScope();
+      ui.scBox.hidden = !on;
+      if (!on) return;
+      const v = scopeVal();
+      [ui.scF, ui.scA].forEach((b) => { setAttr(b, 'aria-checked', b.getAttribute('data-scope') === v); b.disabled = scopeBusy; });
+    }
+
     function render(rowsToo) {
       const nt = noteText();
       ui.note.hidden = !nt;
@@ -188,6 +207,7 @@
       setAttr(ui.path, 'title', cwd || '');
       ui.up.disabled = !mayUse() || !list || list.cwd === '/';
       ui.reload.disabled = !ready() || cmdBusy || loading;
+      renderScope();
       const it = infoText();
       ui.info.hidden = !it;
       setText(ui.info, it);
@@ -319,6 +339,25 @@
       if (!it) return;
       if (it.dir) doCd(i); else doPlay(i);
     });
+    async function doScope(want) {
+      if (scopeBusy || want === scopeVal()) return;
+      scopeBusy = true; scopeHold = { value: want, until: Infinity }; render(false);
+      try {
+        const r = await usbApi.options({ scope: want });
+        const v = r && (r.scope === 'all' || r.scope === 'folder') ? r.scope : want;
+        scopeHold = { value: v, until: Date.now() + CONFIG.usbOptHoldMs };
+      } catch (e) {
+        scopeHold = null;                                   // відкат до значення зі status
+        if (active) toast(errorText(e), 'error');
+      }
+      scopeBusy = false;
+      if (active) render(false);
+    }
+
+    ui.scope.addEventListener('click', (ev) => {
+      const b = ev.target.closest('button[data-scope]');
+      if (b && !b.disabled) doScope(b.getAttribute('data-scope'));
+    });
     ui.up.addEventListener('click', doUp);
     ui.reload.addEventListener('click', () => { if (ready() && !cmdBusy) { nextTry = 0; loadFirst(); } });
     ui.more.addEventListener('click', () => { loadError = ''; nextTry = 0; fetchPage(false); });
@@ -346,7 +385,7 @@
         } else {
           if (unsub) { unsub(); unsub = null; }
           clearList();
-          st = null; cmdBusy = false; busyIndex = -1; nextTry = 0;
+          st = null; cmdBusy = false; busyIndex = -1; nextTry = 0; scopeHold = null; scopeBusy = false;
           render();
         }
       },
