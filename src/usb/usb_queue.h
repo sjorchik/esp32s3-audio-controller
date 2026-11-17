@@ -119,6 +119,37 @@ bool repeatAll();
 void setScope(usb_queue_scope_cfg::Scope s);
 usb_queue_scope_cfg::Scope scope();
 
+// --- [USB22a-1] Бібліотека: плоский список усіх файлів флешки (кеш таблиць «all» з USB20a-2) -----------------------------------
+// Скан запускається ліниво: перший requestLibrary() (з GET /api/usb/library) ставить прапорець, який споживає tick() у задачі
+// usb_nav. Скан не залежить від черги й від scope; таблиці лишаються кешем, поки не зміниться носій / не завершиться режим USB.
+// Порядок файлів = порядок черги «all» (обхід у глибину: файли папки, потім підпапки), тож i = індекс у черзі «all».
+enum class LibState : uint8_t {
+    None,      // кешу немає й скан не йде (наступний requestLibrary його запустить)
+    Building,  // скан іде; total — скільки файлів уже знайдено
+    Ready,     // кеш готовий
+    Empty,     // скан завершено, файлів немає
+    Error      // скан неможливий (reason); тримається до зміни носія / виходу з режиму
+};
+const char* libStateName(LibState s);
+
+struct LibPageInfo {
+    LibState state;
+    bool stale;        // version у запиті не збігається з поточною (кеш перебудовано)
+    bool truncated;    // скан відкинув частину вмісту (ліміти / глибина / помилки / час)
+    uint32_t version;  // змінюється при кожному скиданні / завершенні кешу
+    uint16_t total;    // Ready/Empty — файлів у кеші; Building — прогрес
+    uint16_t returned; // записів у buf (лише Ready)
+    const char* reason;  // статичний рядок (лише Error)
+};
+
+// Сторінка кешу: записи [offset, offset + returned) пакуються в buf як «імʼя\0папка\0» (папка — повний шлях, «/» для кореня;
+// шлях файлу = папка + «/» + імʼя, для кореня — «/» + імʼя). cap ≥ usb_library_cfg::kPageBufMin. expectVersion 0 — не перевіряти.
+// Безпечно з іншої задачі (async_tcp): читає під usb_nav::lock, ≤ kApiLockWaitMs. false — мьютекс зайнятий / аргументи.
+bool libraryPage(uint16_t offset, uint16_t maxItems, uint32_t expectVersion, char* buf, size_t cap, LibPageInfo* out);
+
+// Просить запустити скан бібліотеки (якщо кешу ще немає). НЕ зупиняє відтворення. false — режим не готовий (why = "mode_not_ready").
+bool requestLibrary(const char** why = nullptr);
+
 #if USB_HOST_DIAG
 // Консоль: usb.q play <індекс> | next | prev | stop | stat | shuffle on|off | repeat on|off. Блокує loopTask до завершення.
 // [USB14] Стан паузи / підготовленої черги / відновлення, збережені значення й лічильники записів у NVS (друкує usb.q stat і usb.mode stat).

@@ -694,6 +694,7 @@ curl -X POST --data-binary @firmware.bin -H "Content-Type: application/octet-str
 | GET | `/api/system` | §8 |
 | POST | `/api/system/reboot`, `/api/system/factory-reset`, `/api/ota` | §8 |
 | GET | `/api/usb/status`, `/api/usb/list`, `/api/usb/result` | §16 (USB15; лише `FEATURE_USB_MODE = 1`) |
+| GET | `/api/usb/library` | §21 (USB22a-1; лише `FEATURE_USB_MODE = 1`) |
 | POST | `/api/usb/mode`, `/api/usb/cd`, `/api/usb/play`, `/api/usb/control`, `/api/usb/seek`, `/api/usb/options` | §16 (USB15) |
 
 Видалені маршрути (`POST /api/gain`) — §14.
@@ -1054,7 +1055,7 @@ POST /api/vu {"value":1,"x":2}            -> 400 {"ok":false,"error":"unknown_fi
 | `GET /api/usb/status` | `200`, `active:false` | `200` | `200` |
 | `GET /api/usb/result` | `200` / `404 unknown_req` | як поза | як поза |
 | `POST /api/usb/mode` | працює (це вхід у режим) | працює | працює |
-| `GET /api/usb/list`, `POST /api/usb/cd`, `POST /api/usb/play` | `409 usb_mode_off` | `409 no_media` | працює |
+| `GET /api/usb/list`, `GET /api/usb/library`, `POST /api/usb/cd`, `POST /api/usb/play` | `409 usb_mode_off` | `409 no_media` | працює |
 | `POST /api/usb/control`, `/seek`, `/options` | `409 usb_mode_off` | працює за станом черги | працює |
 
 Спільні відмови (тіло `{"ok":false,"error":"<код>"[,...]}`):
@@ -1356,3 +1357,68 @@ POST /api/input       {"index":3}                     -> 202 {"ok":true,"pending
 **Відновлення при вході в режим** (останній трек із NVS) завжди будує ПАПКОВУ чергу (`queue.scope = "folder"`), незалежно від `options.scope`; «усе» починається з наступного `play`.
 
 **Затримка.** Трек X грає одразу; скан починається, коли X заграв (не пізніше ніж через 3 с після `play`), щоб читання флешки не уповільнювало старт треку. Час скану залежить від кількості папок і файлів і друкується в логу: `[USBQ] all: scan done in N ms: ...`. Веб-клієнт, що показує `queue.count`, має очікувати його зміну після `queue.building` → `false`.
+
+## 21. Бібліотека USB: `GET /api/usb/library` [USB22a-1]
+
+Плоский список УСІХ файлів флешки (`.mp3`, ті самі фільтри / глибина ≤ 8 / службові імена, що й черга «all», §20) для екрана
+«Бібліотека». Працює за будь-якого `options.scope` (і `folder`, і `all`), не залежить від того, що грає, і НЕ зупиняє відтворення.
+Лише `FEATURE_USB_MODE = 1`; без нього маршруту немає (404).
+
+### 21.1. Запит
+
+`GET /api/usb/library?offset=&limit=[&version=]`
+
+| Параметр | За замовчуванням | Межі | Помилка |
+|---|---|---|---|
+| `offset` | 0 | 0 … 65535 (і ≤ `total`, коли кеш готовий) | `400 out_of_range` (`min`, `max`) / `400 invalid_value` |
+| `limit` | 50 | 1 … 100 | `400 out_of_range` (`min`, `max`) / `400 invalid_value` |
+| `version` | — | значення з попередньої відповіді | `409 stale`, якщо кеш перебудовано |
+
+Параметри перевіряються ДО стану режиму (як у `/list`). Далі: `409 usb_mode_off` (режим не «Ready / Playing»), `409 no_media`
+(носія немає), `503 busy` (мьютекс зайнятий довше 20 мс — повторити).
+
+### 21.2. Відповідь `200`
+
+```json
+{"state":"ready","version":7,"total":1560,"truncated":false,"offset":0,"limit":50,
+ "items":[{"i":0,"name":"A.mp3","dir":"/","path":"/A.mp3"},
+          {"i":1,"name":"B.mp3","dir":"/Rock","path":"/Rock/B.mp3"}],"nextOffset":2}
+```
+
+| Поле | Значення |
+|---|---|
+| `state` | `building` — скан іде; `ready` — кеш готовий; `empty` — скан завершено, файлів немає; `error` — скан неможливий (`reason`) |
+| `version` | змінюється при кожному завершенні / скиданні кешу; передавайте його як `version` у наступних сторінках |
+| `total` | `ready` / `empty` — кількість файлів; `building` — скільки файлів уже знайдено (прогрес) |
+| `truncated` | скан відкинув частину вмісту (ліміти файлів / папок / пулу, глибина, помилки читання, час скану) |
+| `items[].i` | порядковий номер у бібліотеці = індекс у черзі «all» (`status.queue.index`, коли грає черга «all») |
+| `items[].name` / `dir` / `path` | імʼя файлу; повний шлях папки (`/` — корінь); `path` = `dir` + `/` + `name` (для кореня `/` + `name`) |
+| `nextOffset` | `offset` наступної сторінки або `null` (кінець; завжди `null`, поки `state` ≠ `ready`) |
+| `reason` | лише для `error`: `no_psram` (не вистачило PSRAM під таблиці) або `volume_not_readable` |
+
+Поки `state` = `building`, `items` порожні: клієнт опитує (≈ раз на секунду) до `ready` / `empty` / `error`.
+
+**Пагінація.** Бюджет відповіді ≈ 4096 Б, а елемент несе `name` + `dir` + `path` (≈ 2,5 раза більший за елемент `/list`), тому
+сторінка вміщає орієнтовно 25–30 елементів, навіть якщо `limit` більший. Клієнт ЗАВЖДИ йде за `nextOffset`, а не за
+`offset + limit`. Перший елемент сторінки віддається цілим, імена не обрізаються.
+
+### 21.3. Життєвий цикл кешу
+
+* Перший запит за відсутності кешу запускає скан і одразу відповідає `building`. Скан читає флешку шматками (як скан черги «all»),
+  відтворення не переривається.
+* Кеш — ті самі таблиці, що й черга «all» (≈ 0,35 МБ PSRAM, окремої копії немає); виділяються при першому запиті бібліотеки або
+  першому `play` у `scope = all`, звільняються при виході з режиму USB.
+* Кеш скидається (`state` повертається до `building` / наступного скану, `version` змінюється) при: виході з режиму USB,
+  вийманні або зміні носія, повторному скані. У `scope = all` кожен `play` перескановує флешку й скидає кеш (USB22a-2 це
+  прибере) — клієнт бачить `building` і чекає.
+* `state = error` тримається до зміни носія або виходу з режиму.
+
+### 21.4. Приклади
+
+```
+GET /api/usb/library?limit=2          -> 200 {"state":"building","version":4,"total":0,"truncated":false,"offset":0,"limit":2,"items":[],"nextOffset":null}
+GET /api/usb/library?limit=2          -> 200 {"state":"ready","version":5,"total":1560,"truncated":false,"offset":0,"limit":2,"items":[...],"nextOffset":2}
+GET /api/usb/library?offset=2&version=4 -> 409 {"ok":false,"error":"stale"}
+GET /api/usb/library?limit=101        -> 400 {"ok":false,"error":"out_of_range","field":"limit","min":1,"max":100}
+GET /api/usb/library                  -> 409 {"ok":false,"error":"no_media",...}
+```

@@ -427,6 +427,103 @@ def usb20a1_scope_roundtrip(d):
         record("usb20a1: scope повернуто до %s" % cur, isinstance(o3, dict) and o3.get("scope") == cur, "options=%r" % (o3,))
 
 
+USB_LIB_MAX = 100  # [USB22a-1] web_api_usb_cfg::kLibraryPageMax
+
+
+def usb22a1_library_checks(d, active):
+    """[USB22a-1] GET /api/usb/library: валідація параметрів (завжди); у активному режимі з носієм — скан, форма, пагінація, порядок."""
+    import time
+
+    expect("GET /api/usb/library?limit=0 -> 400", d.get("/api/usb/library?limit=0"), 400, ["error", "min", "max"], "out_of_range")
+    expect("GET /api/usb/library?limit=%d -> 400" % (USB_LIB_MAX + 1), d.get("/api/usb/library?limit=%d" % (USB_LIB_MAX + 1)), 400,
+           ["error", "min", "max"], "out_of_range")
+    expect("GET /api/usb/library?offset=abc -> 400", d.get("/api/usb/library?offset=abc"), 400, ["error", "field"], "invalid_value")
+    expect("GET /api/usb/library?offset=-1 -> 400", d.get("/api/usb/library?offset=-1"), 400, ["error", "field"], "invalid_value")
+    expect("GET /api/usb/library?limit=abc -> 400", d.get("/api/usb/library?limit=abc"), 400, ["error", "field"], "invalid_value")
+
+    status, st = d.get("/api/usb/status")
+    if status != 200 or not isinstance(st, dict):
+        record("usb22a1: library", False, "status -> %s" % status, skip=True)
+        return
+    if not active:
+        expect("GET /api/usb/library поза режимом -> 409 usb_mode_off", d.get("/api/usb/library"), 409, ["error", "state"], "usb_mode_off")
+        return
+    if st.get("media") != "mounted":
+        expect("GET /api/usb/library без носія -> 409 no_media", d.get("/api/usb/library"), 409, ["error", "media"], "no_media")
+        return
+
+    t0 = time.time()
+    first = None
+    body = None
+    while time.time() - t0 < 75:
+        status, body = d.get("/api/usb/library?limit=1")
+        if status != 200 or not isinstance(body, dict):
+            record("usb22a1: GET /api/usb/library", False, "HTTP %s" % status)
+            return
+        if first is None:
+            first = body.get("state")
+        if body.get("state") != "building":
+            break
+        time.sleep(0.5)
+    elapsed = time.time() - t0
+    record("usb22a1: перший стан бібліотеки building|ready|empty", first in ("building", "ready", "empty"), "first=%r" % (first,))
+    record("usb22a1: скан завершився (state != building) за 75 с", isinstance(body, dict) and body.get("state") in ("ready", "empty", "error"),
+           "state=%r total=%r за %.1f с" % (body.get("state"), body.get("total"), elapsed))
+    if body.get("state") == "error":
+        record("usb22a1: state=error має reason", isinstance(body.get("reason"), str), "reason=%r" % (body.get("reason"),), skip=True)
+        return
+    if body.get("state") == "empty":
+        record("usb22a1: empty -> total == 0, items == []", body.get("total") == 0 and body.get("items") == [] and body.get("nextOffset") is None,
+               "body=%r" % (body,))
+        return
+
+    ok, pg = expect("GET /api/usb/library (ready)", d.get("/api/usb/library"), 200,
+                    ["state", "version", "total", "truncated", "offset", "limit", "items", "nextOffset"])
+    if not ok:
+        return
+    ver, total = pg["version"], pg["total"]
+    record("usb22a1: items[] мають i/name/dir/path", all(has_keys(it, ["i", "name", "dir", "path"]) for it in pg["items"]))
+    items, off, pages, bad = [], 0, 0, False
+    cur = pg
+    while True:
+        pages += 1
+        items.extend(cur["items"])
+        nxt = cur["nextOffset"]
+        if nxt is None or pages > 400:
+            break
+        if nxt != off + len(cur["items"]) or len(cur["items"]) == 0:
+            bad = True
+            break
+        off = nxt
+        st2, cur = d.get("/api/usb/library?offset=%d&limit=%d&version=%d" % (off, USB_LIB_MAX, ver))
+        if st2 != 200 or not isinstance(cur, dict):
+            record("usb22a1: пагінація", st2 == 409, "HTTP %s (409 stale допустимий, якщо кеш перебудовано)" % st2)
+            return
+    record("usb22a1: пагінація за nextOffset: сума == total (%d сторінок)" % pages, len(items) == total and not bad,
+           "items=%d total=%d" % (len(items), total))
+    record("usb22a1: i неперервні 0..total-1", [it["i"] for it in items] == list(range(len(items))))
+    record("usb22a1: path == dir + '/' + name",
+           all(it["path"] == (("/" + it["name"]) if it["dir"] == "/" else it["dir"] + "/" + it["name"]) for it in items))
+    record("usb22a1: dir починається з '/' і без кінцевого '/' (крім кореня)",
+           all(it["dir"].startswith("/") and (it["dir"] == "/" or not it["dir"].endswith("/")) for it in items))
+    seen, closed, interleaved = set(), None, False
+    prev = None
+    for it in items:  # файли однієї папки йдуть підряд (обхід у глибину), папка не повертається після виходу з неї
+        if it["dir"] != prev:
+            if it["dir"] in seen:
+                interleaved = True
+                break
+            seen.add(it["dir"])
+            prev = it["dir"]
+    record("usb22a1: файли кожної папки йдуть підряд", not interleaved)
+    record("usb22a1: truncated — bool", isinstance(pg["truncated"], bool))
+
+    expect("usb22a1: застарілий version -> 409 stale", d.get("/api/usb/library?version=%d" % (ver + 1000)), 409, ["error"], "stale")
+    expect("usb22a1: offset == total -> 200, порожньо", d.get("/api/usb/library?offset=%d" % total), 200, ["state", "items", "nextOffset"])
+    expect("usb22a1: offset > total -> 400 out_of_range", d.get("/api/usb/library?offset=%d" % (total + 1)), 400, ["error", "min", "max"],
+           "out_of_range")
+
+
 def usb_read_checks(d):
     """-> (usb_present, active). usb_present=False, якщо маршрутів нема (FEATURE_USB_MODE = 0)."""
     status, body = d.get("/api/usb/status")
@@ -1392,6 +1489,8 @@ def main():
 
     st = read_checks(d)
     usb_present, usb_active = usb_read_checks(d)  # [USB15]
+    if usb_present:
+        usb22a1_library_checks(d, usb_active)  # [USB22a-1]
     # [INP4b] Узгодженість «веб-активного входу»: у режимі «USB» (usb/status.active) status.input має бути 3; слот 3 доступний
     # (inputs[3].available) тоді й лише тоді, коли USB-маршрути зібрано.
     inp_main = get_inputs(d)

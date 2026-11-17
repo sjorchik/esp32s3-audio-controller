@@ -36,6 +36,14 @@ constexpr size_t kListJsonBudgetBytes = 4096;
 // Службові символи одного запису {"i":NNNN,"name":"…","dir":false}, з комою (рахується для бюджету; точно 33 + запас).
 constexpr size_t kListItemOverheadBytes = 36;
 
+// --- GET /api/usb/library [USB22a-1] -------------------------------------------------------------------------------------------
+// Елемент бібліотеки несе name + dir + path (≈ у 2,5 раза більший за елемент /list), тому за бюджетом 4096 Б сторінка вміщає
+// орієнтовно 25–30 елементів (limit — лише верхня межа; клієнт іде за nextOffset). Перший елемент завжди віддається цілим.
+constexpr uint16_t kLibraryDefaultLimit = 50;
+constexpr uint16_t kLibraryPageMax = 100;
+constexpr size_t kLibraryJsonBudgetBytes = 4096;
+constexpr size_t kLibraryItemOverheadBytes = 48;  // {"i":NNNNN,"name":"","dir":"","path":""}, + кома
+
 // --- POST /api/usb/seek -------------------------------------------------------------------------------------------------
 // Модуль відносного зсуву, с. 3600 = година: достатньо для довгих треків, а помилковий «10^9» відсікається.
 constexpr int32_t kSeekMaxAbsSec = 3600;

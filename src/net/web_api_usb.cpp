@@ -29,6 +29,7 @@
 
 #include "audio/audio_player.h"
 #include "config/usb_browser_config.h"
+#include "config/usb_library_config.h"      // [USB22a-1]
 #include "config/usb_queue_scope_config.h"  // [USB20a-1]
 #include "config/web_api_usb_config.h"
 #include "core/app_controller.h"
@@ -481,6 +482,152 @@ void handleList(AsyncWebServerRequest* req) {
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/usb/library?offset=&limit=[&version=]   [USB22a-1]
+// Плоский список усіх файлів флешки (кеш таблиць «all»). Перший запит запускає скан (state "building"), далі клієнт опитує.
+// ---------------------------------------------------------------------------
+static_assert(web_api_usb_cfg::kListRawBufBytes >= usb_library_cfg::kPageBufMin, "library page buffer too small");
+
+// "шлях" елемента: папка + "/" + імʼя (для кореня — "/" + імʼя); екранується шматками, без проміжного буфера.
+void jsonPrintPath(Print& out, const char* dir, const char* name) {
+    auto emit = [&out](const char* piece, size_t n) { out.write(reinterpret_cast<const uint8_t*>(piece), n); };
+    out.write('"');
+    jsonEscapePieces(dir, emit);
+    if (!(dir[0] == '/' && dir[1] == '\0')) {
+        out.write('/');
+    }
+    jsonEscapePieces(name, emit);
+    out.write('"');
+}
+
+void handleLibrary(AsyncWebServerRequest* req) {
+    if (!exactUrl(req, "/api/usb/library")) return;
+    WEB_API_LOG("%s %s", req->methodToString(), req->url().c_str());
+
+    uint32_t offset = 0;
+    uint32_t limit = web_api_usb_cfg::kLibraryDefaultLimit;
+    uint32_t version = 0;
+    bool present = false;
+    if (!queryUint(req, "offset", &offset, &present)) return;
+    if (!queryUint(req, "limit", &limit, &present)) return;
+    if (!queryUint(req, "version", &version, &present)) return;
+    if (limit < 1 || limit > web_api_usb_cfg::kLibraryPageMax) {
+        sendRangeError(req, "limit", 1, web_api_usb_cfg::kLibraryPageMax);
+        return;
+    }
+    if (offset > 65535u) {
+        sendRangeError(req, "offset", 0, 65535);
+        return;
+    }
+    if (!passModeGate(req) || !passMediaGate(req)) return;
+
+    char* buf = static_cast<char*>(heap_caps_malloc(web_api_usb_cfg::kListRawBufBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (buf == nullptr) {
+        sendError(req, 503, "busy");
+        return;
+    }
+    usb_queue::LibPageInfo pi;
+    if (!usb_queue::libraryPage(static_cast<uint16_t>(offset), static_cast<uint16_t>(limit), version, buf,
+                                web_api_usb_cfg::kListRawBufBytes, &pi)) {
+        free(buf);
+        sendError(req, 503, "busy");
+        return;
+    }
+    if (pi.state == usb_queue::LibState::None || pi.state == usb_queue::LibState::Building) {
+        // Кешу немає — просимо скан; скан уже йде (можливо, запущений чергою) — просимо, щоб він не зупинився без бібліотеки.
+        const char* why = nullptr;
+        if (!usb_queue::requestLibrary(&why)) {
+            free(buf);
+            sendRefused(req, why);
+            return;
+        }
+        if (pi.state == usb_queue::LibState::None) {
+            pi.state = usb_queue::LibState::Building;
+            pi.total = 0;
+        }
+        pi.returned = 0;
+    }
+    if (pi.stale) {
+        free(buf);
+        sendUsbError(req, 409, "stale");
+        return;
+    }
+    const bool ready = (pi.state == usb_queue::LibState::Ready);
+    if ((ready || pi.state == usb_queue::LibState::Empty) && offset > pi.total) {
+        free(buf);
+        sendRangeError(req, "offset", 0, pi.total);
+        return;
+    }
+
+    // Скільки записів вміщається в бюджет JSON (перший — завжди; імена НЕ обрізаються). Запис у buf: імʼя\0папка\0.
+    uint16_t shown = 0;
+    if (ready) {
+        size_t used = 0;
+        const char* p = buf;
+        for (uint16_t k = 0; k < pi.returned; ++k) {
+            const char* name = p;
+            const char* dir = name + strlen(name) + 1;
+            const bool root = (dir[0] == '/' && dir[1] == '\0');
+            const size_t cost = web_api_usb_cfg::kLibraryItemOverheadBytes + 2 * jsonEscapedLen(name) + 2 * jsonEscapedLen(dir) +
+                                (root ? 0 : 1);
+            if (shown > 0 && used + cost > web_api_usb_cfg::kLibraryJsonBudgetBytes) {
+                break;
+            }
+            used += cost;
+            ++shown;
+            p = dir + strlen(dir) + 1;
+        }
+        if (shown == 0 && offset < pi.total) {  // сторінку не вдалося зібрати (недосяжно за лімітів глибини / довжини)
+            free(buf);
+            sendError(req, 500, "internal");
+            return;
+        }
+    }
+
+    AsyncResponseStream* r = req->beginResponseStream("application/json");
+    if (r == nullptr) {
+        free(buf);
+        req->send(503);
+        return;
+    }
+    r->setCode(200);
+    r->addHeader("Cache-Control", "no-store");
+    r->printf("{\"state\":\"%s\",\"version\":%lu,\"total\":%u,\"truncated\":%s,\"offset\":%u,\"limit\":%u", usb_queue::libStateName(pi.state),
+              static_cast<unsigned long>(pi.version), static_cast<unsigned>(pi.total), pi.truncated ? "true" : "false",
+              static_cast<unsigned>(offset), static_cast<unsigned>(limit));
+    if (pi.state == usb_queue::LibState::Error) {
+        r->printf(",\"reason\":\"%s\"", pi.reason != nullptr ? pi.reason : "error");  // статичні ASCII-рядки
+    }
+    r->print(",\"items\":[");
+    {
+        const char* p = buf;
+        for (uint16_t k = 0; k < shown; ++k) {
+            const char* name = p;
+            const char* dir = name + strlen(name) + 1;
+            if (k > 0) {
+                r->write(',');
+            }
+            r->printf("{\"i\":%u,\"name\":", static_cast<unsigned>(offset + k));
+            jsonPrintString(*r, name);
+            r->print(",\"dir\":");
+            jsonPrintString(*r, dir);
+            r->print(",\"path\":");
+            jsonPrintPath(*r, dir, name);
+            r->write('}');
+            p = dir + strlen(dir) + 1;
+        }
+    }
+    r->print("],\"nextOffset\":");
+    if (ready && offset + shown < pi.total) {
+        r->printf("%u", static_cast<unsigned>(offset + shown));
+    } else {
+        r->print("null");
+    }
+    r->write('}');
+    free(buf);
+    req->send(r);
+}
+
+// ---------------------------------------------------------------------------
 // GET /api/usb/result?id=N
 // ---------------------------------------------------------------------------
 void handleResult(AsyncWebServerRequest* req) {
@@ -918,6 +1065,7 @@ void registerUsbRoutes(AsyncWebServer& server) {
     // Точні шляхи; обробники самі перевіряють url (exactUrl), як решта web_api_*.
     server.on("/api/usb/status", HTTP_GET, handleStatus);
     server.on("/api/usb/list", HTTP_GET, handleList);
+    server.on("/api/usb/library", HTTP_GET, handleLibrary);  // [USB22a-1]
     server.on("/api/usb/result", HTTP_GET, handleResult);
     server.on("/api/usb/mode", HTTP_POST, handleMode, nullptr, web_api::jsonBodyCallback);
     server.on("/api/usb/cd", HTTP_POST, handleCd, nullptr, web_api::jsonBodyCallback);
